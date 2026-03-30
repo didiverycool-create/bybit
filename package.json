@@ -1,0 +1,19 @@
+{
+  "name": "bybit-quant-platform",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "npm --workspace apps/desktop run dev",
+    "dev:desktop": "npm --workspace apps/desktop run dev",
+    "build": "npm --workspace apps/desktop run build",
+    "build:desktop": "npm --workspace apps/desktop run build",
+    "lint": "npm --workspace apps/desktop run lint",
+    "lint:desktop": "npm --workspace apps/desktop run lint",
+    "test:control-api": "python3 -m unittest discover -s services/control-api/tests -p 'test_*.py' -v",
+    "verify:backend": "python3 -m py_compile services/control-api/*.py services/control-api/tests/test_control_api.py && python3 -m unittest discover -s services/control-api/tests -p 'test_*.py' -v"
+  }
+}

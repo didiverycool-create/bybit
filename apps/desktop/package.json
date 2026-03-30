@@ -1,0 +1,38 @@
+{
+  "name": "@bybit/desktop",
+  "private": true,
+  "version": "0.1.0",
+  "main": "dist-electron/main/main.js",
+  "scripts": {
+    "dev": "concurrently -k \"python3 ../../services/control-api/main.py\" \"vite\" \"tsc -p tsconfig.electron.json -w\" \"wait-on http://127.0.0.1:8787/health tcp:5173 dist-electron/main/main.js && electron .\"",
+    "build": "npm run build:renderer && npm run build:electron",
+    "build:renderer": "vite build",
+    "build:electron": "tsc -p tsconfig.electron.json",
+    "lint": "eslint ."
+  },
+  "dependencies": {
+    "@tanstack/react-query": "^5.78.0",
+    "echarts": "^5.6.0",
+    "echarts-for-react": "^3.0.2",
+    "lucide-react": "^0.502.0",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.1",
+    "@types/node": "^22.15.3",
+    "@types/react": "^19.1.8",
+    "@types/react-dom": "^19.1.6",
+    "@vitejs/plugin-react": "^4.4.1",
+    "concurrently": "^9.2.1",
+    "electron": "^35.7.5",
+    "eslint": "^9.28.0",
+    "eslint-plugin-react-hooks": "^5.2.0",
+    "eslint-plugin-react-refresh": "^0.4.24",
+    "globals": "^16.4.0",
+    "typescript": "^5.8.3",
+    "typescript-eslint": "^8.46.1",
+    "vite": "^6.3.5",
+    "wait-on": "^8.0.4"
+  }
+}

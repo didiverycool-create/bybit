@@ -1,0 +1,7 @@
+{
+  "api_key": "YOUR_BYBIT_API_KEY",
+  "api_secret": "YOUR_BYBIT_API_SECRET",
+  "api_base_url": "https://api.bybit.com",
+  "account_type": "UNIFIED",
+  "mode": "live"
+}
