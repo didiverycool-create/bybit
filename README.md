@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 # Bybit 量化交易控制端
 
 这是一个中文桌面端优先的 Bybit 量化交易控制端项目。
@@ -351,7 +350,3 @@ pnpm verify:backend
 - 结构化 JSON 形式的 AI 复盘已验证能被解析，并与本地回测启发式提案合并入库
 - `POST /api/ai/scheduler/commands` 已在当前环境内验证可真实终止正在运行的 OpenClaw 任务
 - `POST /api/backtests` 已在当前环境内验证会自动排队 `generate_backtest_review`，并生成带提案的“回测 AI 复盘”
-=======
-# bybit
-Bybit量化交易
->>>>>>> origin/main
