@@ -692,6 +692,16 @@ class StubStrategyRuntimeMarketClient(StubBybitPublicMarketClient):
         )
 
 
+class RecordingBacktestMarketClient(StubBybitPublicMarketClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.requested_markets: list[str] = []
+
+    def get_candles(self, symbol: str, market: str, interval: str = "60", limit: int = 48) -> list[Any]:
+        self.requested_markets.append(market)
+        return super().get_candles(symbol, market, interval=interval, limit=limit)
+
+
 class StubPublicExecutionRealtimeFeed:
     def __init__(
         self,
@@ -713,9 +723,14 @@ class StubPublicExecutionRealtimeFeed:
         self.last_message_at_linear = (
             last_message_at_linear if last_message_at_linear is not None else (now_iso if connected_linear else None)
         )
-        self.symbol_last_message_at = {key.upper(): value for key, value in (symbol_last_message_at or {}).items()}
-        self.ticker_symbols = {item.upper() for item in (ticker_symbols or [])}
+        self.symbol_last_message_at = {str(key).upper(): value for key, value in (symbol_last_message_at or {}).items()}
+        self.ticker_symbols = {str(item).upper() for item in (ticker_symbols or [])}
         self.last_error = last_error
+
+    @staticmethod
+    def _market_key(symbol: str, market: Optional[str] = None) -> str:
+        normalized_symbol = symbol.upper()
+        return f"{market}:{normalized_symbol}".upper() if market else normalized_symbol
 
     def update_watchlist(self, watchlist: list[Any]) -> None:
         return None
@@ -732,11 +747,13 @@ class StubPublicExecutionRealtimeFeed:
             "last_error": self.last_error,
         }
 
-    def has_ticker(self, symbol: str) -> bool:
-        return symbol.upper() in self.ticker_symbols
+    def has_ticker(self, symbol: str, market: Optional[str] = None) -> bool:
+        return self._market_key(symbol, market) in self.ticker_symbols or symbol.upper() in self.ticker_symbols
 
-    def get_symbol_last_message_at(self, symbol: str) -> Optional[str]:
-        return self.symbol_last_message_at.get(symbol.upper())
+    def get_symbol_last_message_at(self, symbol: str, market: Optional[str] = None) -> Optional[str]:
+        return self.symbol_last_message_at.get(self._market_key(symbol, market)) or self.symbol_last_message_at.get(
+            symbol.upper()
+        )
 
 
 class FakeRealtimeFeed:
@@ -750,7 +767,7 @@ class FakeRealtimeFeed:
         self.recent_trades = recent_trades or []
         self.orderbook_snapshot = orderbook_snapshot or {"bids": [], "asks": []}
 
-    def get_ticker_snapshot(self, symbol: str) -> Dict[str, Any]:
+    def get_ticker_snapshot(self, symbol: str, market: Optional[str] = None) -> Dict[str, Any]:  # noqa: ARG002
         return {
             "lastPrice": str(self.live_candle.close),
             "price24hPcnt": "0.021",
@@ -760,7 +777,12 @@ class FakeRealtimeFeed:
             "openInterestValue": "125000000",
         }
 
-    def merge_candles(self, symbol: str, candles: list[CandlePoint]) -> list[CandlePoint]:
+    def merge_candles(
+        self,
+        symbol: str,
+        candles: list[CandlePoint],
+        market: Optional[str] = None,
+    ) -> list[CandlePoint]:  # noqa: ARG002
         if candles and candles[-1].time == self.live_candle.time:
             return [*candles[:-1], self.live_candle]
         return [*candles, self.live_candle]
@@ -768,14 +790,124 @@ class FakeRealtimeFeed:
     def get_status(self) -> Dict[str, Any]:
         return {"last_message_at": self.live_candle.time}
 
-    def get_recent_trades_snapshot(self, symbol: str, limit: int = 12) -> list[Any]:
+    def get_recent_trades_snapshot(
+        self,
+        symbol: str,
+        limit: int = 12,
+        market: Optional[str] = None,
+    ) -> list[Any]:  # noqa: ARG002
         return self.recent_trades[:limit]
 
-    def get_orderbook_snapshot(self, symbol: str, limit: int = 8) -> Dict[str, Any]:
+    def get_orderbook_snapshot(
+        self,
+        symbol: str,
+        limit: int = 8,
+        market: Optional[str] = None,
+    ) -> Dict[str, Any]:  # noqa: ARG002
         return {
             "bids": list(self.orderbook_snapshot.get("bids", []))[:limit],
             "asks": list(self.orderbook_snapshot.get("asks", []))[:limit],
         }
+
+
+class MultiMarketRealtimeFeed:
+    def __init__(self) -> None:
+        self._live_candles = {
+            "spot": CandlePoint(
+                time="2026-03-31T06:00:00+08:00",
+                open=101.0,
+                high=103.0,
+                low=100.5,
+                close=102.5,
+                volume=2400.0,
+            ),
+            "perp": CandlePoint(
+                time="2026-03-31T06:00:00+08:00",
+                open=201.0,
+                high=203.0,
+                low=200.5,
+                close=202.5,
+                volume=4200.0,
+            ),
+        }
+
+    @staticmethod
+    def _normalize_market(market: Optional[str]) -> str:
+        return "spot" if market == "spot" else "perp"
+
+    def get_ticker_snapshot(self, symbol: str, market: Optional[str] = None) -> Dict[str, Any]:  # noqa: ARG002
+        candle = self._live_candles[self._normalize_market(market)]
+        return {
+            "lastPrice": str(candle.close),
+            "price24hPcnt": "0.021",
+            "highPrice24h": str(candle.high * 1.01),
+            "lowPrice24h": str(candle.low * 0.99),
+            "fundingRate": "0.0001" if self._normalize_market(market) == "perp" else "",
+            "openInterestValue": "125000000",
+        }
+
+    def merge_candles(
+        self,
+        symbol: str,
+        candles: list[CandlePoint],
+        market: Optional[str] = None,
+    ) -> list[CandlePoint]:  # noqa: ARG002
+        return [*candles, self._live_candles[self._normalize_market(market)]]
+
+    def get_status(self) -> Dict[str, Any]:
+        return {"last_message_at": "2026-03-31T06:00:00+08:00"}
+
+    def get_recent_trades_snapshot(
+        self,
+        symbol: str,
+        limit: int = 12,
+        market: Optional[str] = None,
+    ) -> list[Any]:  # noqa: ARG002
+        normalized_market = self._normalize_market(market)
+        price = 102.5 if normalized_market == "spot" else 202.5
+        return [
+            {
+                "side": "buy",
+                "price": price,
+                "size": 0.25,
+                "value": round(price * 0.25, 6),
+                "occurred_at": "2026-03-31T06:00:05+08:00",
+                "is_block_trade": False,
+            }
+        ][:limit]
+
+    def get_orderbook_snapshot(
+        self,
+        symbol: str,
+        limit: int = 8,
+        market: Optional[str] = None,
+    ) -> Dict[str, Any]:  # noqa: ARG002
+        normalized_market = self._normalize_market(market)
+        bid_price = 102.4 if normalized_market == "spot" else 202.4
+        ask_price = 102.6 if normalized_market == "spot" else 202.6
+        return {
+            "bids": [OrderBookLevel(price=bid_price, size=12.4, total=12.4)][:limit],
+            "asks": [OrderBookLevel(price=ask_price, size=10.8, total=10.8)][:limit],
+        }
+
+
+class MultiMarketRealtimeClient(BybitPublicMarketClient):
+    def __init__(self) -> None:
+        super().__init__(base_url="https://api.bybit.com")
+        self.realtime = MultiMarketRealtimeFeed()
+
+    def get_candles(self, symbol: str, market: str, interval: str = "60", limit: int = 48) -> list[CandlePoint]:
+        base_price = 100.0 if market == "spot" else 200.0
+        return [
+            CandlePoint(
+                time="2026-03-31T05:00:00+08:00",
+                open=base_price,
+                high=base_price + 1.0,
+                low=base_price - 1.0,
+                close=base_price + 0.5,
+                volume=1800.0,
+            )
+        ][:limit]
 
 
 class FakeRealtimeHistoryMarketClient(BybitPublicMarketClient):
@@ -902,7 +1034,7 @@ class PartialRealtimeWatchlistFeed:
                 enriched.append(item)
         return enriched
 
-    def has_ticker(self, symbol: str) -> bool:
+    def has_ticker(self, symbol: str, market: Optional[str] = None) -> bool:  # noqa: ARG002
         return symbol == "BTCUSDT"
 
 
@@ -1044,6 +1176,33 @@ class BybitPublicMarketClientUnitTests(unittest.TestCase):
         self.assertTrue(all(candle.high < 70_000 for candle in detail.candles))
         self.assertIn("盘口价差", detail.stats)
         self.assertIn("Top5 买盘占比", detail.stats)
+
+    def test_realtime_market_detail_uses_market_scoped_snapshot_for_same_symbol(self) -> None:
+        client = MultiMarketRealtimeClient()
+        spot_item = WatchlistInstrument(
+            symbol="BTCUSDT",
+            market="spot",
+            last_price=102.5,
+            change_24h=1.2,
+            volume_24h=1_200_000,
+            signal="watch",
+            position_side="flat",
+            risk_level="medium",
+        )
+        fallback_detail = build_market_detail_for_watchlist(spot_item)
+
+        detail = client.enrich_market_detail(
+            symbol="BTCUSDT",
+            market="spot",
+            fallback_detail=fallback_detail,
+            watch_item=spot_item,
+        )
+
+        self.assertEqual(detail.source, "bybit_ws")
+        self.assertAlmostEqual(detail.candles[-1].close, 102.5)
+        self.assertEqual(detail.recent_public_trades[0]["price"], 102.5)
+        self.assertEqual(detail.bids[0].price, 102.4)
+        self.assertEqual(detail.asks[0].price, 102.6)
 
     def test_enrich_watchlist_keeps_rest_fallback_for_symbols_without_ws_ticker(self) -> None:
         client = PartialRealtimeWatchlistClient()
@@ -7845,6 +8004,34 @@ class ControlApiIntegrationTests(unittest.TestCase):
                 for item in activity["recent_audit_events"]
             )
         )
+
+    def test_build_backtest_payload_prefers_strategy_market_resolution_when_watchlist_missing(self) -> None:
+        original_market_data = control_main.market_data
+        backtest_market_data = RecordingBacktestMarketClient()
+        control_main.market_data = backtest_market_data
+        self.addCleanup(setattr, control_main, "market_data", original_market_data)
+
+        control_main.repo.state.watchlist = [
+            item for item in control_main.repo.state.watchlist if item.symbol != "SOLUSDT"
+        ]
+        control_main.repo.state.strategy_runtime_snapshots = [
+            snapshot
+            for snapshot in control_main.repo.state.strategy_runtime_snapshots
+            if snapshot.strategy_id != "sol-breakout-03"
+        ]
+
+        strategy = next(
+            item for item in control_main.repo.state.strategies if item.id == "sol-breakout-03"
+        )
+        payload = control_main.build_backtest_payload(
+            strategy,
+            data_range="2025-12-01 ~ 2026-03-29",
+            timeframe="1h",
+        )
+
+        self.assertIsNotNone(payload)
+        self.assertEqual(backtest_market_data.requested_markets[-1], "spot")
+        self.assertEqual(payload["symbol_scope"], ["SOLUSDT"])
 
     def test_change_request_backtest_and_agent_job_endpoints(self) -> None:
         scheduler_status, scheduler_before = self._get("/api/ai/scheduler")

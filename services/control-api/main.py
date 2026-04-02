@@ -1002,9 +1002,9 @@ def _build_public_execution_channel_health(
     connected = bool(realtime_status.get(f"connected_{channel}"))
     enabled = bool(realtime_status.get("enabled", True))
     last_error = str(realtime_status.get("last_error") or "").strip() or None
-    has_symbol_feed = bool(realtime.has_ticker(symbol_upper)) if hasattr(realtime, "has_ticker") else False
+    has_symbol_feed = bool(realtime.has_ticker(symbol_upper, market=market)) if hasattr(realtime, "has_ticker") else False
     raw_symbol_last_message_at = (
-        realtime.get_symbol_last_message_at(symbol_upper)
+        realtime.get_symbol_last_message_at(symbol_upper, market=market)
         if hasattr(realtime, "get_symbol_last_message_at")
         else None
     )
@@ -3138,8 +3138,7 @@ def build_backtest_payload(strategy: Any, data_range: str, timeframe: str) -> Op
     if not symbol:
         return None
     state = repo.snapshot()
-    watch_item = next((item for item in state.watchlist if item.symbol == symbol), None)
-    market = watch_item.market if watch_item else "perp"
+    market = _resolve_strategy_primary_market(state, strategy)
     limit = candle_limit_for_range(data_range, timeframe)
     candles = []
     try:

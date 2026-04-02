@@ -23,7 +23,7 @@ except ModuleNotFoundError:
         def update_watchlist(self, watchlist: List[WatchlistInstrument]) -> None:
             return None
 
-        def has_ticker(self, symbol: str) -> bool:
+        def has_ticker(self, symbol: str, market: Optional[str] = None) -> bool:
             return False
 
         def get_status(self) -> Dict[str, object]:
@@ -37,22 +37,37 @@ except ModuleNotFoundError:
                 "last_error": "bybit_public_realtime 模块缺失，已回退 REST。",
             }
 
-        def get_symbol_last_message_at(self, symbol: str) -> Optional[str]:
+        def get_symbol_last_message_at(self, symbol: str, market: Optional[str] = None) -> Optional[str]:
             return None
 
         def enrich_watchlist(self, watchlist: List[WatchlistInstrument]) -> List[WatchlistInstrument]:
             return list(watchlist)
 
-        def merge_candles(self, symbol: str, candles: List[CandlePoint]) -> List[CandlePoint]:
+        def merge_candles(
+            self,
+            symbol: str,
+            candles: List[CandlePoint],
+            market: Optional[str] = None,
+        ) -> List[CandlePoint]:
             return list(candles)
 
-        def get_ticker_snapshot(self, symbol: str) -> Optional[Dict[str, object]]:
+        def get_ticker_snapshot(self, symbol: str, market: Optional[str] = None) -> Optional[Dict[str, object]]:
             return None
 
-        def get_recent_trades_snapshot(self, symbol: str, limit: int = 12) -> List[MarketRecentTrade]:
+        def get_recent_trades_snapshot(
+            self,
+            symbol: str,
+            limit: int = 12,
+            market: Optional[str] = None,
+        ) -> List[MarketRecentTrade]:
             return []
 
-        def get_orderbook_snapshot(self, symbol: str, limit: int = 8) -> Dict[str, List[OrderBookLevel]]:
+        def get_orderbook_snapshot(
+            self,
+            symbol: str,
+            limit: int = 8,
+            market: Optional[str] = None,
+        ) -> Dict[str, List[OrderBookLevel]]:
             return {"bids": [], "asks": []}
 
 
@@ -246,7 +261,7 @@ class BybitPublicMarketClient:
         return candles
 
     def get_orderbook(self, symbol: str, market: str, limit: int = 8) -> Dict[str, List[OrderBookLevel]]:
-        realtime_orderbook = self.realtime.get_orderbook_snapshot(symbol, limit=limit)
+        realtime_orderbook = self.realtime.get_orderbook_snapshot(symbol, limit=limit, market=market)
         if realtime_orderbook["bids"] and realtime_orderbook["asks"]:
             return realtime_orderbook
 
@@ -280,7 +295,7 @@ class BybitPublicMarketClient:
         }
 
     def get_recent_public_trades(self, symbol: str, market: str, limit: int = 12) -> List[MarketRecentTrade]:
-        realtime_trades = self.realtime.get_recent_trades_snapshot(symbol, limit=limit)
+        realtime_trades = self.realtime.get_recent_trades_snapshot(symbol, limit=limit, market=market)
         if realtime_trades:
             return realtime_trades
 
@@ -400,13 +415,13 @@ class BybitPublicMarketClient:
     def enrich_watchlist(self, watchlist: List[WatchlistInstrument]) -> List[WatchlistInstrument]:
         self.realtime.update_watchlist(watchlist)
         realtime_watchlist = {
-            item.symbol: item for item in self.realtime.enrich_watchlist(watchlist)
+            (item.symbol.upper(), item.market): item for item in self.realtime.enrich_watchlist(watchlist)
         }
 
         enriched: List[WatchlistInstrument] = []
         for item in watchlist:
-            if self.realtime.has_ticker(item.symbol):
-                enriched.append(realtime_watchlist.get(item.symbol, item))
+            if self.realtime.has_ticker(item.symbol, market=item.market):
+                enriched.append(realtime_watchlist.get((item.symbol.upper(), item.market), item))
                 continue
             try:
                 ticker = self.get_ticker(item.symbol, item.market)
@@ -438,7 +453,7 @@ class BybitPublicMarketClient:
         timeframe: str = "1h",
     ) -> MarketDetail:
         normalized_timeframe = self.normalize_timeframe(timeframe)
-        realtime_ticker = self.realtime.get_ticker_snapshot(symbol)
+        realtime_ticker = self.realtime.get_ticker_snapshot(symbol, market=market)
         if realtime_ticker is not None and normalized_timeframe == "1h":
             try:
                 orderbook = self.get_orderbook(symbol, market)
@@ -455,7 +470,7 @@ class BybitPublicMarketClient:
             except RuntimeError:
                 history_candles = fallback_detail.candles
 
-            merged_candles = self.realtime.merge_candles(symbol, history_candles)
+            merged_candles = self.realtime.merge_candles(symbol, history_candles, market=market)
             if history_candles is fallback_detail.candles and merged_candles:
                 latest_close = merged_candles[-1].close
                 previous_close = merged_candles[-2].close if len(merged_candles) > 1 else 0.0

@@ -74,9 +74,18 @@ def _compute_sharpe(trade_returns: List[float]) -> float:
     return avg / std * math.sqrt(len(trade_returns))
 
 
-def _build_metrics(starting_equity: float, ending_equity: float, trade_returns: List[float], bars_per_year: float) -> BacktestMetrics:
+def _build_metrics(
+    starting_equity: float,
+    ending_equity: float,
+    trade_returns: List[float],
+    bars_per_year: float,
+    bars_elapsed: int,
+) -> BacktestMetrics:
     total_return_pct = ((ending_equity / starting_equity) - 1.0) * 100.0 if starting_equity else 0.0
-    annual_return_pct = ((1.0 + total_return_pct / 100.0) ** (bars_per_year / max(len(trade_returns), 1)) - 1.0) * 100.0 if trade_returns else total_return_pct
+    annual_return_pct = total_return_pct
+    if starting_equity and bars_elapsed > 0:
+        gross_return = ending_equity / starting_equity
+        annual_return_pct = ((gross_return ** (bars_per_year / bars_elapsed)) - 1.0) * 100.0 if gross_return > 0 else -100.0
     wins = sum(1 for value in trade_returns if value > 0)
     win_rate = (wins / len(trade_returns) * 100.0) if trade_returns else 0.0
     sharpe = _compute_sharpe(trade_returns)
@@ -128,7 +137,13 @@ def _run_trend_follow(candles: List[CandlePoint], params: Dict[str, object], tim
         equity *= 1.0 + baseline / 100.0
         equity_curve.append(equity)
 
-    metrics = _build_metrics(starting_equity, equity, trade_returns, 365 * 24 / _timeframe_hours(timeframe))
+    metrics = _build_metrics(
+        starting_equity,
+        equity,
+        trade_returns,
+        365 * 24 / _timeframe_hours(timeframe),
+        max(len(candles) - 1, 1),
+    )
     metrics.max_drawdown = _format_signed_pct(_compute_max_drawdown(equity_curve))
     return metrics
 
@@ -174,7 +189,13 @@ def _run_mean_reversion(candles: List[CandlePoint], params: Dict[str, object], t
         equity *= 1.0 + baseline / 100.0
         equity_curve.append(equity)
 
-    metrics = _build_metrics(starting_equity, equity, trade_returns, 365 * 24 / _timeframe_hours(timeframe))
+    metrics = _build_metrics(
+        starting_equity,
+        equity,
+        trade_returns,
+        365 * 24 / _timeframe_hours(timeframe),
+        max(len(candles) - 1, 1),
+    )
     metrics.max_drawdown = _format_signed_pct(_compute_max_drawdown(equity_curve))
     return metrics
 
@@ -225,7 +246,13 @@ def _run_breakout(candles: List[CandlePoint], params: Dict[str, object], timefra
         equity *= 1.0 + baseline / 100.0
         equity_curve.append(equity)
 
-    metrics = _build_metrics(starting_equity, equity, trade_returns, 365 * 24 / _timeframe_hours(timeframe))
+    metrics = _build_metrics(
+        starting_equity,
+        equity,
+        trade_returns,
+        365 * 24 / _timeframe_hours(timeframe),
+        max(len(candles) - 1, 1),
+    )
     metrics.max_drawdown = _format_signed_pct(_compute_max_drawdown(equity_curve))
     return metrics
 

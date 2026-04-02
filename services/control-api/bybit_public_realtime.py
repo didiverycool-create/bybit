@@ -21,11 +21,11 @@ class BybitPublicRealtimeClient:
         self._stop_event = threading.Event()
         self._threads: Dict[str, threading.Thread] = {}
         self._desired_symbols: Dict[str, Set[str]] = {"spot": set(), "linear": set()}
-        self._ticker_cache: Dict[str, Dict[str, object]] = {}
-        self._symbol_last_message_at: Dict[str, str] = {}
-        self._latest_kline: Dict[str, CandlePoint] = {}
-        self._recent_trades: Dict[str, List[MarketRecentTrade]] = {}
-        self._orderbooks: Dict[str, Dict[str, Dict[float, float]]] = {}
+        self._ticker_cache: Dict[tuple[str, str], Dict[str, object]] = {}
+        self._symbol_last_message_at: Dict[tuple[str, str], str] = {}
+        self._latest_kline: Dict[tuple[str, str], CandlePoint] = {}
+        self._recent_trades: Dict[tuple[str, str], List[MarketRecentTrade]] = {}
+        self._orderbooks: Dict[tuple[str, str], Dict[str, Dict[float, float]]] = {}
         self._channel_connected: Dict[str, bool] = {"spot": False, "linear": False}
         self._channel_last_message_at: Dict[str, Optional[str]] = {"spot": None, "linear": None}
         self._last_error: Optional[str] = None
@@ -35,6 +35,28 @@ class BybitPublicRealtimeClient:
     @staticmethod
     def _channel_for_market(market: str) -> str:
         return "spot" if market == "spot" else "linear"
+
+    @staticmethod
+    def _cache_key(channel: str, symbol: str) -> tuple[str, str]:
+        return channel, symbol.upper()
+
+    def _resolve_cache_key_locked(self, symbol: str, market: Optional[str] = None) -> Optional[tuple[str, str]]:
+        normalized_symbol = symbol.upper()
+        if market is not None:
+            return self._cache_key(self._channel_for_market(market), normalized_symbol)
+
+        matches = [
+            self._cache_key(channel, normalized_symbol)
+            for channel in ("spot", "linear")
+            if self._cache_key(channel, normalized_symbol) in self._ticker_cache
+            or self._cache_key(channel, normalized_symbol) in self._symbol_last_message_at
+            or self._cache_key(channel, normalized_symbol) in self._latest_kline
+            or self._cache_key(channel, normalized_symbol) in self._recent_trades
+            or self._cache_key(channel, normalized_symbol) in self._orderbooks
+        ]
+        if len(matches) == 1:
+            return matches[0]
+        return None
 
     @staticmethod
     def _ws_url(channel: str) -> str:
@@ -126,9 +148,10 @@ class BybitPublicRealtimeClient:
                 "linear": {item.symbol for item in watchlist if item.market != "spot"},
             }
 
-    def has_ticker(self, symbol: str) -> bool:
+    def has_ticker(self, symbol: str, market: Optional[str] = None) -> bool:
         with self._lock:
-            return symbol in self._ticker_cache
+            cache_key = self._resolve_cache_key_locked(symbol, market)
+            return cache_key in self._ticker_cache if cache_key is not None else False
 
     def get_status(self) -> Dict[str, object]:
         with self._lock:
@@ -142,15 +165,16 @@ class BybitPublicRealtimeClient:
                 "last_error": self._last_error,
             }
 
-    def get_symbol_last_message_at(self, symbol: str) -> Optional[str]:
+    def get_symbol_last_message_at(self, symbol: str, market: Optional[str] = None) -> Optional[str]:
         with self._lock:
-            return self._symbol_last_message_at.get(symbol)
+            cache_key = self._resolve_cache_key_locked(symbol, market)
+            return self._symbol_last_message_at.get(cache_key) if cache_key is not None else None
 
     def enrich_watchlist(self, watchlist: List[WatchlistInstrument]) -> List[WatchlistInstrument]:
         enriched: List[WatchlistInstrument] = []
         with self._lock:
             for item in watchlist:
-                ticker = self._ticker_cache.get(item.symbol)
+                ticker = self._ticker_cache.get(self._cache_key(self._channel_for_market(item.market), item.symbol))
                 if not ticker:
                     enriched.append(item)
                     continue
@@ -171,9 +195,15 @@ class BybitPublicRealtimeClient:
                 )
         return enriched
 
-    def merge_candles(self, symbol: str, candles: List[CandlePoint]) -> List[CandlePoint]:
+    def merge_candles(
+        self,
+        symbol: str,
+        candles: List[CandlePoint],
+        market: Optional[str] = None,
+    ) -> List[CandlePoint]:
         with self._lock:
-            live_candle = self._latest_kline.get(symbol)
+            cache_key = self._resolve_cache_key_locked(symbol, market)
+            live_candle = self._latest_kline.get(cache_key) if cache_key is not None else None
         if live_candle is None:
             return candles
 
@@ -187,19 +217,32 @@ class BybitPublicRealtimeClient:
             merged = merged[-48:]
         return merged
 
-    def get_ticker_snapshot(self, symbol: str) -> Optional[Dict[str, object]]:
+    def get_ticker_snapshot(self, symbol: str, market: Optional[str] = None) -> Optional[Dict[str, object]]:
         with self._lock:
-            snapshot = self._ticker_cache.get(symbol)
+            cache_key = self._resolve_cache_key_locked(symbol, market)
+            snapshot = self._ticker_cache.get(cache_key) if cache_key is not None else None
             return dict(snapshot) if snapshot else None
 
-    def get_recent_trades_snapshot(self, symbol: str, limit: int = 12) -> List[MarketRecentTrade]:
+    def get_recent_trades_snapshot(
+        self,
+        symbol: str,
+        limit: int = 12,
+        market: Optional[str] = None,
+    ) -> List[MarketRecentTrade]:
         with self._lock:
-            trades = list(self._recent_trades.get(symbol, []))
+            cache_key = self._resolve_cache_key_locked(symbol, market)
+            trades = list(self._recent_trades.get(cache_key, [])) if cache_key is not None else []
         return trades[:limit]
 
-    def get_orderbook_snapshot(self, symbol: str, limit: int = 8) -> Dict[str, List[OrderBookLevel]]:
+    def get_orderbook_snapshot(
+        self,
+        symbol: str,
+        limit: int = 8,
+        market: Optional[str] = None,
+    ) -> Dict[str, List[OrderBookLevel]]:
         with self._lock:
-            raw_book = self._orderbooks.get(symbol)
+            cache_key = self._resolve_cache_key_locked(symbol, market)
+            raw_book = self._orderbooks.get(cache_key) if cache_key is not None else None
             if not raw_book:
                 return {"bids": [], "asks": []}
             bids = self._build_levels(raw_book.get("bids", {}), reverse=True, limit=limit)
@@ -323,12 +366,13 @@ class BybitPublicRealtimeClient:
 
             if topic.startswith("tickers."):
                 symbol = topic.split(".", 1)[1]
-                self._symbol_last_message_at[symbol] = now_iso
-                previous = dict(self._ticker_cache.get(symbol, {}))
+                cache_key = self._cache_key(channel, symbol)
+                self._symbol_last_message_at[cache_key] = now_iso
+                previous = dict(self._ticker_cache.get(cache_key, {}))
                 data = payload.get("data")
                 if isinstance(data, dict):
                     previous.update(data)
-                    self._ticker_cache[symbol] = previous
+                    self._ticker_cache[cache_key] = previous
                 return
 
             if topic.startswith("kline."):
@@ -336,24 +380,26 @@ class BybitPublicRealtimeClient:
                 if len(parts) < 3:
                     return
                 symbol = parts[2]
-                self._symbol_last_message_at[symbol] = now_iso
+                cache_key = self._cache_key(channel, symbol)
+                self._symbol_last_message_at[cache_key] = now_iso
                 data = payload.get("data")
                 rows = data if isinstance(data, list) else []
                 if not rows:
                     return
                 latest_row = rows[-1]
                 if isinstance(latest_row, dict):
-                    self._latest_kline[symbol] = self._candle_from_ws_row(latest_row)
+                    self._latest_kline[cache_key] = self._candle_from_ws_row(latest_row)
                 return
 
             if topic.startswith("publicTrade."):
                 symbol = topic.split(".", 1)[1]
-                self._symbol_last_message_at[symbol] = now_iso
+                cache_key = self._cache_key(channel, symbol)
+                self._symbol_last_message_at[cache_key] = now_iso
                 data = payload.get("data")
                 rows = data if isinstance(data, list) else []
                 if not rows:
                     return
-                existing = list(self._recent_trades.get(symbol, []))
+                existing = list(self._recent_trades.get(cache_key, []))
                 incoming = [self._trade_from_ws_row(row) for row in rows if isinstance(row, dict)]
                 merged = sorted([*incoming, *existing], key=lambda item: item.occurred_at, reverse=True)
                 deduped: List[MarketRecentTrade] = []
@@ -366,7 +412,7 @@ class BybitPublicRealtimeClient:
                     deduped.append(item)
                     if len(deduped) >= self._recent_trade_limit:
                         break
-                self._recent_trades[symbol] = deduped
+                self._recent_trades[cache_key] = deduped
                 return
 
             if topic.startswith("orderbook."):
@@ -374,12 +420,13 @@ class BybitPublicRealtimeClient:
                 if len(parts) < 3:
                     return
                 symbol = parts[2]
-                self._symbol_last_message_at[symbol] = now_iso
+                cache_key = self._cache_key(channel, symbol)
+                self._symbol_last_message_at[cache_key] = now_iso
                 data = payload.get("data")
                 if not isinstance(data, dict):
                     return
                 message_type = str(payload.get("type") or "snapshot").lower()
-                book = self._orderbooks.setdefault(symbol, {"bids": {}, "asks": {}})
+                book = self._orderbooks.setdefault(cache_key, {"bids": {}, "asks": {}})
                 if message_type == "snapshot":
                     book["bids"] = {}
                     book["asks"] = {}

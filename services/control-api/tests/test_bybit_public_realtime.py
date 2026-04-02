@@ -80,6 +80,85 @@ class BybitPublicRealtimeUnitTests(unittest.TestCase):
             },
         )
 
+    def test_market_scoped_cache_keeps_spot_and_perp_data_separate(self) -> None:
+        client = bybit_public_realtime.BybitPublicRealtimeClient()
+
+        client._handle_message(
+            json.dumps(
+                {
+                    "topic": "tickers.BTCUSDT",
+                    "data": {"lastPrice": "101.5", "price24hPcnt": "0.01"},
+                }
+            ),
+            "spot",
+        )
+        client._handle_message(
+            json.dumps(
+                {
+                    "topic": "tickers.BTCUSDT",
+                    "data": {"lastPrice": "202.5", "price24hPcnt": "0.02"},
+                }
+            ),
+            "linear",
+        )
+        client._handle_message(
+            json.dumps(
+                {
+                    "topic": "kline.60.BTCUSDT",
+                    "data": [
+                        {
+                            "start": "1775000000000",
+                            "open": "100.0",
+                            "high": "102.0",
+                            "low": "99.5",
+                            "close": "101.5",
+                            "volume": "18.2",
+                        }
+                    ],
+                }
+            ),
+            "spot",
+        )
+        client._handle_message(
+            json.dumps(
+                {
+                    "topic": "publicTrade.BTCUSDT",
+                    "data": [{"T": 1775000000000, "S": "Buy", "p": "202.5", "v": "0.3"}],
+                }
+            ),
+            "linear",
+        )
+        client._handle_message(
+            json.dumps(
+                {
+                    "topic": "orderbook.50.BTCUSDT",
+                    "type": "snapshot",
+                    "data": {"b": [["101.4", "1.2"]], "a": [["101.6", "1.4"]]},
+                }
+            ),
+            "spot",
+        )
+
+        self.assertFalse(client.has_ticker("BTCUSDT"))
+        self.assertIsNone(client.get_symbol_last_message_at("BTCUSDT"))
+
+        spot_ticker = client.get_ticker_snapshot("BTCUSDT", market="spot")
+        perp_ticker = client.get_ticker_snapshot("BTCUSDT", market="perp")
+        self.assertEqual(spot_ticker["lastPrice"], "101.5")
+        self.assertEqual(perp_ticker["lastPrice"], "202.5")
+
+        merged_spot_candles = client.merge_candles("BTCUSDT", [], market="spot")
+        self.assertEqual(len(merged_spot_candles), 1)
+        self.assertEqual(merged_spot_candles[0].close, 101.5)
+
+        perp_trades = client.get_recent_trades_snapshot("BTCUSDT", market="perp")
+        self.assertEqual(len(perp_trades), 1)
+        self.assertEqual(perp_trades[0].price, 202.5)
+
+        spot_orderbook = client.get_orderbook_snapshot("BTCUSDT", market="spot")
+        self.assertEqual(spot_orderbook["bids"][0].price, 101.4)
+        self.assertEqual(spot_orderbook["asks"][0].price, 101.6)
+
 
 if __name__ == "__main__":
     unittest.main()
