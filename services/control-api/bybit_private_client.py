@@ -12,7 +12,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-from models import AccountMode, BybitPrivateStatus, Direction
+from models import AccountMode, BybitBalanceDiagnostic, BybitPrivateStatus, Direction
 
 
 class BybitPrivateClient:
@@ -84,6 +84,11 @@ class BybitPrivateClient:
             mode=mode,
             key_hint=self._key_hint(api_key),
             last_error=self._last_error,
+            realtime_enabled=False,
+            realtime_connected=False,
+            realtime_authenticated=False,
+            realtime_last_message_at=None,
+            realtime_last_error=None,
             updated_at=self._now_iso(),
         )
 
@@ -100,6 +105,35 @@ class BybitPrivateClient:
             "base_url": base_url,
         }
 
+    def get_websocket_auth_payload(self) -> Dict[str, Any]:
+        config = self._load_config()
+        required = self._load_required_config()
+        mode = self._infer_mode(required["base_url"], config.get("mode"))
+        base_url = required["base_url"].lower()
+        if "demo" in base_url or mode == AccountMode.DEMO:
+            websocket_url = "wss://stream-demo.bybit.com/v5/private"
+        elif "testnet" in base_url:
+            websocket_url = "wss://stream-testnet.bybit.com/v5/private"
+        else:
+            websocket_url = "wss://stream.bybit.com/v5/private"
+
+        expires = int((time() + 10) * 1000)
+        sign_payload = f"GET/realtime{expires}"
+        signature = hmac.new(
+            required["api_secret"].encode("utf-8"),
+            sign_payload.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        return {
+            "url": websocket_url,
+            "message": {
+                "op": "auth",
+                "args": [required["api_key"], expires, signature],
+            },
+            "expires": expires,
+            "mode": mode,
+        }
+
     def _get_server_time_ms(self, base_url: str) -> int:
         request = Request(
             f"{base_url}/v5/market/time",
@@ -108,7 +142,7 @@ class BybitPrivateClient:
         try:
             with urlopen(request, timeout=self.timeout) as response:
                 payload = json.loads(response.read().decode("utf-8"))
-        except (HTTPError, URLError, TimeoutError, json.JSONDecodeError) as exc:
+        except (HTTPError, URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
             self._last_error = f"Bybit 服务器时间获取失败: {exc}"
             raise RuntimeError(self._last_error) from exc
 
@@ -186,7 +220,7 @@ class BybitPrivateClient:
         try:
             with urlopen(request, timeout=self.timeout) as response:
                 payload = json.loads(response.read().decode("utf-8"))
-        except (HTTPError, URLError, TimeoutError, json.JSONDecodeError) as exc:
+        except (HTTPError, URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
             self._last_error = f"Bybit 私有 API 请求失败: {exc}"
             raise RuntimeError(self._last_error) from exc
 
@@ -217,6 +251,14 @@ class BybitPrivateClient:
     def _signed_post(self, path: str, body: Dict[str, Any]) -> Dict:
         return self._signed_request("POST", path, body=body)
 
+    def _signed_get_optional(self, path: str, params: Dict[str, object]) -> Optional[Dict]:
+        previous_error = self._last_error
+        try:
+            return self._signed_get(path, params)
+        except RuntimeError:
+            self._last_error = previous_error
+            return None
+
     def fetch_wallet_balance(self) -> Dict:
         status = self.get_status()
         return self._signed_get(
@@ -224,18 +266,64 @@ class BybitPrivateClient:
             {"accountType": status.account_type},
         )
 
+    def fetch_usdt_balance_diagnostics(self) -> List[Dict[str, Any]]:
+        diagnostics: List[Dict[str, Any]] = []
+        for account_type in ("UNIFIED", "FUND", "CONTRACT"):
+            previous_error = self._last_error
+            try:
+                result = self._signed_get(
+                    "/v5/asset/transfer/query-account-coin-balance",
+                    {"accountType": account_type, "coin": "USDT"},
+                )
+                balance = result.get("balance") if isinstance(result.get("balance"), dict) else {}
+                wallet_balance = str(
+                    balance.get("walletBalance")
+                    or result.get("walletBalance")
+                    or "0"
+                )
+                transfer_balance = str(
+                    balance.get("transferBalance")
+                    or result.get("transferBalance")
+                    or wallet_balance
+                )
+                diagnostics.append(
+                    BybitBalanceDiagnostic(
+                        account_type=account_type,
+                        coin="USDT",
+                        wallet_balance=wallet_balance,
+                        transfer_balance=transfer_balance,
+                        available_balance=transfer_balance,
+                        source="coin-balance",
+                        error=None,
+                    ).model_dump()
+                )
+            except RuntimeError as exc:
+                self._last_error = previous_error
+                diagnostics.append(
+                    BybitBalanceDiagnostic(
+                        account_type=account_type,
+                        coin="USDT",
+                        wallet_balance="0",
+                        transfer_balance="0",
+                        available_balance="0",
+                        source="error",
+                        error=str(exc),
+                    ).model_dump()
+                )
+        return diagnostics
+
     def fetch_positions(self) -> List[Dict]:
         positions: List[Dict] = []
         for category, extra in (
             ("linear", {"settleCoin": "USDT"}),
             ("spot", {}),
         ):
-            try:
+            if category == "linear":
                 result = self._signed_get("/v5/position/list", {"category": category, **extra})
-            except RuntimeError:
-                if category == "linear":
-                    raise
-                continue
+            else:
+                result = self._signed_get_optional("/v5/position/list", {"category": category, **extra})
+                if result is None:
+                    continue
             positions.extend(result.get("list", []))
         return positions
 
@@ -245,20 +333,56 @@ class BybitPrivateClient:
             ("linear", {"settleCoin": "USDT", "openOnly": 0, "limit": 50}),
             ("spot", {"openOnly": 0, "limit": 50}),
         ):
-            try:
+            if category == "linear":
                 result = self._signed_get("/v5/order/realtime", {"category": category, **extra})
-            except RuntimeError:
-                if category == "linear":
-                    raise
-                continue
+            else:
+                result = self._signed_get_optional("/v5/order/realtime", {"category": category, **extra})
+                if result is None:
+                    continue
             orders.extend(result.get("list", []))
         return orders
+
+    def fetch_order_history(self) -> List[Dict]:
+        orders: List[Dict] = []
+        for category, extra in (
+            ("linear", {"settleCoin": "USDT", "limit": 50}),
+            ("spot", {"limit": 50}),
+        ):
+            if category == "linear":
+                result = self._signed_get("/v5/order/history", {"category": category, **extra})
+            else:
+                result = self._signed_get_optional("/v5/order/history", {"category": category, **extra})
+                if result is None:
+                    continue
+            orders.extend(result.get("list", []))
+        return orders
+
+    def fetch_execution_history(self) -> List[Dict]:
+        executions: List[Dict] = []
+        for category, extra in (
+            ("linear", {"settleCoin": "USDT", "limit": 50}),
+            ("spot", {"limit": 50}),
+        ):
+            if category == "linear":
+                result = self._signed_get("/v5/execution/list", {"category": category, **extra})
+            else:
+                result = self._signed_get_optional("/v5/execution/list", {"category": category, **extra})
+                if result is None:
+                    continue
+            executions.extend(result.get("list", []))
+        return executions
 
     def create_order(self, body: Dict[str, Any]) -> Dict:
         return self._signed_post("/v5/order/create", body)
 
+    def amend_order(self, body: Dict[str, Any]) -> Dict:
+        return self._signed_post("/v5/order/amend", body)
+
     def cancel_order(self, body: Dict[str, Any]) -> Dict:
         return self._signed_post("/v5/order/cancel", body)
+
+    def cancel_all_orders(self, body: Dict[str, Any]) -> Dict:
+        return self._signed_post("/v5/order/cancel-all", body)
 
     def probe_trade_route(self) -> Dict[str, Any]:
         order_link_id = f"probe-{int(datetime.now(timezone.utc).timestamp())}"

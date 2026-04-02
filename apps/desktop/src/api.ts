@@ -1,30 +1,48 @@
 import type {
   AccountOverview,
+  AccountLiveSnapshot,
+  AiLiveSnapshot,
   AgentJob,
   AlertRecord,
   BacktestRun,
+  BybitPublicStatus,
   BybitPrivateStatus,
   BybitTradeProbeResult,
   ChangeRequest,
   ControlSnapshot,
   ExecutionEvent,
+  ExecutionPreview,
+  ExchangePositionBulkCloseResult,
+  GrafanaIntegrationStatus,
   MarketDetail,
+  MarketLiveSnapshot,
+  MarketRecentTrade,
   NewsEvent,
   OpenClawStatus,
+  OpsLiveSnapshot,
   OrderRecord,
   PositionRecord,
   ReviewDocument,
+  RuntimeWorkerStatus,
+  RuntimeWorkerActionResult,
   SchedulerCommandType,
   SchedulerPayload,
   ServiceHealth,
   SettingsPayload,
+  StrategyExecutionResult,
+  StrategyActivitySnapshot,
+  StrategyProposalActionResult,
+  StrategyLiveSnapshot,
+  StrategyRuntimeSnapshot,
   StrategySummary,
   TradeRecord,
   WatchlistInstrument,
+  WatchlistRemoveResult,
   WorkspacePreferences,
 } from './types'
 
 const API_BASE = (import.meta.env.VITE_CONTROL_API_BASE as string | undefined) ?? 'http://127.0.0.1:8787'
+export const CONTROL_API_BASE = API_BASE
 
 async function fetchJson<T>(path: string, fallback: T): Promise<T> {
   try {
@@ -35,6 +53,19 @@ async function fetchJson<T>(path: string, fallback: T): Promise<T> {
     return (await response.json()) as T
   } catch (error) {
     console.warn(`使用本地 fallback: ${path}`, error)
+    return fallback
+  }
+}
+
+async function fetchText(path: string, fallback: string): Promise<string> {
+  try {
+    const response = await fetch(`${API_BASE}${path}`)
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`)
+    }
+    return await response.text()
+  } catch (error) {
+    console.warn(`使用本地 fallback 文本: ${path}`, error)
     return fallback
   }
 }
@@ -59,6 +90,67 @@ async function postJson<T>(path: string, payload: unknown): Promise<T> {
   }
 
   return (await response.json()) as T
+}
+
+async function deleteJson<T>(path: string): Promise<T> {
+  const response = await fetch(`${API_BASE}${path}`, {
+    method: 'DELETE',
+    headers: {
+      Accept: 'application/json',
+    },
+  })
+
+  if (!response.ok) {
+    const text = await response.text()
+    try {
+      const parsed = JSON.parse(text) as { detail?: string }
+      throw new Error(parsed.detail || text || `HTTP ${response.status}`)
+    } catch {
+      throw new Error(text || `HTTP ${response.status}`)
+    }
+  }
+
+  return (await response.json()) as T
+}
+
+function buildReviewQueryString(options?: {
+  strategyId?: string | null
+  periods?: string[]
+}) {
+  const query = new URLSearchParams()
+  if (options?.strategyId) {
+    query.set('strategy_id', options.strategyId)
+  }
+  if (options?.periods?.length) {
+    query.set('period', options.periods.join(','))
+  }
+  const text = query.toString()
+  return text ? `?${text}` : ''
+}
+
+function filterFallbackReviews(
+  reviews: ReviewDocument[],
+  options?: {
+    strategyId?: string | null
+    periods?: string[]
+  },
+) {
+  let next = [...reviews]
+
+  if (options?.strategyId) {
+    next = next.filter(
+      (review) =>
+        review.strategy_id === options.strategyId ||
+        review.proposals.some((proposal) => proposal.strategy_id === options.strategyId),
+    )
+  }
+
+  if (options?.periods?.length) {
+    const allowed = new Set(options.periods)
+    next = next.filter((review) => allowed.has(review.period))
+  }
+
+  return next
 }
 
 export async function getServiceHealth(): Promise<ServiceHealth> {
@@ -102,6 +194,24 @@ const fallbackSnapshot: ControlSnapshot = {
     win_rate: '63.8%',
     best_strategy: 'BTC 趋势跟随',
   },
+  execution_health: {
+    runtime_worker_running: true,
+    runtime_worker_issue: false,
+    runtime_worker_stale: false,
+    runtime_stale_seconds: 0,
+    runtime_last_refresh_at: new Date().toISOString(),
+    runtime_last_error: null,
+    public_execution_channel_issue: false,
+    public_execution_stale: false,
+    public_execution_stale_seconds: 0,
+    active_stop_loss_guards: 0,
+    cooldowns: 0,
+    auto_dispatch_blocked: 0,
+    rejection_guards: 0,
+    stale_order_guards: 0,
+    drifts: 0,
+    top_issue: null,
+  },
 }
 
 const fallbackWatchlist: WatchlistInstrument[] = [
@@ -114,6 +224,8 @@ const fallbackWatchlist: WatchlistInstrument[] = [
     signal: 'active',
     position_side: 'long',
     risk_level: 'medium',
+    alert_enabled: true,
+    alert_threshold_pct: 2.8,
   },
   {
     symbol: 'ETHUSDT',
@@ -124,19 +236,62 @@ const fallbackWatchlist: WatchlistInstrument[] = [
     signal: 'watch',
     position_side: 'flat',
     risk_level: 'medium',
+    alert_enabled: true,
+    alert_threshold_pct: 2,
   },
 ]
 
-function buildFallbackCandles(base: number) {
+function normalizeMarketTimeframe(timeframe: string) {
+  const normalized = String(timeframe || '1h').trim().toLowerCase()
+  return (
+    {
+      '15': '15m',
+      '15m': '15m',
+      '60': '1h',
+      '1h': '1h',
+      '240': '4h',
+      '4h': '4h',
+      d: '1d',
+      '1d': '1d',
+    }[normalized] ?? '1h'
+  )
+}
+
+function buildFallbackCandles(base: number, timeframe = '1h') {
+  const normalized = normalizeMarketTimeframe(timeframe)
+  const stepHours =
+    {
+      '15m': 0.25,
+      '1h': 1,
+      '4h': 4,
+      '1d': 24,
+    }[normalized] ?? 1
   return Array.from({ length: 24 }, (_, index) => {
     const close = base + Math.sin(index / 3) * base * 0.008
     return {
-      time: new Date(Date.now() - (24 - index) * 3600_000).toISOString(),
+      time: new Date(Date.now() - (24 - index) * stepHours * 3600_000).toISOString(),
       open: close * 0.992,
       high: close * 1.008,
       low: close * 0.986,
       close,
       volume: 1200 + index * 37,
+    }
+  })
+}
+
+function buildFallbackRecentTrades(base: number): MarketRecentTrade[] {
+  return Array.from({ length: 10 }, (_, index) => {
+    const side = index % 3 === 1 ? 'sell' : 'buy'
+    const priceShift = (0.0008 + index * 0.00035) * base
+    const price = side === 'buy' ? base + priceShift : base - priceShift
+    const size = Number((0.35 + index * 0.22).toFixed(4))
+    return {
+      side,
+      price: Number(price.toFixed(2)),
+      size,
+      value: Number((price * size).toFixed(2)),
+      occurred_at: new Date(Date.now() - index * 90_000).toISOString(),
+      is_block_trade: size >= 1.8,
     }
   })
 }
@@ -157,6 +312,7 @@ const fallbackMarketDetails: Record<string, MarketDetail> = {
       size: 7 + index * 1.3,
       total: 7 + index * 3.8,
     })),
+    recent_public_trades: buildFallbackRecentTrades(86125.4),
     headline: 'BTC 仍处于趋势策略的主跟踪通道',
     stats: {
       '24h振幅': '6.95%',
@@ -182,6 +338,7 @@ const fallbackMarketDetails: Record<string, MarketDetail> = {
       size: 10 + index * 1.8,
       total: 10 + index * 4.9,
     })),
+    recent_public_trades: buildFallbackRecentTrades(4832.6),
     headline: 'ETH 当前用于均值回归参数验证',
     stats: {
       '24h振幅': '5.42%',
@@ -193,6 +350,25 @@ const fallbackMarketDetails: Record<string, MarketDetail> = {
     updated_at: new Date().toISOString(),
   },
 }
+
+function buildFallbackMarketDetail(symbol: string, timeframe = '1h'): MarketDetail {
+  const normalized = normalizeMarketTimeframe(timeframe)
+  const detail = fallbackMarketDetails[symbol] ?? fallbackMarketDetails.BTCUSDT
+  const latestClose = detail.candles.at(-1)?.close ?? detail.candles[0]?.close ?? 1
+  return {
+    ...detail,
+    timeframe: normalized,
+    candles: buildFallbackCandles(latestClose, normalized),
+    recent_public_trades: buildFallbackRecentTrades(latestClose),
+  }
+}
+
+const fallbackMarketLiveSnapshot = (symbol: string, timeframe = '1h'): MarketLiveSnapshot => ({
+  selected_symbol: symbol,
+  watchlist: fallbackWatchlist,
+  detail: buildFallbackMarketDetail(symbol, timeframe),
+  generated_at: new Date().toISOString(),
+})
 
 const fallbackStrategies: StrategySummary[] = [
   {
@@ -300,6 +476,11 @@ const fallbackAlerts: AlertRecord[] = [
     related_news_id: null,
     suggested_action: '进入人工接管并冻结自动发布',
     acknowledged: false,
+    source_type: 'system',
+    rule_id: null,
+    rule_key: 'manual-override:SOLUSDT',
+    trigger_value: null,
+    threshold_value: null,
   },
 ]
 
@@ -370,6 +551,7 @@ const fallbackPositions: PositionRecord[] = [
 const fallbackOrders: OrderRecord[] = [
   {
     source: 'mock',
+    origin: 'manual',
     order_id: 'ord-mock-001',
     symbol: 'ETHUSDT',
     market: 'perp',
@@ -382,6 +564,7 @@ const fallbackOrders: OrderRecord[] = [
   },
   {
     source: 'mock',
+    origin: 'manual',
     order_id: 'ord-mock-002',
     symbol: 'BTCUSDT',
     market: 'perp',
@@ -402,10 +585,101 @@ const fallbackReviews: ReviewDocument[] = [
     summary: 'ETH 需压缩止损，BTC 可继续保持 Live 发布。',
     highlights: ['BTC 趋势策略贡献了主要收益。'],
     risks: ['SOL 影子策略存在过度加仓倾向。'],
-    proposals: [],
+    proposals: [
+      {
+        id: 'prop-001',
+        proposal_type: 'param_update',
+        strategy_id: 'trend-btc-01',
+        title: '压缩 BTC 风险预算',
+        description: '建议在高波动时段将单笔风险从 1.2% 压缩到 1.0%。',
+        created_at: new Date().toISOString(),
+        status: 'pending',
+        expected_impact: '降低夜盘回撤。',
+        payload: {
+          target_mode: 'live',
+          parameter_patch: { risk_per_trade: 1.0 },
+        },
+      },
+    ],
     created_at: new Date().toISOString(),
   },
+  {
+    id: 'review-002',
+    period: 'strategy_issue',
+    strategy_id: 'trend-btc-01',
+    title: '策略问题跟踪 · BTC 趋势跟随',
+    summary: '真实执行线程恢复后，已重新接管 BTC 趋势策略；旧的执行阻断提醒已自动收起。',
+    highlights: ['运行线程已恢复，策略信号重新进入自动评估。'],
+    risks: ['若再次出现连续拒单，系统仍会进入冷却并暂停自动执行。'],
+    proposals: [],
+    created_at: new Date(Date.now() - 3_600_000).toISOString(),
+  },
 ]
+
+const fallbackStrategyRuntime: StrategyRuntimeSnapshot[] = [
+  {
+    strategy_id: 'trend-btc-01',
+    strategy_name: 'BTC 趋势跟随',
+    symbol: 'BTCUSDT',
+    market: 'perp',
+    mode: 'live',
+    runtime_status: 'running',
+    signal: 'long',
+    confidence: 72,
+    last_price: 86125.4,
+    reference_price: 85410.2,
+    change_24h: 3.82,
+    note: '快线持续站上慢线，趋势信号保持。',
+    next_action: '继续监控真实执行层风控，不在前端直接下单。',
+    last_evaluated_at: new Date().toISOString(),
+    last_trade_id: 'trade-001',
+    last_trade_at: new Date().toISOString(),
+  },
+  {
+    strategy_id: 'eth-revert-02',
+    strategy_name: 'ETH 均值回归',
+    symbol: 'ETHUSDT',
+    market: 'perp',
+    mode: 'paper',
+    runtime_status: 'paper_only',
+    signal: 'watch',
+    confidence: 41,
+    last_price: 4832.6,
+    reference_price: 4788.4,
+    change_24h: 2.17,
+    note: '偏离尚未达到新的回归入场阈值。',
+    next_action: '继续等待更明显的偏离或收敛。',
+    last_evaluated_at: new Date().toISOString(),
+    last_trade_id: 'trade-003',
+    last_trade_at: new Date().toISOString(),
+  },
+]
+
+const fallbackStrategyExecutionPreview: ExecutionPreview = {
+  symbol: 'BTCUSDT',
+  market: 'perp',
+  mode: 'paper',
+  side: 'buy',
+  origin: 'strategy',
+  strategy_id: 'trend-btc-01',
+  quantity: 0.8,
+  price: 86125.4,
+  notional: '68,900.32 USDT',
+  action: '等待当前模式的策略执行预检',
+  allowed: false,
+  blocked_reason: '当前本地控制服务不可用，已回退到前端默认策略预检。',
+  warnings: ['服务恢复后会自动重新加载当前策略的执行预检。'],
+  current_position_side: 'flat',
+  current_position_size: '--',
+  current_avg_price: '--',
+  projected_position_side: 'long',
+  projected_position_size: '0.8',
+  projected_avg_price: '86,125.4',
+  available_balance_before: '--',
+  available_balance_after: '--',
+  estimated_realized_pnl: '--',
+  generated_at: new Date().toISOString(),
+}
 
 const fallbackAudit: ExecutionEvent[] = [
   {
@@ -429,6 +703,56 @@ const fallbackSettings: SettingsPayload = {
   default_mode: 'paper',
   notification_channels: ['desktop', 'telegram', 'email'],
   product_language: 'zh-CN',
+  grafana_base_url: null,
+  grafana_dashboard_uid: null,
+  grafana_org_id: 1,
+  grafana_theme: 'dark',
+}
+
+const fallbackGrafanaStatus: GrafanaIntegrationStatus = {
+  configured: false,
+  base_url: null,
+  dashboard_uid: null,
+  org_id: 1,
+  theme: 'dark',
+  metrics_path: '/metrics',
+  dashboard_url: null,
+  recommended_scope: 'ops_monitoring_only',
+  note: 'Grafana 更适合服务状态、AI 调度、风控和回测吞吐监控；主 K 线继续保留本地图表。',
+}
+
+const fallbackPrometheusMetrics = `# HELP bybit_control_watchlist_total Number of instruments in watchlist
+# TYPE bybit_control_watchlist_total gauge
+bybit_control_watchlist_total 4
+# HELP bybit_control_scheduler_queue_depth Number of queued AI jobs
+# TYPE bybit_control_scheduler_queue_depth gauge
+bybit_control_scheduler_queue_depth 3
+# HELP bybit_control_openclaw_connected Whether OpenClaw is reachable
+# TYPE bybit_control_openclaw_connected gauge
+bybit_control_openclaw_connected 1
+`
+
+const fallbackAiLive: AiLiveSnapshot = {
+  ...fallbackScheduler,
+  activity_feed: fallbackAudit,
+  generated_at: new Date().toISOString(),
+}
+
+const fallbackOpsLive: OpsLiveSnapshot = {
+  summary: {
+    pending_alerts: fallbackAlerts.filter((item) => !item.acknowledged).length,
+    p0_alerts: fallbackAlerts.filter((item) => item.severity === 'P0' && !item.acknowledged).length,
+    recent_trades: fallbackTrades.length,
+    manual_trades: fallbackTrades.filter((item) => item.origin === 'manual').length,
+    strategy_trades: fallbackTrades.filter((item) => item.origin === 'strategy').length,
+    audit_warnings: fallbackAudit.filter((item) => item.severity === 'warning').length,
+    audit_critical: fallbackAudit.filter((item) => item.severity === 'critical').length,
+    latest_event_type: fallbackAudit[0]?.event_type ?? null,
+  },
+  alerts: fallbackAlerts,
+  trades: fallbackTrades,
+  audit_events: fallbackAudit,
+  generated_at: new Date().toISOString(),
 }
 
 const fallbackOpenClawStatus: OpenClawStatus = {
@@ -449,6 +773,35 @@ const fallbackBybitPrivateStatus: BybitPrivateStatus = {
   mode: 'live',
   key_hint: null,
   last_error: '未检测到 Bybit 私有 API 配置，当前账户视图使用 mock 回退。',
+  realtime_enabled: false,
+  realtime_connected: false,
+  realtime_authenticated: false,
+  realtime_last_message_at: null,
+  realtime_stale: false,
+  realtime_stale_seconds: 0,
+  realtime_last_error: null,
+  realtime_recommended_action: null,
+  usdt_balance_diagnostics: [],
+  updated_at: new Date().toISOString(),
+}
+
+const fallbackBybitPublicStatus: BybitPublicStatus = {
+  enabled: false,
+  connected_spot: false,
+  connected_linear: false,
+  spot_stale: false,
+  spot_stale_seconds: 0,
+  linear_stale: false,
+  linear_stale_seconds: 0,
+  last_message_at_spot: null,
+  last_message_at_linear: null,
+  last_message_at: null,
+  last_error: null,
+  rest_reachable: null,
+  rest_last_error: null,
+  rest_tested_at: null,
+  recommended_action: null,
+  watched_symbol_diagnostics: [],
   updated_at: new Date().toISOString(),
 }
 
@@ -457,34 +810,149 @@ const fallbackWorkspacePreferences: WorkspacePreferences = {
   layout_preset: 'balanced',
   selected_mode: 'paper',
   selected_symbol: 'BTCUSDT',
+  selected_market_timeframe: '1h',
   selected_strategy_id: 'trend-btc-01',
-  overview_card_order: ['assets', 'scheduler', 'strategy', 'risk', 'pnl', 'requests', 'backtest', 'news'],
-  overview_visible_cards: ['assets', 'scheduler', 'strategy', 'risk', 'pnl', 'requests', 'backtest', 'news'],
+  overview_card_order: ['ai_center', 'strategy_watch', 'account_center'],
+  overview_visible_cards: ['ai_center', 'strategy_watch', 'account_center'],
+  overview_collapsed_cards: [],
   updated_at: new Date().toISOString(),
 }
+
+const fallbackAccountLive: AccountLiveSnapshot = {
+  overview: fallbackAccountOverview,
+  positions: fallbackPositions,
+  orders: fallbackOrders,
+  order_history: fallbackOrders,
+  generated_at: new Date().toISOString(),
+}
+
+const fallbackRuntimeWorkerStatus: RuntimeWorkerStatus = {
+  running: true,
+  started_once: true,
+  issue: false,
+  stale: false,
+  stopped: false,
+  stale_seconds: 0,
+  last_refresh_at: new Date().toISOString(),
+  last_error: null,
+  top_issue: null,
+  recommended_action: null,
+  generated_at: new Date().toISOString(),
+}
+
+const fallbackStrategyActivity = (strategyId: string): StrategyActivitySnapshot => ({
+  strategy_id: strategyId,
+  strategy_name: fallbackStrategies.find((item) => item.id === strategyId)?.name ?? '策略活动',
+  symbol: fallbackStrategies.find((item) => item.id === strategyId)?.symbols?.[0] ?? 'BTCUSDT',
+  market: 'perp',
+  mode: fallbackStrategies.find((item) => item.id === strategyId)?.mode ?? 'paper',
+  runtime: fallbackStrategyRuntime.find((item) => item.strategy_id === strategyId) ?? null,
+  active_orders: fallbackOrders.filter((item) => item.origin === 'strategy').slice(0, 6),
+  recent_orders: fallbackOrders.filter((item) => item.origin === 'strategy').slice(0, 8),
+  recent_trades: fallbackTrades.filter((item) => item.origin === 'strategy').slice(0, 8),
+  recent_alerts: fallbackAlerts.filter((item) => item.source_type === 'system').slice(0, 6),
+  recent_audit_events: fallbackAuditEvents
+    .filter((item) => item.strategy_id === strategyId || item.event_type.startsWith('strategy.'))
+    .slice(0, 12),
+  generated_at: new Date().toISOString(),
+})
 
 export const api = {
   getServiceHealth,
   getControlSnapshot: () => fetchJson('/api/control/snapshot', fallbackSnapshot),
+  getRuntimeWorkerStatus: () =>
+    fetchJson('/api/runtime/strategy-worker/status', fallbackRuntimeWorkerStatus),
+  restartStrategyRuntimeWorker: () =>
+    postJson<RuntimeWorkerActionResult>('/api/runtime/strategy-worker/restart', {
+      requested_by: 'desktop_operator',
+      reason: '桌面端恢复策略运行线程',
+    }),
   getWatchlist: () => fetchJson('/api/market/watchlist', fallbackWatchlist),
-  getMarketDetail: (symbol: string) =>
-    fetchJson(`/api/market/${symbol}`, fallbackMarketDetails[symbol] ?? fallbackMarketDetails.BTCUSDT),
+  addWatchlistItem: (payload: { symbol: string; market: 'spot' | 'perp'; requested_by?: string }) =>
+    postJson<WatchlistInstrument>('/api/market/watchlist', payload),
+  removeWatchlistItem: (symbol: string) =>
+    deleteJson<WatchlistRemoveResult>(
+      `/api/market/watchlist/${encodeURIComponent(symbol)}?requested_by=desktop_operator`,
+    ),
+  getMarketDetail: (symbol: string, timeframe = '1h') =>
+    fetchJson(
+      `/api/market/${symbol}?timeframe=${encodeURIComponent(timeframe)}`,
+      buildFallbackMarketDetail(symbol, timeframe),
+    ),
+  getMarketLiveSnapshot: (symbol: string, timeframe = '1h') =>
+    fetchJson(
+      `/api/market/live?symbol=${encodeURIComponent(symbol)}&timeframe=${encodeURIComponent(timeframe)}`,
+      fallbackMarketLiveSnapshot(symbol, timeframe),
+    ),
   getStrategies: () => fetchJson('/api/strategies', fallbackStrategies),
+  getStrategyRuntime: () => fetchJson('/api/strategies/live', fallbackStrategyRuntime),
+  getStrategyActivity: (strategyId: string) =>
+    fetchJson(`/api/strategies/${encodeURIComponent(strategyId)}/activity`, fallbackStrategyActivity(strategyId)),
+  getStrategyExecutionPreview: async (strategyId: string, mode?: 'paper' | 'demo' | 'live') => {
+    const path = `/api/strategies/${encodeURIComponent(strategyId)}/execution-preview${mode ? `?mode=${encodeURIComponent(mode)}` : ''}`
+    try {
+      const response = await fetch(`${API_BASE}${path}`)
+      if (!response.ok) {
+        let detail = '当前策略执行预检暂不可用。'
+        try {
+          const payload = (await response.json()) as { detail?: string }
+          if (typeof payload.detail === 'string' && payload.detail.trim()) {
+            detail = payload.detail
+          }
+        } catch {
+          // ignore
+        }
+        return {
+          ...fallbackStrategyExecutionPreview,
+          mode: mode ?? fallbackStrategyExecutionPreview.mode,
+          strategy_id: strategyId,
+          blocked_reason: detail,
+          warnings: [detail],
+        }
+      }
+      return (await response.json()) as ExecutionPreview
+    } catch (error) {
+      console.warn(`使用本地 fallback: ${path}`, error)
+      return {
+        ...fallbackStrategyExecutionPreview,
+        mode: mode ?? fallbackStrategyExecutionPreview.mode,
+        strategy_id: strategyId,
+      }
+    }
+  },
+  getStrategyLiveSnapshot: () =>
+    fetchJson<StrategyLiveSnapshot>('/api/strategies/stream?once=true', {
+      items: fallbackStrategyRuntime,
+      generated_at: new Date().toISOString(),
+    }),
   getBacktests: () => fetchJson('/api/backtests', fallbackBacktests),
   getChangeRequests: () => fetchJson('/api/change-requests', fallbackScheduler.change_requests),
   getScheduler: () => fetchJson('/api/ai/scheduler', fallbackScheduler),
+  getAiLiveSnapshot: () => fetchJson('/api/ai/live', fallbackAiLive),
+  getOpsLiveSnapshot: () => fetchJson('/api/ops/live', fallbackOpsLive),
   getNews: () => fetchJson('/api/news', fallbackNews),
   getAlerts: () => fetchJson('/api/alerts', fallbackAlerts),
+  acknowledgeAlert: (alertId: string, acknowledged: boolean) =>
+    postJson<AlertRecord>(`/api/alerts/${alertId}/acknowledge`, {
+      acknowledged,
+      requested_by: 'desktop_operator',
+    }),
+  getAccountLiveSnapshot: () => fetchJson('/api/account/live', fallbackAccountLive),
   getAccountOverview: () => fetchJson('/api/account/overview', fallbackAccountOverview),
   getAccountPositions: () => fetchJson('/api/account/positions', fallbackPositions),
   getAccountOrders: () => fetchJson('/api/account/orders', fallbackOrders),
+  getAccountOrderHistory: () => fetchJson('/api/account/order-history', fallbackOrders),
   getTrades: () => fetchJson('/api/trades', fallbackTrades),
-  getReviews: () => fetchJson('/api/ai/reviews', fallbackReviews),
+  getReviews: (options?: { strategyId?: string | null; periods?: string[] }) =>
+    fetchJson(`/api/ai/reviews${buildReviewQueryString(options)}`, filterFallbackReviews(fallbackReviews, options)),
   getAuditEvents: () => fetchJson('/api/audit/events', fallbackAudit),
   getSettings: () => fetchJson('/api/settings', fallbackSettings),
+  getGrafanaStatus: () => fetchJson('/api/integrations/grafana', fallbackGrafanaStatus),
+  getPrometheusMetrics: () => fetchText('/metrics', fallbackPrometheusMetrics),
   getWorkspacePreferences: () => fetchJson('/api/workspace/preferences', fallbackWorkspacePreferences),
   getOpenClawStatus: () => fetchJson('/api/integrations/openclaw', fallbackOpenClawStatus),
   getBybitPrivateStatus: () => fetchJson('/api/integrations/bybit-private', fallbackBybitPrivateStatus),
+  getBybitPublicStatus: () => fetchJson('/api/integrations/bybit-public', fallbackBybitPublicStatus),
   probeBybitTradeRoute: () =>
     postJson<BybitTradeProbeResult>('/api/integrations/bybit-private/probe-trade', {}),
   createChangeRequest: (payload: {
@@ -497,6 +965,27 @@ export const api = {
   }) => postJson<ChangeRequest>('/api/change-requests', payload),
   createBacktest: (payload: { strategy_id: string; data_range: string; timeframe: string }) =>
     postJson<BacktestRun>('/api/backtests', payload),
+  executeStrategySignal: (
+    strategyId: string,
+    payload?: { requested_by?: string; note?: string; mode?: 'paper' | 'demo' | 'live' },
+  ) =>
+    postJson<StrategyExecutionResult>(`/api/strategies/${encodeURIComponent(strategyId)}/execute`, {
+      requested_by: payload?.requested_by ?? 'desktop_operator',
+      note: payload?.note ?? null,
+      mode: payload?.mode ?? null,
+    }),
+  previewExecution: (payload: {
+    symbol: string
+    market: 'spot' | 'perp'
+    mode: 'paper' | 'demo' | 'live'
+    side: 'buy' | 'sell'
+    quantity: number
+    price: number
+    origin?: 'manual' | 'strategy'
+    strategy_id?: string
+    note?: string
+    exclude_order_id?: string
+  }) => postJson<ExecutionPreview>('/api/trades/preview', payload),
   createManualTrade: (payload: {
     symbol: string
     market: 'spot' | 'perp'
@@ -506,6 +995,73 @@ export const api = {
     price: number
     note?: string
   }) => postJson<TradeRecord>('/api/trades/manual', payload),
+  createExchangeOrder: (payload: {
+    symbol: string
+    market: 'spot' | 'perp'
+    mode: 'paper' | 'demo' | 'live'
+    side: 'buy' | 'sell'
+    quantity: number
+    price: number
+    note?: string
+  }) => postJson<OrderRecord>('/api/orders/exchange', payload),
+  replaceExchangeOrder: (
+    orderId: string,
+    payload: { quantity: number; price: number; requested_by?: string },
+  ) =>
+    postJson<OrderRecord>(`/api/orders/exchange/${encodeURIComponent(orderId)}/replace`, {
+      requested_by: payload.requested_by ?? 'desktop_operator',
+      quantity: payload.quantity,
+      price: payload.price,
+    }),
+  cancelExchangeOrder: (orderId: string, requested_by = 'desktop_operator') =>
+    postJson<OrderRecord>(`/api/orders/exchange/${encodeURIComponent(orderId)}/cancel`, { requested_by }),
+  cancelAllExchangeOrders: (requested_by = 'desktop_operator') =>
+    postJson<{
+      cancelled_count: number
+      cancelled_order_ids: string[]
+      requested_by: string
+      updated_at: string
+    }>('/api/orders/exchange/cancel-all', { requested_by }),
+  createPaperOrder: (payload: {
+    symbol: string
+    market: 'spot' | 'perp'
+    mode: 'paper' | 'demo' | 'live'
+    side: 'buy' | 'sell'
+    quantity: number
+    price: number
+    note?: string
+  }) => postJson<OrderRecord>('/api/account/paper/orders', payload),
+  cancelPaperOrder: (orderId: string, requested_by = 'desktop_operator') =>
+    postJson<OrderRecord>(`/api/account/paper/orders/${encodeURIComponent(orderId)}/cancel`, { requested_by }),
+  cancelAllPaperOrders: (requested_by = 'desktop_operator') =>
+    postJson<{
+      cancelled_count: number
+      cancelled_order_ids: string[]
+      requested_by: string
+      updated_at: string
+    }>('/api/account/paper/orders/cancel-all', { requested_by }),
+  replacePaperOrder: (
+    orderId: string,
+    payload: { quantity: number; price: number; requested_by?: string },
+  ) =>
+    postJson<OrderRecord>(`/api/account/paper/orders/${encodeURIComponent(orderId)}/replace`, {
+      requested_by: payload.requested_by ?? 'desktop_operator',
+      quantity: payload.quantity,
+      price: payload.price,
+    }),
+  closePaperPosition: (symbol: string, requested_by = 'desktop_operator') =>
+    postJson<TradeRecord>(`/api/account/paper/positions/${symbol}/close`, { requested_by }),
+  closeAllPaperPositions: (requested_by = 'desktop_operator') =>
+    postJson<{
+      closed_count: number
+      trade_ids: string[]
+      requested_by: string
+      updated_at: string
+    }>('/api/account/paper/positions/close-all', { requested_by }),
+  closeExchangePosition: (symbol: string, requested_by = 'desktop_operator') =>
+    postJson<OrderRecord>(`/api/account/exchange/positions/${symbol}/close`, { requested_by }),
+  closeAllExchangePositions: (requested_by = 'desktop_operator') =>
+    postJson<ExchangePositionBulkCloseResult>('/api/account/exchange/positions/close-all', { requested_by }),
   sendSchedulerCommand: (payload: {
     command: SchedulerCommandType
     job_id?: string
@@ -521,9 +1077,11 @@ export const api = {
     layout_preset: 'balanced' | 'focus' | 'dense'
     selected_mode: 'paper' | 'demo' | 'live'
     selected_symbol: string
+    selected_market_timeframe: '15m' | '1h' | '4h' | '1d'
     selected_strategy_id?: string | null
     overview_card_order: string[]
     overview_visible_cards: string[]
+    overview_collapsed_cards: string[]
   }) => postJson<WorkspacePreferences>('/api/workspace/preferences', payload),
   createAgentJob: (payload: {
     job_type: string
@@ -533,4 +1091,23 @@ export const api = {
     idempotency_key: string
     writeback_target?: string
   }) => postJson<AgentJob>('/api/ai/jobs', payload),
+  createStrategyTrackingReview: (
+    strategyId: string,
+    payload: {
+      review_kind: 'issue' | 'change'
+      summary: string
+      detail?: string
+      requested_by?: string
+      request_key?: string
+    },
+  ) => postJson<AgentJob>(`/api/strategies/${encodeURIComponent(strategyId)}/review`, payload),
+  retryAgentJob: (jobId: string, requested_by = 'desktop_operator') =>
+    postJson<AgentJob>(`/api/ai/jobs/${encodeURIComponent(jobId)}/retry`, {
+      requested_by,
+    }),
+  applyStrategyProposalAction: (proposalId: string, action: 'accept' | 'reject') =>
+    postJson<StrategyProposalActionResult>(`/api/ai/proposals/${proposalId}/action`, {
+      action,
+      requested_by: 'desktop_operator',
+    }),
 }

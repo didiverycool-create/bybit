@@ -7,6 +7,7 @@ from models import (
     AccountMode,
     AgentJob,
     AlertRecord,
+    AlertRule,
     AppState,
     BacktestMetrics,
     BacktestRun,
@@ -15,9 +16,11 @@ from models import (
     ChangeRequestStatus,
     ControlSnapshot,
     EventSeverity,
+    ExecutionHealthSummary,
     ExecutionEvent,
     JobStatus,
     MarketDetail,
+    MarketRecentTrade,
     MetricCard,
     NewsEvent,
     OrderBookLevel,
@@ -81,6 +84,48 @@ def generate_orderbook(base_price: float, side: str) -> list[OrderBookLevel]:
     return entries
 
 
+def generate_recent_public_trades(base_price: float) -> list[MarketRecentTrade]:
+    entries: list[MarketRecentTrade] = []
+    for index in range(10):
+        dt = BASE_NOW - timedelta(minutes=index * 2)
+        side = "buy" if index % 3 != 1 else "sell"
+        drift = RNG.uniform(0.0008, 0.0042) * base_price
+        price = base_price + drift if side == "buy" else base_price - drift
+        size = round(RNG.uniform(0.2, 6.8), 4)
+        entries.append(
+            MarketRecentTrade(
+                side=side,
+                price=round(price, 2),
+                size=size,
+                value=round(price * size, 2),
+                occurred_at=iso(dt),
+                is_block_trade=size >= 5,
+            )
+        )
+    return entries
+
+
+def build_market_detail_for_watchlist(item: WatchlistInstrument) -> MarketDetail:
+    return MarketDetail(
+        symbol=item.symbol,
+        market=item.market,
+        timeframe="1h",
+        candles=generate_candles(item.symbol, item.last_price),
+        bids=generate_orderbook(item.last_price, "bid"),
+        asks=generate_orderbook(item.last_price, "ask"),
+        recent_public_trades=generate_recent_public_trades(item.last_price),
+        headline=f"{item.symbol} 当前处于 {'策略跟踪' if item.signal != 'neutral' else '观察'} 状态",
+        stats={
+            "24h振幅": f"{abs(item.change_24h) * 1.82:.2f}%",
+            "资金费率": f"{RNG.uniform(0.002, 0.029):.3f}%",
+            "持仓偏向": "多头占优" if item.position_side != "flat" else "中性",
+            "风险热度": {"low": "低", "medium": "中", "high": "高"}[item.risk_level],
+        },
+        source="mock",
+        updated_at=iso(BASE_NOW - timedelta(minutes=5)),
+    )
+
+
 def build_state() -> AppState:
     watchlist = [
         WatchlistInstrument(
@@ -92,6 +137,8 @@ def build_state() -> AppState:
             signal="active",
             position_side="long",
             risk_level="medium",
+            alert_enabled=True,
+            alert_threshold_pct=2.8,
         ),
         WatchlistInstrument(
             symbol="ETHUSDT",
@@ -102,6 +149,8 @@ def build_state() -> AppState:
             signal="watch",
             position_side="flat",
             risk_level="medium",
+            alert_enabled=True,
+            alert_threshold_pct=2.0,
         ),
         WatchlistInstrument(
             symbol="SOLUSDT",
@@ -112,6 +161,8 @@ def build_state() -> AppState:
             signal="watch",
             position_side="long",
             risk_level="high",
+            alert_enabled=True,
+            alert_threshold_pct=4.5,
         ),
         WatchlistInstrument(
             symbol="BNBUSDT",
@@ -122,29 +173,12 @@ def build_state() -> AppState:
             signal="neutral",
             position_side="flat",
             risk_level="low",
+            alert_enabled=False,
+            alert_threshold_pct=3.5,
         ),
     ]
 
-    market_details = {
-        item.symbol: MarketDetail(
-            symbol=item.symbol,
-            market=item.market,
-            timeframe="1h",
-            candles=generate_candles(item.symbol, item.last_price),
-            bids=generate_orderbook(item.last_price, "bid"),
-            asks=generate_orderbook(item.last_price, "ask"),
-            headline=f"{item.symbol} 当前处于 {'策略跟踪' if item.signal != 'neutral' else '观察'} 状态",
-            stats={
-                "24h振幅": f"{abs(item.change_24h) * 1.82:.2f}%",
-                "资金费率": f"{RNG.uniform(0.002, 0.029):.3f}%",
-                "持仓偏向": "多头占优" if item.position_side != "flat" else "中性",
-                "风险热度": {"low": "低", "medium": "中", "high": "高"}[item.risk_level],
-            },
-            source="mock",
-            updated_at=iso(BASE_NOW - timedelta(minutes=5)),
-        )
-        for item in watchlist
-    }
+    market_details = {item.symbol: build_market_detail_for_watchlist(item) for item in watchlist}
 
     strategies = [
         StrategySummary(
@@ -266,6 +300,7 @@ def build_state() -> AppState:
             "win_rate": "63.8%",
             "best_strategy": "BTC 趋势跟随",
         },
+        execution_health=ExecutionHealthSummary(),
     )
 
     change_requests = [
@@ -415,6 +450,13 @@ def build_state() -> AppState:
                     created_at=iso(BASE_NOW - timedelta(minutes=20)),
                     status="testing",
                     expected_impact="降低反复试单产生的回撤。",
+                    payload={
+                        "target_mode": "paper",
+                        "parameter_patch": {
+                            "stop_loss_pct": 1.2,
+                            "cooldown_minutes": 35,
+                        },
+                    },
                 ),
                 StrategyProposal(
                     id="prop-002",
@@ -425,6 +467,24 @@ def build_state() -> AppState:
                     created_at=iso(BASE_NOW - timedelta(minutes=18)),
                     status="pending",
                     expected_impact="保持稳定收益输出。",
+                    payload={
+                        "target_mode": "live",
+                        "recommendation": "keep_live_publish",
+                    },
+                ),
+                StrategyProposal(
+                    id="prop-003",
+                    proposal_type="backtest_request",
+                    strategy_id="sol-breakout-03",
+                    title="SOL 突破策略追加 30 天回放",
+                    description="针对最近高波动区间补跑 30 天 15m 回测，确认人工接管前后的滑点变化。",
+                    created_at=iso(BASE_NOW - timedelta(minutes=12)),
+                    status="pending",
+                    expected_impact="确认突破窗口与滑点上限是否仍然适配当前市场。",
+                    payload={
+                        "data_range": "2026-03-01 ~ 2026-03-29",
+                        "timeframe": "15m",
+                    },
                 ),
             ],
             created_at=iso(BASE_NOW - timedelta(minutes=16)),
@@ -440,6 +500,7 @@ def build_state() -> AppState:
             description="OpenClaw 请求暂停自动发布，等待人工确认当前风控边界。",
             triggered_at=iso(BASE_NOW - timedelta(minutes=42)),
             suggested_action="在 AI 调度页选择“进入人工接管”并冻结自动发布。",
+            rule_key="manual-override:SOLUSDT",
         ),
         AlertRecord(
             id="alert-002",
@@ -450,6 +511,7 @@ def build_state() -> AppState:
             triggered_at=iso(BASE_NOW - timedelta(minutes=24)),
             related_news_id="news-002",
             suggested_action="复查 BTC 趋势策略夜盘持仓时间限制。",
+            rule_key="funding-rate:BTCUSDT",
         ),
         AlertRecord(
             id="alert-003",
@@ -459,6 +521,30 @@ def build_state() -> AppState:
             description="新的止损参数组合已完成 72% 历史区间验证。",
             triggered_at=iso(BASE_NOW - timedelta(minutes=9)),
             suggested_action="查看回测页的参数对比结果。",
+            rule_key="backtest-review:ETHUSDT",
+        ),
+    ]
+
+    alert_rules = [
+        AlertRule(
+            id="rule-btc-vol-001",
+            symbol="BTCUSDT",
+            market="perp",
+            threshold_pct=5.0,
+            enabled=True,
+            cooldown_minutes=30,
+            created_at=iso(BASE_NOW - timedelta(hours=18)),
+            updated_at=iso(BASE_NOW - timedelta(hours=2)),
+        ),
+        AlertRule(
+            id="rule-sol-vol-001",
+            symbol="SOLUSDT",
+            market="spot",
+            threshold_pct=8.0,
+            enabled=True,
+            cooldown_minutes=45,
+            created_at=iso(BASE_NOW - timedelta(hours=10)),
+            updated_at=iso(BASE_NOW - timedelta(hours=1)),
         ),
     ]
 
@@ -468,6 +554,7 @@ def build_state() -> AppState:
             source="Bybit Announcement",
             title="Bybit 公告：新一轮维护窗口预告",
             summary="公告提醒 API 与网页入口在周末维护窗口可能出现短时波动，需关注调度回补逻辑。",
+            url="https://www.bybit-global.com/",
             symbols=["BTCUSDT", "ETHUSDT"],
             impact_score=68,
             published_at=iso(BASE_NOW - timedelta(hours=5)),
@@ -479,6 +566,7 @@ def build_state() -> AppState:
             source="Trading Economics",
             title="美国核心通胀预期回升",
             summary="宏观日历显示通胀预期高于市场一致值，风险资产短线波动上升。",
+            url=None,
             symbols=["BTCUSDT", "ETHUSDT", "SOLUSDT"],
             impact_score=82,
             published_at=iso(BASE_NOW - timedelta(minutes=31)),
@@ -490,6 +578,7 @@ def build_state() -> AppState:
             source="GDELT",
             title="全球科技股风险偏好回暖",
             summary="风险偏好回暖带动加密市场 beta 品种走强，SOL 与 AI 板块关注度上升。",
+            url=None,
             symbols=["SOLUSDT"],
             impact_score=59,
             published_at=iso(BASE_NOW - timedelta(minutes=51)),
@@ -586,6 +675,10 @@ def build_state() -> AppState:
         openclaw_agent="codex",
         default_mode=AccountMode.PAPER,
         notification_channels=["desktop", "telegram", "email"],
+        grafana_base_url=None,
+        grafana_dashboard_uid=None,
+        grafana_org_id=1,
+        grafana_theme="dark",
     )
 
     workspace_preferences = WorkspacePreferences(
@@ -593,27 +686,19 @@ def build_state() -> AppState:
         layout_preset="balanced",
         selected_mode=AccountMode.PAPER,
         selected_symbol="BTCUSDT",
+        selected_market_timeframe="1h",
         selected_strategy_id="trend-btc-01",
         overview_card_order=[
-            "assets",
-            "scheduler",
-            "strategy",
-            "risk",
-            "pnl",
-            "requests",
-            "backtest",
-            "news",
+            "ai_center",
+            "strategy_watch",
+            "account_center",
         ],
         overview_visible_cards=[
-            "assets",
-            "scheduler",
-            "strategy",
-            "risk",
-            "pnl",
-            "requests",
-            "backtest",
-            "news",
+            "ai_center",
+            "strategy_watch",
+            "account_center",
         ],
+        overview_collapsed_cards=[],
         updated_at=iso(BASE_NOW - timedelta(minutes=22)),
     )
 
@@ -627,6 +712,7 @@ def build_state() -> AppState:
         agent_jobs=agent_jobs,
         reviews=reviews,
         alerts=alerts,
+        alert_rules=alert_rules,
         news_events=news_events,
         trades=trades,
         audit_events=audit_events,

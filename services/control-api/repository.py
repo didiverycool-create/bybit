@@ -4,13 +4,16 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 from uuid import uuid4
 
 from models import (
     AccountMode,
     AccountAsset,
     AccountOverview,
+    AlertRecord,
+    AlertAcknowledgePayload,
+    AlertRule,
     AgentJob,
     AgentJobCreate,
     AppState,
@@ -19,19 +22,32 @@ from models import (
     ChangeRequest,
     ChangeRequestCreate,
     ChangeRequestStatus,
+    Direction,
+    ExecutionPreview,
+    ExecutionPreviewRequest,
     EventSeverity,
     ExecutionEvent,
     JobStatus,
     ManualOrderRequest,
+    MarketDetail,
+    NewsEvent,
     OrderRecord,
     PositionRecord,
     SchedulerCommand,
     SchedulerCommandType,
+    StrategyParameter,
+    StrategyRuntimeSnapshot,
+    StrategyProposal,
+    StrategyProposalActionPayload,
+    StrategyProposalActionResult,
     TradeRecord,
+    WatchlistInstrument,
+    WatchlistRemoveResult,
+    ReviewDocument,
     WorkspacePreferences,
     WorkspacePreferencesUpdate,
 )
-from seed import build_state
+from seed import build_market_detail_for_watchlist, build_state
 
 
 def now_iso() -> str:
@@ -39,11 +55,19 @@ def now_iso() -> str:
 
 
 class AppRepository:
-    def __init__(self, path: Optional[Path] = None) -> None:
+    PAPER_STARTING_CASH = 250_000.0
+
+    def __init__(
+        self,
+        path: Optional[Path] = None,
+        backtest_runner: Optional[Callable[[Any, str, str], Optional[Dict[str, Any]]]] = None,
+    ) -> None:
         self.path = path or Path(__file__).resolve().parent / ".runtime" / "state.json"
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = Lock()
+        self.backtest_runner = backtest_runner
         self.state = self._load()
+        self._refresh_derived_state()
 
     def _load(self) -> AppState:
         if self.path.exists():
@@ -62,6 +86,903 @@ class AppRepository:
     def snapshot(self) -> AppState:
         return self.state
 
+    def _recompute_alert_summary(self) -> None:
+        summary = {"P0": 0, "P1": 0, "P2": 0}
+        for alert in self.state.alerts:
+            if not alert.acknowledged:
+                summary[alert.severity] = summary.get(alert.severity, 0) + 1
+        self.state.control_snapshot.alerts_summary = summary
+
+    def _recompute_strategy_metrics(self) -> None:
+        running_count = sum(1 for strategy in self.state.strategies if strategy.status == "running")
+        paper_count = sum(
+            1 for strategy in self.state.strategies if strategy.mode == AccountMode.PAPER or strategy.status == "paper_only"
+        )
+        proposal_count = sum(
+            1
+            for review in self.state.reviews
+            for proposal in review.proposals
+            if proposal.status in {"pending", "testing"}
+        )
+        self.state.control_snapshot.strategy_metrics = [
+            self.state.control_snapshot.strategy_metrics[0].model_copy(
+                update={"value": str(running_count)}
+            ),
+            self.state.control_snapshot.strategy_metrics[1].model_copy(
+                update={"value": str(paper_count)}
+            ),
+            self.state.control_snapshot.strategy_metrics[2].model_copy(
+                update={"value": str(proposal_count)}
+            ),
+        ]
+
+    def _refresh_derived_state(self) -> None:
+        self._settle_open_paper_orders_locked()
+        self._refresh_paper_state_locked()
+        self._recompute_alert_summary()
+        self._recompute_strategy_metrics()
+        self._recompute_scheduler_queue_depth()
+
+    @staticmethod
+    def _format_usdt(value: float) -> str:
+        return f"{value:,.2f} USDT"
+
+    @staticmethod
+    def _format_usdt_delta(value: float) -> str:
+        sign = "+" if value > 0 else ""
+        return f"{sign}{value:,.2f} USDT"
+
+    @staticmethod
+    def _format_quantity(value: float, digits: int = 4) -> str:
+        return f"{value:,.{digits}f}".rstrip("0").rstrip(".")
+
+    @staticmethod
+    def _format_ratio(value: float) -> str:
+        return f"{value:,.2f}".rstrip("0").rstrip(".")
+
+    @staticmethod
+    def _parse_metric_number(value: Any) -> float:
+        normalized = str(value if value is not None else 0).replace("USDT", "").replace("%", "").replace(",", "").replace("+", "").strip()
+        try:
+            return float(normalized)
+        except (TypeError, ValueError):
+            return 0.0
+
+    @staticmethod
+    def _symbol_coin(symbol: str) -> str:
+        return symbol[:-4] if symbol.endswith("USDT") else symbol
+
+    @staticmethod
+    def _parse_trade_time(value: str) -> datetime:
+        try:
+            return datetime.fromisoformat(value)
+        except ValueError:
+            return datetime.min.replace(tzinfo=timezone.utc)
+
+    def _resolve_mark_price_locked(self, symbol: str, fallback_price: float) -> float:
+        watch_item = next((item for item in self.state.watchlist if item.symbol == symbol), None)
+        if watch_item is not None and watch_item.last_price > 0:
+            return watch_item.last_price
+        detail = self.state.market_details.get(symbol)
+        if detail is not None and detail.candles:
+            latest_close = float(detail.candles[-1].close)
+            if latest_close > 0:
+                return latest_close
+        return max(fallback_price, 0.0)
+
+    def _paper_reserved_cash_locked(self, exclude_order_id: Optional[str] = None) -> float:
+        reserved = 0.0
+        for order in self.state.paper_orders:
+            if exclude_order_id and order.order_id == exclude_order_id:
+                continue
+            if order.side != Direction.BUY:
+                continue
+            reserved += self._parse_metric_number(order.qty) * self._parse_metric_number(order.price)
+        return reserved
+
+    def _paper_reserved_sell_quantity_locked(self, symbol: str, exclude_order_id: Optional[str] = None) -> float:
+        reserved = 0.0
+        for order in self.state.paper_orders:
+            if exclude_order_id and order.order_id == exclude_order_id:
+                continue
+            if order.symbol != symbol or order.side != Direction.SELL or order.market != "spot":
+                continue
+            reserved += self._parse_metric_number(order.qty)
+        return reserved
+
+    def _append_paper_order_history_locked(self, order: OrderRecord, status: str) -> None:
+        history_order = order.model_copy(update={"status": status})
+        self.state.paper_order_history.insert(0, history_order)
+        self.state.paper_order_history = self.state.paper_order_history[:120]
+
+    def _is_paper_order_marketable_locked(self, order: OrderRecord) -> bool:
+        order_price = self._parse_metric_number(order.price)
+        reference_price = self._resolve_mark_price_locked(order.symbol, order_price)
+        if order.side == Direction.BUY:
+            return reference_price <= order_price + 1e-9
+        return reference_price >= order_price - 1e-9
+
+    def _settle_open_paper_orders_locked(self) -> bool:
+        if not self.state.paper_orders:
+            return False
+
+        changed = False
+        remaining_orders: list[OrderRecord] = []
+        for order in sorted(self.state.paper_orders, key=lambda item: self._parse_trade_time(item.created_at)):
+            if not self._is_paper_order_marketable_locked(order):
+                remaining_orders.append(order)
+                continue
+
+            trade = TradeRecord(
+                id=f"trade-{uuid4().hex[:6]}",
+                symbol=order.symbol,
+                market=order.market,
+                mode=AccountMode.PAPER,
+                origin="manual",
+                side=order.side,
+                quantity=self._parse_metric_number(order.qty),
+                price=self._parse_metric_number(order.price),
+                pnl="--",
+                strategy_id=None,
+                created_at=now_iso(),
+                status="filled",
+            )
+            self.state.trades.insert(0, trade)
+            self._append_paper_order_history_locked(order, "Filled")
+            self.add_event(
+                event_type="paper_order.filled",
+                source="quant-core",
+                severity=EventSeverity.INFO,
+                payload={
+                    "order_id": order.order_id,
+                    "symbol": order.symbol,
+                    "market": order.market,
+                    "side": order.side.value,
+                    "qty": order.qty,
+                    "price": order.price,
+                    "trade_id": trade.id,
+                },
+                symbol=order.symbol,
+            )
+            changed = True
+
+        if changed:
+            self.state.paper_orders = remaining_orders
+        return changed
+
+    @staticmethod
+    def _classify_position_side(quantity: float) -> str:
+        if quantity > 1e-9:
+            return "long"
+        if quantity < -1e-9:
+            return "short"
+        return "flat"
+
+    def _describe_execution_action_locked(
+        self,
+        market: str,
+        side: Direction,
+        current_qty: float,
+        next_qty: float,
+    ) -> str:
+        if side == Direction.BUY:
+            if current_qty > 1e-9:
+                return "加多"
+            if current_qty < -1e-9:
+                if next_qty < -1e-9:
+                    return "减空"
+                if abs(next_qty) <= 1e-9:
+                    return "平空"
+                return "反手开多"
+            return "开多"
+
+        if current_qty < -1e-9:
+            return "加空"
+        if current_qty > 1e-9:
+            if next_qty > 1e-9:
+                return "减多"
+            if abs(next_qty) <= 1e-9:
+                return "平多"
+            return "反手开空"
+        return "开空" if market == "perp" else "卖出"
+
+    def _build_execution_preview_locked(self, payload: ExecutionPreviewRequest) -> ExecutionPreview:
+        notional = payload.quantity * payload.price
+        base_preview = {
+            "symbol": payload.symbol.upper(),
+            "market": payload.market,
+            "mode": payload.mode,
+            "side": payload.side,
+            "origin": payload.origin,
+            "strategy_id": payload.strategy_id,
+            "quantity": payload.quantity,
+            "price": payload.price,
+            "notional": self._format_usdt(notional),
+            "generated_at": now_iso(),
+        }
+
+        if payload.mode != AccountMode.PAPER:
+            return ExecutionPreview(
+                **base_preview,
+                action="等待真实执行引擎",
+                allowed=False,
+                blocked_reason="当前统一执行预检仅开放 Paper 模式；Demo / Live 待真实执行引擎接通后再开放。",
+                warnings=["当前结果仅适用于 Paper 执行链路。"],
+                current_position_size="--",
+                current_avg_price="--",
+                projected_position_size="--",
+                projected_avg_price="--",
+                available_balance_before="--",
+                available_balance_after="--",
+                estimated_realized_pnl="--",
+            )
+
+        ledger_snapshot = self._build_paper_ledger_locked()
+        cash_balance = float(ledger_snapshot["cash_balance"])
+        available_cash = max(cash_balance - self._paper_reserved_cash_locked(payload.exclude_order_id), 0.0)
+        positions = dict(ledger_snapshot["positions"])
+        position = positions.get(payload.symbol.upper(), {"qty": 0.0, "avg_price": 0.0})
+        current_qty = float(position.get("qty") or 0.0)
+        current_avg = float(position.get("avg_price") or 0.0)
+        signed_qty = payload.quantity if payload.side == Direction.BUY else -payload.quantity
+        next_qty = current_qty + signed_qty
+        close_qty = 0.0
+        realized_on_fill = 0.0
+
+        if current_qty != 0 and current_qty * signed_qty < 0:
+            close_qty = min(abs(current_qty), abs(signed_qty))
+            realized_on_fill = close_qty * (payload.price - current_avg) * (1 if current_qty > 0 else -1)
+
+        if current_qty == 0 or current_qty * signed_qty > 0:
+            total_size = abs(current_qty) + abs(signed_qty)
+            projected_avg = (
+                ((abs(current_qty) * current_avg) + (abs(signed_qty) * payload.price)) / total_size
+                if total_size > 0
+                else 0.0
+            )
+        elif abs(next_qty) <= 1e-9:
+            projected_avg = 0.0
+        elif current_qty * next_qty > 0:
+            projected_avg = current_avg
+        else:
+            projected_avg = payload.price
+
+        available_after = available_cash - (signed_qty * payload.price)
+        blocked_reason = self._evaluate_paper_order_risk_locked(
+            payload.symbol,
+            payload.market,
+            payload.side,
+            payload.quantity,
+            payload.price,
+            exclude_order_id=payload.exclude_order_id,
+        )
+        warnings: list[str] = []
+        if close_qty > 0:
+            warnings.append("本次成交会先结算一部分已实现盈亏。")
+        if current_qty != 0 and current_qty * next_qty < 0:
+            warnings.append("本次成交会反手切换持仓方向。")
+
+        return ExecutionPreview(
+            **base_preview,
+            action=self._describe_execution_action_locked(payload.market, payload.side, current_qty, next_qty),
+            allowed=blocked_reason is None,
+            blocked_reason=blocked_reason,
+            warnings=warnings,
+            current_position_side=self._classify_position_side(current_qty),
+            current_position_size=self._format_quantity(abs(current_qty), 6),
+            current_avg_price=self._format_ratio(current_avg) if abs(current_qty) > 1e-9 else "--",
+            projected_position_side=self._classify_position_side(next_qty),
+            projected_position_size=self._format_quantity(abs(next_qty), 6),
+            projected_avg_price=self._format_ratio(projected_avg) if abs(next_qty) > 1e-9 else "--",
+            available_balance_before=self._format_usdt(available_cash),
+            available_balance_after=self._format_usdt(available_after),
+            estimated_realized_pnl=self._format_usdt_delta(realized_on_fill) if close_qty > 0 else "--",
+        )
+
+    def _build_paper_ledger_locked(self) -> dict[str, Any]:
+        cash_balance = self.PAPER_STARTING_CASH
+        positions: dict[str, dict[str, Any]] = {}
+        realized_pnl = 0.0
+        closed_trades = 0
+        winning_trades = 0
+        strategy_realized: dict[str, float] = {}
+        trade_pnl_map: dict[str, str] = {}
+        paper_trades = sorted(
+            (
+                trade
+                for trade in self.state.trades
+                if trade.mode == AccountMode.PAPER and trade.status in {"filled", "partially_filled"}
+            ),
+            key=lambda item: self._parse_trade_time(item.created_at),
+        )
+
+        for trade in paper_trades:
+            signed_qty = trade.quantity if trade.side == Direction.BUY else -trade.quantity
+            if signed_qty == 0 or trade.price <= 0:
+                continue
+
+            cash_balance -= signed_qty * trade.price
+            position = positions.setdefault(
+                trade.symbol,
+                {
+                    "symbol": trade.symbol,
+                    "market": trade.market,
+                    "qty": 0.0,
+                    "avg_price": 0.0,
+                    "last_trade_at": trade.created_at,
+                },
+            )
+            current_qty = float(position["qty"])
+            current_avg = float(position["avg_price"])
+            realized_on_trade = 0.0
+            close_qty = 0.0
+
+            if current_qty == 0 or current_qty * signed_qty > 0:
+                total_size = abs(current_qty) + abs(signed_qty)
+                next_avg = (
+                    ((abs(current_qty) * current_avg) + (abs(signed_qty) * trade.price)) / total_size
+                    if total_size > 0
+                    else 0.0
+                )
+                position["qty"] = current_qty + signed_qty
+                position["avg_price"] = next_avg
+            else:
+                close_qty = min(abs(current_qty), abs(signed_qty))
+                realized_on_trade = close_qty * (trade.price - current_avg) * (1 if current_qty > 0 else -1)
+                realized_pnl += realized_on_trade
+                closed_trades += 1
+                if realized_on_trade > 0:
+                    winning_trades += 1
+                if trade.strategy_id:
+                    strategy_realized[trade.strategy_id] = strategy_realized.get(trade.strategy_id, 0.0) + realized_on_trade
+                next_qty = current_qty + signed_qty
+                if next_qty == 0:
+                    position["qty"] = 0.0
+                    position["avg_price"] = 0.0
+                elif current_qty * next_qty > 0:
+                    position["qty"] = next_qty
+                    position["avg_price"] = current_avg
+                else:
+                    position["qty"] = next_qty
+                    position["avg_price"] = trade.price
+
+            position["market"] = trade.market
+            position["last_trade_at"] = trade.created_at
+            trade_pnl_map[trade.id] = self._format_usdt_delta(realized_on_trade) if close_qty > 0 else "--"
+
+        return {
+            "cash_balance": cash_balance,
+            "positions": positions,
+            "realized_pnl": realized_pnl,
+            "closed_trades": closed_trades,
+            "winning_trades": winning_trades,
+            "strategy_realized": strategy_realized,
+            "trade_pnl_map": trade_pnl_map,
+        }
+
+    def _build_paper_strategy_ledger_locked(self, strategy_id: str) -> dict[str, Any]:
+        positions: dict[str, dict[str, Any]] = {}
+        strategy_trades = sorted(
+            (
+                trade
+                for trade in self.state.trades
+                if trade.mode == AccountMode.PAPER
+                and trade.origin == "strategy"
+                and trade.strategy_id == strategy_id
+                and trade.status in {"filled", "partially_filled"}
+            ),
+            key=lambda item: self._parse_trade_time(item.created_at),
+        )
+
+        for trade in strategy_trades:
+            signed_qty = trade.quantity if trade.side == Direction.BUY else -trade.quantity
+            if signed_qty == 0 or trade.price <= 0:
+                continue
+
+            position = positions.setdefault(
+                trade.symbol,
+                {
+                    "symbol": trade.symbol,
+                    "market": trade.market,
+                    "qty": 0.0,
+                    "avg_price": 0.0,
+                    "last_trade_at": trade.created_at,
+                },
+            )
+            current_qty = float(position["qty"])
+            current_avg = float(position["avg_price"])
+
+            if current_qty == 0 or current_qty * signed_qty > 0:
+                total_size = abs(current_qty) + abs(signed_qty)
+                next_avg = (
+                    ((abs(current_qty) * current_avg) + (abs(signed_qty) * trade.price)) / total_size
+                    if total_size > 0
+                    else 0.0
+                )
+                position["qty"] = current_qty + signed_qty
+                position["avg_price"] = next_avg
+            else:
+                next_qty = current_qty + signed_qty
+                if abs(next_qty) <= 1e-9:
+                    position["qty"] = 0.0
+                    position["avg_price"] = 0.0
+                elif current_qty * next_qty > 0:
+                    position["qty"] = next_qty
+                    position["avg_price"] = current_avg
+                else:
+                    position["qty"] = next_qty
+                    position["avg_price"] = trade.price
+
+            position["market"] = trade.market
+            position["last_trade_at"] = trade.created_at
+
+        return {"positions": positions}
+
+    def _evaluate_paper_order_risk_locked(
+        self,
+        symbol: str,
+        market: str,
+        side: Direction,
+        quantity: float,
+        price: float,
+        exclude_order_id: Optional[str] = None,
+    ) -> Optional[str]:
+        if quantity <= 0 or price <= 0:
+            return "数量和价格必须大于 0。"
+
+        ledger_snapshot = self._build_paper_ledger_locked()
+        cash_balance = float(ledger_snapshot["cash_balance"])
+        available_cash = cash_balance - self._paper_reserved_cash_locked(exclude_order_id)
+        ledger = dict(ledger_snapshot["positions"])
+        notional = quantity * price
+        symbol_state = ledger.get(symbol, {"qty": 0.0})
+        current_qty = float(symbol_state.get("qty") or 0.0)
+        reserved_spot_sell_qty = self._paper_reserved_sell_quantity_locked(symbol, exclude_order_id)
+
+        if side == Direction.BUY and notional > available_cash + 1e-9:
+            return f"Paper 可用余额不足，当前仅剩 {self._format_usdt(available_cash)}。"
+
+        if market == "spot" and side == Direction.SELL and current_qty - reserved_spot_sell_qty + 1e-9 < quantity:
+            return (
+                f"{symbol} 当前 Paper 现货可卖数量不足，"
+                f"最多可卖 {self._format_quantity(max(current_qty - reserved_spot_sell_qty, 0.0), 6)}。"
+            )
+
+        return None
+
+    def _build_paper_positions_locked(self) -> list[PositionRecord]:
+        ledger_snapshot = self._build_paper_ledger_locked()
+        ledger = dict(ledger_snapshot["positions"])
+        timestamp = now_iso()
+        records: list[PositionRecord] = []
+        for item in ledger.values():
+            qty = float(item["qty"])
+            if abs(qty) < 1e-9:
+                continue
+            avg_price = float(item["avg_price"])
+            mark_price = self._resolve_mark_price_locked(str(item["symbol"]), avg_price)
+            value = abs(qty) * mark_price
+            unrealized_pnl = abs(qty) * (mark_price - avg_price) * (1 if qty > 0 else -1)
+            records.append(
+                PositionRecord(
+                    source="paper",
+                    symbol=str(item["symbol"]),
+                    market=str(item["market"]),
+                    side="long" if qty > 0 else "short",
+                    size=self._format_quantity(abs(qty), 6),
+                    avg_price=self._format_ratio(avg_price),
+                    mark_price=self._format_ratio(mark_price),
+                    value=self._format_usdt(value),
+                    leverage="1.0x" if str(item["market"]) == "spot" else "2.0x",
+                    unrealised_pnl=self._format_usdt(unrealized_pnl),
+                    updated_at=timestamp,
+                )
+            )
+        records.sort(key=lambda entry: self._parse_metric_number(entry.value), reverse=True)
+        return records
+
+    def _build_paper_account_overview_locked(self) -> AccountOverview:
+        ledger_snapshot = self._build_paper_ledger_locked()
+        cash_balance = float(ledger_snapshot["cash_balance"])
+        reserved_cash = self._paper_reserved_cash_locked()
+        available_cash = max(cash_balance - reserved_cash, 0.0)
+        ledger = dict(ledger_snapshot["positions"])
+        positions = self._build_paper_positions_locked()
+        unrealized_pnl = 0.0
+        total_position_value = 0.0
+        for item in ledger.values():
+            qty = float(item["qty"])
+            if abs(qty) < 1e-9:
+                continue
+            avg_price = float(item["avg_price"])
+            mark_price = self._resolve_mark_price_locked(str(item["symbol"]), avg_price)
+            total_position_value += abs(qty) * mark_price
+            unrealized_pnl += abs(qty) * (mark_price - avg_price) * (1 if qty > 0 else -1)
+
+        total_equity = cash_balance + total_position_value
+        assets = [
+            AccountAsset(
+                coin="USDT",
+                wallet_balance=self._format_ratio(cash_balance),
+                usd_value=self._format_usdt(cash_balance),
+                available_balance=self._format_ratio(available_cash),
+            )
+        ]
+        for item in sorted(ledger.values(), key=lambda entry: abs(float(entry["qty"])) * self._resolve_mark_price_locked(str(entry["symbol"]), float(entry["avg_price"])), reverse=True):
+            qty = float(item["qty"])
+            if abs(qty) < 1e-9:
+                continue
+            coin = self._symbol_coin(str(item["symbol"]))
+            mark_price = self._resolve_mark_price_locked(str(item["symbol"]), float(item["avg_price"]))
+            available_qty = qty
+            if str(item["market"]) == "spot" and qty > 0:
+                available_qty = max(qty - self._paper_reserved_sell_quantity_locked(str(item["symbol"])), 0.0)
+            assets.append(
+                AccountAsset(
+                    coin=coin,
+                    wallet_balance=self._format_quantity(qty, 6),
+                    usd_value=self._format_usdt(abs(qty) * mark_price),
+                    available_balance=self._format_quantity(available_qty, 6),
+                )
+            )
+
+        return AccountOverview(
+            source="paper",
+            mode=AccountMode.PAPER,
+            account_type="PAPER",
+            total_equity=self._format_usdt(total_equity),
+            total_wallet_balance=self._format_usdt(cash_balance),
+            total_available_balance=self._format_usdt(available_cash),
+            unrealised_pnl=self._format_usdt(unrealized_pnl),
+            positions_count=len(positions),
+            open_orders_count=len(self.state.paper_orders),
+            top_holdings=assets[:6],
+            updated_at=now_iso(),
+        )
+
+    def _refresh_paper_state_locked(self) -> None:
+        side_by_symbol = {item.symbol: "flat" for item in self.state.watchlist}
+        paper_positions = self._build_paper_positions_locked()
+        for position in paper_positions:
+            side_by_symbol[position.symbol] = position.side
+        for item in self.state.watchlist:
+            item.position_side = side_by_symbol.get(item.symbol, "flat")
+
+        current_mode = self.state.workspace_preferences.selected_mode
+        self.state.control_snapshot.scheduler.current_mode = current_mode
+        ledger_snapshot = self._build_paper_ledger_locked()
+        trade_pnl_map = dict(ledger_snapshot["trade_pnl_map"])
+        for trade in self.state.trades:
+            if trade.mode != AccountMode.PAPER:
+                continue
+            next_pnl = trade_pnl_map.get(trade.id, "--")
+            if trade.pnl != next_pnl:
+                trade.pnl = next_pnl
+
+        if current_mode != AccountMode.PAPER:
+            return
+
+        overview = self._build_paper_account_overview_locked()
+        total_equity = max(self._parse_metric_number(overview.total_equity), 0.01)
+        total_available = self._parse_metric_number(overview.total_available_balance)
+        total_position_value = sum(self._parse_metric_number(position.value) for position in paper_positions)
+        exposure_pct = (total_position_value / total_equity) * 100 if total_equity > 0 else 0.0
+        unrealized = self._parse_metric_number(overview.unrealised_pnl)
+        realized = float(ledger_snapshot["realized_pnl"])
+        closed_trades = int(ledger_snapshot["closed_trades"])
+        winning_trades = int(ledger_snapshot["winning_trades"])
+        strategy_realized = dict(ledger_snapshot["strategy_realized"])
+        total_delta = f"{unrealized:+,.2f} USDT"
+        available_delta = f"{overview.positions_count} 持仓"
+
+        self.state.control_snapshot.account_metrics = [
+            self.state.control_snapshot.account_metrics[0].model_copy(
+                update={
+                    "value": overview.total_equity,
+                    "delta": total_delta,
+                    "tone": "positive" if unrealized >= 0 else "warning",
+                }
+            ),
+            self.state.control_snapshot.account_metrics[1].model_copy(
+                update={
+                    "value": overview.total_available_balance,
+                    "delta": available_delta,
+                    "tone": "positive" if total_available >= 0 else "critical",
+                }
+            ),
+            self.state.control_snapshot.account_metrics[2].model_copy(
+                update={
+                    "value": f"{exposure_pct:.1f}%",
+                    "delta": f"{len(paper_positions)} 个方向",
+                    "tone": "warning" if exposure_pct >= 65 else "neutral",
+                }
+            ),
+        ]
+        best_strategy_name = "暂无已平仓策略"
+        if strategy_realized:
+            best_strategy_id = max(strategy_realized, key=strategy_realized.get)
+            try:
+                best_strategy_name = self._find_strategy(best_strategy_id).name
+            except KeyError:
+                best_strategy_name = best_strategy_id
+        self.state.control_snapshot.today_performance["realized_pnl"] = self._format_usdt_delta(realized)
+        self.state.control_snapshot.today_performance["unrealized_pnl"] = overview.unrealised_pnl
+        self.state.control_snapshot.today_performance["win_rate"] = (
+            f"{(winning_trades / closed_trades) * 100:.1f}%" if closed_trades > 0 else "--"
+        )
+        self.state.control_snapshot.today_performance["best_strategy"] = best_strategy_name
+
+    def _recompute_scheduler_queue_depth(self) -> None:
+        self.state.control_snapshot.scheduler.queue_depth = sum(
+            1 for job in self.state.agent_jobs if job.status in {JobStatus.QUEUED, JobStatus.RUNNING, JobStatus.WAITING}
+        )
+
+    def _find_watchlist_item(self, symbol: str) -> WatchlistInstrument:
+        item = next((entry for entry in self.state.watchlist if entry.symbol == symbol.upper()), None)
+        if item is None:
+            raise KeyError(symbol.upper())
+        return item
+
+    def _find_alert_rule_locked(self, symbol: str) -> Optional[AlertRule]:
+        uppercase_symbol = symbol.upper()
+        return next((rule for rule in self.state.alert_rules if rule.symbol == uppercase_symbol), None)
+
+    def _ensure_market_alert_rule_locked(self, item: WatchlistInstrument) -> AlertRule:
+        existing = self._find_alert_rule_locked(item.symbol)
+        timestamp = now_iso()
+        if existing is not None:
+            existing.market = item.market
+            existing.threshold_pct = max(float(item.alert_threshold_pct or existing.threshold_pct), 0.1)
+            existing.enabled = bool(item.alert_enabled)
+            existing.rule_key = f"watchlist-volatility:{item.symbol}"
+            existing.updated_at = timestamp
+            return existing
+
+        rule = AlertRule(
+            id=f"rule-watchlist-{item.symbol.lower()}",
+            symbol=item.symbol,
+            market=item.market,
+            threshold_pct=max(float(item.alert_threshold_pct or 2.5), 0.1),
+            enabled=bool(item.alert_enabled),
+            cooldown_minutes=30,
+            created_at=timestamp,
+            updated_at=timestamp,
+            rule_key=f"watchlist-volatility:{item.symbol}",
+        )
+        self.state.alert_rules.insert(0, rule)
+        return rule
+
+    @staticmethod
+    def _is_alert_rule_on_cooldown(rule: AlertRule) -> bool:
+        if not rule.last_triggered_at:
+            return False
+        try:
+            last_triggered_at = datetime.fromisoformat(rule.last_triggered_at)
+        except ValueError:
+            return False
+        return (datetime.now(timezone.utc).astimezone() - last_triggered_at).total_seconds() < rule.cooldown_minutes * 60
+
+    @staticmethod
+    def _market_alert_rule_key(item: WatchlistInstrument) -> str:
+        direction = "up" if item.change_24h >= 0 else "down"
+        return f"watchlist-volatility:{item.symbol}:{direction}"
+
+    @staticmethod
+    def _market_alert_severity(item: WatchlistInstrument) -> str:
+        magnitude = abs(item.change_24h)
+        threshold = max(float(item.alert_threshold_pct or 0), 0.1)
+        if item.risk_level == "high" or magnitude >= threshold * 2:
+            return "P0"
+        if item.signal == "active" or magnitude >= threshold * 1.35:
+            return "P1"
+        return "P2"
+
+    @staticmethod
+    def _market_alert_action(item: WatchlistInstrument) -> str:
+        if item.signal == "active" or item.risk_level == "high":
+            return "切到行情页复核盘口与最近成交，必要时进入人工接管。"
+        return "打开提醒中心查看详情，并确认是否需要提高关注级别。"
+
+    @staticmethod
+    def _strategy_signal_alert_rule_prefix(strategy_id: str) -> str:
+        return f"strategy-signal:{strategy_id}:"
+
+    @classmethod
+    def _strategy_signal_alert_rule_key(cls, strategy_id: str, runtime_status: str, signal: str) -> str:
+        return f"{cls._strategy_signal_alert_rule_prefix(strategy_id)}{runtime_status}:{signal}"
+
+    @staticmethod
+    def _strategy_signal_label(signal: str) -> str:
+        return {
+            "long": "做多",
+            "short": "做空",
+            "flat": "平仓",
+            "watch": "观察",
+        }.get(signal, signal)
+
+    def _retire_strategy_signal_alerts_locked(self, strategy_id: str, active_rule_key: str) -> bool:
+        prefix = self._strategy_signal_alert_rule_prefix(strategy_id)
+        changed = False
+        for alert in self.state.alerts:
+            if alert.source_type != "system" or alert.acknowledged:
+                continue
+            rule_key = getattr(alert, "rule_key", None) or ""
+            if not rule_key.startswith(prefix) or rule_key == active_rule_key:
+                continue
+            alert.acknowledged = True
+            changed = True
+        return changed
+
+    def _sync_strategy_signal_alert_locked(
+        self,
+        strategy,
+        snapshot: StrategyRuntimeSnapshot,
+        previous: Optional[StrategyRuntimeSnapshot],
+    ) -> bool:
+        if strategy.mode == AccountMode.PAPER or strategy.status == "paper_only":
+            return False
+
+        if previous is None:
+            if snapshot.signal not in {"long", "short"} or snapshot.runtime_status not in {"running", "shadow"}:
+                return False
+        elif previous.signal == snapshot.signal and previous.runtime_status == snapshot.runtime_status:
+            return False
+
+        signal_label = self._strategy_signal_label(snapshot.signal)
+        runtime_label = "影子模式" if snapshot.runtime_status == "shadow" else "运行中"
+        severity = "P1" if snapshot.runtime_status == "running" and snapshot.signal in {"long", "short", "flat"} else "P2"
+        if snapshot.signal == "watch":
+            severity = "P2"
+        title = f"{snapshot.symbol} 策略信号更新 · {signal_label}"
+        description = (
+            f"{snapshot.strategy_name} 当前切到 {signal_label}，运行状态 {runtime_label}，"
+            f"置信度 {snapshot.confidence:.1f}%。{snapshot.note}"
+        )
+        if snapshot.signal == "flat":
+            suggested_action = "切到策略页复核执行预检，确认是否需要平仓或撤单。"
+        elif snapshot.signal in {"long", "short"}:
+            suggested_action = "切到策略页查看执行预检；确认后可直接提交当前信号。"
+        else:
+            suggested_action = "当前信号已回到观察，继续盯住行情页与提醒中心即可。"
+
+        rule_key = self._strategy_signal_alert_rule_key(strategy.id, snapshot.runtime_status, snapshot.signal)
+        retired = self._retire_strategy_signal_alerts_locked(strategy.id, rule_key)
+        created = self._upsert_system_alert_locked(
+            rule_key=rule_key,
+            severity=severity,
+            symbol=snapshot.symbol,
+            title=title,
+            description=description,
+            suggested_action=suggested_action,
+            strategy_id=strategy.id,
+        )
+        return retired or created
+
+    def _upsert_market_alert_locked(self, item: WatchlistInstrument) -> bool:
+        rule = self._ensure_market_alert_rule_locked(item)
+        if not item.alert_enabled or not rule.enabled:
+            return False
+
+        threshold = max(float(rule.threshold_pct or item.alert_threshold_pct or 0), 0.0)
+        if threshold <= 0 or abs(item.change_24h) < threshold:
+            return False
+
+        rule_key = self._market_alert_rule_key(item)
+        existing = next(
+            (
+                alert
+                for alert in self.state.alerts
+                if getattr(alert, "rule_key", None) == rule_key and not alert.acknowledged
+            ),
+            None,
+        )
+        severity = self._market_alert_severity(item)
+        direction_label = "上涨" if item.change_24h >= 0 else "下跌"
+        title = f"{item.symbol} {direction_label}触发提醒阈值"
+        description = (
+            f"24h 涨跌 {item.change_24h:+.2f}%，已超过你设置的提醒阈值 {threshold:.2f}%。"
+        )
+        suggested_action = self._market_alert_action(item)
+
+        if existing is not None:
+            existing.severity = severity
+            existing.title = title
+            existing.description = description
+            existing.triggered_at = now_iso()
+            existing.suggested_action = suggested_action
+            existing.symbol = item.symbol
+            existing.source_type = "rule"
+            existing.rule_id = rule.id
+            existing.rule_key = rule_key
+            existing.trigger_value = item.change_24h
+            existing.threshold_value = threshold
+            rule.last_triggered_at = existing.triggered_at
+            rule.last_triggered_change_24h = item.change_24h
+            rule.updated_at = existing.triggered_at
+            return True
+
+        if self._is_alert_rule_on_cooldown(rule):
+            return False
+
+        alert = AlertRecord(
+            id=f"alert-{uuid4().hex[:6]}",
+            severity=severity,
+            symbol=item.symbol,
+            title=title,
+            description=description,
+            triggered_at=now_iso(),
+            suggested_action=suggested_action,
+            acknowledged=False,
+            source_type="rule",
+            rule_id=rule.id,
+            rule_key=rule_key,
+            trigger_value=item.change_24h,
+            threshold_value=threshold,
+        )
+        rule.last_triggered_at = alert.triggered_at
+        rule.last_triggered_change_24h = item.change_24h
+        rule.updated_at = alert.triggered_at
+        self.state.alerts.insert(0, alert)
+        self.add_event(
+            event_type="alert.market_triggered",
+            source="quant-core",
+            severity=EventSeverity.WARNING if severity != "P0" else EventSeverity.CRITICAL,
+            payload={
+                "rule_id": rule.id,
+                "rule_key": rule_key,
+                "symbol": item.symbol,
+                "change_24h": item.change_24h,
+                "threshold_pct": threshold,
+                "severity": severity,
+                "cooldown_minutes": rule.cooldown_minutes,
+            },
+            symbol=item.symbol,
+        )
+        return True
+
+    def sync_market_watchlist(
+        self,
+        watchlist: list[WatchlistInstrument],
+        detail_overrides: Optional[Dict[str, MarketDetail]] = None,
+    ) -> None:
+        with self._lock:
+            watchlist_map = {item.symbol: item for item in watchlist}
+            alert_changed = False
+            for index, existing in enumerate(self.state.watchlist):
+                incoming = watchlist_map.get(existing.symbol)
+                if incoming is None:
+                    continue
+                self.state.watchlist[index] = incoming
+                if detail_overrides and incoming.symbol in detail_overrides:
+                    self.state.market_details[incoming.symbol] = detail_overrides[incoming.symbol]
+                alert_changed = self._upsert_market_alert_locked(incoming) or alert_changed
+            self._refresh_derived_state()
+            if alert_changed:
+                self._persist()
+
+    def sync_news_events(self, news_events: list[NewsEvent]) -> None:
+        with self._lock:
+            changed = False
+            existing_index = {item.id: index for index, item in enumerate(self.state.news_events)}
+            synced_events: list[NewsEvent] = []
+            for item in sorted(news_events, key=lambda entry: entry.published_at, reverse=True):
+                alert, alert_changed = self._upsert_news_alert_locked(item)
+                changed = changed or alert_changed
+                related_alert_ids = [alert.id] if alert is not None else list(item.related_alert_ids)
+                synced_item = item.model_copy(update={"related_alert_ids": related_alert_ids})
+                if item.id in existing_index:
+                    current = self.state.news_events[existing_index[item.id]]
+                    if current.model_dump(mode="json") != synced_item.model_dump(mode="json"):
+                        changed = True
+                else:
+                    changed = True
+                synced_events.append(synced_item)
+            if synced_events:
+                self.state.news_events = synced_events
+            self._refresh_derived_state()
+            if changed:
+                self._persist()
+
     @staticmethod
     def _dedupe_strings(values: list[str]) -> list[str]:
         deduped = []
@@ -72,6 +993,205 @@ class AppRepository:
             seen.add(value)
             deduped.append(value)
         return deduped
+
+    @staticmethod
+    def _parse_percent_threshold(value: Any, default: float = 2.5) -> float:
+        normalized = str(value if value is not None else default).replace("%", "").strip()
+        try:
+            parsed = float(normalized)
+        except (TypeError, ValueError):
+            return default
+        return max(parsed, 0.1)
+
+    @staticmethod
+    def _coerce_bool(value: Any, default: bool = True) -> bool:
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return value != 0
+        return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+    @staticmethod
+    def _coerce_int(value: Any, default: int = 30) -> int:
+        try:
+            parsed = int(float(value))
+        except (TypeError, ValueError):
+            return default
+        return max(parsed, 1)
+
+    @staticmethod
+    def _alert_rule_severity(change_24h: float, threshold_pct: float) -> str:
+        ratio = abs(change_24h) / max(threshold_pct, 0.1)
+        if ratio >= 1.75:
+            return "P0"
+        if ratio >= 1.25:
+            return "P1"
+        return "P2"
+
+    @staticmethod
+    def _alert_rule_action(change_24h: float, risk_level: str) -> str:
+        if risk_level == "high" or abs(change_24h) >= 6:
+            return "切到行情页确认盘口与最近成交，再决定是否人工接管。"
+        if abs(change_24h) >= 3:
+            return "关注后续成交与 K 线延续，必要时提高策略风控。"
+        return "继续观察波动是否延续。"
+
+    @staticmethod
+    def _news_alert_rule_key(news_id: str) -> str:
+        return f"news-event:{news_id}"
+
+    @staticmethod
+    def _news_alert_severity(impact_score: int) -> str:
+        if impact_score >= 85:
+            return "P0"
+        if impact_score >= 75:
+            return "P1"
+        return "P2"
+
+    @staticmethod
+    def _news_alert_action(news: NewsEvent) -> str:
+        if news.symbols:
+            return "打开新闻事件页查看详情，并切到行情页复核相关品种。"
+        return "打开新闻事件页查看详情，并评估是否需要人工关注。"
+
+    def _upsert_system_alert_locked(
+        self,
+        *,
+        rule_key: str,
+        severity: str,
+        symbol: str,
+        title: str,
+        description: str,
+        suggested_action: str,
+        strategy_id: Optional[str] = None,
+    ) -> bool:
+        existing = next(
+            (
+                alert
+                for alert in self.state.alerts
+                if getattr(alert, "rule_key", None) == rule_key and not alert.acknowledged
+            ),
+            None,
+        )
+        if existing is not None:
+            changed = (
+                existing.severity != severity
+                or existing.symbol != symbol
+                or existing.title != title
+                or existing.description != description
+                or existing.suggested_action != suggested_action
+                or existing.source_type != "system"
+            )
+            existing.severity = severity
+            existing.symbol = symbol
+            existing.title = title
+            existing.description = description
+            existing.suggested_action = suggested_action
+            existing.source_type = "system"
+            existing.triggered_at = now_iso()
+            return changed
+
+        alert = AlertRecord(
+            id=f"alert-system-{uuid4().hex[:6]}",
+            severity=severity,
+            symbol=symbol,
+            title=title,
+            description=description,
+            triggered_at=now_iso(),
+            suggested_action=suggested_action,
+            acknowledged=False,
+            source_type="system",
+            rule_key=rule_key,
+        )
+        self.state.alerts.insert(0, alert)
+        self.add_event(
+            event_type="alert.system_triggered",
+            source="quant-core",
+            severity=EventSeverity.CRITICAL if severity == "P0" else EventSeverity.WARNING,
+            payload={
+                "rule_key": rule_key,
+                "symbol": symbol,
+                "title": title,
+                "strategy_id": strategy_id,
+            },
+            symbol=symbol,
+            strategy_id=strategy_id,
+        )
+        return True
+
+    def _upsert_news_alert_locked(self, news: NewsEvent) -> tuple[Optional[AlertRecord], bool]:
+        if news.impact_score < 75:
+            return None, False
+        watchlist_symbols = {item.symbol for item in self.state.watchlist}
+        if news.symbols and not any(symbol in watchlist_symbols for symbol in news.symbols):
+            return None, False
+
+        primary_symbol = next((symbol for symbol in news.symbols if symbol in watchlist_symbols), news.symbols[0] if news.symbols else "全市场")
+        rule_key = self._news_alert_rule_key(news.id)
+        existing = next(
+            (
+                alert
+                for alert in self.state.alerts
+                if getattr(alert, "rule_key", None) == rule_key
+                or alert.related_news_id == news.id
+            ),
+            None,
+        )
+        severity = self._news_alert_severity(news.impact_score)
+        title = f"{primary_symbol} 新闻高影响提醒"
+        description = news.title
+        suggested_action = self._news_alert_action(news)
+        if existing is not None:
+            changed = (
+                existing.severity != severity
+                or existing.symbol != primary_symbol
+                or existing.title != title
+                or existing.description != description
+                or existing.suggested_action != suggested_action
+                or existing.source_type != "news"
+                or existing.related_news_id != news.id
+                or existing.rule_key != rule_key
+            )
+            existing.severity = severity
+            existing.symbol = primary_symbol
+            existing.title = title
+            existing.description = description
+            existing.suggested_action = suggested_action
+            existing.source_type = "news"
+            existing.related_news_id = news.id
+            existing.rule_key = rule_key
+            return existing, changed
+
+        alert = AlertRecord(
+            id=f"alert-news-{uuid4().hex[:6]}",
+            severity=severity,
+            symbol=primary_symbol,
+            title=title,
+            description=description,
+            triggered_at=news.published_at,
+            related_news_id=news.id,
+            suggested_action=suggested_action,
+            acknowledged=False,
+            source_type="news",
+            rule_key=rule_key,
+        )
+        self.state.alerts.insert(0, alert)
+        self.add_event(
+            event_type="alert.news_triggered",
+            source="quant-core",
+            severity=EventSeverity.WARNING if severity != "P0" else EventSeverity.CRITICAL,
+            payload={
+                "news_id": news.id,
+                "rule_key": rule_key,
+                "symbols": news.symbols,
+                "impact_score": news.impact_score,
+                "source": news.source,
+            },
+            symbol=primary_symbol if primary_symbol != "全市场" else None,
+        )
+        return alert, True
 
     def add_event(
         self,
@@ -96,104 +1216,699 @@ class AppRepository:
         self.state.audit_events.insert(0, event)
         return event
 
+    def _create_change_request_locked(self, payload: ChangeRequestCreate) -> ChangeRequest:
+        timestamp = now_iso()
+        record = ChangeRequest(
+            id=f"cr-{uuid4().hex[:6]}",
+            type=payload.type,
+            payload=payload.payload,
+            requested_by=payload.requested_by,
+            target_mode=payload.target_mode,
+            priority=payload.priority,
+            status=ChangeRequestStatus.QUEUED,
+            correlation_id=f"corr-{uuid4().hex[:10]}",
+            created_at=timestamp,
+            updated_at=timestamp,
+            summary=payload.summary,
+        )
+        self.state.change_requests.insert(0, record)
+        self.add_event(
+            event_type="change_request.created",
+            source="desktop",
+            severity=EventSeverity.INFO,
+            payload=record.model_dump(mode="json"),
+            symbol=payload.payload.get("symbol"),
+            strategy_id=payload.payload.get("strategy_id"),
+        )
+        return record
+
+    def _create_agent_job_locked(self, payload: AgentJobCreate, source: str = "desktop") -> AgentJob:
+        existing = next(
+            (
+                job
+                for job in self.state.agent_jobs
+                if job.idempotency_key == payload.idempotency_key and job.status not in {JobStatus.CANCELLED, JobStatus.FAILED}
+            ),
+            None,
+        )
+        if existing is not None:
+            return existing
+
+        timestamp = now_iso()
+        record = AgentJob(
+            id=f"job-{uuid4().hex[:6]}",
+            job_type=payload.job_type,
+            context=payload.context,
+            strategy_id=str(payload.context.get("strategy_id") or "") or None,
+            allowed_actions=payload.allowed_actions,
+            timeout=payload.timeout,
+            idempotency_key=payload.idempotency_key,
+            writeback_target=payload.writeback_target,
+            status=JobStatus.QUEUED,
+            created_at=timestamp,
+            updated_at=timestamp,
+        )
+        self.state.agent_jobs.insert(0, record)
+        self._recompute_scheduler_queue_depth()
+        self.add_event(
+            event_type="openclaw.job.queued",
+            source=source,
+            severity=EventSeverity.INFO,
+            payload=record.model_dump(mode="json"),
+            strategy_id=payload.context.get("strategy_id"),
+        )
+        return record
+
+    def _queue_change_request_reconcile_locked(self, record: ChangeRequest) -> AgentJob:
+        return self._create_agent_job_locked(
+            AgentJobCreate(
+                job_type="reconcile_change_request",
+                context={
+                    "change_request_id": record.id,
+                    "change_type": record.type,
+                    "summary": record.summary,
+                    "strategy_id": record.payload.get("strategy_id"),
+                    "symbol": record.payload.get("symbol"),
+                    "requested_by": record.requested_by,
+                    "target_mode": record.target_mode.value,
+                    "payload": record.payload,
+                },
+                allowed_actions=["summarize_change_request"],
+                timeout=45,
+                idempotency_key=f"change-request-reconcile-{record.id}",
+                writeback_target="scheduler",
+            ),
+            source="mock-orchestrator",
+        )
+
+    def _queue_strategy_change_review_locked(self, record: ChangeRequest) -> AgentJob:
+        return self._create_agent_job_locked(
+            AgentJobCreate(
+                job_type="review_strategy_change",
+                context={
+                    "change_request_id": record.id,
+                    "change_type": record.type,
+                    "summary": record.summary,
+                    "strategy_id": record.payload.get("strategy_id"),
+                    "symbol": record.payload.get("symbol"),
+                    "requested_by": record.requested_by,
+                    "target_mode": record.target_mode.value,
+                    "payload": record.payload,
+                },
+                allowed_actions=["review_strategy_change", "summarize_execution_impact"],
+                timeout=60,
+                idempotency_key=f"strategy-change-review-{record.id}",
+                writeback_target="strategy_activity",
+            ),
+            source="mock-orchestrator",
+        )
+
+    @staticmethod
+    def _should_queue_strategy_change_review(record: ChangeRequest) -> bool:
+        strategy_id = str(record.payload.get("strategy_id") or "")
+        if not strategy_id:
+            return False
+        return record.type in {
+            "strategy.parameter.update",
+            "strategy.pause_resume",
+            "strategy.risk_update",
+            "proposal.param_update",
+            "proposal.pause_resume",
+            "proposal.risk_update",
+            "proposal.publish_recommendation",
+            "proposal.script_patch_proposal",
+        }
+
+    def _create_backtest_locked(self, strategy_id: str, data_range: str, timeframe: str) -> BacktestRun:
+        strategy = next((item for item in self.state.strategies if item.id == strategy_id), None)
+        if strategy is None:
+            raise KeyError(strategy_id)
+        timestamp = now_iso()
+        computed = self.backtest_runner(strategy, data_range, timeframe) if self.backtest_runner else None
+        record = BacktestRun(
+            id=f"bt-{uuid4().hex[:6]}",
+            strategy_id=strategy.id,
+            strategy_name=strategy.name,
+            status="completed",
+            started_at=timestamp,
+            finished_at=timestamp,
+            symbol_scope=list(computed.get("symbol_scope", strategy.symbols)) if computed else strategy.symbols,
+            timeframe=timeframe,
+            data_range=data_range,
+            data_granularity=str(computed.get("data_granularity", "kline+trade" if strategy.category == "python" else "kline")) if computed else ("kline+trade" if strategy.category == "python" else "kline"),
+            fee_model="bybit-v5-standard",
+            slippage_model="control-v1-adaptive",
+            parameter_snapshot=computed.get("parameter_snapshot", {param.key: param.value for param in strategy.parameters}) if computed else {param.key: param.value for param in strategy.parameters},
+            metrics=computed.get("metrics") if computed else BacktestMetrics(
+                annual_return="+26.4%",
+                max_drawdown="-5.2%",
+                sharpe="1.57",
+                win_rate="59.8%",
+                pnl="+52,400 USDT",
+                trades=112,
+            ),
+            notes=str(computed.get("notes")) if computed else "由控制端发起的即时回测，当前为 mock 结果用于联调。",
+        )
+        self.state.backtests.insert(0, record)
+        self.add_event(
+            event_type="backtest.completed",
+            source="quant-core",
+            severity=EventSeverity.INFO,
+            payload=record.model_dump(mode="json"),
+            strategy_id=strategy_id,
+            symbol=",".join(strategy.symbols),
+        )
+        return record
+
+    def _queue_backtest_review_locked(self, backtest: BacktestRun, requested_by: str) -> AgentJob:
+        idempotency_key = f"backtest-review-{backtest.id}"
+        existing = next((job for job in self.state.agent_jobs if job.idempotency_key == idempotency_key), None)
+        if existing is not None:
+            return existing
+
+        strategy = self._find_strategy(backtest.strategy_id)
+        execution_health = self.state.control_snapshot.execution_health.model_dump(mode="json")
+        payload = AgentJobCreate(
+            job_type="generate_backtest_review",
+            context={
+                "strategy_id": backtest.strategy_id,
+                "strategy_name": backtest.strategy_name,
+                "focus_symbols": backtest.symbol_scope,
+                "timeframe": backtest.timeframe,
+                "data_range": backtest.data_range,
+                "metrics": backtest.metrics.model_dump(mode="json"),
+                "parameter_snapshot": backtest.parameter_snapshot,
+                "requested_by": requested_by,
+                "mode": strategy.mode.value,
+                "backtest_id": backtest.id,
+                "execution_health": execution_health,
+                "execution_top_issue": execution_health.get("top_issue"),
+            },
+            allowed_actions=["review_backtest", "propose_next_step"],
+            timeout=90,
+            idempotency_key=idempotency_key,
+            writeback_target="reviews",
+        )
+        return self._create_agent_job_locked(payload, source="quant-core")
+
+    def _find_proposal(self, proposal_id: str) -> StrategyProposal:
+        for review in self.state.reviews:
+            for proposal in review.proposals:
+                if proposal.id == proposal_id:
+                    return proposal
+        raise KeyError(proposal_id)
+
+    def _find_strategy(self, strategy_id: str):
+        strategy = next((item for item in self.state.strategies if item.id == strategy_id), None)
+        if strategy is None:
+            raise KeyError(strategy_id)
+        return strategy
+
+    @staticmethod
+    def _normalize_strategy_value(current_value: Any, next_value: Any) -> Any:
+        if isinstance(current_value, bool):
+            if isinstance(next_value, str):
+                return next_value.strip().lower() in {"1", "true", "yes", "on"}
+            return bool(next_value)
+        if isinstance(current_value, int) and not isinstance(current_value, bool):
+            return int(float(next_value))
+        if isinstance(current_value, float):
+            return float(next_value)
+        return str(next_value)
+
+    @staticmethod
+    def _extract_parameter_patch(payload: Dict[str, Any]) -> Dict[str, Any]:
+        patch = payload.get("parameter_patch")
+        if isinstance(patch, dict):
+            return patch
+
+        reserved_keys = {
+            "strategy_id",
+            "proposal_id",
+            "target_mode",
+            "next_status",
+            "risk_budget",
+            "recommendation",
+            "symbol",
+            "threshold_pct",
+            "data_range",
+            "timeframe",
+        }
+        return {key: value for key, value in payload.items() if key not in reserved_keys}
+
+    def _apply_parameter_patch(self, strategy_id: str, patch: Dict[str, Any]) -> None:
+        if not patch:
+            return
+
+        strategy = self._find_strategy(strategy_id)
+        parameter_map = {parameter.key: parameter for parameter in strategy.parameters}
+        for key, value in patch.items():
+            current = parameter_map.get(key)
+            if current is None:
+                strategy.parameters.append(
+                    StrategyParameter(
+                        key=key,
+                        label=key.replace("_", " ").title(),
+                        value=value,
+                    )
+                )
+                continue
+            current.value = self._normalize_strategy_value(current.value, value)
+
+    def _apply_change_request_locked(self, record: ChangeRequest) -> Optional[BacktestRun]:
+        change_type = record.type
+        payload = record.payload
+        strategy_id = str(payload.get("strategy_id") or "")
+        created_backtest = None
+        applied = False
+
+        if change_type in {"strategy.parameter.update", "proposal.param_update"} and strategy_id:
+            self._apply_parameter_patch(strategy_id, self._extract_parameter_patch(payload))
+            applied = True
+        elif change_type in {"strategy.pause_resume", "proposal.pause_resume"} and strategy_id:
+            strategy = self._find_strategy(strategy_id)
+            next_status = str(payload.get("next_status") or ("paused" if strategy.status == "running" else "running"))
+            if next_status in {"running", "paused", "paper_only", "shadow"}:
+                strategy.status = next_status
+                applied = True
+        elif change_type in {"strategy.risk_update", "proposal.risk_update"} and strategy_id:
+            strategy = self._find_strategy(strategy_id)
+            risk_budget = payload.get("risk_budget")
+            if risk_budget is not None:
+                strategy.risk_budget = str(risk_budget)
+                applied = True
+        elif change_type in {"proposal.publish_recommendation"} and strategy_id:
+            strategy = self._find_strategy(strategy_id)
+            target_mode = payload.get("target_mode")
+            if target_mode in {"paper", "demo", "live"}:
+                strategy.mode = AccountMode(target_mode)
+            applied = True
+        elif change_type == "backtest.launch" and strategy_id:
+            created_backtest = self._create_backtest_locked(
+                strategy_id=strategy_id,
+                data_range=str(payload.get("data_range", "2025-12-01 ~ 2026-03-29")),
+                timeframe=str(payload.get("timeframe", "1h")),
+            )
+            self._queue_backtest_review_locked(created_backtest, requested_by=record.requested_by)
+            applied = True
+        elif change_type == "alert.rule.update":
+            symbol = str(payload.get("symbol") or "").upper()
+            if symbol:
+                watch_item = self._find_watchlist_item(symbol)
+                if payload.get("threshold_pct") is not None:
+                    try:
+                        watch_item.alert_threshold_pct = float(payload.get("threshold_pct"))
+                    except (TypeError, ValueError):
+                        pass
+                if payload.get("alert_enabled") is not None:
+                    watch_item.alert_enabled = bool(payload.get("alert_enabled"))
+                else:
+                    watch_item.alert_enabled = True
+                rule = self._ensure_market_alert_rule_locked(watch_item)
+                rule.enabled = watch_item.alert_enabled
+                rule.threshold_pct = max(float(watch_item.alert_threshold_pct or rule.threshold_pct), 0.1)
+                if payload.get("cooldown_minutes") is not None:
+                    rule.cooldown_minutes = self._coerce_int(payload.get("cooldown_minutes"), rule.cooldown_minutes)
+                rule.updated_at = now_iso()
+                applied = True
+
+        if not applied:
+            return created_backtest
+
+        record.status = ChangeRequestStatus.APPLIED
+        record.updated_at = now_iso()
+        self.add_event(
+            event_type="change_request.applied",
+            source="mock-orchestrator",
+            severity=EventSeverity.INFO,
+            payload=record.model_dump(mode="json"),
+            symbol=payload.get("symbol"),
+            strategy_id=payload.get("strategy_id"),
+        )
+        if self._should_queue_strategy_change_review(record):
+            self._queue_strategy_change_review_locked(record)
+        else:
+            self._queue_change_request_reconcile_locked(record)
+        return created_backtest
+
     def create_change_request(self, payload: ChangeRequestCreate) -> ChangeRequest:
         with self._lock:
-            timestamp = now_iso()
-            record = ChangeRequest(
-                id=f"cr-{uuid4().hex[:6]}",
-                type=payload.type,
-                payload=payload.payload,
-                requested_by=payload.requested_by,
-                target_mode=payload.target_mode,
-                priority=payload.priority,
-                status=ChangeRequestStatus.QUEUED,
-                correlation_id=f"corr-{uuid4().hex[:10]}",
-                created_at=timestamp,
-                updated_at=timestamp,
-                summary=payload.summary,
-            )
-            self.state.change_requests.insert(0, record)
-            self.add_event(
-                event_type="change_request.created",
-                source="desktop",
-                severity=EventSeverity.INFO,
-                payload=record.model_dump(mode="json"),
-                symbol=payload.payload.get("symbol"),
-                strategy_id=payload.payload.get("strategy_id"),
-            )
+            record = self._create_change_request_locked(payload)
+            self._apply_change_request_locked(record)
+            self._refresh_derived_state()
             self._persist()
             return record
+
+    def acknowledge_alert(self, alert_id: str, payload: AlertAcknowledgePayload) -> AlertRecord:
+        with self._lock:
+            alert = next((item for item in self.state.alerts if item.id == alert_id), None)
+            if alert is None:
+                raise KeyError(alert_id)
+            alert.acknowledged = payload.acknowledged
+            self._refresh_derived_state()
+            self.add_event(
+                event_type="alert.acknowledged" if payload.acknowledged else "alert.reopened",
+                source="desktop",
+                severity=EventSeverity.INFO,
+                payload={
+                    "alert_id": alert.id,
+                    "requested_by": payload.requested_by,
+                    "acknowledged": payload.acknowledged,
+                    "title": alert.title,
+                },
+                symbol=alert.symbol,
+            )
+            self._persist()
+            return alert
 
     def create_agent_job(self, payload: AgentJobCreate) -> AgentJob:
         with self._lock:
-            timestamp = now_iso()
-            record = AgentJob(
-                id=f"job-{uuid4().hex[:6]}",
-                job_type=payload.job_type,
-                context=payload.context,
-                allowed_actions=payload.allowed_actions,
-                timeout=payload.timeout,
-                idempotency_key=payload.idempotency_key,
-                writeback_target=payload.writeback_target,
-                status=JobStatus.QUEUED,
-                created_at=timestamp,
-                updated_at=timestamp,
-            )
-            self.state.agent_jobs.insert(0, record)
-            self.state.control_snapshot.scheduler.queue_depth = max(
-                0, self.state.control_snapshot.scheduler.queue_depth + 1
-            )
-            self.add_event(
-                event_type="openclaw.job.queued",
-                source="desktop",
-                severity=EventSeverity.INFO,
-                payload=record.model_dump(mode="json"),
-                strategy_id=payload.context.get("strategy_id"),
-            )
+            record = self._create_agent_job_locked(payload)
             self._persist()
             return record
 
-    def create_backtest(self, strategy_id: str, data_range: str, timeframe: str) -> BacktestRun:
+    def retry_agent_job(self, job_id: str, requested_by: str) -> AgentJob:
         with self._lock:
-            strategy = next((item for item in self.state.strategies if item.id == strategy_id), None)
-            if strategy is None:
-                raise KeyError(strategy_id)
-            timestamp = now_iso()
-            record = BacktestRun(
-                id=f"bt-{uuid4().hex[:6]}",
-                strategy_id=strategy.id,
-                strategy_name=strategy.name,
-                status="completed",
-                started_at=timestamp,
-                finished_at=timestamp,
-                symbol_scope=strategy.symbols,
-                timeframe=timeframe,
-                data_range=data_range,
-                data_granularity="kline+trade" if strategy.category == "python" else "kline",
-                fee_model="bybit-v5-standard",
-                slippage_model="control-v1-adaptive",
-                parameter_snapshot={param.key: param.value for param in strategy.parameters},
-                metrics=BacktestMetrics(
-                    annual_return="+26.4%",
-                    max_drawdown="-5.2%",
-                    sharpe="1.57",
-                    win_rate="59.8%",
-                    pnl="+52,400 USDT",
-                    trades=112,
+            job = next((item for item in self.state.agent_jobs if item.id == job_id), None)
+            if job is None:
+                raise KeyError(job_id)
+            if job.status not in {JobStatus.FAILED, JobStatus.CANCELLED}:
+                raise ValueError("只有失败或已取消的任务可以重试。")
+
+            retry_count = int(job.context.get("retry_count", 0)) + 1
+            retried_job = self._create_agent_job_locked(
+                AgentJobCreate(
+                    job_type=job.job_type,
+                    context={
+                        **job.context,
+                        "retried_from_job_id": job.id,
+                        "retry_count": retry_count,
+                    },
+                    allowed_actions=job.allowed_actions,
+                    timeout=job.timeout,
+                    idempotency_key=f"{job.idempotency_key}-retry-{retry_count}",
+                    writeback_target=job.writeback_target,
                 ),
-                notes="由控制端发起的即时回测，当前为 mock 结果用于联调。",
+                source="desktop",
             )
-            self.state.backtests.insert(0, record)
+            retried_job.retried_from_job_id = job.id
+            retried_job.retry_count = retry_count
             self.add_event(
-                event_type="backtest.completed",
-                source="quant-core",
+                event_type="openclaw.job.retry_requested",
+                source="desktop",
                 severity=EventSeverity.INFO,
-                payload=record.model_dump(mode="json"),
-                strategy_id=strategy_id,
-                symbol=",".join(strategy.symbols),
+                payload={
+                    "previous_job_id": job.id,
+                    "retry_job_id": retried_job.id,
+                    "requested_by": requested_by,
+                },
+                strategy_id=str(job.context.get("strategy_id") or "") or None,
             )
             self._persist()
+            return retried_job
+
+    def claim_next_agent_job(self) -> Optional[AgentJob]:
+        with self._lock:
+            scheduler = self.state.control_snapshot.scheduler
+            if scheduler.status != "running" or scheduler.current_job_id:
+                return None
+
+            next_job = next((item for item in self.state.agent_jobs if item.status == JobStatus.QUEUED), None)
+            if next_job is None:
+                return None
+
+            next_job.status = JobStatus.RUNNING
+            next_job.updated_at = now_iso()
+            scheduler.current_job_id = next_job.id
+            scheduler.last_heartbeat_at = now_iso()
+            self._recompute_scheduler_queue_depth()
+            self.add_event(
+                event_type="openclaw.job.started",
+                source="openclaw",
+                severity=EventSeverity.INFO,
+                payload=next_job.model_dump(mode="json"),
+                strategy_id=str(next_job.context.get("strategy_id") or "") or None,
+            )
+            self._persist()
+            return next_job.model_copy(deep=True)
+
+    def complete_agent_job(
+        self,
+        job_id: str,
+        result_summary: str,
+        review: Optional[ReviewDocument] = None,
+        source: str = "openclaw",
+    ) -> AgentJob:
+        with self._lock:
+            job = next((item for item in self.state.agent_jobs if item.id == job_id), None)
+            if job is None:
+                raise KeyError(job_id)
+
+            job.status = JobStatus.COMPLETED
+            job.result_summary = result_summary
+            job.updated_at = now_iso()
+            scheduler = self.state.control_snapshot.scheduler
+            if scheduler.current_job_id == job.id:
+                scheduler.current_job_id = None
+            scheduler.last_heartbeat_at = now_iso()
+            if review is not None:
+                review.source_job_id = job.id
+                review.source_job_type = job.job_type
+                review.source_job_status = job.status.value if hasattr(job.status, "value") else str(job.status)
+                job.context = {
+                    **job.context,
+                    "linked_review_id": review.id,
+                    "linked_review_title": review.title,
+                    "linked_review_period": review.period,
+                }
+                job.linked_review_id = review.id
+                job.linked_review_title = review.title
+                job.linked_review_period = review.period
+                self.state.reviews.insert(0, review)
+            self._recompute_scheduler_queue_depth()
+            self.add_event(
+                event_type="openclaw.job.completed",
+                source=source,
+                severity=EventSeverity.INFO,
+                payload={
+                    "job_id": job.id,
+                    "job_type": job.job_type,
+                    "result_summary": result_summary,
+                    "review_id": review.id if review else None,
+                    "review_title": review.title if review else None,
+                    "review_period": review.period if review else None,
+                },
+                strategy_id=str(job.context.get("strategy_id") or "") or None,
+            )
+            if job.job_type == "review_strategy_change":
+                self.add_event(
+                    event_type="strategy.change.review.completed",
+                    source=source,
+                    severity=EventSeverity.INFO,
+                    payload={
+                        "job_id": job.id,
+                        "change_request_id": job.context.get("change_request_id"),
+                        "strategy_id": job.context.get("strategy_id"),
+                        "summary": result_summary,
+                        "writeback_target": job.writeback_target,
+                        "linked_review_id": review.id if review else None,
+                        "linked_review_title": review.title if review else None,
+                        "linked_review_period": review.period if review else None,
+                    },
+                    strategy_id=str(job.context.get("strategy_id") or "") or None,
+                )
+            if job.job_type == "review_strategy_issue":
+                self.add_event(
+                    event_type="strategy.issue.review.completed",
+                    source=source,
+                    severity=EventSeverity.INFO,
+                    payload={
+                        "job_id": job.id,
+                        "issue_type": job.context.get("issue_type"),
+                        "strategy_id": job.context.get("strategy_id"),
+                        "summary": result_summary,
+                        "writeback_target": job.writeback_target,
+                        "linked_review_id": review.id if review else None,
+                        "linked_review_title": review.title if review else None,
+                        "linked_review_period": review.period if review else None,
+                    },
+                    strategy_id=str(job.context.get("strategy_id") or "") or None,
+                )
+            self._refresh_derived_state()
+            self._persist()
+            return job.model_copy(deep=True)
+
+    def fail_agent_job(self, job_id: str, error: str, source: str = "openclaw") -> AgentJob:
+        with self._lock:
+            job = next((item for item in self.state.agent_jobs if item.id == job_id), None)
+            if job is None:
+                raise KeyError(job_id)
+
+            job.status = JobStatus.FAILED
+            job.result_summary = error
+            job.updated_at = now_iso()
+            scheduler = self.state.control_snapshot.scheduler
+            if scheduler.current_job_id == job.id:
+                scheduler.current_job_id = None
+            scheduler.last_heartbeat_at = now_iso()
+            self._recompute_scheduler_queue_depth()
+            self.add_event(
+                event_type="openclaw.job.failed",
+                source=source,
+                severity=EventSeverity.WARNING,
+                payload={
+                    "job_id": job.id,
+                    "job_type": job.job_type,
+                    "error": error,
+                },
+                strategy_id=str(job.context.get("strategy_id") or "") or None,
+            )
+            if job.job_type == "review_strategy_change":
+                self.add_event(
+                    event_type="strategy.change.review.failed",
+                    source=source,
+                    severity=EventSeverity.WARNING,
+                    payload={
+                        "job_id": job.id,
+                        "change_request_id": job.context.get("change_request_id"),
+                        "strategy_id": job.context.get("strategy_id"),
+                        "error": error,
+                    },
+                    strategy_id=str(job.context.get("strategy_id") or "") or None,
+                )
+            if job.job_type == "review_strategy_issue":
+                self.add_event(
+                    event_type="strategy.issue.review.failed",
+                    source=source,
+                    severity=EventSeverity.WARNING,
+                    payload={
+                        "job_id": job.id,
+                        "issue_type": job.context.get("issue_type"),
+                        "strategy_id": job.context.get("strategy_id"),
+                        "error": error,
+                    },
+                    strategy_id=str(job.context.get("strategy_id") or "") or None,
+                )
+            self._persist()
+            return job.model_copy(deep=True)
+
+    def should_cancel_agent_job(self, job_id: str) -> bool:
+        with self._lock:
+            job = next((item for item in self.state.agent_jobs if item.id == job_id), None)
+            if job is None:
+                return True
+            scheduler = self.state.control_snapshot.scheduler
+            return job.status == JobStatus.CANCELLED or scheduler.current_job_id != job.id
+
+    def _cancel_agent_job_locked(self, job: AgentJob, requested_by: str, reason: Optional[str]) -> None:
+        if job.status not in {JobStatus.QUEUED, JobStatus.RUNNING, JobStatus.WAITING}:
+            return
+
+        job.status = JobStatus.CANCELLED
+        job.result_summary = reason or "已由桌面控制端终止。"
+        job.updated_at = now_iso()
+        scheduler = self.state.control_snapshot.scheduler
+        if scheduler.current_job_id == job.id:
+            scheduler.current_job_id = None
+        self.add_event(
+            event_type="openclaw.job.cancelled",
+            source="desktop",
+            severity=EventSeverity.WARNING,
+            payload={
+                "job_id": job.id,
+                "job_type": job.job_type,
+                "requested_by": requested_by,
+                "reason": reason,
+            },
+            strategy_id=str(job.context.get("strategy_id") or "") or None,
+        )
+
+    def set_openclaw_connection(self, connected: bool) -> None:
+        with self._lock:
+            scheduler = self.state.control_snapshot.scheduler
+            if scheduler.openclaw_connected == connected:
+                return
+            scheduler.openclaw_connected = connected
+            scheduler.last_heartbeat_at = now_iso()
+            self.add_event(
+                event_type="openclaw.connection.restored" if connected else "openclaw.connection.lost",
+                source="openclaw",
+                severity=EventSeverity.INFO if connected else EventSeverity.WARNING,
+                payload={"connected": connected},
+            )
+            self._persist()
+
+    def create_backtest(self, strategy_id: str, data_range: str, timeframe: str) -> BacktestRun:
+        with self._lock:
+            record = self._create_backtest_locked(strategy_id, data_range, timeframe)
+            self._queue_backtest_review_locked(record, requested_by="desktop_operator")
+            self._refresh_derived_state()
+            self._persist()
             return record
+
+    def apply_strategy_proposal(
+        self, proposal_id: str, payload: StrategyProposalActionPayload
+    ) -> StrategyProposalActionResult:
+        with self._lock:
+            proposal = self._find_proposal(proposal_id)
+            if proposal.status not in {"pending", "testing"}:
+                raise ValueError(f"提案当前状态为 {proposal.status}，不能重复处理。")
+            created_change_request = None
+            created_backtest = None
+
+            if payload.action == "accept":
+                scheduler = self.state.control_snapshot.scheduler
+                if proposal.proposal_type == "publish_recommendation":
+                    if scheduler.status == "manual_override":
+                        raise ValueError("当前处于人工接管状态，不能接受发布建议。")
+                    if scheduler.freeze_publish:
+                        raise ValueError("当前已冻结自动发布，不能接受发布建议。")
+                proposal.status = "accepted"
+                proposal_payload = dict(proposal.payload)
+                strategy_id = proposal.strategy_id
+
+                if proposal.proposal_type in {"param_update", "pause_resume", "risk_update", "publish_recommendation", "script_patch_proposal"}:
+                    created_change_request = self._create_change_request_locked(
+                        ChangeRequestCreate(
+                            type=f"proposal.{proposal.proposal_type}",
+                            payload={"strategy_id": strategy_id, **proposal_payload, "proposal_id": proposal.id},
+                            requested_by=payload.requested_by,
+                            target_mode=AccountMode(proposal_payload.get("target_mode", "paper")),
+                            priority="high" if proposal.proposal_type != "publish_recommendation" else "normal",
+                            summary=f"接受提案：{proposal.title}",
+                        )
+                    )
+                    self._apply_change_request_locked(created_change_request)
+                elif proposal.proposal_type == "backtest_request":
+                    created_backtest = self._create_backtest_locked(
+                        strategy_id=strategy_id,
+                        data_range=str(proposal_payload.get("data_range", "2025-12-01 ~ 2026-03-29")),
+                        timeframe=str(proposal_payload.get("timeframe", "1h")),
+                    )
+                    self._queue_backtest_review_locked(created_backtest, requested_by=payload.requested_by)
+            else:
+                proposal.status = "rejected"
+
+            self.add_event(
+                event_type=f"strategy_proposal.{payload.action}ed",
+                source="desktop",
+                severity=EventSeverity.INFO if payload.action == "accept" else EventSeverity.WARNING,
+                payload={
+                    "proposal_id": proposal.id,
+                    "proposal_type": proposal.proposal_type,
+                    "requested_by": payload.requested_by,
+                    "created_change_request_id": created_change_request.id if created_change_request else None,
+                    "created_backtest_id": created_backtest.id if created_backtest else None,
+                },
+                strategy_id=proposal.strategy_id,
+            )
+            self._refresh_derived_state()
+            self._persist()
+            return StrategyProposalActionResult(
+                proposal=proposal,
+                created_change_request=created_change_request,
+                created_backtest=created_backtest,
+            )
 
     def apply_scheduler_command(self, command: SchedulerCommand) -> dict:
         with self._lock:
@@ -206,24 +1921,24 @@ class AppRepository:
             elif command.command == SchedulerCommandType.CANCEL_JOB and command.job_id:
                 for job in self.state.agent_jobs:
                     if job.id == command.job_id:
-                        job.status = JobStatus.CANCELLED
-                        job.updated_at = now_iso()
-                        scheduler.current_job_id = None if scheduler.current_job_id == job.id else scheduler.current_job_id
+                        self._cancel_agent_job_locked(job, requested_by=command.requested_by, reason=command.reason)
                         break
             elif command.command == SchedulerCommandType.CANCEL_ALL:
                 for job in self.state.agent_jobs:
-                    if job.status in {JobStatus.QUEUED, JobStatus.RUNNING, JobStatus.WAITING}:
-                        job.status = JobStatus.CANCELLED
-                        job.updated_at = now_iso()
+                    self._cancel_agent_job_locked(job, requested_by=command.requested_by, reason=command.reason)
                 scheduler.current_job_id = None
-                scheduler.queue_depth = 0
             elif command.command == SchedulerCommandType.FREEZE_PUBLISH:
                 scheduler.freeze_publish = not scheduler.freeze_publish
                 result["freeze_publish"] = scheduler.freeze_publish
             elif command.command == SchedulerCommandType.ENTER_MANUAL_OVERRIDE:
                 scheduler.status = "manual_override"
                 scheduler.freeze_publish = True
+                if scheduler.current_job_id:
+                    current = next((job for job in self.state.agent_jobs if job.id == scheduler.current_job_id), None)
+                    if current is not None:
+                        self._cancel_agent_job_locked(current, requested_by=command.requested_by, reason=command.reason)
             scheduler.last_heartbeat_at = now_iso()
+            self._recompute_scheduler_queue_depth()
             self.add_event(
                 event_type="scheduler.command",
                 source="desktop",
@@ -253,17 +1968,24 @@ class AppRepository:
             if not visible_cards:
                 visible_cards = previous.overview_visible_cards[:]
 
+            collapsed_candidates = self._dedupe_strings(payload.overview_collapsed_cards)
+            collapsed_cards = [card_id for card_id in card_order if card_id in collapsed_candidates]
+
             next_preferences = WorkspacePreferences(
                 active_section=payload.active_section,
                 layout_preset=payload.layout_preset,
                 selected_mode=payload.selected_mode,
                 selected_symbol=payload.selected_symbol,
+                selected_market_timeframe=payload.selected_market_timeframe,
                 selected_strategy_id=payload.selected_strategy_id,
                 overview_card_order=card_order,
                 overview_visible_cards=visible_cards,
+                overview_collapsed_cards=collapsed_cards,
                 updated_at=now_iso(),
             )
             self.state.workspace_preferences = next_preferences
+            self.state.control_snapshot.scheduler.current_mode = payload.selected_mode
+            self._refresh_derived_state()
             self.add_event(
                 event_type="workspace.preferences.updated",
                 source="desktop",
@@ -274,6 +1996,90 @@ class AppRepository:
             )
             self._persist()
             return next_preferences
+
+    def add_watchlist_item(
+        self,
+        item: WatchlistInstrument,
+        requested_by: str,
+        detail_override: Optional[MarketDetail] = None,
+    ) -> WatchlistInstrument:
+        with self._lock:
+            existing = next((entry for entry in self.state.watchlist if entry.symbol == item.symbol), None)
+            if existing is not None:
+                existing.market = item.market
+                existing.last_price = item.last_price
+                existing.change_24h = item.change_24h
+                existing.volume_24h = item.volume_24h
+                existing.signal = item.signal
+                existing.position_side = item.position_side
+                existing.risk_level = item.risk_level
+                existing.alert_enabled = item.alert_enabled
+                existing.alert_threshold_pct = item.alert_threshold_pct
+                self._ensure_market_alert_rule_locked(existing)
+                detail = detail_override or build_market_detail_for_watchlist(existing)
+                self.state.market_details[item.symbol] = detail
+                self.add_event(
+                    event_type="watchlist.updated",
+                    source="desktop",
+                    severity=EventSeverity.INFO,
+                    payload={"symbol": item.symbol, "market": item.market, "requested_by": requested_by},
+                    symbol=item.symbol,
+                )
+                self._persist()
+                return existing
+
+            self.state.watchlist.append(item)
+            self._ensure_market_alert_rule_locked(item)
+            detail = detail_override or build_market_detail_for_watchlist(item)
+            self.state.market_details[item.symbol] = detail
+            self.add_event(
+                event_type="watchlist.added",
+                source="desktop",
+                severity=EventSeverity.INFO,
+                payload={"symbol": item.symbol, "market": item.market, "requested_by": requested_by},
+                symbol=item.symbol,
+            )
+            self._persist()
+            return item
+
+    def remove_watchlist_item(self, symbol: str, requested_by: str) -> WatchlistRemoveResult:
+        with self._lock:
+            uppercase_symbol = symbol.upper()
+            if len(self.state.watchlist) <= 1:
+                raise ValueError("至少保留一个自选品种，当前不能删除最后一个。")
+
+            target_index = next(
+                (index for index, item in enumerate(self.state.watchlist) if item.symbol == uppercase_symbol),
+                None,
+            )
+            if target_index is None:
+                raise KeyError(uppercase_symbol)
+
+            removed_item = self.state.watchlist.pop(target_index)
+            self.state.market_details.pop(uppercase_symbol, None)
+            self.state.alert_rules = [rule for rule in self.state.alert_rules if rule.symbol != uppercase_symbol]
+
+            next_selected_symbol = self.state.workspace_preferences.selected_symbol
+            if next_selected_symbol == uppercase_symbol:
+                next_index = min(target_index, len(self.state.watchlist) - 1)
+                next_selected_symbol = self.state.watchlist[next_index].symbol
+                self.state.workspace_preferences.selected_symbol = next_selected_symbol
+                self.state.workspace_preferences.updated_at = now_iso()
+
+            self.add_event(
+                event_type="watchlist.removed",
+                source="desktop",
+                severity=EventSeverity.WARNING,
+                payload={"symbol": removed_item.symbol, "requested_by": requested_by},
+                symbol=removed_item.symbol,
+            )
+            self._persist()
+            return WatchlistRemoveResult(
+                symbol=removed_item.symbol,
+                removed=True,
+                updated_at=now_iso(),
+                next_selected_symbol=next_selected_symbol,
+            )
 
     def get_mock_account_overview(self) -> AccountOverview:
         snapshot = self.state.control_snapshot
@@ -310,6 +2116,244 @@ class AppRepository:
             ],
             updated_at=updated_at,
         )
+
+    def get_paper_account_overview(self) -> AccountOverview:
+        with self._lock:
+            self._refresh_derived_state()
+            overview = self._build_paper_account_overview_locked()
+            return overview.model_copy(deep=True)
+
+    def get_paper_positions(self) -> list[PositionRecord]:
+        with self._lock:
+            self._refresh_derived_state()
+            return [item.model_copy(deep=True) for item in self._build_paper_positions_locked()]
+
+    def get_paper_orders(self) -> list[OrderRecord]:
+        with self._lock:
+            self._refresh_derived_state()
+            return [item.model_copy(deep=True) for item in self.state.paper_orders]
+
+    def get_paper_order_history(self) -> list[OrderRecord]:
+        with self._lock:
+            self._refresh_derived_state()
+            trade_records = [
+                OrderRecord(
+                    source="paper",
+                    order_id=f"paper-order-{trade.id}",
+                    symbol=trade.symbol,
+                    market=trade.market,
+                    side=trade.side,
+                    order_type="Market",
+                    qty=self._format_quantity(trade.quantity, 6),
+                    price=self._format_ratio(trade.price),
+                    status=trade.status.title().replace("_", ""),
+                    created_at=trade.created_at,
+                )
+                for trade in sorted(
+                    (
+                        item
+                        for item in self.state.trades
+                        if item.mode == AccountMode.PAPER and item.status in {"filled", "partially_filled", "cancelled"}
+                    ),
+                    key=lambda item: self._parse_trade_time(item.created_at),
+                    reverse=True,
+                )
+            ]
+            combined: list[OrderRecord] = []
+            seen_order_ids: set[str] = set()
+            for item in [*self.state.paper_order_history, *trade_records]:
+                if item.order_id in seen_order_ids:
+                    continue
+                seen_order_ids.add(item.order_id)
+                combined.append(item)
+            combined.sort(key=lambda item: self._parse_trade_time(item.created_at), reverse=True)
+            return [item.model_copy(deep=True) for item in combined[:80]]
+
+    def create_paper_order(self, payload: ManualOrderRequest) -> OrderRecord:
+        with self._lock:
+            blocked_reason = self._evaluate_paper_order_risk_locked(
+                payload.symbol,
+                payload.market,
+                payload.side,
+                payload.quantity,
+                payload.price,
+            )
+            if blocked_reason is not None:
+                self.add_event(
+                    event_type="risk.blocked_order",
+                    source="quant-core",
+                    severity=EventSeverity.ERROR,
+                    payload={
+                        "symbol": payload.symbol,
+                        "market": payload.market,
+                        "mode": payload.mode.value,
+                        "side": payload.side.value,
+                        "quantity": payload.quantity,
+                        "price": payload.price,
+                        "reason": blocked_reason,
+                        "stage": "paper_order_create",
+                    },
+                    symbol=payload.symbol,
+                )
+                self._persist()
+                raise ValueError(blocked_reason)
+
+            order = OrderRecord(
+                source="paper",
+                order_id=f"paper-order-{uuid4().hex[:8]}",
+                symbol=payload.symbol.upper(),
+                market=payload.market,
+                side=payload.side,
+                order_type="Limit",
+                qty=self._format_quantity(payload.quantity, 6),
+                price=self._format_ratio(payload.price),
+                status="New",
+                created_at=now_iso(),
+            )
+            self.state.paper_orders.insert(0, order)
+            self.add_event(
+                event_type="paper_order.placed",
+                source="desktop",
+                severity=EventSeverity.INFO,
+                payload={
+                    "order_id": order.order_id,
+                    "symbol": order.symbol,
+                    "market": order.market,
+                    "side": order.side.value,
+                    "quantity": payload.quantity,
+                    "price": payload.price,
+                    "note": payload.note,
+                },
+                symbol=order.symbol,
+            )
+            self._refresh_derived_state()
+            self._persist()
+            return order.model_copy(deep=True)
+
+    def cancel_paper_order(self, order_id: str, requested_by: str) -> OrderRecord:
+        with self._lock:
+            target_index = next((index for index, item in enumerate(self.state.paper_orders) if item.order_id == order_id), None)
+            if target_index is None:
+                raise KeyError(order_id)
+
+            order = self.state.paper_orders.pop(target_index)
+            self._append_paper_order_history_locked(order, "Cancelled")
+            self.add_event(
+                event_type="paper_order.cancelled",
+                source="desktop",
+                severity=EventSeverity.WARNING,
+                payload={
+                    "order_id": order.order_id,
+                    "symbol": order.symbol,
+                    "requested_by": requested_by,
+                },
+                symbol=order.symbol,
+            )
+            self._refresh_derived_state()
+            self._persist()
+            return order.model_copy(update={"status": "Cancelled"}, deep=True)
+
+    def replace_paper_order(self, order_id: str, quantity: float, price: float, requested_by: str) -> OrderRecord:
+        with self._lock:
+            target_index = next((index for index, item in enumerate(self.state.paper_orders) if item.order_id == order_id), None)
+            if target_index is None:
+                raise KeyError(order_id)
+
+            order = self.state.paper_orders[target_index]
+            blocked_reason = self._evaluate_paper_order_risk_locked(
+                order.symbol,
+                order.market,
+                order.side,
+                quantity,
+                price,
+                exclude_order_id=order_id,
+            )
+            if blocked_reason is not None:
+                self.add_event(
+                    event_type="risk.blocked_order",
+                    source="quant-core",
+                    severity=EventSeverity.ERROR,
+                    payload={
+                        "order_id": order.order_id,
+                        "symbol": order.symbol,
+                        "market": order.market,
+                        "mode": AccountMode.PAPER.value,
+                        "side": order.side.value,
+                        "quantity": quantity,
+                        "price": price,
+                        "reason": blocked_reason,
+                        "stage": "paper_order_replace",
+                    },
+                    symbol=order.symbol,
+                )
+                self._persist()
+                raise ValueError(blocked_reason)
+
+            updated_order = order.model_copy(
+                update={
+                    "qty": self._format_quantity(quantity, 6),
+                    "price": self._format_ratio(price),
+                    "status": "New",
+                }
+            )
+            self.state.paper_orders[target_index] = updated_order
+            self.add_event(
+                event_type="paper_order.replaced",
+                source="desktop",
+                severity=EventSeverity.INFO,
+                payload={
+                    "order_id": updated_order.order_id,
+                    "symbol": updated_order.symbol,
+                    "requested_by": requested_by,
+                    "quantity": quantity,
+                    "price": price,
+                },
+                symbol=updated_order.symbol,
+            )
+            self._refresh_derived_state()
+            current_order = next((item for item in self.state.paper_orders if item.order_id == order_id), None)
+            if current_order is not None:
+                result = current_order.model_copy(deep=True)
+            else:
+                history_order = next((item for item in self.state.paper_order_history if item.order_id == order_id), None)
+                result = (history_order or updated_order).model_copy(deep=True)
+            self._persist()
+            return result
+
+    def cancel_all_paper_orders(self, requested_by: str) -> dict[str, Any]:
+        with self._lock:
+            if not self.state.paper_orders:
+                return {
+                    "cancelled_count": 0,
+                    "cancelled_order_ids": [],
+                    "requested_by": requested_by,
+                    "updated_at": now_iso(),
+                }
+
+            cancelled_orders = [item.model_copy(deep=True) for item in self.state.paper_orders]
+            self.state.paper_orders = []
+            for order in cancelled_orders:
+                self._append_paper_order_history_locked(order, "Cancelled")
+
+            self.add_event(
+                event_type="paper_order.cancelled_all",
+                source="desktop",
+                severity=EventSeverity.WARNING,
+                payload={
+                    "requested_by": requested_by,
+                    "cancelled_count": len(cancelled_orders),
+                    "cancelled_order_ids": [item.order_id for item in cancelled_orders],
+                },
+            )
+            self._refresh_derived_state()
+            updated_at = now_iso()
+            self._persist()
+            return {
+                "cancelled_count": len(cancelled_orders),
+                "cancelled_order_ids": [item.order_id for item in cancelled_orders],
+                "requested_by": requested_by,
+                "updated_at": updated_at,
+            }
 
     def get_mock_positions(self) -> list[PositionRecord]:
         timestamp = now_iso()
@@ -382,8 +2426,494 @@ class AppRepository:
             ),
         ]
 
+    @staticmethod
+    def _parse_percent_number(value: Any, default: float = 1.0) -> float:
+        normalized = str(value if value is not None else default).replace("%", "").replace(",", "").strip()
+        try:
+            return max(float(normalized), 0.1)
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _get_strategy_parameter(strategy, key: str, default: Optional[float] = None) -> Optional[float]:
+        parameter = next((item for item in strategy.parameters if item.key == key), None)
+        if parameter is None:
+            return default
+        try:
+            return float(parameter.value)
+        except (TypeError, ValueError):
+            return default
+
+    def _strategy_cooldown_remaining_minutes_locked(self, strategy) -> Optional[int]:
+        cooldown_minutes = self._get_strategy_parameter(strategy, "cooldown_minutes", 0.0) or 0.0
+        if cooldown_minutes <= 0:
+            return None
+        latest_stop_loss = next(
+            (
+                event
+                for event in self.state.audit_events
+                if event.event_type == "strategy.paper_stop_loss.executed"
+                and event.strategy_id == strategy.id
+            ),
+            None,
+        )
+        if latest_stop_loss is None:
+            return None
+        try:
+            occurred_at = datetime.fromisoformat(latest_stop_loss.occurred_at)
+        except ValueError:
+            return None
+        elapsed_minutes = (datetime.now(timezone.utc).astimezone() - occurred_at).total_seconds() / 60
+        remaining = int(round(cooldown_minutes - elapsed_minutes))
+        return remaining if remaining > 0 else None
+
+    def _estimate_strategy_trade_quantity(self, strategy_id: str, price: float) -> float:
+        strategy = self._find_strategy(strategy_id)
+        risk_budget_pct = self._parse_percent_number(strategy.risk_budget, 1.0)
+        base_notional = max(250.0, 6000.0 * (risk_budget_pct / 100.0))
+        if price <= 0:
+            return 0.0
+        raw_qty = base_notional / price
+        if price >= 1000:
+            return round(raw_qty, 4)
+        if price >= 10:
+            return round(raw_qty, 3)
+        return round(raw_qty, 2)
+
+    def _resolve_strategy_target_signed_qty_locked(
+        self,
+        strategy,
+        snapshot: StrategyRuntimeSnapshot,
+    ) -> Optional[float]:
+        base_quantity = max(self._estimate_strategy_trade_quantity(strategy.id, snapshot.last_price), 0.001)
+        if snapshot.signal == "long":
+            return base_quantity
+        if snapshot.signal == "short":
+            if snapshot.market == "spot":
+                return 0.0
+            return -base_quantity
+        if snapshot.signal == "flat":
+            return 0.0
+        return None
+
+    def _apply_strategy_risk_controls_locked(
+        self,
+        strategy,
+        snapshot: StrategyRuntimeSnapshot,
+    ) -> Optional[TradeRecord]:
+        if not (strategy.mode == AccountMode.PAPER or strategy.status == "paper_only"):
+            return None
+        if snapshot.runtime_status == "paused":
+            return None
+
+        strategy_ledger = self._build_paper_strategy_ledger_locked(strategy.id)
+        position = dict(strategy_ledger["positions"]).get(snapshot.symbol)
+        if position is None:
+            return None
+
+        current_qty = float(position.get("qty") or 0.0)
+        current_avg = float(position.get("avg_price") or 0.0)
+        if abs(current_qty) <= 1e-9 or current_avg <= 0:
+            return None
+
+        stop_loss_pct = self._get_strategy_parameter(strategy, "stop_loss_pct")
+        if stop_loss_pct is None or stop_loss_pct <= 0:
+            return None
+
+        stop_triggered = False
+        if current_qty > 0 and snapshot.last_price <= current_avg * (1 - stop_loss_pct / 100):
+            stop_triggered = True
+        elif current_qty < 0 and snapshot.last_price >= current_avg * (1 + stop_loss_pct / 100):
+            stop_triggered = True
+
+        if not stop_triggered:
+            return None
+
+        record = TradeRecord(
+            id=f"trade-{uuid4().hex[:6]}",
+            symbol=snapshot.symbol,
+            market=snapshot.market,
+            mode=AccountMode.PAPER,
+            origin="strategy",
+            side=Direction.SELL if current_qty > 0 else Direction.BUY,
+            quantity=abs(current_qty),
+            price=round(snapshot.last_price, 6),
+            pnl="--",
+            strategy_id=strategy.id,
+            created_at=now_iso(),
+            status="filled",
+        )
+        self.state.trades.insert(0, record)
+        self.add_event(
+            event_type="strategy.paper_stop_loss.executed",
+            source="quant-core",
+            severity=EventSeverity.CRITICAL,
+            payload={
+                **record.model_dump(mode="json"),
+                "stop_loss_pct": stop_loss_pct,
+                "avg_price": current_avg,
+                "last_price": snapshot.last_price,
+            },
+            symbol=snapshot.symbol,
+            strategy_id=strategy.id,
+        )
+        self._upsert_system_alert_locked(
+            rule_key=f"strategy-stop-loss:{strategy.id}:{snapshot.symbol}",
+            severity="P0",
+            symbol=snapshot.symbol,
+            title=f"{strategy.name} 触发本地止损",
+            description=(
+                f"{snapshot.symbol} 当前参考价 {snapshot.last_price:.4f} 已触发 {stop_loss_pct:.2f}% 止损，"
+                "系统已按当前持仓自动平仓。"
+            ),
+            suggested_action="打开策略页复核当前信号、止损参数与回测表现，必要时暂停该策略。",
+            strategy_id=strategy.id,
+        )
+        return record
+
+    def _create_strategy_trade_locked(
+        self,
+        strategy_id: str,
+        symbol: str,
+        market: str,
+        side: Direction,
+        price: float,
+        note: str,
+        quantity_override: Optional[float] = None,
+        event_type: str = "strategy.paper_trade.executed",
+        requested_by: Optional[str] = None,
+    ) -> Optional[TradeRecord]:
+        quantity = max(quantity_override or self._estimate_strategy_trade_quantity(strategy_id, price), 0.001)
+        preview = self._build_execution_preview_locked(
+            ExecutionPreviewRequest(
+                symbol=symbol,
+                market=market,
+                mode=AccountMode.PAPER,
+                side=side,
+                quantity=quantity,
+                price=price,
+                origin="strategy",
+                strategy_id=strategy_id,
+                note=note,
+            )
+        )
+        if not preview.allowed:
+            strategy_name = strategy_id
+            try:
+                strategy_name = self._find_strategy(strategy_id).name
+            except KeyError:
+                pass
+            self.add_event(
+                event_type="risk.blocked_order",
+                source="quant-core",
+                severity=EventSeverity.ERROR,
+                payload={
+                    "strategy_id": strategy_id,
+                    "symbol": symbol,
+                    "market": market,
+                    "side": side.value,
+                    "quantity": quantity,
+                    "price": price,
+                    "reason": preview.blocked_reason,
+                },
+                symbol=symbol,
+                strategy_id=strategy_id,
+            )
+            self._upsert_system_alert_locked(
+                rule_key=f"strategy-risk:{strategy_id}:{symbol}",
+                severity="P1",
+                symbol=symbol,
+                title=f"{strategy_name} 执行被风控拦截",
+                description=preview.blocked_reason or "当前策略纸面执行未通过风控校验。",
+                suggested_action="打开策略页查看当前 execution preview、Paper 余额与已有持仓，再决定是否手动处理。",
+                strategy_id=strategy_id,
+            )
+            return None
+
+        record = TradeRecord(
+            id=f"trade-{uuid4().hex[:6]}",
+            symbol=symbol,
+            market=market,
+            mode=AccountMode.PAPER,
+            origin="strategy",
+            side=side,
+            quantity=quantity,
+            price=round(price, 6),
+            pnl="--",
+            strategy_id=strategy_id,
+            created_at=now_iso(),
+            status="filled",
+        )
+        self.state.trades.insert(0, record)
+        self.add_event(
+            event_type=event_type,
+            source="quant-core",
+            severity=EventSeverity.INFO,
+            payload={
+                **record.model_dump(mode="json"),
+                "note": note,
+                "requested_by": requested_by,
+            },
+            symbol=symbol,
+            strategy_id=strategy_id,
+        )
+        return record
+
+    def _build_strategy_execution_preview_locked(
+        self,
+        strategy,
+        snapshot: StrategyRuntimeSnapshot,
+        previous: Optional[StrategyRuntimeSnapshot],
+    ) -> Optional[ExecutionPreview]:
+        if not (strategy.mode == AccountMode.PAPER or strategy.status == "paper_only"):
+            return None
+        if snapshot.runtime_status == "paused":
+            return None
+        if self._strategy_cooldown_remaining_minutes_locked(strategy) is not None:
+            return None
+
+        target_signed_qty = self._resolve_strategy_target_signed_qty_locked(strategy, snapshot)
+        if target_signed_qty is None:
+            return None
+
+        strategy_ledger = self._build_paper_strategy_ledger_locked(strategy.id)
+        strategy_position = dict(strategy_ledger["positions"]).get(snapshot.symbol, {})
+        current_qty = float(strategy_position.get("qty") or 0.0)
+        current_avg = float(strategy_position.get("avg_price") or 0.0)
+        delta_qty = round(target_signed_qty - current_qty, 12)
+        if abs(delta_qty) <= 1e-9:
+            return None
+
+        side = Direction.BUY if delta_qty > 0 else Direction.SELL
+        quantity = abs(delta_qty)
+        notional = quantity * snapshot.last_price
+        account_ledger = self._build_paper_ledger_locked()
+        cash_balance = float(account_ledger["cash_balance"])
+        available_cash = max(cash_balance - self._paper_reserved_cash_locked(), 0.0)
+        next_qty = current_qty + delta_qty
+        close_qty = 0.0
+        realized_on_fill = 0.0
+
+        if current_qty != 0 and current_qty * delta_qty < 0:
+            close_qty = min(abs(current_qty), abs(delta_qty))
+            realized_on_fill = close_qty * (snapshot.last_price - current_avg) * (1 if current_qty > 0 else -1)
+
+        if current_qty == 0 or current_qty * delta_qty > 0:
+            total_size = abs(current_qty) + abs(delta_qty)
+            projected_avg = (
+                ((abs(current_qty) * current_avg) + (abs(delta_qty) * snapshot.last_price)) / total_size
+                if total_size > 0
+                else 0.0
+            )
+        elif abs(next_qty) <= 1e-9:
+            projected_avg = 0.0
+        elif current_qty * next_qty > 0:
+            projected_avg = current_avg
+        else:
+            projected_avg = snapshot.last_price
+
+        blocked_reason = self._evaluate_paper_order_risk_locked(
+            snapshot.symbol,
+            snapshot.market,
+            side,
+            quantity,
+            snapshot.last_price,
+        )
+        warnings: list[str] = []
+        if close_qty > 0:
+            warnings.append("本次执行会先结算该策略自身的一部分已实现盈亏。")
+        if current_qty != 0 and current_qty * next_qty < 0:
+            warnings.append("本次执行会让该策略自身仓位发生反手。")
+        if snapshot.market == "spot" and snapshot.signal == "short":
+            warnings.append("现货模式不支持裸做空，short 信号会按减仓或清仓处理。")
+
+        return ExecutionPreview(
+            symbol=snapshot.symbol,
+            market=snapshot.market,
+            mode=AccountMode.PAPER,
+            side=side,
+            origin="strategy",
+            strategy_id=strategy.id,
+            quantity=quantity,
+            price=snapshot.last_price,
+            notional=self._format_usdt(notional),
+            action=self._describe_execution_action_locked(snapshot.market, side, current_qty, next_qty),
+            allowed=blocked_reason is None,
+            blocked_reason=blocked_reason,
+            warnings=warnings,
+            current_position_side=self._classify_position_side(current_qty),
+            current_position_size=self._format_quantity(abs(current_qty), 6),
+            current_avg_price=self._format_ratio(current_avg) if abs(current_qty) > 1e-9 else "--",
+            projected_position_side=self._classify_position_side(next_qty),
+            projected_position_size=self._format_quantity(abs(next_qty), 6),
+            projected_avg_price=self._format_ratio(projected_avg) if abs(next_qty) > 1e-9 else "--",
+            available_balance_before=self._format_usdt(available_cash),
+            available_balance_after=self._format_usdt(available_cash - (delta_qty * snapshot.last_price)),
+            estimated_realized_pnl=self._format_usdt_delta(realized_on_fill) if close_qty > 0 else "--",
+            generated_at=now_iso(),
+        )
+
+    def get_strategy_signal_order_hint(self, strategy_id: str) -> Dict[str, Any]:
+        with self._lock:
+            strategy = self._find_strategy(strategy_id)
+            snapshot = next((item for item in self.state.strategy_runtime_snapshots if item.strategy_id == strategy_id), None)
+            if snapshot is None:
+                raise ValueError("当前策略运行态尚未准备好，请先刷新策略页后再试。")
+            if snapshot.runtime_status == "paused":
+                raise ValueError("当前策略已暂停，不能提交策略信号委托。")
+
+            target_signed_qty = self._resolve_strategy_target_signed_qty_locked(strategy, snapshot)
+            if target_signed_qty is None:
+                raise ValueError("当前策略仍处于 watch 观察状态，暂时没有可提交的委托方向。")
+            price = round(snapshot.reference_price or snapshot.last_price, 6)
+            return {
+                "strategy_id": strategy.id,
+                "strategy_name": strategy.name,
+                "symbol": snapshot.symbol,
+                "market": snapshot.market,
+                "signal": snapshot.signal,
+                "risk_budget": strategy.risk_budget,
+                "target_signed_qty": target_signed_qty,
+                "price": price,
+                "note": snapshot.next_action,
+            }
+
+    def update_strategy_runtime_snapshots(
+        self,
+        snapshots: list[StrategyRuntimeSnapshot],
+    ) -> list[StrategyRuntimeSnapshot]:
+        with self._lock:
+            previous_by_id = {item.strategy_id: item for item in self.state.strategy_runtime_snapshots}
+            changed = False
+            next_snapshots: list[StrategyRuntimeSnapshot] = []
+
+            for snapshot in snapshots:
+                previous = previous_by_id.get(snapshot.strategy_id)
+                strategy = self._find_strategy(snapshot.strategy_id)
+                trade_record: Optional[TradeRecord] = None
+                risk_trade_record = self._apply_strategy_risk_controls_locked(strategy, snapshot)
+                if risk_trade_record is not None:
+                    trade_record = risk_trade_record
+                    execution_preview = None
+                    snapshot = snapshot.model_copy(
+                        update={
+                            "note": f"{snapshot.note} 已触发本地止损并自动平仓。",
+                            "next_action": "等待下一次信号切换，或先在策略页复核参数后再恢复人工执行。",
+                        }
+                    )
+                else:
+                    cooldown_remaining = self._strategy_cooldown_remaining_minutes_locked(strategy)
+                    execution_preview = self._build_strategy_execution_preview_locked(strategy, snapshot, previous)
+                    if cooldown_remaining is not None:
+                        snapshot = snapshot.model_copy(
+                            update={
+                                "note": f"{snapshot.note} 当前处于止损后冷却期，剩余约 {cooldown_remaining} 分钟。",
+                                "next_action": "冷却结束前不再给出可执行预估；可在策略页检查止损与冷却参数。",
+                            }
+                        )
+
+                if trade_record is None and (strategy.mode == AccountMode.PAPER or strategy.status == "paper_only"):
+                    previous_signal = previous.signal if previous else "flat"
+                    if previous_signal != snapshot.signal and execution_preview is not None:
+                        note = f"{snapshot.strategy_name} 信号切换至 {snapshot.signal}，按目标仓位差额执行纸面成交。"
+                        if snapshot.signal == "flat":
+                            note = f"{snapshot.strategy_name} 信号回到 flat，按当前剩余仓位纸面平仓。"
+                        trade_record = self._create_strategy_trade_locked(
+                            strategy_id=snapshot.strategy_id,
+                            symbol=snapshot.symbol,
+                            market=snapshot.market,
+                            side=execution_preview.side,
+                            price=execution_preview.price,
+                            note=note,
+                            quantity_override=execution_preview.quantity,
+                        )
+
+                if previous is None or previous.signal != snapshot.signal or previous.runtime_status != snapshot.runtime_status:
+                    self.add_event(
+                        event_type="strategy.runtime.signal_changed",
+                        source="quant-core",
+                        severity=EventSeverity.INFO,
+                        payload={
+                            "strategy_id": snapshot.strategy_id,
+                            "strategy_name": snapshot.strategy_name,
+                            "previous_signal": previous.signal if previous else None,
+                            "signal": snapshot.signal,
+                            "runtime_status": snapshot.runtime_status,
+                            "confidence": snapshot.confidence,
+                            "note": snapshot.note,
+                            "next_action": snapshot.next_action,
+                        },
+                        symbol=snapshot.symbol,
+                        strategy_id=snapshot.strategy_id,
+                    )
+                    changed = True
+                    if self._sync_strategy_signal_alert_locked(strategy, snapshot, previous):
+                        changed = True
+
+                if trade_record is None and previous is not None:
+                    snapshot = snapshot.model_copy(
+                        update={
+                            "last_trade_id": snapshot.last_trade_id or previous.last_trade_id,
+                            "last_trade_at": snapshot.last_trade_at or previous.last_trade_at,
+                            "execution_preview": execution_preview,
+                        }
+                    )
+                elif trade_record is not None:
+                    snapshot = snapshot.model_copy(
+                        update={
+                            "last_trade_id": trade_record.id,
+                            "last_trade_at": trade_record.created_at,
+                            "execution_preview": execution_preview,
+                        }
+                    )
+                    changed = True
+                else:
+                    snapshot = snapshot.model_copy(update={"execution_preview": execution_preview})
+
+                next_snapshots.append(snapshot)
+
+            if len(next_snapshots) != len(self.state.strategy_runtime_snapshots):
+                changed = True
+
+            self.state.strategy_runtime_snapshots = next_snapshots
+            self._refresh_derived_state()
+            if changed:
+                self._persist()
+            return [item.model_copy(deep=True) for item in next_snapshots]
+
     def create_manual_trade(self, payload: ManualOrderRequest) -> TradeRecord:
         with self._lock:
+            preview = self._build_execution_preview_locked(
+                ExecutionPreviewRequest(
+                    symbol=payload.symbol,
+                    market=payload.market,
+                    mode=payload.mode,
+                    side=payload.side,
+                    quantity=payload.quantity,
+                    price=payload.price,
+                    origin="manual",
+                    note=payload.note,
+                )
+            )
+            if not preview.allowed:
+                self.add_event(
+                    event_type="risk.blocked_order",
+                    source="quant-core",
+                    severity=EventSeverity.ERROR,
+                    payload={
+                        "symbol": payload.symbol,
+                        "market": payload.market,
+                        "mode": payload.mode.value,
+                        "side": payload.side.value,
+                        "quantity": payload.quantity,
+                        "price": payload.price,
+                        "reason": preview.blocked_reason,
+                    },
+                    symbol=payload.symbol,
+                )
+                self._persist()
+                raise ValueError(preview.blocked_reason or "当前执行预检未通过。")
+
             record = TradeRecord(
                 id=f"trade-{uuid4().hex[:6]}",
                 symbol=payload.symbol,
@@ -406,5 +2936,162 @@ class AppRepository:
                 payload=record.model_dump(mode="json"),
                 symbol=payload.symbol,
             )
+            self._refresh_derived_state()
             self._persist()
             return record
+
+    def preview_execution(self, payload: ExecutionPreviewRequest) -> ExecutionPreview:
+        with self._lock:
+            return self._build_execution_preview_locked(payload)
+
+    def close_paper_position(self, symbol: str, requested_by: str) -> TradeRecord:
+        with self._lock:
+            ledger_snapshot = self._build_paper_ledger_locked()
+            position = dict(ledger_snapshot["positions"]).get(symbol.upper())
+            if position is None or abs(float(position.get("qty") or 0.0)) < 1e-9:
+                raise KeyError(symbol.upper())
+
+            qty = float(position["qty"])
+            price = self._resolve_mark_price_locked(str(position["symbol"]), float(position["avg_price"]))
+            if price <= 0:
+                raise ValueError("当前无法获取可用的平仓参考价，请稍后再试。")
+
+            record = TradeRecord(
+                id=f"trade-{uuid4().hex[:6]}",
+                symbol=str(position["symbol"]),
+                market=str(position["market"]),
+                mode=AccountMode.PAPER,
+                origin="manual",
+                side=Direction.SELL if qty > 0 else Direction.BUY,
+                quantity=abs(qty),
+                price=price,
+                pnl="--",
+                strategy_id=None,
+                created_at=now_iso(),
+                status="filled",
+            )
+            self.state.trades.insert(0, record)
+            self.add_event(
+                event_type="manual_trade.position_closed",
+                source="desktop",
+                severity=EventSeverity.INFO,
+                payload={
+                    "requested_by": requested_by,
+                    **record.model_dump(mode="json"),
+                },
+                symbol=record.symbol,
+            )
+            self._refresh_derived_state()
+            self._persist()
+            return record
+
+    def close_all_paper_positions(self, requested_by: str) -> dict[str, Any]:
+        with self._lock:
+            ledger_snapshot = self._build_paper_ledger_locked()
+            positions = [
+                item
+                for item in dict(ledger_snapshot["positions"]).values()
+                if abs(float(item.get("qty") or 0.0)) >= 1e-9
+            ]
+            if not positions:
+                return {
+                    "closed_count": 0,
+                    "trade_ids": [],
+                    "requested_by": requested_by,
+                    "updated_at": now_iso(),
+                }
+
+            trades: list[TradeRecord] = []
+            for position in positions:
+                qty = float(position["qty"])
+                price = self._resolve_mark_price_locked(str(position["symbol"]), float(position["avg_price"]))
+                if price <= 0:
+                    continue
+                record = TradeRecord(
+                    id=f"trade-{uuid4().hex[:6]}",
+                    symbol=str(position["symbol"]),
+                    market=str(position["market"]),
+                    mode=AccountMode.PAPER,
+                    origin="manual",
+                    side=Direction.SELL if qty > 0 else Direction.BUY,
+                    quantity=abs(qty),
+                    price=price,
+                    pnl="--",
+                    strategy_id=None,
+                    created_at=now_iso(),
+                    status="filled",
+                )
+                self.state.trades.insert(0, record)
+                trades.append(record)
+
+            if trades:
+                self.add_event(
+                    event_type="manual_trade.positions_closed_all",
+                    source="desktop",
+                    severity=EventSeverity.INFO,
+                    payload={
+                        "requested_by": requested_by,
+                        "closed_count": len(trades),
+                        "trade_ids": [item.id for item in trades],
+                        "symbols": [item.symbol for item in trades],
+                    },
+                )
+                self._refresh_derived_state()
+                self._persist()
+
+            return {
+                "closed_count": len(trades),
+                "trade_ids": [item.id for item in trades],
+                "requested_by": requested_by,
+                "updated_at": now_iso(),
+            }
+
+    def execute_strategy_signal(self, strategy_id: str, requested_by: str, note: Optional[str] = None) -> TradeRecord:
+        with self._lock:
+            strategy = self._find_strategy(strategy_id)
+            if not (strategy.mode == AccountMode.PAPER or strategy.status == "paper_only"):
+                raise ValueError("当前仅允许执行 Paper / 仅模拟盘策略的纸面信号。")
+
+            snapshot = next((item for item in self.state.strategy_runtime_snapshots if item.strategy_id == strategy_id), None)
+            if snapshot is None:
+                raise ValueError("当前策略运行态尚未准备好，请先刷新策略页后再试。")
+            if snapshot.runtime_status == "paused":
+                raise ValueError("当前策略已暂停，不能执行纸面信号。")
+
+            preview = snapshot.execution_preview
+            if preview is None:
+                raise ValueError("当前策略没有可执行的纸面预估。")
+            if not preview.allowed:
+                raise ValueError(preview.blocked_reason or "当前策略纸面执行预估未通过。")
+
+            trade = self._create_strategy_trade_locked(
+                strategy_id=strategy_id,
+                symbol=snapshot.symbol,
+                market=snapshot.market,
+                side=preview.side,
+                price=preview.price,
+                quantity_override=preview.quantity,
+                note=note or snapshot.next_action or f"{snapshot.strategy_name} 人工执行当前纸面信号。",
+                event_type="strategy.paper_trade.executed_manual",
+                requested_by=requested_by,
+            )
+            if trade is None:
+                raise ValueError("当前策略纸面执行被风控拦截。")
+
+            next_snapshots: list[StrategyRuntimeSnapshot] = []
+            for item in self.state.strategy_runtime_snapshots:
+                if item.strategy_id == strategy_id:
+                    next_snapshots.append(
+                        item.model_copy(
+                            update={
+                                "last_trade_id": trade.id,
+                                "last_trade_at": trade.created_at,
+                            }
+                        )
+                    )
+                else:
+                    next_snapshots.append(item)
+            self.state.strategy_runtime_snapshots = next_snapshots
+            self._refresh_derived_state()
+            self._persist()
+            return trade.model_copy(deep=True)

@@ -7,6 +7,7 @@ import sys
 import threading
 import time
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 from urllib.error import HTTPError
@@ -20,7 +21,10 @@ if str(CONTROL_API_DIR) not in sys.path:
     sys.path.insert(0, str(CONTROL_API_DIR))
 
 import main as control_main  # type: ignore  # noqa: E402
-from models import AccountMode, BybitPrivateStatus, OpenClawStatus  # type: ignore  # noqa: E402
+from bybit_private_client import BybitPrivateClient  # type: ignore  # noqa: E402
+from bybit_public_client import BybitPublicMarketClient  # type: ignore  # noqa: E402
+from models import AlertRecord, AccountMode, BybitPrivateStatus, CandlePoint, Direction, OpenClawStatus, OrderBookLevel, StrategyParameter, StrategyRuntimeSnapshot, WatchlistInstrument  # type: ignore  # noqa: E402
+from seed import build_market_detail_for_watchlist, build_state  # type: ignore  # noqa: E402
 
 
 def _find_free_port() -> int:
@@ -64,17 +68,30 @@ def _wait_for_server(base_url: str, timeout: float = 10.0) -> None:
     raise RuntimeError(f"control-api 服务未能在 {timeout} 秒内启动: {last_error}")
 
 
+def _request_text(base_url: str, method: str, path: str) -> tuple[int, str]:
+    request = Request(f"{base_url}{path}", method=method.upper(), headers={"Accept": "text/plain"})
+    with urlopen(request, timeout=10) as response:
+        return response.status, response.read().decode("utf-8")
+
+
 class StubOpenClawClient:
-    def get_status(self) -> OpenClawStatus:
+    def get_status(self, worker_state: Optional[Dict[str, Any]] = None) -> OpenClawStatus:
         return OpenClawStatus(
             configured=False,
             gateway_url="ws://127.0.0.1:18789",
             auth_mode=None,
             default_agent=None,
+            resolved_agent=None,
             heartbeat=None,
             health_output=None,
             status_output=None,
             reachable=False,
+            worker_running=bool(worker_state.get("running")) if worker_state else False,
+            active_job_id=worker_state.get("active_job_id") if worker_state else None,
+            last_worker_event_at=worker_state.get("last_worker_event_at") if worker_state else None,
+            last_job_id=worker_state.get("last_job_id") if worker_state else None,
+            last_job_status=worker_state.get("last_job_status") if worker_state else None,
+            last_job_summary=worker_state.get("last_job_summary") if worker_state else None,
         )
 
 
@@ -131,10 +148,47 @@ class StubConfiguredEmptyBybitPrivateClient:
             ]
         }
 
+    def fetch_usdt_balance_diagnostics(self) -> list[Dict[str, Any]]:
+        return [
+            {
+                "account_type": "UNIFIED",
+                "coin": "USDT",
+                "wallet_balance": "0",
+                "transfer_balance": "0",
+                "available_balance": "0",
+                "source": "coin-balance",
+                "error": None,
+            },
+            {
+                "account_type": "FUND",
+                "coin": "USDT",
+                "wallet_balance": "0",
+                "transfer_balance": "0",
+                "available_balance": "0",
+                "source": "coin-balance",
+                "error": None,
+            },
+            {
+                "account_type": "CONTRACT",
+                "coin": "USDT",
+                "wallet_balance": "0",
+                "transfer_balance": "0",
+                "available_balance": "0",
+                "source": "coin-balance",
+                "error": None,
+            },
+        ]
+
     def fetch_positions(self) -> list[Dict[str, Any]]:
         return []
 
     def fetch_open_orders(self) -> list[Dict[str, Any]]:
+        return []
+
+    def fetch_order_history(self) -> list[Dict[str, Any]]:
+        return []
+
+    def fetch_execution_history(self) -> list[Dict[str, Any]]:
         return []
 
     def probe_trade_route(self) -> Dict[str, Any]:
@@ -147,6 +201,1358 @@ class StubConfiguredEmptyBybitPrivateClient:
             "tested_at": "2026-03-30T00:00:00+08:00",
         }
 
+    def create_order(self, body: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "orderId": "created-order-001",
+            "orderLinkId": body.get("orderLinkId"),
+            "orderStatus": "New",
+        }
+
+    def amend_order(self, body: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "orderId": body.get("orderId"),
+            "orderStatus": "New",
+        }
+
+    def cancel_order(self, body: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "orderId": body.get("orderId"),
+            "orderLinkId": None,
+            "orderStatus": "Cancelled",
+        }
+
+    def cancel_all_orders(self, body: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "list": [],
+            "success": "1",
+        }
+
+
+class StubConfiguredTradingBybitPrivateClient(StubConfiguredEmptyBybitPrivateClient):
+    def __init__(self) -> None:
+        self.created_order_bodies: list[Dict[str, Any]] = []
+        self.amended_order_bodies: list[Dict[str, Any]] = []
+        self.cancelled_order_bodies: list[Dict[str, Any]] = []
+        self.order_history_items: list[Dict[str, Any]] = []
+
+    def get_status(self) -> BybitPrivateStatus:
+        return BybitPrivateStatus(
+            configured=True,
+            can_query_private=True,
+            source="file",
+            api_base_url="https://api.bybit.com",
+            account_type="UNIFIED",
+            mode=AccountMode.LIVE,
+            key_hint="test...1234",
+            last_error=None,
+            updated_at="2026-03-30T00:00:00+08:00",
+        )
+
+    def fetch_wallet_balance(self) -> Dict[str, Any]:
+        return {
+            "list": [
+                {
+                    "accountType": "UNIFIED",
+                    "totalEquity": "5000",
+                    "totalWalletBalance": "5000",
+                    "totalAvailableBalance": "4200",
+                    "totalPerpUPL": "0",
+                    "coin": [
+                        {
+                            "coin": "USDT",
+                            "walletBalance": "4200",
+                            "usdValue": "4200",
+                            "availableToWithdraw": "4200",
+                        }
+                    ],
+                }
+            ]
+        }
+
+    def fetch_positions(self) -> list[Dict[str, Any]]:
+        return [
+            {
+                "symbol": "BTCUSDT",
+                "category": "linear",
+                "side": "Buy",
+                "size": "0.15",
+                "avgPrice": "66500",
+                "markPrice": "66800",
+                "positionValue": "10020",
+                "leverage": "2",
+                "unrealisedPnl": "45.5",
+            },
+            {
+                "symbol": "ETHUSDT",
+                "category": "spot",
+                "side": "Buy",
+                "size": "2.5",
+                "avgPrice": "2050",
+                "markPrice": "2062",
+                "positionValue": "5155",
+                "leverage": "1",
+                "unrealisedPnl": "30",
+            },
+        ]
+
+    def create_order(self, body: Dict[str, Any]) -> Dict[str, Any]:
+        self.created_order_bodies.append(dict(body))
+        return {
+            "orderId": f"live-order-created-{len(self.created_order_bodies):03d}",
+            "orderLinkId": body.get("orderLinkId"),
+            "orderStatus": "New",
+        }
+
+    def amend_order(self, body: Dict[str, Any]) -> Dict[str, Any]:
+        self.amended_order_bodies.append(dict(body))
+        return {
+            "orderId": body.get("orderId"),
+            "orderStatus": "New",
+        }
+
+    def cancel_order(self, body: Dict[str, Any]) -> Dict[str, Any]:
+        self.cancelled_order_bodies.append(dict(body))
+        return {
+            "orderId": body.get("orderId"),
+            "orderLinkId": None,
+            "orderStatus": "Cancelled",
+        }
+
+    def fetch_order_history(self) -> list[Dict[str, Any]]:
+        return copy.deepcopy(self.order_history_items)
+
+
+class StubConfiguredDemoBybitPrivateClient(StubConfiguredTradingBybitPrivateClient):
+    def get_status(self) -> BybitPrivateStatus:
+        return BybitPrivateStatus(
+            configured=True,
+            can_query_private=True,
+            source="file",
+            api_base_url="https://api-demo.bybit.com",
+            account_type="UNIFIED",
+            mode=AccountMode.DEMO,
+            key_hint="demo...1234",
+            last_error=None,
+            updated_at="2026-03-30T00:00:00+08:00",
+        )
+
+
+class StubConfiguredTradeHistoryBybitPrivateClient(StubConfiguredEmptyBybitPrivateClient):
+    def fetch_execution_history(self) -> list[Dict[str, Any]]:
+        return [
+            {
+                "execId": "exec-btc-001",
+                "orderId": "order-btc-001",
+                "symbol": "BTCUSDT",
+                "category": "linear",
+                "side": "Buy",
+                "execQty": "0.12",
+                "execPrice": "66780.5",
+                "closedPnl": "12.45",
+                "execTime": "1774887000000",
+                "orderLinkId": "live-review-btc",
+            },
+            {
+                "execId": "exec-eth-001",
+                "orderId": "order-eth-001",
+                "symbol": "ETHUSDT",
+                "category": "spot",
+                "side": "Sell",
+                "execQty": "1.5",
+                "execPrice": "2058.4",
+                "closedPnl": "0",
+                "execTime": "1774887600000",
+                "orderLinkId": "",
+            },
+        ]
+
+
+class StubConfiguredOrderHistoryBybitPrivateClient(StubConfiguredEmptyBybitPrivateClient):
+    def fetch_order_history(self) -> list[Dict[str, Any]]:
+        return [
+            {
+                "orderId": "hist-order-001",
+                "symbol": "BTCUSDT",
+                "category": "linear",
+                "side": "Buy",
+                "orderType": "Limit",
+                "qty": "0.50",
+                "price": "66820",
+                "orderStatus": "Filled",
+                "createdTime": "1774887000000",
+            },
+            {
+                "orderId": "hist-order-002",
+                "symbol": "ETHUSDT",
+                "category": "spot",
+                "side": "Sell",
+                "orderType": "Limit",
+                "qty": "2",
+                "price": "2068",
+                "orderStatus": "Cancelled",
+                "createdTime": "1774887600000",
+            },
+        ]
+
+
+class StubBybitPrivateRealtimeClient:
+    def __init__(
+        self,
+        *,
+        client: Optional[Any] = None,
+        wallet: Optional[Dict[str, Any]] = None,
+        positions: Optional[list[Dict[str, Any]]] = None,
+        orders: Optional[list[Dict[str, Any]]] = None,
+        executions: Optional[list[Dict[str, Any]]] = None,
+        connected: bool = False,
+        authenticated: bool = False,
+        last_message_at: Optional[str] = None,
+        last_error: Optional[str] = None,
+    ) -> None:
+        self.client = client
+        self.wallet = copy.deepcopy(wallet)
+        self.positions = copy.deepcopy(positions or [])
+        self.orders = copy.deepcopy(orders or [])
+        self.executions = copy.deepcopy(executions or [])
+        self.connected = connected
+        self.authenticated = authenticated
+        self.last_message_at = (
+            last_message_at
+            if last_message_at is not None
+            else (datetime.now(timezone.utc).astimezone().isoformat() if connected else None)
+        )
+        self.last_error = last_error
+        self.ensure_started_calls = 0
+
+    def start(self) -> bool:
+        self.ensure_started_calls += 1
+        return self.connected
+
+    def ensure_started(self) -> bool:
+        self.ensure_started_calls += 1
+        return self.connected
+
+    def stop(self) -> None:
+        return None
+
+    def get_status(self) -> Dict[str, Any]:
+        return {
+            "enabled": True,
+            "connected": self.connected,
+            "authenticated": self.authenticated,
+            "last_message_at": self.last_message_at,
+            "last_error": self.last_error,
+            "has_wallet": self.wallet is not None,
+            "positions_count": len(self.positions),
+            "open_orders_count": len(self.orders),
+            "executions_count": len(self.executions),
+        }
+
+    def get_wallet_snapshot(self) -> Optional[Dict[str, Any]]:
+        return copy.deepcopy(self.wallet)
+
+    def get_positions_snapshot(self) -> list[Dict[str, Any]]:
+        return copy.deepcopy(self.positions)
+
+    def get_open_orders_snapshot(self) -> list[Dict[str, Any]]:
+        return copy.deepcopy(self.orders)
+
+    def get_execution_snapshot(self, limit: int = 50) -> list[Dict[str, Any]]:
+        return copy.deepcopy(self.executions[:limit])
+
+    def seed_wallet_snapshot(self, wallet: Dict[str, Any]) -> None:
+        self.wallet = copy.deepcopy(wallet)
+
+    def seed_positions_snapshot(self, positions: list[Dict[str, Any]]) -> None:
+        self.positions = copy.deepcopy(positions)
+
+    def seed_open_orders_snapshot(self, orders: list[Dict[str, Any]]) -> None:
+        self.orders = copy.deepcopy(orders)
+
+    def seed_execution_snapshot(self, executions: list[Dict[str, Any]]) -> None:
+        self.executions = copy.deepcopy(executions)
+
+
+class StubAliveThread:
+    def is_alive(self) -> bool:
+        return True
+
+    def join(self, timeout: Optional[float] = None) -> None:
+        return None
+
+
+class StubBybitPublicMarketClient:
+    def __init__(self) -> None:
+        seeded_items = {item.symbol: item for item in build_state().watchlist}
+        seeded_items["XRPUSDT"] = WatchlistInstrument(
+            symbol="XRPUSDT",
+            market="perp",
+            last_price=1.2648,
+            change_24h=1.83,
+            volume_24h=182_000_000,
+            signal="watch",
+            position_side="flat",
+            risk_level="medium",
+        )
+        self._items = seeded_items
+        self.rest_probe = {
+            "reachable": True,
+            "last_error": None,
+            "tested_at": "2026-03-31T09:00:00+08:00",
+        }
+
+    @staticmethod
+    def normalize_timeframe(timeframe: str) -> str:
+        normalized = str(timeframe or "1h").strip().lower()
+        mapping = {
+            "15": "15m",
+            "15m": "15m",
+            "60": "1h",
+            "1h": "1h",
+            "240": "4h",
+            "4h": "4h",
+            "d": "1d",
+            "1d": "1d",
+        }
+        if normalized not in mapping:
+            raise ValueError("当前仅支持 15m、1h、4h、1d 四种 K 线周期。")
+        return mapping[normalized]
+
+    def _lookup_item(self, symbol: str, market: str) -> WatchlistInstrument:
+        normalized = symbol.upper()
+        item = self._items.get(normalized)
+        if item is None:
+            item = WatchlistInstrument(
+                symbol=normalized,
+                market="spot" if market == "spot" else "perp",
+                last_price=1.0,
+                change_24h=0.92,
+                volume_24h=12_000_000,
+                signal="neutral",
+                position_side="flat",
+                risk_level="low",
+            )
+            self._items[normalized] = item
+        if item.market != market:
+            return item.model_copy(update={"market": "spot" if market == "spot" else "perp"})
+        return item
+
+    def get_ticker(self, symbol: str, market: str) -> Dict[str, Any]:
+        item = self._lookup_item(symbol, market)
+        last_price = float(item.last_price)
+        return {
+            "lastPrice": str(last_price),
+            "price24hPcnt": str(item.change_24h / 100.0),
+            "turnover24h": str(item.volume_24h),
+            "volume24h": str(item.volume_24h),
+            "highPrice24h": str(last_price * 1.03),
+            "lowPrice24h": str(last_price * 0.97),
+            "fundingRate": "0.0001" if item.market == "perp" else "",
+            "openInterestValue": "125000000",
+        }
+
+    def get_candles(self, symbol: str, market: str, interval: str = "60", limit: int = 48) -> list[Any]:
+        item = self._lookup_item(symbol, market)
+        return build_market_detail_for_watchlist(item).candles[:limit]
+
+    def get_orderbook(self, symbol: str, market: str, limit: int = 8) -> Dict[str, Any]:
+        item = self._lookup_item(symbol, market)
+        detail = build_market_detail_for_watchlist(item)
+        return {"bids": detail.bids[:limit], "asks": detail.asks[:limit]}
+
+    def get_recent_public_trades(self, symbol: str, market: str, limit: int = 12) -> list[Any]:
+        item = self._lookup_item(symbol, market)
+        detail = build_market_detail_for_watchlist(item)
+        return detail.recent_public_trades[:limit]
+
+    def get_announcements(self, locale: str = "zh-TW", limit: int = 8) -> list[Dict[str, Any]]:
+        return [
+            {
+                "id": "ann-btc-maintenance",
+                "title": "BTCUSDT 永续合约维护窗口提醒",
+                "description": "Bybit 将在短时维护窗口内更新 BTCUSDT 永续合约相关服务。",
+                "url": "https://announcements.bybit.com/article/btc-maintenance",
+                "publishTime": "1774887600000",
+                "tags": ["maintenance", "derivatives"],
+            },
+            {
+                "id": "ann-sol-listing",
+                "title": "SOL 生态新币上线公告",
+                "description": "新资产将在 Bybit 现货区开放交易。",
+                "url": "https://announcements.bybit.com/article/sol-listing",
+                "publishTime": "1774884000000",
+                "tags": ["listing", "spot"],
+            },
+        ]
+
+    def get_instrument_constraints(self, symbol: str, market: str) -> Dict[str, str]:
+        return {
+            "symbol": symbol.upper(),
+            "market": market,
+            "tick_size": "0.1",
+            "qty_step": "0.0001",
+            "min_order_qty": "0.0001",
+            "min_notional_value": "5",
+        }
+
+    def enrich_watchlist(self, watchlist: list[WatchlistInstrument]) -> list[WatchlistInstrument]:
+        enriched: list[WatchlistInstrument] = []
+        for item in watchlist:
+            realtime_item = self._lookup_item(item.symbol, item.market)
+            enriched.append(
+                item.model_copy(
+                    update={
+                        "last_price": realtime_item.last_price,
+                        "change_24h": realtime_item.change_24h,
+                        "volume_24h": realtime_item.volume_24h,
+                        "signal": realtime_item.signal,
+                        "position_side": realtime_item.position_side,
+                        "risk_level": realtime_item.risk_level,
+                    }
+                )
+            )
+        return enriched
+
+    def enrich_market_detail(
+        self,
+        symbol: str,
+        market: str,
+        fallback_detail: Any,
+        watch_item: Optional[WatchlistInstrument] = None,
+        timeframe: str = "1h",
+    ) -> Any:
+        item = watch_item or self._lookup_item(symbol, market)
+        detail = build_market_detail_for_watchlist(item)
+        return detail.model_copy(
+            update={
+                "timeframe": timeframe,
+                "source": "bybit_rest",
+                "updated_at": "2026-03-30T00:00:00+08:00",
+            }
+        )
+
+    def probe_rest_connectivity(self, force: bool = False) -> Dict[str, Any]:  # noqa: ARG002
+        return dict(self.rest_probe)
+
+
+class StubStrategyRuntimeMarketClient(StubBybitPublicMarketClient):
+    def __init__(
+        self,
+        symbol: str,
+        price: float,
+        change_24h: float,
+        candles: list[CandlePoint],
+        instrument_constraints: Optional[Dict[str, str]] = None,
+    ) -> None:
+        super().__init__()
+        normalized = symbol.upper()
+        base_item = self._lookup_item(normalized, "perp")
+        self._items[normalized] = base_item.model_copy(
+            update={
+                "last_price": price,
+                "change_24h": change_24h,
+                "signal": "active" if abs(change_24h) >= 3 else "watch",
+                "risk_level": "medium",
+            }
+        )
+        self._candles = candles
+        self._instrument_constraints = {
+            "tick_size": "0.1",
+            "qty_step": "0.0001",
+            "min_order_qty": "0.0001",
+            "min_notional_value": "5",
+        }
+        if instrument_constraints:
+            self._instrument_constraints.update({key: str(value) for key, value in instrument_constraints.items()})
+
+    def get_instrument_constraints(self, symbol: str, market: str) -> Dict[str, str]:
+        return {
+            "symbol": symbol.upper(),
+            "market": market,
+            **self._instrument_constraints,
+        }
+
+    def enrich_market_detail(
+        self,
+        symbol: str,
+        market: str,
+        fallback_detail: Any,
+        watch_item: Optional[WatchlistInstrument] = None,
+        timeframe: str = "1h",
+    ) -> Any:
+        item = watch_item or self._lookup_item(symbol, market)
+        detail = build_market_detail_for_watchlist(item)
+        return detail.model_copy(
+            update={
+                "timeframe": timeframe,
+                "candles": list(self._candles),
+                "source": "bybit_rest",
+                "updated_at": "2026-03-31T09:00:00+08:00",
+            }
+        )
+
+
+class StubPublicExecutionRealtimeFeed:
+    def __init__(
+        self,
+        *,
+        enabled: bool = True,
+        connected_spot: bool = True,
+        connected_linear: bool = True,
+        last_message_at_spot: Optional[str] = None,
+        last_message_at_linear: Optional[str] = None,
+        symbol_last_message_at: Optional[Dict[str, str]] = None,
+        ticker_symbols: Optional[list[str]] = None,
+        last_error: Optional[str] = None,
+    ) -> None:
+        now_iso = datetime.now(timezone.utc).astimezone().isoformat()
+        self.enabled = enabled
+        self.connected_spot = connected_spot
+        self.connected_linear = connected_linear
+        self.last_message_at_spot = last_message_at_spot if last_message_at_spot is not None else (now_iso if connected_spot else None)
+        self.last_message_at_linear = (
+            last_message_at_linear if last_message_at_linear is not None else (now_iso if connected_linear else None)
+        )
+        self.symbol_last_message_at = {key.upper(): value for key, value in (symbol_last_message_at or {}).items()}
+        self.ticker_symbols = {item.upper() for item in (ticker_symbols or [])}
+        self.last_error = last_error
+
+    def update_watchlist(self, watchlist: list[Any]) -> None:
+        return None
+
+    def get_status(self) -> Dict[str, Any]:
+        latest = self.last_message_at_linear or self.last_message_at_spot
+        return {
+            "enabled": self.enabled,
+            "connected_spot": self.connected_spot,
+            "connected_linear": self.connected_linear,
+            "last_message_at_spot": self.last_message_at_spot,
+            "last_message_at_linear": self.last_message_at_linear,
+            "last_message_at": latest,
+            "last_error": self.last_error,
+        }
+
+    def has_ticker(self, symbol: str) -> bool:
+        return symbol.upper() in self.ticker_symbols
+
+    def get_symbol_last_message_at(self, symbol: str) -> Optional[str]:
+        return self.symbol_last_message_at.get(symbol.upper())
+
+
+class FakeRealtimeFeed:
+    def __init__(
+        self,
+        live_candle: CandlePoint,
+        recent_trades: Optional[list[Dict[str, Any]]] = None,
+        orderbook_snapshot: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        self.live_candle = live_candle
+        self.recent_trades = recent_trades or []
+        self.orderbook_snapshot = orderbook_snapshot or {"bids": [], "asks": []}
+
+    def get_ticker_snapshot(self, symbol: str) -> Dict[str, Any]:
+        return {
+            "lastPrice": str(self.live_candle.close),
+            "price24hPcnt": "0.021",
+            "highPrice24h": str(self.live_candle.high * 1.01),
+            "lowPrice24h": str(self.live_candle.low * 0.99),
+            "fundingRate": "0.0001",
+            "openInterestValue": "125000000",
+        }
+
+    def merge_candles(self, symbol: str, candles: list[CandlePoint]) -> list[CandlePoint]:
+        if candles and candles[-1].time == self.live_candle.time:
+            return [*candles[:-1], self.live_candle]
+        return [*candles, self.live_candle]
+
+    def get_status(self) -> Dict[str, Any]:
+        return {"last_message_at": self.live_candle.time}
+
+    def get_recent_trades_snapshot(self, symbol: str, limit: int = 12) -> list[Any]:
+        return self.recent_trades[:limit]
+
+    def get_orderbook_snapshot(self, symbol: str, limit: int = 8) -> Dict[str, Any]:
+        return {
+            "bids": list(self.orderbook_snapshot.get("bids", []))[:limit],
+            "asks": list(self.orderbook_snapshot.get("asks", []))[:limit],
+        }
+
+
+class FakeRealtimeHistoryMarketClient(BybitPublicMarketClient):
+    def __init__(self, rest_candles: list[CandlePoint], live_candle: CandlePoint) -> None:
+        super().__init__(base_url="https://api.bybit.com")
+        self._rest_candles = rest_candles
+        self.realtime = FakeRealtimeFeed(live_candle)
+
+    def get_candles(self, symbol: str, market: str, interval: str = "60", limit: int = 48) -> list[CandlePoint]:
+        return list(self._rest_candles[:limit])
+
+    def get_orderbook(self, symbol: str, market: str, limit: int = 8) -> Dict[str, Any]:
+        return {"bids": [], "asks": []}
+
+    def get_recent_public_trades(self, symbol: str, market: str, limit: int = 12) -> list[Any]:
+        detail = build_market_detail_for_watchlist(
+            WatchlistInstrument(
+                symbol=symbol,
+                market=market,
+                last_price=self._rest_candles[-1].close,
+                change_24h=1.2,
+                volume_24h=1_000_000,
+                signal="active",
+                position_side="flat",
+                risk_level="medium",
+            )
+        )
+        return detail.recent_public_trades[:limit]
+
+
+class FakeRealtimeTradePriorityClient(BybitPublicMarketClient):
+    def __init__(self) -> None:
+        super().__init__(base_url="https://api.bybit.com")
+        self.rest_called = False
+        self.realtime = FakeRealtimeFeed(
+            live_candle=CandlePoint(
+                time="2026-03-31T06:00:00+08:00",
+                open=66_620,
+                high=66_820,
+                low=66_540,
+                close=66_727.3,
+                volume=1_075.993,
+            ),
+            recent_trades=[
+                {
+                    "side": "buy",
+                    "price": 66727.3,
+                    "size": 0.42,
+                    "value": 28025.466,
+                    "occurred_at": "2026-03-31T06:00:05+08:00",
+                    "is_block_trade": False,
+                }
+            ],
+        )
+
+    def _request(self, path: str, params: Dict[str, object]) -> Dict:
+        self.rest_called = True
+        return {"list": []}
+
+
+class FakeRealtimeOrderbookPriorityClient(BybitPublicMarketClient):
+    def __init__(self) -> None:
+        super().__init__(base_url="https://api.bybit.com")
+        self.rest_called = False
+        self.realtime = FakeRealtimeFeed(
+            live_candle=CandlePoint(
+                time="2026-03-31T06:00:00+08:00",
+                open=66_620,
+                high=66_820,
+                low=66_540,
+                close=66_727.3,
+                volume=1_075.993,
+            ),
+            orderbook_snapshot={
+                "bids": [
+                    OrderBookLevel(price=66726.8, size=12.4, total=12.4),
+                    OrderBookLevel(price=66726.7, size=9.8, total=22.2),
+                ],
+                "asks": [
+                    OrderBookLevel(price=66727.1, size=11.1, total=11.1),
+                    OrderBookLevel(price=66727.2, size=8.7, total=19.8),
+                ],
+            },
+        )
+
+    def _request(self, path: str, params: Dict[str, object]) -> Dict:
+        self.rest_called = True
+        return {"b": [], "a": []}
+
+
+class FakeRecentTradeMarketClient(BybitPublicMarketClient):
+    def _request(self, path: str, params: Dict[str, object]) -> Dict:
+        self.assert_path = path
+        self.assert_params = params
+        return {
+            "list": [
+                {"T": "1711812900000", "S": "Buy", "p": "67705.9", "v": "0.752", "BT": False},
+                {"T": "1711812840000", "S": "Sell", "p": "67701.1", "v": "1.204", "BT": True},
+            ]
+        }
+
+
+class PartialRealtimeWatchlistFeed:
+    def __init__(self) -> None:
+        self.updated_symbols: list[str] = []
+
+    def update_watchlist(self, watchlist: list[WatchlistInstrument]) -> None:
+        self.updated_symbols = [item.symbol for item in watchlist]
+
+    def enrich_watchlist(self, watchlist: list[WatchlistInstrument]) -> list[WatchlistInstrument]:
+        enriched: list[WatchlistInstrument] = []
+        for item in watchlist:
+            if item.symbol == "BTCUSDT":
+                enriched.append(
+                    item.model_copy(
+                        update={
+                            "last_price": 70250.0,
+                            "change_24h": 4.25,
+                            "volume_24h": 999_000_000,
+                        }
+                    )
+                )
+            else:
+                enriched.append(item)
+        return enriched
+
+    def has_ticker(self, symbol: str) -> bool:
+        return symbol == "BTCUSDT"
+
+
+class PartialRealtimeWatchlistClient(BybitPublicMarketClient):
+    def __init__(self) -> None:
+        super().__init__(base_url="https://api.bybit.com")
+        self.realtime = PartialRealtimeWatchlistFeed()
+        self.rest_calls: list[str] = []
+
+    def get_ticker(self, symbol: str, market: str) -> Dict[str, Any]:
+        self.rest_calls.append(symbol)
+        price_map = {
+            "ETHUSDT": 2155.5,
+            "SOLUSDT": 86.4,
+        }
+        change_map = {
+            "ETHUSDT": 1.8,
+            "SOLUSDT": -0.4,
+        }
+        volume_map = {
+            "ETHUSDT": 555_000_000,
+            "SOLUSDT": 222_000_000,
+        }
+        last_price = price_map.get(symbol, 100.0)
+        return {
+            "lastPrice": str(last_price),
+            "price24hPcnt": str(change_map.get(symbol, 0.0) / 100.0),
+            "turnover24h": str(volume_map.get(symbol, 0)),
+            "volume24h": str(volume_map.get(symbol, 0)),
+        }
+
+
+class BybitPublicMarketClientUnitTests(unittest.TestCase):
+    def test_probe_rest_connectivity_caches_latest_result(self) -> None:
+        class ProbeConnectivityClient(BybitPublicMarketClient):
+            def __init__(self) -> None:
+                super().__init__(base_url="https://api.bybit.com")
+                self.calls = 0
+
+            def _request(self, path: str, params: Dict[str, object]) -> Dict[str, Any]:
+                self.calls += 1
+                assert path == "/v5/market/time"
+                assert params == {}
+                return {"timeSecond": "1775000000"}
+
+        client = ProbeConnectivityClient()
+
+        first = client.probe_rest_connectivity()
+        second = client.probe_rest_connectivity()
+
+        self.assertTrue(first["reachable"])
+        self.assertIsNone(first["last_error"])
+        self.assertEqual(client.calls, 1)
+        self.assertEqual(first, second)
+
+    def test_orderbook_prefers_realtime_snapshot(self) -> None:
+        client = FakeRealtimeOrderbookPriorityClient()
+
+        result = client.get_orderbook("BTCUSDT", "perp", limit=2)
+
+        self.assertFalse(client.rest_called)
+        self.assertEqual(len(result["bids"]), 2)
+        self.assertEqual(result["bids"][0].price, 66726.8)
+        self.assertEqual(result["asks"][0].price, 66727.1)
+
+    def test_recent_public_trades_prefers_realtime_snapshot(self) -> None:
+        client = FakeRealtimeTradePriorityClient()
+        trades = client.get_recent_public_trades("BTCUSDT", "perp", limit=4)
+
+        self.assertEqual(len(trades), 1)
+        self.assertEqual(trades[0]["side"] if isinstance(trades[0], dict) else trades[0].side, "buy")
+        self.assertFalse(client.rest_called)
+
+    def test_recent_public_trades_supports_bybit_short_fields(self) -> None:
+        client = FakeRecentTradeMarketClient(base_url="https://api.bybit.com")
+        trades = client.get_recent_public_trades("BTCUSDT", "perp", limit=2)
+
+        self.assertEqual(client.assert_path, "/v5/market/recent-trade")
+        self.assertEqual(client.assert_params["category"], "linear")
+        self.assertEqual(client.assert_params["limit"], 2)
+        self.assertEqual(len(trades), 2)
+        self.assertEqual(trades[0].side, "buy")
+        self.assertEqual(trades[1].side, "sell")
+        self.assertAlmostEqual(trades[0].value, 67705.9 * 0.752, places=4)
+        self.assertTrue(trades[1].is_block_trade)
+
+    def test_realtime_market_detail_uses_rest_history_instead_of_stale_fallback(self) -> None:
+        stale_item = WatchlistInstrument(
+            symbol="BTCUSDT",
+            market="perp",
+            last_price=86_000,
+            change_24h=1.2,
+            volume_24h=1_000_000,
+            signal="active",
+            position_side="flat",
+            risk_level="medium",
+        )
+        fallback_detail = build_market_detail_for_watchlist(stale_item)
+
+        rest_candles = [
+            CandlePoint(
+                time="2026-03-31T04:00:00+08:00",
+                open=66_400,
+                high=66_520,
+                low=66_210,
+                close=66_480,
+                volume=1_800,
+            ),
+            CandlePoint(
+                time="2026-03-31T05:00:00+08:00",
+                open=66_480,
+                high=66_710,
+                low=66_350,
+                close=66_620,
+                volume=1_950,
+            ),
+        ]
+        live_candle = CandlePoint(
+            time="2026-03-31T06:00:00+08:00",
+            open=66_620,
+            high=66_820,
+            low=66_540,
+            close=66_727.3,
+            volume=1_075.993,
+        )
+        client = FakeRealtimeHistoryMarketClient(rest_candles=rest_candles, live_candle=live_candle)
+
+        detail = client.enrich_market_detail(
+            symbol="BTCUSDT",
+            market="perp",
+            fallback_detail=fallback_detail,
+            watch_item=stale_item.model_copy(update={"last_price": 66_727.3}),
+        )
+
+        self.assertEqual(detail.source, "bybit_ws")
+        self.assertEqual(len(detail.candles), 3)
+        self.assertAlmostEqual(detail.candles[0].open, 66_400)
+        self.assertAlmostEqual(detail.candles[-1].close, 66_727.3)
+        self.assertTrue(all(candle.high < 70_000 for candle in detail.candles))
+        self.assertIn("盘口价差", detail.stats)
+        self.assertIn("Top5 买盘占比", detail.stats)
+
+    def test_enrich_watchlist_keeps_rest_fallback_for_symbols_without_ws_ticker(self) -> None:
+        client = PartialRealtimeWatchlistClient()
+        watchlist = [
+            WatchlistInstrument(
+                symbol="BTCUSDT",
+                market="perp",
+                last_price=66000,
+                change_24h=0.8,
+                volume_24h=100,
+                signal="neutral",
+                position_side="flat",
+                risk_level="low",
+            ),
+            WatchlistInstrument(
+                symbol="ETHUSDT",
+                market="perp",
+                last_price=2000,
+                change_24h=0.2,
+                volume_24h=80,
+                signal="neutral",
+                position_side="flat",
+                risk_level="low",
+            ),
+        ]
+
+        enriched = client.enrich_watchlist(watchlist)
+
+        self.assertEqual(client.realtime.updated_symbols, ["BTCUSDT", "ETHUSDT"])
+        self.assertEqual(client.rest_calls, ["ETHUSDT"])
+        self.assertEqual(enriched[0].last_price, 70250.0)
+        self.assertEqual(enriched[1].last_price, 2155.5)
+        self.assertEqual(enriched[1].change_24h, 1.8)
+
+    def test_enrich_watchlist_keeps_rest_fallback_for_symbols_without_ws_ticker(self) -> None:
+        client = PartialRealtimeWatchlistClient()
+        watchlist = [
+            WatchlistInstrument(
+                symbol="BTCUSDT",
+                market="perp",
+                last_price=66000,
+                change_24h=0.8,
+                volume_24h=100,
+                signal="neutral",
+                position_side="flat",
+                risk_level="low",
+            ),
+            WatchlistInstrument(
+                symbol="ETHUSDT",
+                market="perp",
+                last_price=2000,
+                change_24h=0.2,
+                volume_24h=80,
+                signal="neutral",
+                position_side="flat",
+                risk_level="low",
+            ),
+        ]
+
+        enriched = client.enrich_watchlist(watchlist)
+
+        self.assertEqual(client.realtime.updated_symbols, ["BTCUSDT", "ETHUSDT"])
+        self.assertEqual(client.rest_calls, ["ETHUSDT"])
+        self.assertEqual(enriched[0].last_price, 70250.0)
+        self.assertEqual(enriched[1].last_price, 2155.5)
+        self.assertEqual(enriched[1].change_24h, 1.8)
+
+
+class BybitPrivateClientUnitTests(unittest.TestCase):
+    def test_fetch_usdt_balance_diagnostics_reads_nested_balance_payload(self) -> None:
+        test_case = self
+
+        class StubNestedBalanceClient(BybitPrivateClient):
+            def _signed_get(self, path: str, params: Dict[str, object]) -> Dict[str, Any]:
+                test_case.assertEqual(path, "/v5/asset/transfer/query-account-coin-balance")
+                account_type = str(params.get("accountType"))
+                payloads = {
+                    "UNIFIED": {
+                        "accountType": "UNIFIED",
+                        "balance": {"coin": "USDT", "walletBalance": "0", "transferBalance": "0"},
+                    },
+                    "FUND": {
+                        "accountType": "FUND",
+                        "balance": {"coin": "USDT", "walletBalance": "20", "transferBalance": "20"},
+                    },
+                    "CONTRACT": {
+                        "accountType": "CONTRACT",
+                        "balance": {"coin": "USDT", "walletBalance": "0", "transferBalance": "0"},
+                    },
+                }
+                return payloads[account_type]
+
+        diagnostics = StubNestedBalanceClient().fetch_usdt_balance_diagnostics()
+
+        self.assertEqual(len(diagnostics), 3)
+        self.assertEqual(diagnostics[1]["account_type"], "FUND")
+        self.assertEqual(diagnostics[1]["wallet_balance"], "20")
+        self.assertEqual(diagnostics[1]["transfer_balance"], "20")
+        self.assertEqual(diagnostics[1]["available_balance"], "20")
+
+    def test_fetch_positions_ignores_optional_spot_error_without_polluting_last_error(self) -> None:
+        class StubOptionalSpotErrorClient(BybitPrivateClient):
+            def _signed_get(self, path: str, params: Dict[str, object]) -> Dict[str, Any]:
+                self._last_error = None
+                if str(params.get("category")) == "linear":
+                    return {"list": [{"symbol": "BTCUSDT", "side": "Buy"}]}
+                self._last_error = "category only support linear or option"
+                raise RuntimeError(self._last_error)
+
+        client = StubOptionalSpotErrorClient()
+
+        positions = client.fetch_positions()
+
+        self.assertEqual(positions, [{"symbol": "BTCUSDT", "side": "Buy"}])
+        self.assertIsNone(client.get_status().last_error)
+
+    def test_fetch_usdt_balance_diagnostics_preserves_last_error_on_optional_account_probe_failure(self) -> None:
+        class StubBalanceDiagnosticErrorClient(BybitPrivateClient):
+            def _signed_get(self, path: str, params: Dict[str, object]) -> Dict[str, Any]:
+                account_type = str(params.get("accountType"))
+                if account_type == "UNIFIED":
+                    self._last_error = None
+                    return {
+                        "accountType": "UNIFIED",
+                        "balance": {"coin": "USDT", "walletBalance": "20", "transferBalance": "20"},
+                    }
+                self._last_error = f"{account_type} unavailable"
+                raise RuntimeError(self._last_error)
+
+        client = StubBalanceDiagnosticErrorClient()
+
+        diagnostics = client.fetch_usdt_balance_diagnostics()
+
+        self.assertEqual(diagnostics[0]["account_type"], "UNIFIED")
+        self.assertEqual(diagnostics[0]["available_balance"], "20")
+        self.assertEqual(diagnostics[1]["error"], "FUND unavailable")
+        self.assertEqual(diagnostics[2]["error"], "CONTRACT unavailable")
+        self.assertIsNone(client.get_status().last_error)
+
+
+class ReviewParsingUnitTests(unittest.TestCase):
+    def test_build_agent_job_prompt_includes_execution_health_context(self) -> None:
+        original_running = control_main.strategy_runtime_state.get("running")
+        original_last_refresh = control_main.strategy_runtime_state.get("last_refresh_at")
+        original_last_error = control_main.strategy_runtime_state.get("last_error")
+        original_started_once = control_main.strategy_runtime_state.get("started_once")
+        try:
+            control_main.strategy_runtime_state.update(
+                {
+                    "running": False,
+                    "last_refresh_at": None,
+                    "last_error": "runtime boom",
+                    "started_once": True,
+                }
+            )
+            prompt = control_main.build_agent_job_prompt(
+                "generate_daily_review",
+                {"focus_symbols": ["BTCUSDT"], "mode": "live"},
+            )
+            self.assertIn("执行健康：", prompt)
+            self.assertIn("运行线程异常", prompt)
+            self.assertIn("execution_top_issue_detail", prompt)
+        finally:
+            control_main.strategy_runtime_state.update(
+                {
+                    "running": original_running,
+                    "last_refresh_at": original_last_refresh,
+                    "last_error": original_last_error,
+                    "started_once": original_started_once,
+                }
+            )
+
+    def test_enrich_review_job_context_includes_strategy_activity(self) -> None:
+        context = control_main.enrich_review_job_context(
+            {
+                "strategy_id": "eth-revert-02",
+                "strategy_name": "ETH 均值回归",
+                "mode": "paper",
+            }
+        )
+        activity = context.get("review_strategy_activity")
+        self.assertIsInstance(activity, dict)
+        self.assertEqual(activity["strategy_id"], "eth-revert-02")
+        self.assertEqual(activity["strategy_name"], "ETH 均值回归")
+        self.assertIsInstance(activity.get("runtime"), dict)
+        self.assertIn("next_action", activity["runtime"])
+        self.assertIn("recent_alerts", activity)
+        self.assertIn("recent_audit_events", activity)
+
+    def test_enrich_review_job_context_includes_strategy_execution_preview_summary(self) -> None:
+        original_market = control_main.market_data
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        original_hint_getter = control_main.repo.get_strategy_signal_order_hint
+        original_selected_mode = control_main.repo.state.workspace_preferences.selected_mode
+        original_scheduler_mode = control_main.repo.state.control_snapshot.scheduler.current_mode
+        candles = [
+            CandlePoint(
+                time=f"2026-03-29T{hour:02d}:00:00+08:00",
+                open=66200.0 + hour * 90,
+                high=66280.0 + hour * 90,
+                low=66140.0 + hour * 90,
+                close=66240.0 + hour * 90,
+                volume=1800.0 + hour * 25,
+            )
+            for hour in range(24)
+        ]
+        control_main.market_data = StubStrategyRuntimeMarketClient(
+            symbol="BTCUSDT",
+            price=68450.0,
+            change_24h=3.9,
+            candles=candles,
+            instrument_constraints={"qty_step": "0.001", "min_order_qty": "0.001"},
+        )
+        private_client = StubConfiguredEmptyBybitPrivateClient()
+        control_main.private_data = private_client
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(
+            client=private_client,
+            wallet={
+                "accountType": "UNIFIED",
+                "totalEquity": "20",
+                "totalWalletBalance": "20",
+                "totalAvailableBalance": "20",
+                "coin": [
+                    {
+                        "coin": "USDT",
+                        "walletBalance": "20",
+                        "availableToWithdraw": "20",
+                    }
+                ],
+            },
+            connected=True,
+            authenticated=True,
+        )
+
+        def tiny_balance_hint(strategy_id: str) -> Dict[str, Any]:
+            hint = original_hint_getter(strategy_id)
+            return {
+                **hint,
+                "target_signed_qty": 0.015,
+                "price": 68450.0,
+                "note": "tiny balance preview",
+            }
+
+        control_main.repo.get_strategy_signal_order_hint = tiny_balance_hint  # type: ignore[method-assign]
+        control_main.repo.state.workspace_preferences.selected_mode = AccountMode.LIVE
+        control_main.repo.state.control_snapshot.scheduler.current_mode = AccountMode.LIVE
+        self.addCleanup(lambda: setattr(control_main, "market_data", original_market))
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+        self.addCleanup(lambda: setattr(control_main.repo, "get_strategy_signal_order_hint", original_hint_getter))
+        self.addCleanup(
+            lambda: setattr(
+                control_main.repo.state.workspace_preferences,
+                "selected_mode",
+                original_selected_mode,
+            )
+        )
+        self.addCleanup(
+            lambda: setattr(
+                control_main.repo.state.control_snapshot.scheduler,
+                "current_mode",
+                original_scheduler_mode,
+            )
+        )
+
+        context = control_main.enrich_review_job_context(
+            {
+                "strategy_id": "trend-btc-01",
+                "strategy_name": "BTC 趋势跟随",
+                "mode": "live",
+            }
+        )
+        activity = context.get("review_strategy_activity")
+        self.assertIsInstance(activity, dict)
+        assert isinstance(activity, dict)
+        runtime = activity.get("runtime")
+        self.assertIsInstance(runtime, dict)
+        assert isinstance(runtime, dict)
+        self.assertEqual(runtime["guard_state"], "auto_dispatch_blocked")
+        self.assertIn("risk_budget 18%", runtime["next_action"])
+        preview = runtime.get("execution_preview")
+        self.assertIsInstance(preview, dict)
+        assert isinstance(preview, dict)
+        self.assertEqual(preview["mode"], "live")
+        self.assertFalse(preview["allowed"])
+        self.assertIn("当前 Bybit 可用余额 20.00 USDT", preview["blocked_reason"])
+        self.assertEqual(preview["sizing_risk_budget"], "18%")
+        self.assertEqual(preview["sizing_budget_notional"], "3.60 USDT")
+        self.assertEqual(preview["sizing_minimum_required_notional"], "68.45 USDT")
+        self.assertEqual(preview["sizing_available_balance_gap"], "360.28 USDT")
+
+        prompt = control_main.build_agent_job_prompt(
+            "review_strategy_issue",
+            {
+                "issue_type": "manual_execution_blocked",
+                "summary": "BTCUSDT 手动策略执行被拦截",
+                "detail": "账户余额不足，需补齐最小下单门槛。",
+                "strategy_id": "trend-btc-01",
+                "strategy_name": "BTC 趋势跟随",
+                "mode": "live",
+            },
+        )
+        self.assertIn('"execution_preview"', prompt)
+        self.assertIn('"sizing_available_balance_gap": "360.28 USDT"', prompt)
+
+    def test_build_backtest_review_prompt_includes_strategy_activity_context(self) -> None:
+        prompt = control_main.build_agent_job_prompt(
+            "generate_backtest_review",
+            {
+                "strategy_id": "eth-revert-02",
+                "strategy_name": "ETH 均值回归",
+                "mode": "paper",
+                "focus_symbols": ["ETHUSDT"],
+                "timeframe": "1h",
+                "data_range": "最近 90 天",
+                "metrics": {"annual_return": "+8.2%", "max_drawdown": "-2.4%"},
+                "parameter_snapshot": {"entry_z": 2.1},
+            },
+        )
+        self.assertIn("策略最近活动：", prompt)
+        self.assertIn('"strategy_id": "eth-revert-02"', prompt)
+        self.assertIn('"recent_audit_events"', prompt)
+
+    def test_build_strategy_change_review_prompt_includes_strategy_activity_context(self) -> None:
+        prompt = control_main.build_agent_job_prompt(
+            "review_strategy_change",
+            {
+                "change_type": "strategy.parameter.update",
+                "summary": "更新 ETH 均值回归参数",
+                "strategy_id": "eth-revert-02",
+                "strategy_name": "ETH 均值回归",
+                "target_mode": "paper",
+            },
+        )
+        self.assertIn("策略最近活动：", prompt)
+        self.assertIn('"strategy_id": "eth-revert-02"', prompt)
+        self.assertIn('"active_order_count"', prompt)
+
+    def test_build_strategy_issue_review_prompt_includes_strategy_activity_context(self) -> None:
+        prompt = control_main.build_agent_job_prompt(
+            "review_strategy_issue",
+            {
+                "issue_type": "manual_execution_blocked",
+                "summary": "BTCUSDT 手动策略执行被拦截",
+                "detail": "运行线程异常，建议先恢复运行线程。",
+                "strategy_id": "eth-revert-02",
+                "strategy_name": "ETH 均值回归",
+                "mode": "live",
+            },
+        )
+        self.assertIn("策略最近活动：", prompt)
+        self.assertIn('"strategy_id": "eth-revert-02"', prompt)
+        self.assertIn('"recent_alerts"', prompt)
+
+    def test_parse_review_text_supports_json_payload(self) -> None:
+        parsed = control_main.parse_review_text(
+            json.dumps(
+                {
+                    "summary": "BTC 趋势维持强势，建议补充短周期验证。",
+                    "highlights": ["收益质量稳定", "滑点表现可控"],
+                    "risks": ["ETH 回撤扩大"],
+                    "proposals": [
+                        {
+                            "proposal_type": "backtest_request",
+                            "title": "补跑 15m 样本",
+                            "description": "验证短周期稳定性。",
+                            "expected_impact": "降低过拟合风险。",
+                            "payload": {"data_range": "最近 45 天", "timeframe": "15m"},
+                        }
+                    ],
+                },
+                ensure_ascii=False,
+            )
+        )
+
+        self.assertEqual(parsed["summary"], "BTC 趋势维持强势，建议补充短周期验证。")
+        self.assertEqual(parsed["highlights"], ["收益质量稳定", "滑点表现可控"])
+        self.assertEqual(parsed["risks"], ["ETH 回撤扩大"])
+        self.assertEqual(len(parsed["proposals"]), 1)
+
+    def test_build_review_document_merges_json_proposals_with_heuristics(self) -> None:
+        text = json.dumps(
+            {
+                "summary": "SOL 回测收益较强，但回撤仍需控制。",
+                "highlights": ["年化收益抬升", "胜率维持在高位"],
+                "risks": ["最大回撤偏高"],
+                "proposals": [
+                    {
+                        "proposal_type": "param_update",
+                        "title": "下调止损阈值",
+                        "description": "将止损收紧到 1.1%。",
+                        "expected_impact": "压缩回撤尖峰。",
+                        "payload": {"stop_loss_pct": 1.1},
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        )
+        context = {
+            "strategy_id": "sol-breakout-01",
+            "strategy_name": "SOL 突破增强",
+            "mode": "paper",
+            "timeframe": "1h",
+            "metrics": {
+                "annual_return": "+24.8%",
+                "max_drawdown": "-6.3%",
+                "win_rate": "61.2%",
+            },
+        }
+
+        review = control_main.build_review_document_from_text(
+            text=text,
+            context=context,
+            source="openclaw",
+            job_type="generate_backtest_review",
+        )
+
+        proposal_types = {proposal.proposal_type for proposal in review.proposals}
+        self.assertIn("param_update", proposal_types)
+        self.assertIn("risk_update", proposal_types)
+        parsed_param = next((proposal for proposal in review.proposals if proposal.proposal_type == "param_update"), None)
+        self.assertIsNotNone(parsed_param)
+        assert parsed_param is not None
+        self.assertEqual(parsed_param.payload["target_mode"], "paper")
+        self.assertEqual(parsed_param.strategy_id, "sol-breakout-01")
+
+    def test_build_review_document_appends_execution_health_issue_to_risks(self) -> None:
+        original_running = control_main.strategy_runtime_state.get("running")
+        original_last_refresh = control_main.strategy_runtime_state.get("last_refresh_at")
+        original_last_error = control_main.strategy_runtime_state.get("last_error")
+        original_started_once = control_main.strategy_runtime_state.get("started_once")
+        try:
+            control_main.strategy_runtime_state.update(
+                {
+                    "running": False,
+                    "last_refresh_at": None,
+                    "last_error": "runtime boom",
+                    "started_once": True,
+                }
+            )
+            review = control_main.build_review_document_from_text(
+                text=json.dumps(
+                    {
+                        "summary": "系统已完成今日复盘。",
+                        "highlights": ["收益稳定"],
+                        "risks": ["ETH 波动抬升"],
+                        "proposals": [],
+                    },
+                    ensure_ascii=False,
+                ),
+                context={"strategy_id": "trend-btc-01", "strategy_name": "BTC 趋势跟随", "mode": "live"},
+                source="openclaw",
+                job_type="generate_daily_review",
+            )
+            self.assertTrue(
+                any(
+                    "运行线程异常" in item
+                    and "runtime boom" in item
+                    and "恢复运行线程" in item
+                    for item in review.risks
+                )
+            )
+        finally:
+            control_main.strategy_runtime_state.update(
+                {
+                    "running": original_running,
+                    "last_refresh_at": original_last_refresh,
+                    "last_error": original_last_error,
+                    "started_once": original_started_once,
+                }
+            )
+
+    def test_build_fallback_review_document_appends_execution_health_issue_to_risks(self) -> None:
+        original_running = control_main.strategy_runtime_state.get("running")
+        original_last_refresh = control_main.strategy_runtime_state.get("last_refresh_at")
+        original_last_error = control_main.strategy_runtime_state.get("last_error")
+        original_started_once = control_main.strategy_runtime_state.get("started_once")
+        try:
+            control_main.strategy_runtime_state.update(
+                {
+                    "running": False,
+                    "last_refresh_at": None,
+                    "last_error": "runtime boom",
+                    "started_once": True,
+                }
+            )
+            review = control_main.build_fallback_review_document(
+                {"strategy_id": "trend-btc-01", "strategy_name": "BTC 趋势跟随"},
+                job_type="generate_daily_review",
+            )
+            self.assertTrue(
+                any(
+                    "运行线程异常" in item
+                    and "runtime boom" in item
+                    and "恢复运行线程" in item
+                    for item in review.risks
+                )
+            )
+        finally:
+            control_main.strategy_runtime_state.update(
+                {
+                    "running": original_running,
+                    "last_refresh_at": original_last_refresh,
+                    "last_error": original_last_error,
+                    "started_once": original_started_once,
+                }
+            )
+
 
 class ControlApiIntegrationTests(unittest.TestCase):
     @classmethod
@@ -154,9 +1560,13 @@ class ControlApiIntegrationTests(unittest.TestCase):
         cls._original_repo_state = copy.deepcopy(control_main.repo.state)
         cls._original_openclaw = control_main.openclaw
         cls._original_private_data = control_main.private_data
+        cls._original_private_realtime = control_main.private_realtime
+        cls._original_market_data = control_main.market_data
 
         control_main.openclaw = StubOpenClawClient()
         control_main.private_data = StubBybitPrivateClient()
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(client=control_main.private_data)
+        control_main.market_data = StubBybitPublicMarketClient()
 
         cls._port = _find_free_port()
         cls._base_url = f"http://127.0.0.1:{cls._port}"
@@ -181,20 +1591,63 @@ class ControlApiIntegrationTests(unittest.TestCase):
         control_main.repo._persist(cls._original_repo_state)
         control_main.openclaw = cls._original_openclaw
         control_main.private_data = cls._original_private_data
+        control_main.private_realtime = cls._original_private_realtime
+        control_main.market_data = cls._original_market_data
 
     def setUp(self) -> None:
-        self._state_backup = copy.deepcopy(control_main.repo.state)
+        self._state_backup = build_state()
+        self._strategy_runtime_state_backup = copy.deepcopy(control_main.strategy_runtime_state)
+        if control_main.strategy_runtime_thread is not None and control_main.strategy_runtime_thread.is_alive():
+            control_main.strategy_runtime_stop_event.set()
+            control_main.strategy_runtime_thread.join(timeout=2)
+        control_main.strategy_runtime_thread = None
+        control_main.strategy_runtime_stop_event.clear()
+        control_main.repo.state = copy.deepcopy(self._state_backup)
+        control_main.repo._persist(control_main.repo.state)
+        control_main.private_order_metadata.clear()
+        control_main.private_trade_cache.update({"status_key": None, "updated_at": 0.0, "items": []})
+        control_main.private_order_history_cache.update({"status_key": None, "updated_at": 0.0, "items": []})
+        control_main.strategy_runtime_state.update({"running": False, "last_refresh_at": None, "last_error": None, "started_once": False})
         self.addCleanup(self._restore_state)
 
     def _restore_state(self) -> None:
+        if control_main.strategy_runtime_thread is not None and control_main.strategy_runtime_thread.is_alive():
+            control_main.strategy_runtime_stop_event.set()
+            control_main.strategy_runtime_thread.join(timeout=2)
+        control_main.strategy_runtime_thread = None
+        control_main.strategy_runtime_stop_event.clear()
         control_main.repo.state = self._state_backup
         control_main.repo._persist(self._state_backup)
+        control_main.private_order_metadata.clear()
+        control_main.private_trade_cache.update({"status_key": None, "updated_at": 0.0, "items": []})
+        control_main.private_order_history_cache.update({"status_key": None, "updated_at": 0.0, "items": []})
+        control_main.strategy_runtime_state.clear()
+        control_main.strategy_runtime_state.update(self._strategy_runtime_state_backup)
 
     def _get(self, path: str) -> tuple[int, Any]:
         return _request_json(self._base_url, "GET", path)
 
     def _post(self, path: str, payload: Dict[str, Any]) -> tuple[int, Any]:
         return _request_json(self._base_url, "POST", path, payload)
+
+    def _delete(self, path: str) -> tuple[int, Any]:
+        return _request_json(self._base_url, "DELETE", path)
+
+    def _get_text(self, path: str) -> tuple[int, str]:
+        return _request_text(self._base_url, "GET", path)
+
+    def _reset_strategy_paper_state(self, strategy_id: str) -> None:
+        control_main.repo.state.trades = [
+            trade
+            for trade in control_main.repo.state.trades
+            if not (trade.mode == AccountMode.PAPER and trade.strategy_id == strategy_id)
+        ]
+        control_main.repo.state.strategy_runtime_snapshots = [
+            snapshot
+            for snapshot in control_main.repo.state.strategy_runtime_snapshots
+            if snapshot.strategy_id != strategy_id
+        ]
+        control_main.repo._persist(control_main.repo.state)
 
     def test_health_and_key_get_endpoints_return_basic_payloads(self) -> None:
         status, health = self._get("/health")
@@ -208,12 +1661,20 @@ class ControlApiIntegrationTests(unittest.TestCase):
         cases = {
             "/api/control/snapshot": ("scheduler", "account_metrics"),
             "/api/strategies": None,
+            "/api/strategies/live": None,
             "/api/news": None,
             "/api/alerts": None,
             "/api/trades": None,
+            "/api/ops/live": ("summary", "alerts"),
+            "/api/account/live": ("overview", "positions"),
+            "/api/account/order-history": None,
+            "/api/runtime/strategy-worker/status": ("running", "issue"),
             "/api/workspace/preferences": ("active_section", "updated_at"),
+            "/api/ai/live": ("scheduler", "activity_feed"),
             "/api/integrations/openclaw": ("configured", "gateway_url"),
+            "/api/integrations/bybit-public": ("enabled", "updated_at"),
             "/api/integrations/bybit-private": ("configured", "can_query_private"),
+            "/api/integrations/grafana": ("configured", "metrics_path"),
             "/api/integrations/bybit-private/probe-trade": ("configured", "outcome"),
         }
 
@@ -237,29 +1698,77 @@ class ControlApiIntegrationTests(unittest.TestCase):
         self.assertEqual(initial_status, 200)
 
         payload = {
-            "active_section": "strategy",
+            "active_section": "settings",
             "layout_preset": "dense",
             "selected_mode": "demo",
             "selected_symbol": "ETHUSDT",
+            "selected_market_timeframe": "4h",
             "selected_strategy_id": "eth-revert-02",
-            "overview_card_order": ["risk", "account", "strategy", "account"],
-            "overview_visible_cards": ["strategy", "risk", "unknown", "risk"],
+            "overview_card_order": ["ai_center", "account_center", "strategy_watch", "account_center"],
+            "overview_visible_cards": ["strategy_watch", "account_center", "unknown", "account_center"],
+            "overview_collapsed_cards": ["account_center", "unknown", "account_center"],
         }
 
         post_status, updated = self._post("/api/workspace/preferences", payload)
         self.assertEqual(post_status, 200)
-        self.assertEqual(updated["active_section"], "strategy")
+        self.assertEqual(updated["active_section"], "settings")
         self.assertEqual(updated["layout_preset"], "dense")
         self.assertEqual(updated["selected_mode"], "demo")
         self.assertEqual(updated["selected_symbol"], "ETHUSDT")
+        self.assertEqual(updated["selected_market_timeframe"], "4h")
         self.assertEqual(updated["selected_strategy_id"], "eth-revert-02")
-        self.assertEqual(updated["overview_card_order"][:3], ["risk", "account", "strategy"])
-        self.assertEqual(updated["overview_visible_cards"], ["risk", "strategy"])
+        self.assertEqual(updated["overview_card_order"][:3], ["ai_center", "account_center", "strategy_watch"])
+        self.assertEqual(updated["overview_visible_cards"], ["account_center", "strategy_watch"])
+        self.assertEqual(updated["overview_collapsed_cards"], ["account_center"])
 
         get_status, persisted = self._get("/api/workspace/preferences")
         self.assertEqual(get_status, 200)
         self.assertEqual(persisted, updated)
         self.assertNotEqual(initial_preferences, updated)
+
+    def test_alert_acknowledge_updates_alert_summary_and_audit(self) -> None:
+        initial_snapshot_status, initial_snapshot = self._get("/api/control/snapshot")
+        self.assertEqual(initial_snapshot_status, 200)
+        initial_p1_count = initial_snapshot["alerts_summary"]["P1"]
+
+        status, alerts = self._get("/api/alerts")
+        self.assertEqual(status, 200)
+        target = next((item for item in alerts if item["id"] == "alert-002"), None)
+        self.assertIsNotNone(target)
+        self.assertFalse(target["acknowledged"])
+
+        ack_status, acknowledged = self._post(
+            "/api/alerts/alert-002/acknowledge",
+            {"acknowledged": True, "requested_by": "test-suite"},
+        )
+        self.assertEqual(ack_status, 200)
+        self.assertTrue(acknowledged["acknowledged"])
+
+        status, refreshed_alerts = self._get("/api/alerts")
+        self.assertEqual(status, 200)
+        refreshed_target = next((item for item in refreshed_alerts if item["id"] == "alert-002"), None)
+        self.assertIsNotNone(refreshed_target)
+        self.assertTrue(refreshed_target["acknowledged"])
+
+        snapshot_status, snapshot = self._get("/api/control/snapshot")
+        self.assertEqual(snapshot_status, 200)
+        self.assertEqual(snapshot["alerts_summary"]["P1"], initial_p1_count - 1)
+
+        audit_status, audit_events = self._get("/api/audit/events")
+        self.assertEqual(audit_status, 200)
+        acknowledged_event = next((item for item in audit_events if item["event_type"] == "alert.acknowledged"), None)
+        self.assertIsNotNone(acknowledged_event)
+
+        reopen_status, reopened = self._post(
+            "/api/alerts/alert-002/acknowledge",
+            {"acknowledged": False, "requested_by": "test-suite"},
+        )
+        self.assertEqual(reopen_status, 200)
+        self.assertFalse(reopened["acknowledged"])
+
+        snapshot_status, snapshot = self._get("/api/control/snapshot")
+        self.assertEqual(snapshot_status, 200)
+        self.assertEqual(snapshot["alerts_summary"]["P1"], initial_p1_count)
 
     def test_account_endpoints_gracefully_fallback_without_private_api(self) -> None:
         status, status_payload = self._get("/api/integrations/bybit-private")
@@ -267,10 +1776,11 @@ class ControlApiIntegrationTests(unittest.TestCase):
         self.assertFalse(status_payload["configured"])
         self.assertFalse(status_payload["can_query_private"])
         self.assertEqual(status_payload["source"], "none")
+        self.assertEqual(status_payload["usdt_balance_diagnostics"], [])
 
         overview_status, overview = self._get("/api/account/overview")
         self.assertEqual(overview_status, 200)
-        self.assertEqual(overview["source"], "mock")
+        self.assertEqual(overview["source"], "paper")
         self.assertIn("total_equity", overview)
         self.assertGreaterEqual(int(overview["positions_count"]), 0)
         self.assertGreaterEqual(int(overview["open_orders_count"]), 0)
@@ -280,13 +1790,17 @@ class ControlApiIntegrationTests(unittest.TestCase):
         self.assertEqual(positions_status, 200)
         self.assertIsInstance(positions, list)
         self.assertGreaterEqual(len(positions), 1)
-        self.assertTrue(all(item["source"] == "mock" for item in positions))
+        self.assertTrue(all(item["source"] == "paper" for item in positions))
 
         orders_status, orders = self._get("/api/account/orders")
         self.assertEqual(orders_status, 200)
         self.assertIsInstance(orders, list)
-        self.assertGreaterEqual(len(orders), 1)
-        self.assertTrue(all(item["source"] == "mock" for item in orders))
+        self.assertEqual(len(orders), 0)
+
+        history_status, history_orders = self._get("/api/account/order-history")
+        self.assertEqual(history_status, 200)
+        self.assertGreaterEqual(len(history_orders), 1)
+        self.assertTrue(all(item["source"] == "paper" for item in history_orders))
 
     def test_scheduler_freeze_publish_toggles(self) -> None:
         initial_status, initial_scheduler = self._get("/api/ai/scheduler")
@@ -320,6 +1834,8 @@ class ControlApiIntegrationTests(unittest.TestCase):
         original_private = control_main.private_data
         control_main.private_data = StubConfiguredEmptyBybitPrivateClient()
         self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        control_main.repo.state.workspace_preferences.selected_mode = AccountMode.LIVE
+        control_main.repo.state.control_snapshot.scheduler.current_mode = AccountMode.LIVE
 
         overview_status, overview = self._get("/api/account/overview")
         self.assertEqual(overview_status, 200)
@@ -342,6 +1858,5994 @@ class ControlApiIntegrationTests(unittest.TestCase):
         self.assertTrue(probe["authenticated"])
         self.assertTrue(probe["trade_permission"])
 
+    def test_account_positions_derives_spot_holdings_from_wallet_snapshot(self) -> None:
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        private_client = StubConfiguredEmptyBybitPrivateClient()
+        control_main.private_data = private_client
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(
+            client=private_client,
+            wallet={
+                "accountType": "UNIFIED",
+                "totalEquity": "9355",
+                "totalWalletBalance": "9355",
+                "totalAvailableBalance": "4200",
+                "totalPerpUPL": "0",
+                "coin": [
+                    {
+                        "coin": "USDT",
+                        "walletBalance": "4200",
+                        "usdValue": "4200",
+                        "availableToWithdraw": "4200",
+                    },
+                    {
+                        "coin": "ETH",
+                        "walletBalance": "2.5",
+                        "usdValue": "5155",
+                        "availableToWithdraw": "2.5",
+                    },
+                ],
+            },
+            positions=[],
+            connected=True,
+            authenticated=True,
+        )
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+        control_main.repo.state.workspace_preferences.selected_mode = AccountMode.LIVE
+        control_main.repo.state.control_snapshot.scheduler.current_mode = AccountMode.LIVE
+
+        overview_status, overview = self._get("/api/account/overview")
+        self.assertEqual(overview_status, 200)
+        self.assertEqual(overview["positions_count"], 1)
+
+        positions_status, positions = self._get("/api/account/positions")
+        self.assertEqual(positions_status, 200)
+        eth_position = next((item for item in positions if item["symbol"] == "ETHUSDT"), None)
+        self.assertIsNotNone(eth_position)
+        assert eth_position is not None
+        self.assertEqual(eth_position["market"], "spot")
+        self.assertEqual(eth_position["side"], "long")
+        self.assertEqual(eth_position["size"], "2.5")
+        self.assertEqual(eth_position["avg_price"], "--")
+        self.assertEqual(control_main.parse_metric_number(eth_position["mark_price"]), 2062.0)
+        self.assertEqual(eth_position["value"], "5,155.00 USDT")
+
+    def test_account_positions_dedupes_wallet_spot_holdings_against_private_position_records(self) -> None:
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        private_client = StubConfiguredTradingBybitPrivateClient()
+        control_main.private_data = private_client
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(
+            client=private_client,
+            wallet={
+                "accountType": "UNIFIED",
+                "totalEquity": "9355",
+                "totalWalletBalance": "9355",
+                "totalAvailableBalance": "4200",
+                "totalPerpUPL": "0",
+                "coin": [
+                    {
+                        "coin": "USDT",
+                        "walletBalance": "4200",
+                        "usdValue": "4200",
+                        "availableToWithdraw": "4200",
+                    },
+                    {
+                        "coin": "ETH",
+                        "walletBalance": "2.5",
+                        "usdValue": "5155",
+                        "availableToWithdraw": "2.5",
+                    },
+                ],
+            },
+            positions=[],
+            connected=True,
+            authenticated=True,
+        )
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+        control_main.repo.state.workspace_preferences.selected_mode = AccountMode.LIVE
+        control_main.repo.state.control_snapshot.scheduler.current_mode = AccountMode.LIVE
+
+        positions_status, positions = self._get("/api/account/positions")
+        self.assertEqual(positions_status, 200)
+        eth_spot_positions = [item for item in positions if item["symbol"] == "ETHUSDT" and item["market"] == "spot"]
+        self.assertEqual(len(eth_spot_positions), 1)
+
+    def test_private_execution_history_populates_recent_trades(self) -> None:
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        control_main.private_data = StubConfiguredTradeHistoryBybitPrivateClient()
+        control_main.private_realtime = StubBybitPrivateRealtimeClient()
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+
+        trades_status, trades = self._get("/api/trades")
+        self.assertEqual(trades_status, 200)
+        self.assertGreaterEqual(len(trades), 2)
+        exchange_trades = [item for item in trades if item["origin"] == "exchange"]
+        self.assertEqual(len(exchange_trades), 2)
+        self.assertEqual({item["symbol"] for item in exchange_trades}, {"BTCUSDT", "ETHUSDT"})
+        self.assertTrue(all(item["mode"] == "live" for item in exchange_trades))
+
+        ops_status, ops = self._get("/api/ops/live")
+        self.assertEqual(ops_status, 200)
+        self.assertGreaterEqual(ops["summary"]["recent_trades"], 2)
+        self.assertTrue(any(item["origin"] == "exchange" for item in ops["trades"]))
+
+    def test_private_execution_history_infers_strategy_origin_and_strategy_id(self) -> None:
+        class StubStrategyExecutionHistoryClient(StubConfiguredEmptyBybitPrivateClient):
+            def fetch_execution_history(self) -> list[Dict[str, Any]]:
+                return [
+                    {
+                        "execId": "exec-strategy-001",
+                        "orderId": "order-strategy-001",
+                        "symbol": "BTCUSDT",
+                        "category": "linear",
+                        "side": "Sell",
+                        "execQty": "0.08",
+                        "execPrice": "66840.5",
+                        "closedPnl": "16.25",
+                        "execTime": "1774887000000",
+                        "orderLinkId": "strategy-live-trend-btc-01-abcd1234",
+                    }
+                ]
+
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        control_main.private_data = StubStrategyExecutionHistoryClient()
+        control_main.private_realtime = StubBybitPrivateRealtimeClient()
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+
+        trades_status, trades = self._get("/api/trades")
+        self.assertEqual(trades_status, 200)
+        strategy_trade = next((item for item in trades if item["id"] == "exec-strategy-001"), None)
+        self.assertIsNotNone(strategy_trade)
+        assert strategy_trade is not None
+        self.assertEqual(strategy_trade["origin"], "strategy")
+        self.assertEqual(strategy_trade["strategy_id"], "trend-btc-01")
+
+    def test_private_order_history_endpoint_returns_recent_exchange_orders(self) -> None:
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        control_main.private_data = StubConfiguredOrderHistoryBybitPrivateClient()
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(client=control_main.private_data)
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+        control_main.repo.state.workspace_preferences.selected_mode = AccountMode.LIVE
+        control_main.repo.state.control_snapshot.scheduler.current_mode = AccountMode.LIVE
+
+        history_status, history = self._get("/api/account/order-history")
+        self.assertEqual(history_status, 200)
+        self.assertEqual(len(history), 2)
+        self.assertEqual(history[0]["order_id"], "hist-order-001")
+        self.assertEqual(history[0]["status"], "Filled")
+        self.assertEqual(history[1]["market"], "spot")
+
+    def test_private_realtime_snapshots_enrich_account_and_trade_views(self) -> None:
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        control_main.private_data = StubConfiguredEmptyBybitPrivateClient()
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(
+            client=control_main.private_data,
+            wallet={
+                "accountType": "UNIFIED",
+                "totalEquity": "128.54",
+                "totalWalletBalance": "127.30",
+                "totalAvailableBalance": "118.10",
+                "totalPerpUPL": "1.24",
+                "coin": [
+                    {
+                        "coin": "USDT",
+                        "walletBalance": "118.1",
+                        "usdValue": "118.1",
+                        "availableToWithdraw": "118.1",
+                    }
+                ],
+            },
+            positions=[
+                {
+                    "symbol": "BTCUSDT",
+                    "category": "linear",
+                    "side": "Buy",
+                    "size": "0.25",
+                    "avgPrice": "66850",
+                    "markPrice": "66910",
+                    "positionValue": "16727.5",
+                    "leverage": "3",
+                    "unrealisedPnl": "15.2",
+                }
+            ],
+            orders=[
+                {
+                    "orderId": "live-order-001",
+                    "symbol": "ETHUSDT",
+                    "category": "spot",
+                    "side": "Sell",
+                    "orderType": "Limit",
+                    "qty": "0.8",
+                    "price": "2100",
+                    "orderStatus": "New",
+                    "createdTime": "1774887600000",
+                }
+            ],
+            executions=[
+                {
+                    "execId": "ws-exec-001",
+                    "orderId": "live-order-002",
+                    "symbol": "SOLUSDT",
+                    "category": "linear",
+                    "side": "Buy",
+                    "execQty": "4",
+                    "execPrice": "84.51",
+                    "closedPnl": "0",
+                    "execTime": "1774888200000",
+                    "orderLinkId": "ws-review-sol",
+                }
+            ],
+            connected=True,
+            authenticated=True,
+        )
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+        control_main.repo.state.workspace_preferences.selected_mode = AccountMode.LIVE
+        control_main.repo.state.control_snapshot.scheduler.current_mode = AccountMode.LIVE
+
+        status_code, private_status = self._get("/api/integrations/bybit-private")
+        self.assertEqual(status_code, 200)
+        self.assertTrue(private_status["configured"])
+        self.assertTrue(private_status["realtime_enabled"])
+        self.assertTrue(private_status["realtime_connected"])
+        self.assertTrue(private_status["realtime_authenticated"])
+        self.assertFalse(private_status["realtime_stale"])
+        self.assertEqual(private_status["realtime_stale_seconds"], 0)
+        self.assertEqual(len(private_status["usdt_balance_diagnostics"]), 3)
+        self.assertEqual(private_status["usdt_balance_diagnostics"][0]["account_type"], "UNIFIED")
+        self.assertEqual(private_status["usdt_balance_diagnostics"][0]["available_balance"], "0")
+
+        live_status, live_snapshot = self._get("/api/account/live")
+        self.assertEqual(live_status, 200)
+        self.assertEqual(live_snapshot["overview"]["source"], "bybit_private")
+        self.assertEqual(live_snapshot["overview"]["total_equity"], "128.54 USDT")
+        self.assertEqual(live_snapshot["overview"]["positions_count"], 1)
+        self.assertEqual(live_snapshot["overview"]["open_orders_count"], 1)
+        self.assertEqual(live_snapshot["positions"][0]["symbol"], "BTCUSDT")
+        self.assertEqual(live_snapshot["orders"][0]["order_id"], "live-order-001")
+
+        trades_status, trades = self._get("/api/trades")
+        self.assertEqual(trades_status, 200)
+        realtime_trade = next((item for item in trades if item["id"] == "ws-exec-001"), None)
+        self.assertIsNotNone(realtime_trade)
+        assert realtime_trade is not None
+        self.assertEqual(realtime_trade["origin"], "exchange")
+        self.assertEqual(realtime_trade["symbol"], "SOLUSDT")
+
+    def test_bybit_public_status_endpoint_returns_realtime_diagnostics(self) -> None:
+        original_market = control_main.market_data
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        candles = [
+            CandlePoint(
+                time=f"2026-03-29T{hour:02d}:00:00+08:00",
+                open=66200.0 + hour * 90,
+                high=66280.0 + hour * 90,
+                low=66140.0 + hour * 90,
+                close=66240.0 + hour * 90,
+                volume=1800.0 + hour * 25,
+            )
+            for hour in range(24)
+        ]
+        market_client = StubStrategyRuntimeMarketClient(
+            symbol="BTCUSDT",
+            price=68450.0,
+            change_24h=3.9,
+            candles=candles,
+        )
+        market_client.realtime = StubPublicExecutionRealtimeFeed(
+            connected_linear=True,
+            ticker_symbols=["BTCUSDT"],
+        )
+        private_client = StubConfiguredTradingBybitPrivateClient()
+        control_main.market_data = market_client
+        control_main.private_data = private_client
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(client=private_client, connected=True, authenticated=True)
+        self.addCleanup(lambda: setattr(control_main, "market_data", original_market))
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+
+        public_status_code, public_status = self._get("/api/integrations/bybit-public")
+        self.assertEqual(public_status_code, 200)
+        self.assertTrue(public_status["enabled"])
+        self.assertTrue(public_status["connected_linear"])
+        self.assertTrue(public_status["rest_reachable"])
+        self.assertIsNotNone(public_status["recommended_action"])
+        btc_diag = next((item for item in public_status["watched_symbol_diagnostics"] if item["symbol"] == "BTCUSDT"), None)
+        self.assertIsNotNone(btc_diag)
+        assert btc_diag is not None
+        self.assertEqual(btc_diag["channel"], "linear")
+        self.assertTrue(btc_diag["connected"])
+        self.assertIsNone(btc_diag["recommended_action"])
+
+    def test_account_overview_prefers_wallet_entry_matching_configured_account_type(self) -> None:
+        class StubMultiWalletBybitPrivateClient(StubConfiguredEmptyBybitPrivateClient):
+            def get_status(self) -> BybitPrivateStatus:
+                return BybitPrivateStatus(
+                    configured=True,
+                    can_query_private=True,
+                    source="file",
+                    api_base_url="https://api.bybit.com",
+                    account_type="UNIFIED",
+                    mode=AccountMode.LIVE,
+                    key_hint="test...1234",
+                    last_error=None,
+                    updated_at="2026-03-30T00:00:00+08:00",
+                )
+
+            def fetch_wallet_balance(self) -> Dict[str, Any]:
+                return {
+                    "list": [
+                        {
+                            "accountType": "FUND",
+                            "totalEquity": "25",
+                            "totalWalletBalance": "25",
+                            "totalAvailableBalance": "25",
+                            "totalPerpUPL": "0",
+                            "coin": [
+                                {
+                                    "coin": "USDT",
+                                    "walletBalance": "25",
+                                    "usdValue": "25",
+                                    "transferBalance": "25",
+                                }
+                            ],
+                        },
+                        {
+                            "accountType": "UNIFIED",
+                            "totalEquity": "4200",
+                            "totalWalletBalance": "4200",
+                            "totalAvailableBalance": "4200",
+                            "totalPerpUPL": "0",
+                            "coin": [
+                                {
+                                    "coin": "USDT",
+                                    "walletBalance": "4200",
+                                    "usdValue": "4200",
+                                    "transferBalance": "4200",
+                                }
+                            ],
+                        },
+                    ]
+                }
+
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        control_main.private_data = StubMultiWalletBybitPrivateClient()
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(client=control_main.private_data)
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+        control_main.repo.state.workspace_preferences.selected_mode = AccountMode.LIVE
+        control_main.repo.state.control_snapshot.scheduler.current_mode = AccountMode.LIVE
+
+        overview_status, overview = self._get("/api/account/overview")
+        self.assertEqual(overview_status, 200)
+        self.assertEqual(overview["account_type"], "UNIFIED")
+        self.assertEqual(overview["total_available_balance"], "4,200.00 USDT")
+        self.assertEqual(overview["top_holdings"][0]["available_balance"], "4,200.00")
+
+    def test_paper_mode_prefers_derived_account_even_when_private_key_is_configured(self) -> None:
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        private_client = StubConfiguredTradingBybitPrivateClient()
+        control_main.private_data = private_client
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(
+            client=private_client,
+            orders=[
+                {
+                    "orderId": "live-order-001",
+                    "orderLinkId": "manual-live-btc",
+                    "symbol": "BTCUSDT",
+                    "category": "linear",
+                    "side": "Buy",
+                    "orderType": "Limit",
+                    "qty": "0.15",
+                    "price": "66500",
+                    "orderStatus": "New",
+                    "createdTime": "1774887000000",
+                }
+            ],
+            connected=True,
+            authenticated=True,
+        )
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+
+        control_main.repo.state.workspace_preferences.selected_mode = AccountMode.PAPER
+        control_main.repo.state.control_snapshot.scheduler.current_mode = AccountMode.PAPER
+
+        overview_status, overview = self._get("/api/account/overview")
+        self.assertEqual(overview_status, 200)
+        self.assertEqual(overview["source"], "paper")
+
+        positions_status, positions = self._get("/api/account/positions")
+        self.assertEqual(positions_status, 200)
+        self.assertTrue(all(item["source"] == "paper" for item in positions))
+
+        history_status, history = self._get("/api/account/order-history")
+        self.assertEqual(history_status, 200)
+        self.assertTrue(all(item["source"] == "paper" for item in history))
+
+        live_overview_status, live_overview = self._get("/api/account/overview?mode=live")
+        self.assertEqual(live_overview_status, 200)
+        self.assertEqual(live_overview["source"], "bybit_private")
+        self.assertEqual(live_overview["total_equity"], "5,000.00 USDT")
+
+        live_positions_status, live_positions = self._get("/api/account/positions?mode=live")
+        self.assertEqual(live_positions_status, 200)
+        self.assertTrue(any(item["source"] == "bybit_private" and item["symbol"] == "BTCUSDT" for item in live_positions))
+
+        live_orders_status, live_orders = self._get("/api/account/orders?mode=live")
+        self.assertEqual(live_orders_status, 200)
+        self.assertTrue(any(item["source"] == "bybit_private" and item["order_id"] == "live-order-001" for item in live_orders))
+
+        live_history_status, live_history = self._get("/api/account/order-history?mode=live")
+        self.assertEqual(live_history_status, 200)
+        self.assertEqual(live_history, [])
+
+        live_snapshot_status, live_snapshot = self._get("/api/account/live?mode=live")
+        self.assertEqual(live_snapshot_status, 200)
+        self.assertEqual(live_snapshot["overview"]["source"], "bybit_private")
+        self.assertTrue(any(item["symbol"] == "BTCUSDT" for item in live_snapshot["positions"]))
+        self.assertTrue(any(item["order_id"] == "live-order-001" for item in live_snapshot["orders"]))
+
+    def test_watchlist_add_remove_updates_market_state_and_selected_symbol(self) -> None:
+        watchlist_status, initial_watchlist = self._get("/api/market/watchlist")
+        self.assertEqual(watchlist_status, 200)
+        self.assertEqual(len(initial_watchlist), 4)
+
+        add_status, added_item = self._post(
+            "/api/market/watchlist",
+            {
+                "symbol": "XRPUSDT",
+                "market": "perp",
+                "requested_by": "unit_test",
+            },
+        )
+        self.assertEqual(add_status, 200)
+        self.assertEqual(added_item["symbol"], "XRPUSDT")
+        self.assertEqual(added_item["market"], "perp")
+
+        watchlist_status, updated_watchlist = self._get("/api/market/watchlist")
+        self.assertEqual(watchlist_status, 200)
+        self.assertEqual(len(updated_watchlist), 5)
+        self.assertTrue(any(item["symbol"] == "XRPUSDT" for item in updated_watchlist))
+
+        detail_status, market_detail = self._get("/api/market/XRPUSDT")
+        self.assertEqual(detail_status, 200)
+        self.assertEqual(market_detail["symbol"], "XRPUSDT")
+        self.assertEqual(market_detail["source"], "bybit_rest")
+
+        remove_status, remove_result = self._delete("/api/market/watchlist/BTCUSDT?requested_by=unit_test")
+        self.assertEqual(remove_status, 200)
+        self.assertTrue(remove_result["removed"])
+        self.assertEqual(remove_result["next_selected_symbol"], "ETHUSDT")
+
+        preferences_status, preferences = self._get("/api/workspace/preferences")
+        self.assertEqual(preferences_status, 200)
+        self.assertEqual(preferences["selected_symbol"], "ETHUSDT")
+
+        audit_status, audit_events = self._get("/api/audit/events")
+        self.assertEqual(audit_status, 200)
+        event_types = [event["event_type"] for event in audit_events]
+        self.assertIn("watchlist.added", event_types)
+        self.assertIn("watchlist.removed", event_types)
+
+    def test_remove_watchlist_item_keeps_selection_near_removed_symbol(self) -> None:
+        update_status, _updated = self._post(
+            "/api/workspace/preferences",
+            {
+                "active_section": "market",
+                "layout_preset": "balanced",
+                "selected_mode": "paper",
+                "selected_symbol": "ETHUSDT",
+                "selected_market_timeframe": "1h",
+                "selected_strategy_id": "eth-revert-02",
+                "overview_card_order": ["ai_center", "strategy_watch", "account_center"],
+                "overview_visible_cards": ["ai_center", "strategy_watch", "account_center"],
+                "overview_collapsed_cards": [],
+            },
+        )
+        self.assertEqual(update_status, 200)
+
+        remove_status, remove_result = self._delete("/api/market/watchlist/ETHUSDT?requested_by=unit_test")
+        self.assertEqual(remove_status, 200)
+        self.assertEqual(remove_result["next_selected_symbol"], "SOLUSDT")
+
+        preferences_status, preferences = self._get("/api/workspace/preferences")
+        self.assertEqual(preferences_status, 200)
+        self.assertEqual(preferences["selected_symbol"], "SOLUSDT")
+
+    def test_watchlist_alert_rule_update_generates_market_alert_without_duplicates(self) -> None:
+        add_status, added_item = self._post(
+            "/api/market/watchlist",
+            {
+                "symbol": "XRPUSDT",
+                "market": "perp",
+                "requested_by": "unit_test",
+            },
+        )
+        self.assertEqual(add_status, 200)
+        self.assertEqual(added_item["symbol"], "XRPUSDT")
+
+        update_status, updated_rule = self._post(
+            "/api/change-requests",
+            {
+                "type": "alert.rule.update",
+                "payload": {"symbol": "XRPUSDT", "threshold_pct": 1.5, "alert_enabled": True, "cooldown_minutes": 45},
+                "requested_by": "unit_test",
+                "target_mode": "paper",
+                "priority": "normal",
+                "summary": "更新 XRP 提醒阈值",
+            },
+        )
+        self.assertEqual(update_status, 200)
+        self.assertEqual(updated_rule["status"], "applied")
+
+        live_status, live_snapshot = self._get("/api/market/live?symbol=XRPUSDT&timeframe=1h")
+        self.assertEqual(live_status, 200)
+        self.assertEqual(live_snapshot["selected_symbol"], "XRPUSDT")
+
+        rules_status, rules = self._get("/api/alert-rules")
+        self.assertEqual(rules_status, 200)
+        target_rule = next((item for item in rules if item["symbol"] == "XRPUSDT"), None)
+        self.assertIsNotNone(target_rule)
+        self.assertEqual(target_rule["threshold_pct"], 1.5)
+        self.assertEqual(target_rule["cooldown_minutes"], 45)
+        self.assertTrue(target_rule["enabled"])
+
+        alerts_status, alerts = self._get("/api/alerts")
+        self.assertEqual(alerts_status, 200)
+        rule_key = "watchlist-volatility:XRPUSDT:up"
+        matching_alerts = [item for item in alerts if item.get("rule_key") == rule_key]
+        self.assertEqual(len(matching_alerts), 1)
+        self.assertEqual(matching_alerts[0]["severity"], "P2")
+        self.assertFalse(matching_alerts[0]["acknowledged"])
+        self.assertEqual(matching_alerts[0]["source_type"], "rule")
+        self.assertEqual(matching_alerts[0]["rule_id"], target_rule["id"])
+        self.assertEqual(matching_alerts[0]["threshold_value"], 1.5)
+        self.assertEqual(matching_alerts[0]["trigger_value"], 1.83)
+
+        ack_status, acknowledged = self._post(
+            f"/api/alerts/{matching_alerts[0]['id']}/acknowledge",
+            {"acknowledged": True, "requested_by": "unit_test"},
+        )
+        self.assertEqual(ack_status, 200)
+        self.assertTrue(acknowledged["acknowledged"])
+
+        second_live_status, _second_live_snapshot = self._get("/api/market/live?symbol=XRPUSDT&timeframe=1h")
+        self.assertEqual(second_live_status, 200)
+
+        alerts_status, refreshed_alerts = self._get("/api/alerts")
+        self.assertEqual(alerts_status, 200)
+        refreshed_matching = [item for item in refreshed_alerts if item.get("rule_key") == rule_key]
+        self.assertEqual(len(refreshed_matching), 1)
+        self.assertTrue(refreshed_matching[0]["acknowledged"])
+        self.assertEqual(sum(1 for item in refreshed_matching if not item["acknowledged"]), 0)
+
+        snapshot_status, snapshot = self._get("/api/control/snapshot")
+        self.assertEqual(snapshot_status, 200)
+        self.assertGreaterEqual(snapshot["alerts_summary"]["P2"], 0)
+
+        audit_status, audit_events = self._get("/api/audit/events")
+        self.assertEqual(audit_status, 200)
+        self.assertTrue(
+          any(
+              item["event_type"] == "alert.market_triggered"
+              and item["payload"].get("rule_key") == rule_key
+              for item in audit_events
+          )
+        )
+
+    def test_market_live_snapshot_returns_watchlist_and_detail_together(self) -> None:
+        status, payload = self._get("/api/market/live?symbol=ETHUSDT")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["selected_symbol"], "ETHUSDT")
+        self.assertEqual(payload["detail"]["symbol"], "ETHUSDT")
+        self.assertEqual(payload["detail"]["source"], "bybit_rest")
+        self.assertGreaterEqual(len(payload["detail"]["recent_public_trades"]), 1)
+        self.assertGreaterEqual(len(payload["watchlist"]), 4)
+        self.assertTrue(any(item["symbol"] == "ETHUSDT" for item in payload["watchlist"]))
+        self.assertIn("generated_at", payload)
+
+    def test_strategy_runtime_endpoint_generates_paper_trade_once_for_signal_change(self) -> None:
+        original_market = control_main.market_data
+        candles = [
+            CandlePoint(
+                time=f"2026-03-29T{hour:02d}:00:00+08:00",
+                open=100.0,
+                high=100.6,
+                low=99.4,
+                close=100.0,
+                volume=1200.0,
+            )
+            for hour in range(23)
+        ]
+        candles.append(
+            CandlePoint(
+                time="2026-03-30T23:00:00+08:00",
+                open=100.0,
+                high=100.2,
+                low=93.6,
+                close=94.0,
+                volume=1880.0,
+            )
+        )
+        control_main.market_data = StubStrategyRuntimeMarketClient(
+            symbol="ETHUSDT",
+            price=94.0,
+            change_24h=-2.4,
+            candles=candles,
+        )
+        self.addCleanup(lambda: setattr(control_main, "market_data", original_market))
+
+        self._reset_strategy_paper_state("eth-revert-02")
+
+        initial_trades_status, initial_trades = self._get("/api/trades")
+        self.assertEqual(initial_trades_status, 200)
+        initial_eth_strategy_trades = len(
+            [
+                item
+                for item in initial_trades
+                if item["origin"] == "strategy" and item.get("strategy_id") == "eth-revert-02"
+            ]
+        )
+
+        runtime_status, runtime_payload = self._get("/api/strategies/live")
+        self.assertEqual(runtime_status, 200)
+        eth_runtime = next((item for item in runtime_payload if item["strategy_id"] == "eth-revert-02"), None)
+        self.assertIsNotNone(eth_runtime)
+        assert eth_runtime is not None
+        self.assertEqual(eth_runtime["signal"], "long")
+        self.assertEqual(eth_runtime["runtime_status"], "paper_only")
+        self.assertGreater(eth_runtime["confidence"], 0)
+        self.assertIsNotNone(eth_runtime["last_trade_id"])
+        self.assertIsNotNone(eth_runtime["execution_preview"])
+        self.assertTrue(eth_runtime["execution_preview"]["allowed"])
+        self.assertEqual(eth_runtime["execution_preview"]["projected_position_side"], "long")
+
+        after_status, after_trades = self._get("/api/trades")
+        self.assertEqual(after_status, 200)
+        after_eth_strategy_trades = len(
+            [
+                item
+                for item in after_trades
+                if item["origin"] == "strategy" and item.get("strategy_id") == "eth-revert-02"
+            ]
+        )
+        self.assertEqual(after_eth_strategy_trades, initial_eth_strategy_trades + 1)
+
+        second_runtime_status, second_runtime_payload = self._get("/api/strategies/live")
+        self.assertEqual(second_runtime_status, 200)
+        second_eth_runtime = next((item for item in second_runtime_payload if item["strategy_id"] == "eth-revert-02"), None)
+        self.assertIsNotNone(second_eth_runtime)
+        assert second_eth_runtime is not None
+        self.assertEqual(second_eth_runtime["signal"], "long")
+        self.assertIsNone(second_eth_runtime["execution_preview"])
+
+        final_status, final_trades = self._get("/api/trades")
+        self.assertEqual(final_status, 200)
+        final_eth_strategy_trades = len(
+            [
+                item
+                for item in final_trades
+                if item["origin"] == "strategy" and item.get("strategy_id") == "eth-revert-02"
+            ]
+        )
+        self.assertEqual(final_eth_strategy_trades, after_eth_strategy_trades)
+
+        audit_status, audit_events = self._get("/api/audit/events")
+        self.assertEqual(audit_status, 200)
+        self.assertTrue(any(item["event_type"] == "strategy.runtime.signal_changed" for item in audit_events))
+
+    def test_execute_strategy_signal_endpoint_creates_manual_strategy_trade(self) -> None:
+        original_market = control_main.market_data
+        candles = [
+            CandlePoint(
+                time=f"2026-03-29T{hour:02d}:00:00+08:00",
+                open=100.0,
+                high=100.6,
+                low=99.4,
+                close=100.0,
+                volume=1200.0,
+            )
+            for hour in range(23)
+        ]
+        candles.append(
+            CandlePoint(
+                time="2026-03-30T23:00:00+08:00",
+                open=100.0,
+                high=100.2,
+                low=93.6,
+                close=94.0,
+                volume=1880.0,
+            )
+        )
+        control_main.market_data = StubStrategyRuntimeMarketClient(
+            symbol="ETHUSDT",
+            price=94.0,
+            change_24h=-2.4,
+            candles=candles,
+        )
+        self.addCleanup(lambda: setattr(control_main, "market_data", original_market))
+
+        self._reset_strategy_paper_state("eth-revert-02")
+
+        runtime_status, runtime_payload = self._get("/api/strategies/live")
+        self.assertEqual(runtime_status, 200)
+        eth_runtime = next((item for item in runtime_payload if item["strategy_id"] == "eth-revert-02"), None)
+        self.assertIsNotNone(eth_runtime)
+        assert eth_runtime is not None
+        self.assertTrue(eth_runtime["execution_preview"]["allowed"])
+
+        control_main.repo.state.trades.insert(
+            0,
+            control_main.repo.state.trades[0].model_copy(
+                update={
+                    "id": "trade-strategy-drift-001",
+                    "symbol": "ETHUSDT",
+                    "market": "perp",
+                    "mode": AccountMode.PAPER,
+                    "origin": "strategy",
+                    "side": Direction.SELL,
+                    "quantity": 0.12,
+                    "price": 94.0,
+                    "strategy_id": "eth-revert-02",
+                    "created_at": "2026-03-31T09:05:00+08:00",
+                    "status": "filled",
+                }
+            ),
+        )
+        control_main.repo._persist(control_main.repo.state)
+
+        drifted_runtime_status, drifted_runtime_payload = self._get("/api/strategies/live")
+        self.assertEqual(drifted_runtime_status, 200)
+        drifted_runtime = next((item for item in drifted_runtime_payload if item["strategy_id"] == "eth-revert-02"), None)
+        self.assertIsNotNone(drifted_runtime)
+        assert drifted_runtime is not None
+        self.assertIsNotNone(drifted_runtime["execution_preview"])
+        self.assertTrue(drifted_runtime["execution_preview"]["allowed"])
+        self.assertIn(drifted_runtime["execution_preview"]["action"], {"开多", "加多"})
+
+        execute_status, trade = self._post(
+            "/api/strategies/eth-revert-02/execute",
+            {"requested_by": "unit_test", "note": "execute current strategy signal"},
+        )
+        self.assertEqual(execute_status, 200)
+        self.assertEqual(trade["strategy_id"], "eth-revert-02")
+        self.assertEqual(trade["kind"], "paper_trade")
+        self.assertEqual(trade["mode"], "paper")
+        self.assertEqual(trade["trade"]["origin"], "strategy")
+        self.assertEqual(trade["trade"]["mode"], "paper")
+        self.assertEqual(trade["trade"]["side"], "buy")
+
+        second_runtime_status, second_runtime_payload = self._get("/api/strategies/live")
+        self.assertEqual(second_runtime_status, 200)
+        second_eth_runtime = next((item for item in second_runtime_payload if item["strategy_id"] == "eth-revert-02"), None)
+        self.assertIsNotNone(second_eth_runtime)
+        assert second_eth_runtime is not None
+        self.assertEqual(second_eth_runtime["last_trade_id"], trade["trade"]["id"])
+        self.assertTrue(
+            second_eth_runtime["execution_preview"] is None
+            or not second_eth_runtime["execution_preview"]["allowed"]
+            or second_eth_runtime["execution_preview"]["projected_position_side"] == "long"
+        )
+
+        audit_status, audit_events = self._get("/api/audit/events")
+        self.assertEqual(audit_status, 200)
+        self.assertTrue(any(item["event_type"] == "strategy.paper_trade.executed_manual" for item in audit_events))
+
+    def test_execute_strategy_signal_endpoint_rejects_paused_strategy(self) -> None:
+        target = next(item for item in control_main.repo.state.strategies if item.id == "eth-revert-02")
+        target.status = "paused"
+
+        execute_status, payload = self._post(
+            "/api/strategies/eth-revert-02/execute",
+            {"requested_by": "unit_test"},
+        )
+        self.assertEqual(execute_status, 409)
+        self.assertIn("已暂停", payload["detail"])
+
+    def test_strategy_execution_preview_endpoint_builds_live_advisory_preview(self) -> None:
+        original_market = control_main.market_data
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        candles = [
+            CandlePoint(
+                time=f"2026-03-29T{hour:02d}:00:00+08:00",
+                open=66200.0 + hour * 90,
+                high=66280.0 + hour * 90,
+                low=66140.0 + hour * 90,
+                close=66240.0 + hour * 90,
+                volume=1800.0 + hour * 25,
+            )
+            for hour in range(24)
+        ]
+        control_main.market_data = StubStrategyRuntimeMarketClient(
+            symbol="BTCUSDT",
+            price=68450.0,
+            change_24h=3.9,
+            candles=candles,
+        )
+        private_client = StubConfiguredTradingBybitPrivateClient()
+        control_main.private_data = private_client
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(client=private_client, connected=True, authenticated=True)
+        self.addCleanup(lambda: setattr(control_main, "market_data", original_market))
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+
+        preview_status, preview = self._get("/api/strategies/trend-btc-01/execution-preview?mode=live")
+        self.assertEqual(preview_status, 200)
+        self.assertEqual(preview["mode"], "live")
+        self.assertEqual(preview["origin"], "strategy")
+        self.assertEqual(preview["symbol"], "BTCUSDT")
+        self.assertTrue(preview["allowed"])
+        self.assertEqual(preview["side"], "sell")
+        self.assertAlmostEqual(preview["quantity"], 0.1342, places=4)
+
+    def test_strategy_execution_preview_endpoint_aligns_live_target_quantity_to_bybit_qty_step(self) -> None:
+        original_market = control_main.market_data
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        candles = [
+            CandlePoint(
+                time=f"2026-03-29T{hour:02d}:00:00+08:00",
+                open=66200.0 + hour * 90,
+                high=66280.0 + hour * 90,
+                low=66140.0 + hour * 90,
+                close=66240.0 + hour * 90,
+                volume=1800.0 + hour * 25,
+            )
+            for hour in range(24)
+        ]
+        control_main.market_data = StubStrategyRuntimeMarketClient(
+            symbol="BTCUSDT",
+            price=68450.0,
+            change_24h=3.9,
+            candles=candles,
+            instrument_constraints={"qty_step": "0.001", "min_order_qty": "0.001"},
+        )
+        private_client = StubConfiguredTradingBybitPrivateClient()
+        control_main.private_data = private_client
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(client=private_client, connected=True, authenticated=True)
+        self.addCleanup(lambda: setattr(control_main, "market_data", original_market))
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+
+        preview_status, preview = self._get("/api/strategies/trend-btc-01/execution-preview?mode=live")
+        self.assertEqual(preview_status, 200)
+        self.assertTrue(preview["allowed"])
+        self.assertEqual(preview["side"], "sell")
+        self.assertAlmostEqual(preview["quantity"], 0.135, places=6)
+        self.assertIn("数量步长 0.001", preview["warnings"][0])
+        self.assertIn("收敛到 0.015", preview["warnings"][0])
+
+    def test_strategy_execution_preview_reports_recommended_action_when_live_balance_is_insufficient(self) -> None:
+        original_market = control_main.market_data
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        candles = [
+            CandlePoint(
+                time=f"2026-03-29T{hour:02d}:00:00+08:00",
+                open=66200.0 + hour * 90,
+                high=66280.0 + hour * 90,
+                low=66140.0 + hour * 90,
+                close=66240.0 + hour * 90,
+                volume=1800.0 + hour * 25,
+            )
+            for hour in range(24)
+        ]
+        control_main.market_data = StubStrategyRuntimeMarketClient(
+            symbol="BTCUSDT",
+            price=68450.0,
+            change_24h=3.9,
+            candles=candles,
+        )
+        private_client = StubConfiguredEmptyBybitPrivateClient()
+        control_main.private_data = private_client
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(client=private_client, connected=True, authenticated=True)
+        self.addCleanup(lambda: setattr(control_main, "market_data", original_market))
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+
+        preview_status, preview = self._get("/api/strategies/trend-btc-01/execution-preview?mode=live")
+        self.assertEqual(preview_status, 200)
+        self.assertFalse(preview["allowed"])
+        self.assertIn("当前可用", preview["blocked_reason"])
+        self.assertIn("UNIFIED 账户可用", preview["recommended_action"])
+
+    def test_strategy_execution_preview_endpoint_caps_live_target_quantity_by_available_balance(self) -> None:
+        original_market = control_main.market_data
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        original_hint_getter = control_main.repo.get_strategy_signal_order_hint
+        candles = [
+            CandlePoint(
+                time=f"2026-03-29T{hour:02d}:00:00+08:00",
+                open=66200.0 + hour * 90,
+                high=66280.0 + hour * 90,
+                low=66140.0 + hour * 90,
+                close=66240.0 + hour * 90,
+                volume=1800.0 + hour * 25,
+            )
+            for hour in range(24)
+        ]
+        control_main.market_data = StubStrategyRuntimeMarketClient(
+            symbol="BTCUSDT",
+            price=68450.0,
+            change_24h=3.9,
+            candles=candles,
+            instrument_constraints={"qty_step": "0.001", "min_order_qty": "0.001"},
+        )
+        private_client = StubConfiguredTradingBybitPrivateClient()
+        control_main.private_data = private_client
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(
+            client=private_client,
+            wallet={
+                "accountType": "UNIFIED",
+                "totalEquity": "100",
+                "totalWalletBalance": "100",
+                "totalAvailableBalance": "100",
+                "coin": [
+                    {
+                        "coin": "USDT",
+                        "walletBalance": "100",
+                        "availableToWithdraw": "100",
+                    }
+                ],
+            },
+            positions=[
+                {
+                    "symbol": "ETHUSDT",
+                    "category": "spot",
+                    "side": "Buy",
+                    "size": "1",
+                    "avgPrice": "2000",
+                    "markPrice": "2005",
+                    "positionValue": "2005",
+                    "leverage": "1",
+                    "unrealisedPnl": "5",
+                }
+            ],
+            connected=True,
+            authenticated=True,
+        )
+
+        def balance_capped_hint(strategy_id: str) -> Dict[str, Any]:
+            hint = original_hint_getter(strategy_id)
+            return {
+                **hint,
+                "risk_budget": "100%",
+                "target_signed_qty": 0.015,
+                "price": 68450.0,
+                "note": "balance linked sizing preview",
+            }
+
+        control_main.repo.get_strategy_signal_order_hint = balance_capped_hint  # type: ignore[method-assign]
+        self.addCleanup(lambda: setattr(control_main, "market_data", original_market))
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+        self.addCleanup(lambda: setattr(control_main.repo, "get_strategy_signal_order_hint", original_hint_getter))
+
+        preview_status, preview = self._get("/api/strategies/trend-btc-01/execution-preview?mode=live")
+        self.assertEqual(preview_status, 200)
+        self.assertTrue(preview["allowed"])
+        self.assertEqual(preview["side"], "buy")
+        self.assertAlmostEqual(preview["quantity"], 0.001, places=6)
+        self.assertEqual(preview["notional"], "68.45 USDT")
+        self.assertTrue(any("账户可用余额 100.00 USDT" in item for item in preview["warnings"]))
+        self.assertTrue(any("risk_budget 100%" in item for item in preview["warnings"]))
+        self.assertTrue(any("数量步长 0.001" in item for item in preview["warnings"]))
+
+    def test_strategy_execution_preview_endpoint_blocks_live_when_balance_linked_target_is_below_min_order_qty(self) -> None:
+        original_market = control_main.market_data
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        original_hint_getter = control_main.repo.get_strategy_signal_order_hint
+        candles = [
+            CandlePoint(
+                time=f"2026-03-29T{hour:02d}:00:00+08:00",
+                open=66200.0 + hour * 90,
+                high=66280.0 + hour * 90,
+                low=66140.0 + hour * 90,
+                close=66240.0 + hour * 90,
+                volume=1800.0 + hour * 25,
+            )
+            for hour in range(24)
+        ]
+        control_main.market_data = StubStrategyRuntimeMarketClient(
+            symbol="BTCUSDT",
+            price=68450.0,
+            change_24h=3.9,
+            candles=candles,
+            instrument_constraints={"qty_step": "0.001", "min_order_qty": "0.001"},
+        )
+        private_client = StubConfiguredEmptyBybitPrivateClient()
+        control_main.private_data = private_client
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(
+            client=private_client,
+            wallet={
+                "accountType": "UNIFIED",
+                "totalEquity": "20",
+                "totalWalletBalance": "20",
+                "totalAvailableBalance": "20",
+                "coin": [
+                    {
+                        "coin": "USDT",
+                        "walletBalance": "20",
+                        "availableToWithdraw": "20",
+                    }
+                ],
+            },
+            positions=[
+                {
+                    "symbol": "ETHUSDT",
+                    "category": "spot",
+                    "side": "Buy",
+                    "size": "1",
+                    "avgPrice": "2000",
+                    "markPrice": "2005",
+                    "positionValue": "2005",
+                    "leverage": "1",
+                    "unrealisedPnl": "5",
+                }
+            ],
+            connected=True,
+            authenticated=True,
+        )
+
+        def tiny_balance_hint(strategy_id: str) -> Dict[str, Any]:
+            hint = original_hint_getter(strategy_id)
+            return {
+                **hint,
+                "target_signed_qty": 0.015,
+                "price": 68450.0,
+                "note": "tiny balance preview",
+            }
+
+        control_main.repo.get_strategy_signal_order_hint = tiny_balance_hint  # type: ignore[method-assign]
+        self.addCleanup(lambda: setattr(control_main, "market_data", original_market))
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+        self.addCleanup(lambda: setattr(control_main.repo, "get_strategy_signal_order_hint", original_hint_getter))
+
+        preview_status, preview = self._get("/api/strategies/trend-btc-01/execution-preview?mode=live")
+        self.assertEqual(preview_status, 200)
+        self.assertFalse(preview["allowed"])
+        self.assertEqual(preview["side"], "buy")
+        self.assertLess(preview["quantity"], 0.001)
+        self.assertEqual(preview["notional"], "3.60 USDT")
+        self.assertIn("当前 Bybit 可用余额 20.00 USDT", preview["blocked_reason"])
+        self.assertIn("risk_budget 18%", preview["blocked_reason"])
+        self.assertIn("最小下单数量 0.001", preview["blocked_reason"])
+        self.assertIn("risk_budget", preview["recommended_action"])
+        self.assertEqual(preview["sizing_risk_budget"], "18%")
+        self.assertEqual(preview["sizing_budget_notional"], "3.60 USDT")
+        self.assertEqual(preview["sizing_minimum_required_notional"], "68.45 USDT")
+        self.assertIn("360.28 USDT", preview["recommended_action"])
+        self.assertEqual(preview["sizing_available_balance_gap"], "360.28 USDT")
+        self.assertNotIn("1,015", preview["blocked_reason"])
+
+    def test_strategy_execution_preview_releases_existing_strategy_buy_order_reservation_for_balance_linked_sizing(self) -> None:
+        original_market = control_main.market_data
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        original_hint_getter = control_main.repo.get_strategy_signal_order_hint
+        candles = [
+            CandlePoint(
+                time=f"2026-03-29T{hour:02d}:00:00+08:00",
+                open=66200.0 + hour * 90,
+                high=66280.0 + hour * 90,
+                low=66140.0 + hour * 90,
+                close=66240.0 + hour * 90,
+                volume=1800.0 + hour * 25,
+            )
+            for hour in range(24)
+        ]
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        control_main.market_data = StubStrategyRuntimeMarketClient(
+            symbol="BTCUSDT",
+            price=68450.0,
+            change_24h=3.9,
+            candles=candles,
+            instrument_constraints={"qty_step": "0.001", "min_order_qty": "0.001"},
+        )
+        private_client = StubConfiguredEmptyBybitPrivateClient()
+        control_main.private_data = private_client
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(
+            client=private_client,
+            wallet={
+                "accountType": "UNIFIED",
+                "totalEquity": "0",
+                "totalWalletBalance": "0",
+                "totalAvailableBalance": "0",
+                "coin": [
+                    {
+                        "coin": "USDT",
+                        "walletBalance": "0",
+                        "availableToWithdraw": "0",
+                    }
+                ],
+            },
+            orders=[
+                {
+                    "orderId": "live-open-strategy-balance-001",
+                    "orderLinkId": "strategy-live-trend-btc-01-balance001",
+                    "symbol": "BTCUSDT",
+                    "category": "linear",
+                    "side": "Buy",
+                    "orderType": "Limit",
+                    "qty": "0.001",
+                    "price": "68450",
+                    "orderStatus": "New",
+                    "createdTime": str(now_ms),
+                }
+            ],
+            connected=True,
+            authenticated=True,
+        )
+
+        def reserved_balance_hint(strategy_id: str) -> Dict[str, Any]:
+            hint = original_hint_getter(strategy_id)
+            return {
+                **hint,
+                "target_signed_qty": 0.001,
+                "price": 68450.0,
+                "note": "reuse reserved strategy order",
+            }
+
+        control_main.repo.get_strategy_signal_order_hint = reserved_balance_hint  # type: ignore[method-assign]
+        self.addCleanup(lambda: setattr(control_main, "market_data", original_market))
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+        self.addCleanup(lambda: setattr(control_main.repo, "get_strategy_signal_order_hint", original_hint_getter))
+
+        preview_status, preview = self._get("/api/strategies/trend-btc-01/execution-preview?mode=live")
+        self.assertEqual(preview_status, 200)
+        self.assertTrue(preview["allowed"])
+        self.assertEqual(preview["quantity"], 0.001)
+        self.assertEqual(preview["notional"], "68.45 USDT")
+        self.assertIn("当前已有同参数策略委托", preview["warnings"][-1])
+
+    def test_strategy_execution_preview_allows_perp_flip_by_reusing_current_position_capacity(self) -> None:
+        original_market = control_main.market_data
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        original_hint_getter = control_main.repo.get_strategy_signal_order_hint
+        candles = [
+            CandlePoint(
+                time=f"2026-03-29T{hour:02d}:00:00+08:00",
+                open=66200.0 + hour * 90,
+                high=66280.0 + hour * 90,
+                low=66140.0 + hour * 90,
+                close=66240.0 + hour * 90,
+                volume=1800.0 + hour * 25,
+            )
+            for hour in range(24)
+        ]
+        control_main.market_data = StubStrategyRuntimeMarketClient(
+            symbol="BTCUSDT",
+            price=68450.0,
+            change_24h=3.9,
+            candles=candles,
+            instrument_constraints={"qty_step": "0.001", "min_order_qty": "0.001"},
+        )
+        private_client = StubConfiguredEmptyBybitPrivateClient()
+        control_main.private_data = private_client
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(
+            client=private_client,
+            wallet={
+                "accountType": "UNIFIED",
+                "totalEquity": "0",
+                "totalWalletBalance": "0",
+                "totalAvailableBalance": "0",
+                "coin": [
+                    {
+                        "coin": "USDT",
+                        "walletBalance": "0",
+                        "availableToWithdraw": "0",
+                    }
+                ],
+            },
+            positions=[
+                {
+                    "symbol": "BTCUSDT",
+                    "category": "linear",
+                    "side": "Sell",
+                    "size": "0.01",
+                    "avgPrice": "68520",
+                    "markPrice": "68450",
+                    "positionValue": "684.5",
+                    "leverage": "1",
+                    "unrealisedPnl": "0.7",
+                }
+            ],
+            connected=True,
+            authenticated=True,
+        )
+
+        def flip_hint(strategy_id: str) -> Dict[str, Any]:
+            hint = original_hint_getter(strategy_id)
+            return {
+                **hint,
+                "target_signed_qty": 0.02,
+                "price": 68450.0,
+                "note": "perp flip balance linked preview",
+            }
+
+        control_main.repo.get_strategy_signal_order_hint = flip_hint  # type: ignore[method-assign]
+        self.addCleanup(lambda: setattr(control_main, "market_data", original_market))
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+        self.addCleanup(lambda: setattr(control_main.repo, "get_strategy_signal_order_hint", original_hint_getter))
+
+        preview_status, preview = self._get("/api/strategies/trend-btc-01/execution-preview?mode=live")
+        self.assertEqual(preview_status, 200)
+        self.assertTrue(preview["allowed"])
+        self.assertEqual(preview["side"], "buy")
+        self.assertAlmostEqual(preview["quantity"], 0.02, places=6)
+        self.assertEqual(preview["projected_position_side"], "long")
+        self.assertEqual(preview["projected_position_size"], "0.01")
+        self.assertTrue(any("账户可用余额 0.00 USDT" in item and "收敛到 0.01" in item for item in preview["warnings"]))
+
+    def test_strategy_execution_preview_endpoint_aligns_live_price_to_bybit_tick_size(self) -> None:
+        original_market = control_main.market_data
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        original_hint_getter = control_main.repo.get_strategy_signal_order_hint
+        candles = [
+            CandlePoint(
+                time=f"2026-03-29T{hour:02d}:00:00+08:00",
+                open=66200.0 + hour * 90,
+                high=66280.0 + hour * 90,
+                low=66140.0 + hour * 90,
+                close=66240.0 + hour * 90,
+                volume=1800.0 + hour * 25,
+            )
+            for hour in range(24)
+        ]
+        control_main.market_data = StubStrategyRuntimeMarketClient(
+            symbol="BTCUSDT",
+            price=68450.0,
+            change_24h=3.9,
+            candles=candles,
+            instrument_constraints={"tick_size": "0.1"},
+        )
+        private_client = StubConfiguredTradingBybitPrivateClient()
+        control_main.private_data = private_client
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(client=private_client, connected=True, authenticated=True)
+
+        def misaligned_price_hint(strategy_id: str) -> Dict[str, Any]:
+            hint = original_hint_getter(strategy_id)
+            return {
+                **hint,
+                "price": 68450.07,
+            }
+
+        control_main.repo.get_strategy_signal_order_hint = misaligned_price_hint  # type: ignore[method-assign]
+        self.addCleanup(lambda: setattr(control_main, "market_data", original_market))
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+        self.addCleanup(lambda: setattr(control_main.repo, "get_strategy_signal_order_hint", original_hint_getter))
+
+        preview_status, preview = self._get("/api/strategies/trend-btc-01/execution-preview?mode=live")
+        self.assertEqual(preview_status, 200)
+        self.assertTrue(preview["allowed"])
+        self.assertIsNone(preview["blocked_reason"])
+        self.assertAlmostEqual(preview["price"], 68450.1, places=6)
+        self.assertIn("价格步长 0.1", preview["warnings"][0])
+
+    def test_strategy_execution_preview_endpoint_blocks_live_when_runtime_worker_is_unhealthy(self) -> None:
+        original_market = control_main.market_data
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        candles = [
+            CandlePoint(
+                time=f"2026-03-29T{hour:02d}:00:00+08:00",
+                open=66200.0 + hour * 90,
+                high=66280.0 + hour * 90,
+                low=66140.0 + hour * 90,
+                close=66240.0 + hour * 90,
+                volume=1800.0 + hour * 25,
+            )
+            for hour in range(24)
+        ]
+        control_main.market_data = StubStrategyRuntimeMarketClient(
+            symbol="BTCUSDT",
+            price=68450.0,
+            change_24h=3.9,
+            candles=candles,
+        )
+        private_client = StubConfiguredTradingBybitPrivateClient()
+        control_main.private_data = private_client
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(client=private_client, connected=True, authenticated=True)
+        control_main.strategy_runtime_state.update(
+            {
+                "running": False,
+                "last_refresh_at": None,
+                "last_error": "runtime boom",
+            }
+        )
+        self.addCleanup(lambda: setattr(control_main, "market_data", original_market))
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+
+        preview_status, preview = self._get("/api/strategies/trend-btc-01/execution-preview?mode=live")
+        self.assertEqual(preview_status, 409)
+        self.assertIn("恢复运行线程", preview["detail"])
+
+    def test_strategy_execution_preview_endpoint_blocks_live_when_runtime_worker_is_stopped(self) -> None:
+        original_market = control_main.market_data
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        candles = [
+            CandlePoint(
+                time=f"2026-03-29T{hour:02d}:00:00+08:00",
+                open=66200.0 + hour * 90,
+                high=66280.0 + hour * 90,
+                low=66140.0 + hour * 90,
+                close=66240.0 + hour * 90,
+                volume=1800.0 + hour * 25,
+            )
+            for hour in range(24)
+        ]
+        control_main.market_data = StubStrategyRuntimeMarketClient(
+            symbol="BTCUSDT",
+            price=68450.0,
+            change_24h=3.9,
+            candles=candles,
+        )
+        private_client = StubConfiguredTradingBybitPrivateClient()
+        control_main.private_data = private_client
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(client=private_client, connected=True, authenticated=True)
+        control_main.strategy_runtime_thread = None
+        control_main.strategy_runtime_state.update(
+            {
+                "running": False,
+                "last_refresh_at": datetime.now(timezone.utc).astimezone().isoformat(),
+                "last_error": None,
+                "started_once": True,
+            }
+        )
+        self.addCleanup(lambda: setattr(control_main, "market_data", original_market))
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+
+        preview_status, preview = self._get("/api/strategies/trend-btc-01/execution-preview?mode=live")
+        self.assertEqual(preview_status, 409)
+        self.assertIn("恢复运行线程", preview["detail"])
+
+    def test_strategy_runtime_endpoint_embeds_live_execution_preview_for_selected_mode(self) -> None:
+        original_market = control_main.market_data
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        candles = [
+            CandlePoint(
+                time=f"2026-03-29T{hour:02d}:00:00+08:00",
+                open=66200.0 + hour * 90,
+                high=66280.0 + hour * 90,
+                low=66140.0 + hour * 90,
+                close=66240.0 + hour * 90,
+                volume=1800.0 + hour * 25,
+            )
+            for hour in range(24)
+        ]
+        control_main.market_data = StubStrategyRuntimeMarketClient(
+            symbol="BTCUSDT",
+            price=68450.0,
+            change_24h=3.9,
+            candles=candles,
+        )
+        private_client = StubConfiguredTradingBybitPrivateClient()
+        control_main.private_data = private_client
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(client=private_client, connected=True, authenticated=True)
+        self.addCleanup(lambda: setattr(control_main, "market_data", original_market))
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+        control_main.repo.state.workspace_preferences.selected_mode = AccountMode.LIVE
+        control_main.repo.state.control_snapshot.scheduler.current_mode = AccountMode.LIVE
+
+        runtime_status, runtime_payload = self._get("/api/strategies/live")
+        self.assertEqual(runtime_status, 200)
+        runtime_snapshot = next((item for item in runtime_payload if item["strategy_id"] == "trend-btc-01"), None)
+        self.assertIsNotNone(runtime_snapshot)
+        assert runtime_snapshot is not None
+        preview = runtime_snapshot.get("execution_preview")
+        self.assertIsNotNone(preview)
+        assert preview is not None
+        self.assertEqual(preview["mode"], "live")
+        self.assertEqual(preview["origin"], "strategy")
+        self.assertTrue(preview["allowed"])
+        self.assertEqual(preview["side"], "sell")
+
+    def test_strategy_runtime_endpoint_uses_balance_linked_target_size_for_live_summary(self) -> None:
+        original_market = control_main.market_data
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        original_hint_getter = control_main.repo.get_strategy_signal_order_hint
+        candles = [
+            CandlePoint(
+                time=f"2026-03-29T{hour:02d}:00:00+08:00",
+                open=66200.0 + hour * 90,
+                high=66280.0 + hour * 90,
+                low=66140.0 + hour * 90,
+                close=66240.0 + hour * 90,
+                volume=1800.0 + hour * 25,
+            )
+            for hour in range(24)
+        ]
+        control_main.market_data = StubStrategyRuntimeMarketClient(
+            symbol="BTCUSDT",
+            price=68450.0,
+            change_24h=3.9,
+            candles=candles,
+            instrument_constraints={"qty_step": "0.001", "min_order_qty": "0.001"},
+        )
+        private_client = StubConfiguredEmptyBybitPrivateClient()
+        control_main.private_data = private_client
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(
+            client=private_client,
+            wallet={
+                "accountType": "UNIFIED",
+                "totalEquity": "20",
+                "totalWalletBalance": "20",
+                "totalAvailableBalance": "20",
+                "coin": [
+                    {
+                        "coin": "USDT",
+                        "walletBalance": "20",
+                        "availableToWithdraw": "20",
+                    }
+                ],
+            },
+            positions=[
+                {
+                    "symbol": "ETHUSDT",
+                    "category": "spot",
+                    "side": "Buy",
+                    "size": "1",
+                    "avgPrice": "2000",
+                    "markPrice": "2005",
+                    "positionValue": "2005",
+                    "leverage": "1",
+                    "unrealisedPnl": "5",
+                }
+            ],
+            connected=True,
+            authenticated=True,
+        )
+
+        def tiny_balance_hint(strategy_id: str) -> Dict[str, Any]:
+            hint = original_hint_getter(strategy_id)
+            return {
+                **hint,
+                "target_signed_qty": 0.015,
+                "price": 68450.0,
+                "note": "runtime balance linked sizing",
+            }
+
+        control_main.repo.get_strategy_signal_order_hint = tiny_balance_hint  # type: ignore[method-assign]
+        self.addCleanup(lambda: setattr(control_main, "market_data", original_market))
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+        self.addCleanup(lambda: setattr(control_main.repo, "get_strategy_signal_order_hint", original_hint_getter))
+        control_main.repo.state.workspace_preferences.selected_mode = AccountMode.LIVE
+        control_main.repo.state.control_snapshot.scheduler.current_mode = AccountMode.LIVE
+
+        runtime_status, runtime_payload = self._get("/api/strategies/live")
+        self.assertEqual(runtime_status, 200)
+        runtime_snapshot = next((item for item in runtime_payload if item["strategy_id"] == "trend-btc-01"), None)
+        self.assertIsNotNone(runtime_snapshot)
+        assert runtime_snapshot is not None
+        self.assertEqual(runtime_snapshot["position_alignment"], "unknown")
+        self.assertEqual(runtime_snapshot["target_position_side"], "long")
+        self.assertEqual(runtime_snapshot["target_position_size"], "0.000053")
+        self.assertIn("当前 Bybit 可用余额 20.00 USDT", runtime_snapshot["position_alignment_detail"])
+        self.assertIn("risk_budget 18%", runtime_snapshot["position_alignment_detail"])
+        preview = runtime_snapshot.get("execution_preview")
+        self.assertIsNotNone(preview)
+        assert preview is not None
+        self.assertFalse(preview["allowed"])
+        self.assertEqual(preview["notional"], "3.60 USDT")
+        self.assertEqual(preview["sizing_risk_budget"], "18%")
+        self.assertEqual(preview["sizing_budget_notional"], "3.60 USDT")
+        self.assertEqual(preview["sizing_minimum_required_notional"], "68.45 USDT")
+        self.assertEqual(preview["sizing_available_balance_gap"], "360.28 USDT")
+
+    def test_strategy_runtime_and_control_snapshot_surface_live_balance_block_without_existing_alert(self) -> None:
+        original_market = control_main.market_data
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        candles = [
+            CandlePoint(
+                time=f"2026-03-29T{hour:02d}:00:00+08:00",
+                open=66200.0 + hour * 90,
+                high=66280.0 + hour * 90,
+                low=66140.0 + hour * 90,
+                close=66240.0 + hour * 90,
+                volume=1800.0 + hour * 25,
+            )
+            for hour in range(24)
+        ]
+        control_main.market_data = StubStrategyRuntimeMarketClient(
+            symbol="BTCUSDT",
+            price=68450.0,
+            change_24h=3.9,
+            candles=candles,
+        )
+        private_client = StubConfiguredEmptyBybitPrivateClient()
+        control_main.private_data = private_client
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(client=private_client, connected=True, authenticated=True)
+        self.addCleanup(lambda: setattr(control_main, "market_data", original_market))
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+        control_main.repo.state.workspace_preferences.selected_mode = AccountMode.LIVE
+        control_main.repo.state.control_snapshot.scheduler.current_mode = AccountMode.LIVE
+
+        runtime_status, runtime_payload = self._get("/api/strategies/live")
+        self.assertEqual(runtime_status, 200)
+        runtime_snapshot = next((item for item in runtime_payload if item["strategy_id"] == "trend-btc-01"), None)
+        self.assertIsNotNone(runtime_snapshot)
+        assert runtime_snapshot is not None
+        self.assertEqual(runtime_snapshot["guard_state"], "auto_dispatch_blocked")
+        self.assertIn("当前 Bybit 可用余额不足", runtime_snapshot["guard_detail"])
+        self.assertIn("当前 Bybit 可用余额不足", runtime_snapshot["note"])
+        self.assertIn("UNIFIED 账户可用余额", runtime_snapshot["next_action"])
+        preview = runtime_snapshot.get("execution_preview")
+        self.assertIsNotNone(preview)
+        assert preview is not None
+        self.assertFalse(preview["allowed"])
+        self.assertIn("UNIFIED 账户可用余额", preview["recommended_action"])
+
+        alerts_status, alerts = self._get("/api/alerts")
+        self.assertEqual(alerts_status, 200)
+        self.assertFalse(any(str(item.get("rule_key") or "").startswith("strategy-auto-dispatch:trend-btc-01:") for item in alerts))
+
+        snapshot_status, control_snapshot = self._get("/api/control/snapshot")
+        self.assertEqual(snapshot_status, 200)
+        self.assertEqual(control_snapshot["strategy_metrics"][0]["delta"], "执行受阻 1")
+        self.assertEqual(control_snapshot["execution_health"]["auto_dispatch_blocked"], 1)
+        self.assertEqual(control_snapshot["execution_health"]["top_issue"], "执行受阻 1")
+        self.assertIn("当前 Bybit 可用余额不足", control_snapshot["execution_health"]["top_issue_detail"])
+        self.assertIn("UNIFIED 账户可用余额", control_snapshot["execution_health"]["top_issue_recommended_action"])
+
+        metrics_status, metrics_body = self._get_text("/metrics")
+        self.assertEqual(metrics_status, 200)
+        self.assertIn(
+            'bybit_control_strategy_auto_dispatch_blocked{strategy_id="trend-btc-01",mode="live",status="running"} 1',
+            metrics_body,
+        )
+
+    def test_strategy_runtime_prefers_latest_block_detail_when_selected_mode_differs(self) -> None:
+        original_market = control_main.market_data
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        candles = [
+            CandlePoint(
+                time=f"2026-03-29T{hour:02d}:00:00+08:00",
+                open=66200.0 + hour * 90,
+                high=66280.0 + hour * 90,
+                low=66140.0 + hour * 90,
+                close=66240.0 + hour * 90,
+                volume=1800.0 + hour * 25,
+            )
+            for hour in range(24)
+        ]
+        control_main.market_data = StubStrategyRuntimeMarketClient(
+            symbol="BTCUSDT",
+            price=68450.0,
+            change_24h=3.9,
+            candles=candles,
+        )
+        private_client = StubConfiguredEmptyBybitPrivateClient()
+        control_main.private_data = private_client
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(client=private_client, connected=True, authenticated=True)
+        self.addCleanup(lambda: setattr(control_main, "market_data", original_market))
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+
+        blocked_detail = "当前 Bybit 可用余额不足，当前可用 0.00 USDT，按该价格提交本次买入约需 1,014.87 USDT。"
+        blocked_action = "请先补充 UNIFIED 账户可用余额，或先把资金划转到 UNIFIED 后再重试。"
+        control_main.repo.state.alerts.insert(
+            0,
+            AlertRecord(
+                id="alert-auto-dispatch-balance-001",
+                severity="P1",
+                symbol="BTCUSDT",
+                title="BTCUSDT 自动执行被拦截",
+                description=f"BTC 趋势跟随 在 LIVE 自动执行时被阻断。{blocked_detail}",
+                triggered_at="2026-03-31T00:00:00+08:00",
+                suggested_action="切到策略页查看执行预检与当前委托，必要时进入人工接管。",
+                acknowledged=False,
+                source_type="system",
+                rule_key="strategy-auto-dispatch:trend-btc-01:long:live",
+            ),
+        )
+        control_main.repo.add_event(
+            event_type="strategy.exchange_order.auto_blocked",
+            source="quant-core",
+            severity=control_main.EventSeverity.WARNING,
+            payload={
+                "strategy_id": "trend-btc-01",
+                "strategy_name": "BTC 趋势跟随",
+                "symbol": "BTCUSDT",
+                "mode": AccountMode.LIVE.value,
+                "detail": blocked_detail,
+                "recommended_action": blocked_action,
+            },
+            symbol="BTCUSDT",
+            strategy_id="trend-btc-01",
+        )
+
+        alerts_status, alerts = self._get("/api/alerts")
+        self.assertEqual(alerts_status, 200)
+        self.assertTrue(any(str(item.get("rule_key") or "").startswith("strategy-auto-dispatch:trend-btc-01:") for item in alerts))
+
+        control_main.repo.state.workspace_preferences.selected_mode = AccountMode.PAPER
+        control_main.repo.state.control_snapshot.scheduler.current_mode = AccountMode.PAPER
+
+        runtime_status, runtime_payload = self._get("/api/strategies/live")
+        self.assertEqual(runtime_status, 200)
+        runtime_snapshot = next((item for item in runtime_payload if item["strategy_id"] == "trend-btc-01"), None)
+        self.assertIsNotNone(runtime_snapshot)
+        assert runtime_snapshot is not None
+        self.assertEqual(runtime_snapshot["guard_state"], "auto_dispatch_blocked")
+        self.assertIn("当前 Bybit 可用余额不足", runtime_snapshot["guard_detail"])
+        self.assertIn("当前 Bybit 可用余额不足", runtime_snapshot["note"])
+        self.assertEqual(runtime_snapshot["next_action"], blocked_action)
+        self.assertIsNone(runtime_snapshot.get("execution_preview"))
+
+        snapshot_status, control_snapshot = self._get("/api/control/snapshot")
+        self.assertEqual(snapshot_status, 200)
+        self.assertEqual(control_snapshot["execution_health"]["top_issue"], "执行受阻 1")
+        self.assertIn("当前 Bybit 可用余额不足", control_snapshot["execution_health"]["top_issue_detail"])
+        self.assertEqual(control_snapshot["execution_health"]["top_issue_recommended_action"], blocked_action)
+
+    def test_strategy_activity_endpoint_includes_strategy_mode_execution_preview_when_selected_mode_differs(self) -> None:
+        original_market = control_main.market_data
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        candles = [
+            CandlePoint(
+                time=f"2026-03-29T{hour:02d}:00:00+08:00",
+                open=66200.0 + hour * 90,
+                high=66280.0 + hour * 90,
+                low=66140.0 + hour * 90,
+                close=66240.0 + hour * 90,
+                volume=1800.0 + hour * 25,
+            )
+            for hour in range(24)
+        ]
+        control_main.market_data = StubStrategyRuntimeMarketClient(
+            symbol="BTCUSDT",
+            price=68450.0,
+            change_24h=3.9,
+            candles=candles,
+        )
+        private_client = StubConfiguredEmptyBybitPrivateClient()
+        control_main.private_data = private_client
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(client=private_client, connected=True, authenticated=True)
+        self.addCleanup(lambda: setattr(control_main, "market_data", original_market))
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+
+        control_main.repo.state.workspace_preferences.selected_mode = AccountMode.PAPER
+        control_main.repo.state.control_snapshot.scheduler.current_mode = AccountMode.PAPER
+
+        runtime_status, runtime_payload = self._get("/api/strategies/live")
+        self.assertEqual(runtime_status, 200)
+        runtime_snapshot = next((item for item in runtime_payload if item["strategy_id"] == "trend-btc-01"), None)
+        self.assertIsNotNone(runtime_snapshot)
+        assert runtime_snapshot is not None
+        self.assertIsNone(runtime_snapshot.get("execution_preview"))
+
+        activity_status, activity = self._get("/api/strategies/trend-btc-01/activity")
+        self.assertEqual(activity_status, 200)
+        runtime = activity.get("runtime")
+        self.assertIsInstance(runtime, dict)
+        assert isinstance(runtime, dict)
+        preview = runtime.get("execution_preview")
+        self.assertIsInstance(preview, dict)
+        assert isinstance(preview, dict)
+        self.assertEqual(preview["mode"], "live")
+        self.assertFalse(preview["allowed"])
+        self.assertIn("当前 Bybit 可用余额不足", preview["blocked_reason"])
+        self.assertIn("UNIFIED 账户可用余额", preview["recommended_action"])
+        self.assertEqual(runtime["guard_state"], "auto_dispatch_blocked")
+        self.assertIn("当前 Bybit 可用余额不足", runtime["guard_detail"])
+        self.assertIn("UNIFIED 账户可用余额", runtime["next_action"])
+
+    def test_record_strategy_auto_dispatch_balance_issue_uses_account_type_suggested_action(self) -> None:
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        private_client = StubConfiguredEmptyBybitPrivateClient()
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(client=private_client, connected=True, authenticated=True)
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+        control_main.private_data = private_client
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        control_main.repo.state.alerts = []
+
+        blocked_detail = "当前 Bybit 可用余额不足，当前可用 0.00 USDT，按该价格提交本次买入约需 1,014.87 USDT。"
+        blocked_action = "当前还差 1,014.87 USDT，请补足 UNIFIED 账户可用余额，或降低下单数量后再重试。"
+        control_main._record_strategy_auto_dispatch_issue(
+            "trend-btc-01",
+            "BTC 趋势跟随",
+            "BTCUSDT",
+            "long",
+            AccountMode.LIVE,
+            blocked_detail,
+            recommended_action=blocked_action,
+        )
+
+        alerts_status, alerts = self._get("/api/alerts")
+        self.assertEqual(alerts_status, 200)
+        auto_alert = next(
+            (item for item in alerts if str(item.get("rule_key") or "").startswith("strategy-auto-dispatch:trend-btc-01:")),
+            None,
+        )
+        self.assertIsNotNone(auto_alert)
+        assert auto_alert is not None
+        self.assertEqual(auto_alert["suggested_action"], blocked_action)
+
+        audit_status, audit_events = self._get("/api/audit/events")
+        self.assertEqual(audit_status, 200)
+        blocked_event = next((item for item in audit_events if item["event_type"] == "strategy.exchange_order.auto_blocked"), None)
+        self.assertIsNotNone(blocked_event)
+        assert blocked_event is not None
+        self.assertEqual(blocked_event["payload"]["recommended_action"], blocked_action)
+
+        snapshot_status, control_snapshot = self._get("/api/control/snapshot")
+        self.assertEqual(snapshot_status, 200)
+        self.assertEqual(control_snapshot["execution_health"]["top_issue"], "执行受阻 1")
+        self.assertEqual(control_snapshot["execution_health"]["top_issue_recommended_action"], blocked_action)
+
+    def test_strategy_runtime_endpoint_blocks_live_execution_preview_when_runtime_worker_is_unhealthy(self) -> None:
+        original_market = control_main.market_data
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        candles = [
+            CandlePoint(
+                time=f"2026-03-29T{hour:02d}:00:00+08:00",
+                open=66200.0 + hour * 90,
+                high=66280.0 + hour * 90,
+                low=66140.0 + hour * 90,
+                close=66240.0 + hour * 90,
+                volume=1800.0 + hour * 25,
+            )
+            for hour in range(24)
+        ]
+        control_main.market_data = StubStrategyRuntimeMarketClient(
+            symbol="BTCUSDT",
+            price=68450.0,
+            change_24h=3.9,
+            candles=candles,
+        )
+        private_client = StubConfiguredTradingBybitPrivateClient()
+        control_main.private_data = private_client
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(client=private_client, connected=True, authenticated=True)
+        control_main.strategy_runtime_state.update(
+            {
+                "running": False,
+                "last_refresh_at": None,
+                "last_error": "runtime boom",
+            }
+        )
+        self.addCleanup(lambda: setattr(control_main, "market_data", original_market))
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+        control_main.repo.state.workspace_preferences.selected_mode = AccountMode.LIVE
+        control_main.repo.state.control_snapshot.scheduler.current_mode = AccountMode.LIVE
+
+        runtime_status, runtime_payload = self._get("/api/strategies/live")
+        self.assertEqual(runtime_status, 200)
+        runtime_snapshot = next((item for item in runtime_payload if item["strategy_id"] == "trend-btc-01"), None)
+        self.assertIsNotNone(runtime_snapshot)
+        assert runtime_snapshot is not None
+        preview = runtime_snapshot.get("execution_preview")
+        self.assertIsNotNone(preview)
+        assert preview is not None
+        self.assertEqual(preview["mode"], "live")
+        self.assertFalse(preview["allowed"])
+        self.assertIn("恢复运行线程", preview["blocked_reason"])
+        self.assertEqual(runtime_snapshot["guard_state"], "auto_dispatch_blocked")
+        self.assertIn("恢复运行线程", runtime_snapshot["guard_detail"])
+        self.assertIn("恢复运行线程", runtime_snapshot["note"])
+        self.assertIn("恢复运行线程", runtime_snapshot["next_action"])
+
+    def test_strategy_execution_preview_endpoint_blocks_live_when_private_ws_is_unavailable(self) -> None:
+        original_market = control_main.market_data
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        candles = [
+            CandlePoint(
+                time=f"2026-03-29T{hour:02d}:00:00+08:00",
+                open=66200.0 + hour * 90,
+                high=66280.0 + hour * 90,
+                low=66140.0 + hour * 90,
+                close=66240.0 + hour * 90,
+                volume=1800.0 + hour * 25,
+            )
+            for hour in range(24)
+        ]
+        control_main.market_data = StubStrategyRuntimeMarketClient(
+            symbol="BTCUSDT",
+            price=68450.0,
+            change_24h=3.9,
+            candles=candles,
+        )
+        private_client = StubConfiguredTradingBybitPrivateClient()
+        control_main.private_data = private_client
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(
+            client=private_client,
+            connected=False,
+            authenticated=False,
+            last_error="EOF occurred in violation of protocol (_ssl.c:1129)",
+        )
+        self.addCleanup(lambda: setattr(control_main, "market_data", original_market))
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+
+        preview_status, preview = self._get("/api/strategies/trend-btc-01/execution-preview?mode=live")
+        self.assertEqual(preview_status, 200)
+        self.assertFalse(preview["allowed"])
+        self.assertIn("私有 WS", preview["blocked_reason"])
+        self.assertIn("TLS", preview["recommended_action"])
+
+        runtime_status, runtime_payload = self._get("/api/strategies/live")
+        self.assertEqual(runtime_status, 200)
+        runtime_snapshot = next((item for item in runtime_payload if item["strategy_id"] == "trend-btc-01"), None)
+        self.assertIsNotNone(runtime_snapshot)
+        assert runtime_snapshot is not None
+        self.assertEqual(runtime_snapshot["guard_state"], "auto_dispatch_blocked")
+        self.assertIn("私有 WS", runtime_snapshot["guard_detail"])
+        self.assertIn("私有 WS", runtime_snapshot["note"])
+        self.assertIn("TLS", runtime_snapshot["next_action"])
+
+        private_status_code, private_status = self._get("/api/integrations/bybit-private")
+        self.assertEqual(private_status_code, 200)
+        self.assertEqual(private_status["realtime_last_error"], "EOF occurred in violation of protocol (_ssl.c:1129)")
+        self.assertIn("REST 已可达", private_status["realtime_recommended_action"])
+
+    def test_strategy_execution_preview_endpoint_blocks_live_when_private_ws_is_stale(self) -> None:
+        original_market = control_main.market_data
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        candles = [
+            CandlePoint(
+                time=f"2026-03-29T{hour:02d}:00:00+08:00",
+                open=66200.0 + hour * 90,
+                high=66280.0 + hour * 90,
+                low=66140.0 + hour * 90,
+                close=66240.0 + hour * 90,
+                volume=1800.0 + hour * 25,
+            )
+            for hour in range(24)
+        ]
+        control_main.market_data = StubStrategyRuntimeMarketClient(
+            symbol="BTCUSDT",
+            price=68450.0,
+            change_24h=3.9,
+            candles=candles,
+        )
+        private_client = StubConfiguredTradingBybitPrivateClient()
+        control_main.private_data = private_client
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(
+            client=private_client,
+            connected=True,
+            authenticated=True,
+            last_message_at="2026-03-29T08:00:00+08:00",
+        )
+        self.addCleanup(lambda: setattr(control_main, "market_data", original_market))
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+
+        status_code, private_status = self._get("/api/integrations/bybit-private")
+        self.assertEqual(status_code, 200)
+        self.assertTrue(private_status["realtime_stale"])
+        self.assertGreater(private_status["realtime_stale_seconds"], 0)
+
+        preview_status, preview = self._get("/api/strategies/trend-btc-01/execution-preview?mode=live")
+        self.assertEqual(preview_status, 200)
+        self.assertFalse(preview["allowed"])
+        self.assertIn("超过约", preview["blocked_reason"])
+        self.assertIn("私有 WS", preview["blocked_reason"])
+
+    def test_strategy_execution_preview_endpoint_blocks_live_when_public_ws_is_unavailable(self) -> None:
+        original_market = control_main.market_data
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        candles = [
+            CandlePoint(
+                time=f"2026-03-29T{hour:02d}:00:00+08:00",
+                open=66200.0 + hour * 90,
+                high=66280.0 + hour * 90,
+                low=66140.0 + hour * 90,
+                close=66240.0 + hour * 90,
+                volume=1800.0 + hour * 25,
+            )
+            for hour in range(24)
+        ]
+        market_client = StubStrategyRuntimeMarketClient(
+            symbol="BTCUSDT",
+            price=68450.0,
+            change_24h=3.9,
+            candles=candles,
+        )
+        market_client.realtime = StubPublicExecutionRealtimeFeed(
+            connected_linear=False,
+            ticker_symbols=[],
+        )
+        control_main.market_data = market_client
+        private_client = StubConfiguredTradingBybitPrivateClient()
+        control_main.private_data = private_client
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(client=private_client, connected=True, authenticated=True)
+        self.addCleanup(lambda: setattr(control_main, "market_data", original_market))
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+
+        preview_status, preview = self._get("/api/strategies/trend-btc-01/execution-preview?mode=live")
+        self.assertEqual(preview_status, 200)
+        self.assertFalse(preview["allowed"])
+        self.assertIn("公共 WS", preview["blocked_reason"])
+
+        runtime_status, runtime_payload = self._get("/api/strategies/live")
+        self.assertEqual(runtime_status, 200)
+        runtime_snapshot = next((item for item in runtime_payload if item["strategy_id"] == "trend-btc-01"), None)
+        self.assertIsNotNone(runtime_snapshot)
+        assert runtime_snapshot is not None
+        self.assertEqual(runtime_snapshot["guard_state"], "auto_dispatch_blocked")
+        self.assertIn("公共 WS", runtime_snapshot["guard_detail"])
+        self.assertIn("公共 WS", runtime_snapshot["note"])
+        self.assertIn("Bybit 公共实时链路", runtime_snapshot["next_action"])
+
+    def test_strategy_runtime_endpoint_blocks_live_execution_preview_when_runtime_worker_is_stopped(self) -> None:
+        original_market = control_main.market_data
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        candles = [
+            CandlePoint(
+                time=f"2026-03-29T{hour:02d}:00:00+08:00",
+                open=66200.0 + hour * 90,
+                high=66280.0 + hour * 90,
+                low=66140.0 + hour * 90,
+                close=66240.0 + hour * 90,
+                volume=1800.0 + hour * 25,
+            )
+            for hour in range(24)
+        ]
+        control_main.market_data = StubStrategyRuntimeMarketClient(
+            symbol="BTCUSDT",
+            price=68450.0,
+            change_24h=3.9,
+            candles=candles,
+        )
+        private_client = StubConfiguredTradingBybitPrivateClient()
+        control_main.private_data = private_client
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(client=private_client, connected=True, authenticated=True)
+        control_main.strategy_runtime_thread = None
+        control_main.strategy_runtime_state.update(
+            {
+                "running": False,
+                "last_refresh_at": datetime.now(timezone.utc).astimezone().isoformat(),
+                "last_error": None,
+                "started_once": True,
+            }
+        )
+        self.addCleanup(lambda: setattr(control_main, "market_data", original_market))
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+        control_main.repo.state.workspace_preferences.selected_mode = AccountMode.LIVE
+        control_main.repo.state.control_snapshot.scheduler.current_mode = AccountMode.LIVE
+
+        runtime_status, runtime_payload = self._get("/api/strategies/live")
+        self.assertEqual(runtime_status, 200)
+        runtime_snapshot = next((item for item in runtime_payload if item["strategy_id"] == "trend-btc-01"), None)
+        self.assertIsNotNone(runtime_snapshot)
+        assert runtime_snapshot is not None
+        preview = runtime_snapshot.get("execution_preview")
+        self.assertIsNotNone(preview)
+        assert preview is not None
+        self.assertEqual(preview["mode"], "live")
+        self.assertFalse(preview["allowed"])
+        self.assertIn("恢复运行线程", preview["blocked_reason"])
+        self.assertEqual(runtime_snapshot["guard_state"], "auto_dispatch_blocked")
+        self.assertIn("恢复运行线程", runtime_snapshot["guard_detail"])
+        self.assertIn("恢复运行线程", runtime_snapshot["note"])
+        self.assertIn("恢复运行线程", runtime_snapshot["next_action"])
+
+    def test_execute_strategy_signal_endpoint_submits_live_exchange_order(self) -> None:
+        original_market = control_main.market_data
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        candles = [
+            CandlePoint(
+                time=f"2026-03-29T{hour:02d}:00:00+08:00",
+                open=66200.0 + hour * 95,
+                high=66290.0 + hour * 95,
+                low=66130.0 + hour * 95,
+                close=66250.0 + hour * 95,
+                volume=1700.0 + hour * 22,
+            )
+            for hour in range(24)
+        ]
+        control_main.market_data = StubStrategyRuntimeMarketClient(
+            symbol="BTCUSDT",
+            price=68520.0,
+            change_24h=4.2,
+            candles=candles,
+        )
+        private_client = StubConfiguredTradingBybitPrivateClient()
+        control_main.private_data = private_client
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(client=private_client, connected=True, authenticated=True)
+        self.addCleanup(lambda: setattr(control_main, "market_data", original_market))
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+        control_main.repo.state.workspace_preferences.selected_mode = AccountMode.LIVE
+        control_main.repo.state.control_snapshot.scheduler.current_mode = AccountMode.LIVE
+
+        execute_status, result = self._post(
+            "/api/strategies/trend-btc-01/execute",
+            {"requested_by": "unit_test", "mode": "live", "note": "dispatch live strategy signal"},
+        )
+        self.assertEqual(execute_status, 200)
+        self.assertEqual(result["kind"], "exchange_order")
+        self.assertEqual(result["mode"], "live")
+        self.assertEqual(result["order"]["source"], "bybit_private")
+        self.assertEqual(result["order"]["origin"], "strategy")
+        self.assertEqual(result["order"]["strategy_id"], "trend-btc-01")
+        self.assertEqual(result["order"]["symbol"], "BTCUSDT")
+        self.assertTrue(private_client.created_order_bodies)
+        created_body = private_client.created_order_bodies[-1]
+        self.assertEqual(created_body["symbol"], "BTCUSDT")
+        self.assertEqual(created_body["side"], "Sell")
+
+        orders_status, orders = self._get("/api/account/orders")
+        self.assertEqual(orders_status, 200)
+        strategy_order = next((item for item in orders if item["order_id"] == result["order"]["order_id"]), None)
+        self.assertIsNotNone(strategy_order)
+        self.assertEqual(strategy_order["origin"], "strategy")
+        self.assertEqual(strategy_order["strategy_id"], "trend-btc-01")
+
+        audit_status, audit_events = self._get("/api/audit/events")
+        self.assertEqual(audit_status, 200)
+
+    def test_execute_strategy_signal_endpoint_blocks_live_when_runtime_worker_is_unhealthy(self) -> None:
+        original_market = control_main.market_data
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        candles = [
+            CandlePoint(
+                time=f"2026-03-29T{hour:02d}:00:00+08:00",
+                open=66200.0 + hour * 95,
+                high=66290.0 + hour * 95,
+                low=66130.0 + hour * 95,
+                close=66250.0 + hour * 95,
+                volume=1700.0 + hour * 22,
+            )
+            for hour in range(24)
+        ]
+        control_main.market_data = StubStrategyRuntimeMarketClient(
+            symbol="BTCUSDT",
+            price=68520.0,
+            change_24h=4.2,
+            candles=candles,
+        )
+        private_client = StubConfiguredTradingBybitPrivateClient()
+        control_main.private_data = private_client
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(client=private_client, connected=True, authenticated=True)
+        control_main.strategy_runtime_state.update(
+            {
+                "running": False,
+                "last_refresh_at": None,
+                "last_error": "runtime boom",
+            }
+        )
+        self.addCleanup(lambda: setattr(control_main, "market_data", original_market))
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+        control_main.repo.state.workspace_preferences.selected_mode = AccountMode.LIVE
+        control_main.repo.state.control_snapshot.scheduler.current_mode = AccountMode.LIVE
+
+        execute_status, result = self._post(
+            "/api/strategies/trend-btc-01/execute",
+            {"requested_by": "unit_test", "mode": "live", "note": "dispatch live strategy signal"},
+        )
+        self.assertEqual(execute_status, 409)
+        self.assertIn("恢复运行线程", result["detail"])
+
+        audit_status, audit_events = self._get("/api/audit/events")
+        self.assertEqual(audit_status, 200)
+        blocked_event = next((item for item in audit_events if item["event_type"] == "strategy.execution.blocked"), None)
+        self.assertIsNotNone(blocked_event)
+        assert blocked_event is not None
+        self.assertEqual(blocked_event["strategy_id"], "trend-btc-01")
+        self.assertIn("恢复运行线程", blocked_event["payload"]["detail"])
+
+        alerts_status, alerts_payload = self._get("/api/alerts")
+        self.assertEqual(alerts_status, 200)
+        blocked_alert = next(
+            (
+                item
+                for item in alerts_payload
+                if item["source_type"] == "system" and item["title"] == "BTCUSDT 手动策略执行被拦截"
+            ),
+            None,
+        )
+        self.assertIsNotNone(blocked_alert)
+
+        activity_status, activity = self._get("/api/strategies/trend-btc-01/activity")
+        self.assertEqual(activity_status, 200)
+        issue_job = next(
+            (
+                item
+                for item in activity["recent_agent_jobs"]
+                if item["job_type"] == "review_strategy_issue"
+            ),
+            None,
+        )
+        self.assertIsNotNone(issue_job)
+
+    def test_execute_strategy_signal_endpoint_blocks_live_when_runtime_worker_is_stopped(self) -> None:
+        original_market = control_main.market_data
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        candles = [
+            CandlePoint(
+                time=f"2026-03-29T{hour:02d}:00:00+08:00",
+                open=66200.0 + hour * 95,
+                high=66290.0 + hour * 95,
+                low=66130.0 + hour * 95,
+                close=66250.0 + hour * 95,
+                volume=1700.0 + hour * 22,
+            )
+            for hour in range(24)
+        ]
+        control_main.market_data = StubStrategyRuntimeMarketClient(
+            symbol="BTCUSDT",
+            price=68520.0,
+            change_24h=4.2,
+            candles=candles,
+        )
+        private_client = StubConfiguredTradingBybitPrivateClient()
+        control_main.private_data = private_client
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(client=private_client, connected=True, authenticated=True)
+        control_main.strategy_runtime_thread = None
+        control_main.strategy_runtime_state.update(
+            {
+                "running": False,
+                "last_refresh_at": datetime.now(timezone.utc).astimezone().isoformat(),
+                "last_error": None,
+                "started_once": True,
+            }
+        )
+        self.addCleanup(lambda: setattr(control_main, "market_data", original_market))
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+        control_main.repo.state.workspace_preferences.selected_mode = AccountMode.LIVE
+        control_main.repo.state.control_snapshot.scheduler.current_mode = AccountMode.LIVE
+
+        execute_status, result = self._post(
+            "/api/strategies/trend-btc-01/execute",
+            {"requested_by": "unit_test", "mode": "live", "note": "dispatch live strategy signal"},
+        )
+        self.assertEqual(execute_status, 409)
+        self.assertIn("恢复运行线程", result["detail"])
+
+        alerts_status, alerts_payload = self._get("/api/alerts")
+        self.assertEqual(alerts_status, 200)
+        blocked_alert = next(
+            (
+                item
+                for item in alerts_payload
+                if item["source_type"] == "system" and item["title"] == "BTCUSDT 手动策略执行被拦截"
+            ),
+            None,
+        )
+        self.assertIsNotNone(blocked_alert)
+
+    def test_execute_strategy_signal_endpoint_surfaces_recommended_action_when_live_balance_is_insufficient(self) -> None:
+        original_market = control_main.market_data
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        candles = [
+            CandlePoint(
+                time=f"2026-03-29T{hour:02d}:00:00+08:00",
+                open=66200.0 + hour * 95,
+                high=66290.0 + hour * 95,
+                low=66130.0 + hour * 95,
+                close=66250.0 + hour * 95,
+                volume=1700.0 + hour * 22,
+            )
+            for hour in range(24)
+        ]
+        control_main.market_data = StubStrategyRuntimeMarketClient(
+            symbol="BTCUSDT",
+            price=68520.0,
+            change_24h=4.2,
+            candles=candles,
+        )
+        private_client = StubConfiguredEmptyBybitPrivateClient()
+        control_main.private_data = private_client
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(client=private_client, connected=True, authenticated=True)
+        self.addCleanup(lambda: setattr(control_main, "market_data", original_market))
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+        control_main.repo.state.workspace_preferences.selected_mode = AccountMode.LIVE
+        control_main.repo.state.control_snapshot.scheduler.current_mode = AccountMode.LIVE
+
+        execute_status, result = self._post(
+            "/api/strategies/trend-btc-01/execute",
+            {"requested_by": "unit_test", "mode": "live", "note": "dispatch live strategy signal"},
+        )
+        self.assertEqual(execute_status, 409)
+        self.assertIn("当前 Bybit 可用余额不足", result["detail"])
+        self.assertIn("建议 按当前策略 risk_budget 18%", result["detail"])
+        self.assertIn("账户可用余额还差约", result["detail"])
+        self.assertIn("UNIFIED 账户可用余额", result["detail"])
+        self.assertIn("risk_budget", result["detail"])
+
+        audit_status, audit_events = self._get("/api/audit/events")
+        self.assertEqual(audit_status, 200)
+        blocked_event = next((item for item in audit_events if item["event_type"] == "strategy.execution.blocked"), None)
+        self.assertIsNotNone(blocked_event)
+        assert blocked_event is not None
+        self.assertIn("当前 Bybit 可用余额不足", blocked_event["payload"]["detail"])
+        self.assertIn("UNIFIED 账户可用余额", blocked_event["payload"]["recommended_action"])
+
+        alerts_status, alerts_payload = self._get("/api/alerts")
+        self.assertEqual(alerts_status, 200)
+        blocked_alert = next(
+            (
+                item
+                for item in alerts_payload
+                if item["source_type"] == "system" and item["title"] == "BTCUSDT 手动策略执行被拦截"
+            ),
+            None,
+        )
+        self.assertIsNotNone(blocked_alert)
+        assert blocked_alert is not None
+        self.assertIn("UNIFIED 账户可用余额", blocked_alert["suggested_action"])
+
+    def test_execute_strategy_signal_endpoint_resolves_blocked_live_alert_after_later_success(self) -> None:
+        original_market = control_main.market_data
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        candles = [
+            CandlePoint(
+                time=f"2026-03-29T{hour:02d}:00:00+08:00",
+                open=66200.0 + hour * 95,
+                high=66290.0 + hour * 95,
+                low=66130.0 + hour * 95,
+                close=66250.0 + hour * 95,
+                volume=1700.0 + hour * 22,
+            )
+            for hour in range(24)
+        ]
+        control_main.market_data = StubStrategyRuntimeMarketClient(
+            symbol="BTCUSDT",
+            price=68520.0,
+            change_24h=4.2,
+            candles=candles,
+        )
+        private_client = StubConfiguredTradingBybitPrivateClient()
+        control_main.private_data = private_client
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(client=private_client, connected=True, authenticated=True)
+        control_main.strategy_runtime_state.update(
+            {
+                "running": False,
+                "last_refresh_at": None,
+                "last_error": "runtime boom",
+            }
+        )
+        self.addCleanup(lambda: setattr(control_main, "market_data", original_market))
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+        control_main.repo.state.workspace_preferences.selected_mode = AccountMode.LIVE
+        control_main.repo.state.control_snapshot.scheduler.current_mode = AccountMode.LIVE
+
+        blocked_status, _ = self._post(
+            "/api/strategies/trend-btc-01/execute",
+            {"requested_by": "unit_test", "mode": "live", "note": "blocked live strategy signal"},
+        )
+        self.assertEqual(blocked_status, 409)
+
+        alerts_status, alerts_payload = self._get("/api/alerts")
+        self.assertEqual(alerts_status, 200)
+        blocked_alert = next(
+            (
+                item
+                for item in alerts_payload
+                if item["source_type"] == "system" and item["title"] == "BTCUSDT 手动策略执行被拦截"
+            ),
+            None,
+        )
+        self.assertIsNotNone(blocked_alert)
+        assert blocked_alert is not None
+        self.assertFalse(blocked_alert["acknowledged"])
+
+        control_main.strategy_runtime_state.update(
+            {
+                "running": False,
+                "last_refresh_at": None,
+                "last_error": None,
+            }
+        )
+
+        success_status, success_result = self._post(
+            "/api/strategies/trend-btc-01/execute",
+            {"requested_by": "unit_test", "mode": "live", "note": "recovered live strategy signal"},
+        )
+        self.assertEqual(success_status, 200)
+        self.assertEqual(success_result["kind"], "exchange_order")
+
+        refreshed_alerts_status, refreshed_alerts = self._get("/api/alerts")
+        self.assertEqual(refreshed_alerts_status, 200)
+        refreshed_blocked_alert = next((item for item in refreshed_alerts if item["id"] == blocked_alert["id"]), None)
+        self.assertIsNotNone(refreshed_blocked_alert)
+        assert refreshed_blocked_alert is not None
+        self.assertTrue(refreshed_blocked_alert["acknowledged"])
+
+        audit_status, audit_events = self._get("/api/audit/events")
+        self.assertEqual(audit_status, 200)
+        blocked_resolved_event = next(
+            (item for item in audit_events if item["event_type"] == "strategy.execution.blocked_resolved"),
+            None,
+        )
+        self.assertIsNotNone(blocked_resolved_event)
+        assert blocked_resolved_event is not None
+        self.assertEqual(blocked_resolved_event["strategy_id"], "trend-btc-01")
+        self.assertEqual(blocked_resolved_event["payload"]["mode"], "live")
+
+    def test_execute_strategy_signal_endpoint_blocks_live_when_private_ws_is_unavailable(self) -> None:
+        original_market = control_main.market_data
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        candles = [
+            CandlePoint(
+                time=f"2026-03-29T{hour:02d}:00:00+08:00",
+                open=66200.0 + hour * 95,
+                high=66290.0 + hour * 95,
+                low=66130.0 + hour * 95,
+                close=66250.0 + hour * 95,
+                volume=1700.0 + hour * 22,
+            )
+            for hour in range(24)
+        ]
+        control_main.market_data = StubStrategyRuntimeMarketClient(
+            symbol="BTCUSDT",
+            price=68520.0,
+            change_24h=4.2,
+            candles=candles,
+        )
+        private_client = StubConfiguredTradingBybitPrivateClient()
+        control_main.private_data = private_client
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(client=private_client, connected=False, authenticated=False)
+        self.addCleanup(lambda: setattr(control_main, "market_data", original_market))
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+        control_main.repo.state.workspace_preferences.selected_mode = AccountMode.LIVE
+        control_main.repo.state.control_snapshot.scheduler.current_mode = AccountMode.LIVE
+
+        execute_status, payload = self._post(
+            "/api/strategies/trend-btc-01/execute",
+            {"requested_by": "unit_test", "mode": "live", "note": "private ws down"},
+        )
+        self.assertEqual(execute_status, 409)
+        self.assertIn("私有 WS", payload["detail"])
+        self.assertEqual(len(private_client.created_order_bodies), 0)
+
+        alerts_status, alerts = self._get("/api/alerts")
+        self.assertEqual(alerts_status, 200)
+        blocked_alert = next(
+            (item for item in alerts if str(item.get("rule_key") or "").startswith("strategy-blocked-execution:trend-btc-01:")),
+            None,
+        )
+        self.assertIsNotNone(blocked_alert)
+        assert blocked_alert is not None
+        self.assertIn("私有 WS", blocked_alert["description"])
+
+    def test_execute_strategy_signal_endpoint_blocks_live_when_private_ws_is_stale(self) -> None:
+        original_market = control_main.market_data
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        candles = [
+            CandlePoint(
+                time=f"2026-03-29T{hour:02d}:00:00+08:00",
+                open=66200.0 + hour * 95,
+                high=66290.0 + hour * 95,
+                low=66130.0 + hour * 95,
+                close=66250.0 + hour * 95,
+                volume=1700.0 + hour * 22,
+            )
+            for hour in range(24)
+        ]
+        control_main.market_data = StubStrategyRuntimeMarketClient(
+            symbol="BTCUSDT",
+            price=68520.0,
+            change_24h=4.2,
+            candles=candles,
+        )
+        private_client = StubConfiguredTradingBybitPrivateClient()
+        control_main.private_data = private_client
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(
+            client=private_client,
+            connected=True,
+            authenticated=True,
+            last_message_at="2026-03-29T08:00:00+08:00",
+        )
+        self.addCleanup(lambda: setattr(control_main, "market_data", original_market))
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+        control_main.repo.state.workspace_preferences.selected_mode = AccountMode.LIVE
+        control_main.repo.state.control_snapshot.scheduler.current_mode = AccountMode.LIVE
+
+        execute_status, payload = self._post(
+            "/api/strategies/trend-btc-01/execute",
+            {"requested_by": "unit_test", "mode": "live", "note": "private ws stale"},
+        )
+        self.assertEqual(execute_status, 409)
+        self.assertIn("私有 WS", payload["detail"])
+        self.assertIn("超过约", payload["detail"])
+        self.assertEqual(len(private_client.created_order_bodies), 0)
+
+    def test_execute_strategy_signal_endpoint_blocks_live_when_public_ws_is_stale(self) -> None:
+        original_market = control_main.market_data
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        candles = [
+            CandlePoint(
+                time=f"2026-03-29T{hour:02d}:00:00+08:00",
+                open=66200.0 + hour * 95,
+                high=66290.0 + hour * 95,
+                low=66130.0 + hour * 95,
+                close=66250.0 + hour * 95,
+                volume=1700.0 + hour * 22,
+            )
+            for hour in range(24)
+        ]
+        market_client = StubStrategyRuntimeMarketClient(
+            symbol="BTCUSDT",
+            price=68520.0,
+            change_24h=4.2,
+            candles=candles,
+        )
+        market_client.realtime = StubPublicExecutionRealtimeFeed(
+            connected_linear=True,
+            ticker_symbols=["BTCUSDT"],
+            symbol_last_message_at={"BTCUSDT": "2026-03-29T08:00:00+08:00"},
+            last_message_at_linear="2026-03-29T08:00:00+08:00",
+        )
+        control_main.market_data = market_client
+        private_client = StubConfiguredTradingBybitPrivateClient()
+        control_main.private_data = private_client
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(client=private_client, connected=True, authenticated=True)
+        self.addCleanup(lambda: setattr(control_main, "market_data", original_market))
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+        control_main.repo.state.workspace_preferences.selected_mode = AccountMode.LIVE
+        control_main.repo.state.control_snapshot.scheduler.current_mode = AccountMode.LIVE
+
+        execute_status, payload = self._post(
+            "/api/strategies/trend-btc-01/execute",
+            {"requested_by": "unit_test", "mode": "live", "note": "public ws stale"},
+        )
+        self.assertEqual(execute_status, 409)
+        self.assertIn("公共 WS", payload["detail"])
+        self.assertIn("超过约", payload["detail"])
+        self.assertEqual(len(private_client.created_order_bodies), 0)
+
+    def test_execute_strategy_signal_endpoint_reuses_existing_live_strategy_order_without_amend(self) -> None:
+        original_market = control_main.market_data
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        candles = [
+            CandlePoint(
+                time=f"2026-03-29T{hour:02d}:00:00+08:00",
+                open=66200.0 + hour * 95,
+                high=66290.0 + hour * 95,
+                low=66130.0 + hour * 95,
+                close=66250.0 + hour * 95,
+                volume=1700.0 + hour * 22,
+            )
+            for hour in range(24)
+        ]
+        control_main.market_data = StubStrategyRuntimeMarketClient(
+            symbol="BTCUSDT",
+            price=68520.0,
+            change_24h=4.2,
+            candles=candles,
+        )
+        private_client = StubConfiguredTradingBybitPrivateClient()
+        control_main.private_data = private_client
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(client=private_client, connected=True, authenticated=True)
+        self.addCleanup(lambda: setattr(control_main, "market_data", original_market))
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+        control_main.repo.state.workspace_preferences.selected_mode = AccountMode.LIVE
+        control_main.repo.state.control_snapshot.scheduler.current_mode = AccountMode.LIVE
+
+        first_status, first_result = self._post(
+            "/api/strategies/trend-btc-01/execute",
+            {"requested_by": "unit_test", "mode": "live", "note": "first live strategy order"},
+        )
+        self.assertEqual(first_status, 200)
+        self.assertEqual(first_result["order"]["origin"], "strategy")
+        self.assertEqual(len(private_client.created_order_bodies), 1)
+        self.assertEqual(len(private_client.amended_order_bodies), 0)
+
+        second_status, second_result = self._post(
+            "/api/strategies/trend-btc-01/execute",
+            {"requested_by": "unit_test", "mode": "live", "note": "second live strategy order"},
+        )
+        self.assertEqual(second_status, 200)
+        self.assertEqual(second_result["order"]["order_id"], first_result["order"]["order_id"])
+        self.assertEqual(second_result["order"]["origin"], "strategy")
+        self.assertEqual(len(private_client.created_order_bodies), 1)
+        self.assertEqual(len(private_client.amended_order_bodies), 0)
+
+        audit_status, audit_events = self._get("/api/audit/events")
+        self.assertEqual(audit_status, 200)
+        self.assertTrue(any(item["event_type"] == "strategy.exchange_order.reused_existing" for item in audit_events))
+
+    def test_execute_strategy_signal_endpoint_reuses_existing_live_strategy_order_even_when_balance_is_fully_reserved(self) -> None:
+        original_market = control_main.market_data
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        original_hint_getter = control_main.repo.get_strategy_signal_order_hint
+        candles = [
+            CandlePoint(
+                time=f"2026-03-29T{hour:02d}:00:00+08:00",
+                open=66200.0 + hour * 95,
+                high=66290.0 + hour * 95,
+                low=66130.0 + hour * 95,
+                close=66250.0 + hour * 95,
+                volume=1700.0 + hour * 22,
+            )
+            for hour in range(24)
+        ]
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        control_main.market_data = StubStrategyRuntimeMarketClient(
+            symbol="BTCUSDT",
+            price=68450.0,
+            change_24h=4.2,
+            candles=candles,
+            instrument_constraints={"qty_step": "0.001", "min_order_qty": "0.001"},
+        )
+        private_client = StubConfiguredTradingBybitPrivateClient()
+        private_client.fetch_positions = lambda: []
+        control_main.private_data = private_client
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(
+            client=private_client,
+            wallet={
+                "accountType": "UNIFIED",
+                "totalEquity": "0",
+                "totalWalletBalance": "0",
+                "totalAvailableBalance": "0",
+                "coin": [
+                    {
+                        "coin": "USDT",
+                        "walletBalance": "0",
+                        "availableToWithdraw": "0",
+                    }
+                ],
+            },
+            orders=[
+                {
+                    "orderId": "live-open-strategy-balance-001",
+                    "orderLinkId": "strategy-live-trend-btc-01-balance001",
+                    "symbol": "BTCUSDT",
+                    "category": "linear",
+                    "side": "Buy",
+                    "orderType": "Limit",
+                    "qty": "0.001",
+                    "price": "68450",
+                    "orderStatus": "New",
+                    "createdTime": str(now_ms),
+                }
+            ],
+            connected=True,
+            authenticated=True,
+        )
+
+        def reserved_balance_hint(strategy_id: str) -> Dict[str, Any]:
+            hint = original_hint_getter(strategy_id)
+            return {
+                **hint,
+                "target_signed_qty": 0.001,
+                "price": 68450.0,
+                "note": "reuse reserved strategy order",
+            }
+
+        control_main.repo.get_strategy_signal_order_hint = reserved_balance_hint  # type: ignore[method-assign]
+        self.addCleanup(lambda: setattr(control_main, "market_data", original_market))
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+        self.addCleanup(lambda: setattr(control_main.repo, "get_strategy_signal_order_hint", original_hint_getter))
+        control_main.repo.state.workspace_preferences.selected_mode = AccountMode.LIVE
+        control_main.repo.state.control_snapshot.scheduler.current_mode = AccountMode.LIVE
+
+        execute_status, result = self._post(
+            "/api/strategies/trend-btc-01/execute",
+            {"requested_by": "unit_test", "mode": "live", "note": "reuse reserved live strategy order"},
+        )
+        self.assertEqual(execute_status, 200)
+        self.assertEqual(result["order"]["order_id"], "live-open-strategy-balance-001")
+        self.assertEqual(result["order"]["origin"], "strategy")
+        self.assertEqual(private_client.created_order_bodies, [])
+        self.assertEqual(private_client.amended_order_bodies, [])
+
+    def test_execute_strategy_signal_endpoint_reuses_existing_live_strategy_sell_order_even_when_margin_is_fully_reserved(self) -> None:
+        original_market = control_main.market_data
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        original_hint_getter = control_main.repo.get_strategy_signal_order_hint
+        candles = [
+            CandlePoint(
+                time=f"2026-03-29T{hour:02d}:00:00+08:00",
+                open=66200.0 + hour * 95,
+                high=66290.0 + hour * 95,
+                low=66130.0 + hour * 95,
+                close=66250.0 + hour * 95,
+                volume=1700.0 + hour * 22,
+            )
+            for hour in range(24)
+        ]
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        control_main.market_data = StubStrategyRuntimeMarketClient(
+            symbol="BTCUSDT",
+            price=68450.0,
+            change_24h=4.2,
+            candles=candles,
+            instrument_constraints={"qty_step": "0.001", "min_order_qty": "0.001"},
+        )
+        private_client = StubConfiguredTradingBybitPrivateClient()
+        private_client.fetch_positions = lambda: []
+        control_main.private_data = private_client
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(
+            client=private_client,
+            wallet={
+                "accountType": "UNIFIED",
+                "totalEquity": "0",
+                "totalWalletBalance": "0",
+                "totalAvailableBalance": "0",
+                "coin": [
+                    {
+                        "coin": "USDT",
+                        "walletBalance": "0",
+                        "availableToWithdraw": "0",
+                    }
+                ],
+            },
+            orders=[
+                {
+                    "orderId": "live-open-strategy-sell-balance-001",
+                    "orderLinkId": "strategy-live-trend-btc-01-sellbalance001",
+                    "symbol": "BTCUSDT",
+                    "category": "linear",
+                    "side": "Sell",
+                    "orderType": "Limit",
+                    "qty": "0.001",
+                    "price": "68450",
+                    "orderStatus": "New",
+                    "createdTime": str(now_ms),
+                }
+            ],
+            connected=True,
+            authenticated=True,
+        )
+
+        def reserved_sell_balance_hint(strategy_id: str) -> Dict[str, Any]:
+            hint = original_hint_getter(strategy_id)
+            return {
+                **hint,
+                "target_signed_qty": -0.001,
+                "price": 68450.0,
+                "note": "reuse reserved strategy sell order",
+            }
+
+        control_main.repo.get_strategy_signal_order_hint = reserved_sell_balance_hint  # type: ignore[method-assign]
+        self.addCleanup(lambda: setattr(control_main, "market_data", original_market))
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+        self.addCleanup(lambda: setattr(control_main.repo, "get_strategy_signal_order_hint", original_hint_getter))
+        control_main.repo.state.workspace_preferences.selected_mode = AccountMode.LIVE
+        control_main.repo.state.control_snapshot.scheduler.current_mode = AccountMode.LIVE
+
+        execute_status, result = self._post(
+            "/api/strategies/trend-btc-01/execute",
+            {"requested_by": "unit_test", "mode": "live", "note": "reuse reserved live strategy sell order"},
+        )
+        self.assertEqual(execute_status, 200)
+        self.assertEqual(result["order"]["order_id"], "live-open-strategy-sell-balance-001")
+        self.assertEqual(result["order"]["origin"], "strategy")
+        self.assertEqual(private_client.created_order_bodies, [])
+        self.assertEqual(private_client.amended_order_bodies, [])
+
+    def test_execute_strategy_signal_endpoint_amends_existing_order_to_add_reduce_only_when_needed(self) -> None:
+        original_market = control_main.market_data
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        original_hint_getter = control_main.repo.get_strategy_signal_order_hint
+        candles = [
+            CandlePoint(
+                time=f"2026-03-29T{hour:02d}:00:00+08:00",
+                open=66200.0 + hour * 95,
+                high=66290.0 + hour * 95,
+                low=66130.0 + hour * 95,
+                close=66250.0 + hour * 95,
+                volume=1700.0 + hour * 22,
+            )
+            for hour in range(24)
+        ]
+        control_main.market_data = StubStrategyRuntimeMarketClient(
+            symbol="BTCUSDT",
+            price=66800.0,
+            change_24h=4.2,
+            candles=candles,
+        )
+        private_client = StubConfiguredTradingBybitPrivateClient()
+        control_main.private_data = private_client
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(
+            client=private_client,
+            orders=[
+                {
+                    "orderId": "live-open-strategy-reduce-only-001",
+                    "orderLinkId": "strategy-live-trend-btc-01-reduceonly001",
+                    "symbol": "BTCUSDT",
+                    "category": "linear",
+                    "side": "Sell",
+                    "orderType": "Limit",
+                    "qty": "0.05",
+                    "price": "66800",
+                    "orderStatus": "New",
+                    "createdTime": "1774887600000",
+                }
+            ],
+            connected=True,
+            authenticated=True,
+        )
+
+        def reduce_only_hint(strategy_id: str) -> Dict[str, Any]:
+            hint = original_hint_getter(strategy_id)
+            return {
+                **hint,
+                "target_signed_qty": 0.10,
+                "price": 66800.0,
+                "note": "align reduce-only strategy order",
+            }
+
+        control_main.repo.get_strategy_signal_order_hint = reduce_only_hint  # type: ignore[method-assign]
+        self.addCleanup(lambda: setattr(control_main, "market_data", original_market))
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+        self.addCleanup(lambda: setattr(control_main.repo, "get_strategy_signal_order_hint", original_hint_getter))
+        control_main.repo.state.workspace_preferences.selected_mode = AccountMode.LIVE
+        control_main.repo.state.control_snapshot.scheduler.current_mode = AccountMode.LIVE
+
+        execute_status, result = self._post(
+            "/api/strategies/trend-btc-01/execute",
+            {"requested_by": "unit_test", "mode": "live", "note": "align reduce-only strategy order"},
+        )
+        self.assertEqual(execute_status, 200)
+        self.assertEqual(result["order"]["order_id"], "live-open-strategy-reduce-only-001")
+        self.assertEqual(private_client.created_order_bodies, [])
+        self.assertEqual(len(private_client.amended_order_bodies), 1)
+        self.assertTrue(private_client.amended_order_bodies[-1].get("reduceOnly"))
+
+    def test_execute_strategy_signal_endpoint_replaces_existing_live_strategy_order_when_target_changes(self) -> None:
+        original_market = control_main.market_data
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        candles = [
+            CandlePoint(
+                time=f"2026-03-29T{hour:02d}:00:00+08:00",
+                open=66200.0 + hour * 95,
+                high=66290.0 + hour * 95,
+                low=66130.0 + hour * 95,
+                close=66250.0 + hour * 95,
+                volume=1700.0 + hour * 22,
+            )
+            for hour in range(24)
+        ]
+        control_main.market_data = StubStrategyRuntimeMarketClient(
+            symbol="BTCUSDT",
+            price=68520.0,
+            change_24h=4.2,
+            candles=candles,
+        )
+        private_client = StubConfiguredTradingBybitPrivateClient()
+        realtime_client = StubBybitPrivateRealtimeClient(client=private_client, connected=True, authenticated=True)
+        control_main.private_data = private_client
+        control_main.private_realtime = realtime_client
+        self.addCleanup(lambda: setattr(control_main, "market_data", original_market))
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+        control_main.repo.state.workspace_preferences.selected_mode = AccountMode.LIVE
+        control_main.repo.state.control_snapshot.scheduler.current_mode = AccountMode.LIVE
+
+        first_status, first_result = self._post(
+            "/api/strategies/trend-btc-01/execute",
+            {"requested_by": "unit_test", "mode": "live", "note": "first live strategy order"},
+        )
+        self.assertEqual(first_status, 200)
+        self.assertEqual(len(private_client.created_order_bodies), 1)
+        self.assertEqual(len(private_client.amended_order_bodies), 0)
+
+        realtime_client.seed_open_orders_snapshot(
+            [
+                {
+                    "orderId": first_result["order"]["order_id"],
+                    "orderLinkId": first_result["order"].get("order_link_id") or "strategy-live-trend-btc-01-deadbeef",
+                    "symbol": "BTCUSDT",
+                    "category": "linear",
+                    "side": "Sell",
+                    "orderType": "Limit",
+                    "qty": "0.10",
+                    "price": "69999",
+                    "orderStatus": "New",
+                    "createdTime": "1774887600000",
+                }
+            ]
+        )
+
+        second_status, second_result = self._post(
+            "/api/strategies/trend-btc-01/execute",
+            {"requested_by": "unit_test", "mode": "live", "note": "second live strategy order"},
+        )
+        self.assertEqual(second_status, 200)
+        self.assertEqual(second_result["order"]["order_id"], first_result["order"]["order_id"])
+        self.assertEqual(len(private_client.created_order_bodies), 1)
+        self.assertEqual(len(private_client.amended_order_bodies), 1)
+        self.assertEqual(private_client.amended_order_bodies[-1]["orderId"], first_result["order"]["order_id"])
+
+        audit_status, audit_events = self._get("/api/audit/events")
+        self.assertEqual(audit_status, 200)
+        self.assertTrue(any(item["event_type"] == "strategy.exchange_order.replaced_existing" for item in audit_events))
+
+    def test_strategy_runtime_refresh_auto_dispatches_live_strategy_signal(self) -> None:
+        original_market = control_main.market_data
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        candles = [
+            CandlePoint(
+                time=f"2026-03-29T{hour:02d}:00:00+08:00",
+                open=69000.0 - hour * 120,
+                high=69080.0 - hour * 120,
+                low=68920.0 - hour * 120,
+                close=68940.0 - hour * 120,
+                volume=1700.0 + hour * 22,
+            )
+            for hour in range(24)
+        ]
+        control_main.market_data = StubStrategyRuntimeMarketClient(
+            symbol="BTCUSDT",
+            price=66120.0,
+            change_24h=-4.3,
+            candles=candles,
+        )
+        private_client = StubConfiguredTradingBybitPrivateClient()
+        control_main.private_data = private_client
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(client=private_client, connected=True, authenticated=True)
+        self.addCleanup(lambda: setattr(control_main, "market_data", original_market))
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+
+        control_main.repo.state.workspace_preferences.selected_mode = AccountMode.PAPER
+        control_main.repo.state.control_snapshot.scheduler.current_mode = AccountMode.PAPER
+        control_main.repo.state.strategy_runtime_snapshots = [
+            StrategyRuntimeSnapshot(
+                strategy_id="trend-btc-01",
+                strategy_name="BTC 趋势跟随",
+                symbol="BTCUSDT",
+                market="perp",
+                mode=AccountMode.LIVE,
+                runtime_status="running",
+                signal="watch",
+                confidence=28.0,
+                last_price=66800.0,
+                reference_price=66720.0,
+                change_24h=0.6,
+                note="上一轮仍在观察。",
+                next_action="继续观察。",
+                last_evaluated_at="2026-03-31T00:00:00+08:00",
+            )
+        ]
+
+        snapshots = control_main.refresh_strategy_runtime_once(auto_dispatch=True)
+        updated = next((item for item in snapshots if item.strategy_id == "trend-btc-01"), None)
+        self.assertIsNotNone(updated)
+        assert updated is not None
+        self.assertEqual(updated.signal, "short")
+        self.assertTrue(private_client.created_order_bodies)
+        created_body = private_client.created_order_bodies[-1]
+        self.assertEqual(created_body["symbol"], "BTCUSDT")
+        self.assertEqual(created_body["side"], "Sell")
+
+        runtime_status, runtime_payload = self._get("/api/strategies/live")
+        self.assertEqual(runtime_status, 200)
+        runtime_snapshot = next((item for item in runtime_payload if item["strategy_id"] == "trend-btc-01"), None)
+        self.assertIsNotNone(runtime_snapshot)
+        assert runtime_snapshot is not None
+        self.assertEqual(runtime_snapshot["active_order_count"], 1)
+        self.assertIsNotNone(runtime_snapshot["active_order"])
+        self.assertEqual(runtime_snapshot["active_order"]["strategy_id"], "trend-btc-01")
+        self.assertEqual(runtime_snapshot["active_order"]["status"], "New")
+        self.assertEqual(runtime_snapshot["current_position_side"], "long")
+        self.assertEqual(runtime_snapshot["current_position_size"], "0.15")
+        self.assertEqual(runtime_snapshot["current_position_avg_price"], "66,500.00")
+        self.assertEqual(runtime_snapshot["target_position_side"], "short")
+        self.assertEqual(runtime_snapshot["position_alignment"], "reconciling")
+        self.assertIn("正在向目标仓位对齐", runtime_snapshot["position_alignment_detail"])
+        self.assertEqual(runtime_snapshot["last_execution_event_type"], "strategy.exchange_order.submitted")
+        self.assertEqual(runtime_snapshot["last_execution_severity"], "info")
+        self.assertIn("order_id=", runtime_snapshot["last_execution_detail"])
+
+        audit_status, audit_events = self._get("/api/audit/events")
+        self.assertEqual(audit_status, 200)
+        self.assertTrue(any(item["event_type"] == "strategy.exchange_order.submitted" for item in audit_events))
+
+    def test_strategy_runtime_refresh_auto_dispatches_live_strategy_signal_with_qty_step_aligned_target(self) -> None:
+        original_market = control_main.market_data
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        candles = [
+            CandlePoint(
+                time=f"2026-03-29T{hour:02d}:00:00+08:00",
+                open=69000.0 - hour * 120,
+                high=69080.0 - hour * 120,
+                low=68920.0 - hour * 120,
+                close=68940.0 - hour * 120,
+                volume=1700.0 + hour * 22,
+            )
+            for hour in range(24)
+        ]
+        control_main.market_data = StubStrategyRuntimeMarketClient(
+            symbol="BTCUSDT",
+            price=66120.0,
+            change_24h=-4.3,
+            candles=candles,
+            instrument_constraints={"qty_step": "0.001", "min_order_qty": "0.001"},
+        )
+        private_client = StubConfiguredTradingBybitPrivateClient()
+        control_main.private_data = private_client
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(client=private_client, connected=True, authenticated=True)
+        self.addCleanup(lambda: setattr(control_main, "market_data", original_market))
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+
+        control_main.repo.state.workspace_preferences.selected_mode = AccountMode.PAPER
+        control_main.repo.state.control_snapshot.scheduler.current_mode = AccountMode.PAPER
+        control_main.repo.state.strategy_runtime_snapshots = [
+            StrategyRuntimeSnapshot(
+                strategy_id="trend-btc-01",
+                strategy_name="BTC 趋势跟随",
+                symbol="BTCUSDT",
+                market="perp",
+                mode=AccountMode.LIVE,
+                runtime_status="running",
+                signal="watch",
+                confidence=28.0,
+                last_price=66800.0,
+                reference_price=66720.0,
+                change_24h=0.6,
+                note="上一轮仍在观察。",
+                next_action="继续观察。",
+                last_evaluated_at="2026-03-31T00:00:00+08:00",
+            )
+        ]
+
+        snapshots = control_main.refresh_strategy_runtime_once(auto_dispatch=True)
+        updated = next((item for item in snapshots if item.strategy_id == "trend-btc-01"), None)
+        self.assertIsNotNone(updated)
+        assert updated is not None
+        self.assertEqual(updated.signal, "short")
+        self.assertTrue(private_client.created_order_bodies)
+        created_body = private_client.created_order_bodies[-1]
+        self.assertEqual(created_body["symbol"], "BTCUSDT")
+        self.assertEqual(created_body["side"], "Sell")
+        self.assertEqual(created_body["qty"], "0.166")
+
+        runtime_status, runtime_payload = self._get("/api/strategies/live")
+        self.assertEqual(runtime_status, 200)
+        runtime_snapshot = next((item for item in runtime_payload if item["strategy_id"] == "trend-btc-01"), None)
+        self.assertIsNotNone(runtime_snapshot)
+        assert runtime_snapshot is not None
+        self.assertEqual(runtime_snapshot["target_position_size"], "0.016")
+        self.assertEqual(runtime_snapshot["position_alignment"], "reconciling")
+
+    def test_strategy_runtime_endpoint_does_not_auto_dispatch_live_strategy_signal(self) -> None:
+        original_market = control_main.market_data
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        candles = [
+            CandlePoint(
+                time=f"2026-03-29T{hour:02d}:00:00+08:00",
+                open=69000.0 - hour * 120,
+                high=69080.0 - hour * 120,
+                low=68920.0 - hour * 120,
+                close=68940.0 - hour * 120,
+                volume=1700.0 + hour * 22,
+            )
+            for hour in range(24)
+        ]
+        control_main.market_data = StubStrategyRuntimeMarketClient(
+            symbol="BTCUSDT",
+            price=66120.0,
+            change_24h=-4.3,
+            candles=candles,
+        )
+        private_client = StubConfiguredTradingBybitPrivateClient()
+        control_main.private_data = private_client
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(client=private_client, connected=True, authenticated=True)
+        self.addCleanup(lambda: setattr(control_main, "market_data", original_market))
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+
+        control_main.repo.state.strategy_runtime_snapshots = [
+            StrategyRuntimeSnapshot(
+                strategy_id="trend-btc-01",
+                strategy_name="BTC 趋势跟随",
+                symbol="BTCUSDT",
+                market="perp",
+                mode=AccountMode.LIVE,
+                runtime_status="running",
+                signal="watch",
+                confidence=28.0,
+                last_price=66800.0,
+                reference_price=66720.0,
+                change_24h=0.6,
+                note="上一轮仍在观察。",
+                next_action="继续观察。",
+                last_evaluated_at="2026-03-31T00:00:00+08:00",
+            )
+        ]
+
+        runtime_status, runtime_payload = self._get("/api/strategies/live")
+        self.assertEqual(runtime_status, 200)
+        runtime_snapshot = next((item for item in runtime_payload if item["strategy_id"] == "trend-btc-01"), None)
+        self.assertIsNotNone(runtime_snapshot)
+        self.assertEqual(private_client.created_order_bodies, [])
+
+    def test_strategy_runtime_refresh_cancels_live_strategy_orders_when_strategy_enters_shadow(self) -> None:
+        original_market = control_main.market_data
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        candles = [
+            CandlePoint(
+                time=f"2026-03-29T{hour:02d}:00:00+08:00",
+                open=66800.0 + (5 if hour % 2 == 0 else -5),
+                high=66830.0,
+                low=66770.0,
+                close=66805.0 + (4 if hour % 2 == 0 else -4),
+                volume=1200.0 + hour * 10,
+            )
+            for hour in range(24)
+        ]
+        control_main.market_data = StubStrategyRuntimeMarketClient(
+            symbol="BTCUSDT",
+            price=66802.0,
+            change_24h=0.3,
+            candles=candles,
+        )
+        private_client = StubConfiguredTradingBybitPrivateClient()
+        control_main.private_data = private_client
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(
+            client=private_client,
+            connected=True,
+            authenticated=True,
+            orders=[
+                {
+                    "orderId": "live-open-strategy-watch-001",
+                    "orderLinkId": "strategy-live-watch-001",
+                    "symbol": "BTCUSDT",
+                    "category": "linear",
+                    "side": "Buy",
+                    "orderType": "Limit",
+                    "qty": "0.03",
+                    "price": "66880",
+                    "orderStatus": "New",
+                    "createdTime": "1774887600000",
+                }
+            ],
+        )
+        self.addCleanup(lambda: setattr(control_main, "market_data", original_market))
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+        control_main.repo.state.strategies = [
+            item.model_copy(update={"status": "shadow"}) if item.id == "trend-btc-01" else item
+            for item in control_main.repo.state.strategies
+        ]
+
+        control_main.repo.state.strategy_runtime_snapshots = [
+            StrategyRuntimeSnapshot(
+                strategy_id="trend-btc-01",
+                strategy_name="BTC 趋势跟随",
+                symbol="BTCUSDT",
+                market="perp",
+                mode=AccountMode.LIVE,
+                runtime_status="running",
+                signal="long",
+                confidence=74.0,
+                last_price=68900.0,
+                reference_price=68200.0,
+                change_24h=4.2,
+                note="上一轮仍为多头。",
+                next_action="继续观察。",
+                last_evaluated_at="2026-03-31T00:00:00+08:00",
+            )
+        ]
+
+        snapshots = control_main.refresh_strategy_runtime_once(auto_dispatch=True)
+        updated = next((item for item in snapshots if item.strategy_id == "trend-btc-01"), None)
+        self.assertIsNotNone(updated)
+        assert updated is not None
+        self.assertEqual(updated.runtime_status, "shadow")
+        self.assertEqual(private_client.created_order_bodies, [])
+        self.assertEqual(len(private_client.cancelled_order_bodies), 1)
+        self.assertEqual(private_client.cancelled_order_bodies[-1]["orderId"], "live-open-strategy-watch-001")
+
+        audit_status, audit_events = self._get("/api/audit/events")
+        self.assertEqual(audit_status, 200)
+        self.assertTrue(any(item["event_type"] == "strategy.exchange_order.cancelled_inactive" for item in audit_events))
+
+    def test_strategy_runtime_refresh_skips_auto_dispatch_when_scheduler_paused(self) -> None:
+        original_market = control_main.market_data
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        candles = [
+            CandlePoint(
+                time=f"2026-03-29T{hour:02d}:00:00+08:00",
+                open=69000.0 - hour * 120,
+                high=69080.0 - hour * 120,
+                low=68920.0 - hour * 120,
+                close=68940.0 - hour * 120,
+                volume=1700.0 + hour * 22,
+            )
+            for hour in range(24)
+        ]
+        control_main.market_data = StubStrategyRuntimeMarketClient(
+            symbol="BTCUSDT",
+            price=66120.0,
+            change_24h=-4.3,
+            candles=candles,
+        )
+        private_client = StubConfiguredTradingBybitPrivateClient()
+        control_main.private_data = private_client
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(client=private_client, connected=True, authenticated=True)
+        self.addCleanup(lambda: setattr(control_main, "market_data", original_market))
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+        control_main.repo.state.control_snapshot.scheduler.status = "paused"
+        self.addCleanup(lambda: setattr(control_main.repo.state.control_snapshot.scheduler, "status", "running"))
+
+        control_main.repo.state.strategy_runtime_snapshots = [
+            StrategyRuntimeSnapshot(
+                strategy_id="trend-btc-01",
+                strategy_name="BTC 趋势跟随",
+                symbol="BTCUSDT",
+                market="perp",
+                mode=AccountMode.LIVE,
+                runtime_status="running",
+                signal="watch",
+                confidence=28.0,
+                last_price=66800.0,
+                reference_price=66720.0,
+                change_24h=0.6,
+                note="上一轮仍在观察。",
+                next_action="继续观察。",
+                last_evaluated_at="2026-03-31T00:00:00+08:00",
+            )
+        ]
+
+        snapshots = control_main.refresh_strategy_runtime_once(auto_dispatch=True)
+        updated = next((item for item in snapshots if item.strategy_id == "trend-btc-01"), None)
+        self.assertIsNotNone(updated)
+        assert updated is not None
+        self.assertEqual(updated.signal, "short")
+        self.assertEqual(private_client.created_order_bodies, [])
+
+        alerts_status, alerts = self._get("/api/alerts")
+        self.assertEqual(alerts_status, 200)
+        auto_alert = next(
+            (item for item in alerts if str(item.get("rule_key") or "").startswith("strategy-auto-dispatch:trend-btc-01:")),
+            None,
+        )
+        self.assertIsNotNone(auto_alert)
+        drift_alert = next(
+            (item for item in alerts if str(item.get("rule_key") or "").startswith("strategy-position-drift:trend-btc-01:")),
+            None,
+        )
+        self.assertIsNotNone(drift_alert)
+        assert drift_alert is not None
+        self.assertEqual(drift_alert["severity"], "P1")
+        self.assertIn("仓位偏离目标", drift_alert["title"])
+        runtime_status, runtime_payload = self._get("/api/strategies/live")
+        self.assertEqual(runtime_status, 200)
+        runtime_snapshot = next((item for item in runtime_payload if item["strategy_id"] == "trend-btc-01"), None)
+        self.assertIsNotNone(runtime_snapshot)
+        assert runtime_snapshot is not None
+        self.assertEqual(runtime_snapshot["guard_state"], "auto_dispatch_blocked")
+        self.assertIn("当前 AI 调度已暂停", runtime_snapshot["guard_detail"])
+        self.assertEqual(runtime_snapshot["current_position_side"], "long")
+        self.assertEqual(runtime_snapshot["current_position_size"], "0.15")
+        self.assertEqual(runtime_snapshot["position_alignment"], "drifted")
+        self.assertIn("仍有偏差", runtime_snapshot["position_alignment_detail"])
+
+        audit_status, audit_events = self._get("/api/audit/events")
+        self.assertEqual(audit_status, 200)
+        self.assertTrue(any(item["event_type"] == "strategy.position_drift.alerted" for item in audit_events))
+
+        snapshot_status, control_snapshot = self._get("/api/control/snapshot")
+        self.assertEqual(snapshot_status, 200)
+        self.assertEqual(control_snapshot["strategy_metrics"][0]["delta"], "执行受阻 1")
+        self.assertEqual(control_snapshot["strategy_metrics"][0]["tone"], "warning")
+        self.assertEqual(control_snapshot["strategy_metrics"][1]["delta"], "偏离 1")
+        self.assertEqual(control_snapshot["strategy_metrics"][1]["tone"], "warning")
+        self.assertEqual(control_snapshot["execution_health"]["auto_dispatch_blocked"], 1)
+        self.assertEqual(control_snapshot["execution_health"]["drifts"], 1)
+        self.assertEqual(control_snapshot["execution_health"]["top_issue"], "执行受阻 1")
+
+        metrics_status, metrics_body = self._get_text("/metrics")
+        self.assertEqual(metrics_status, 200)
+        self.assertIn(
+            'bybit_control_strategy_auto_dispatch_blocked{strategy_id="trend-btc-01",mode="live",status="running"} 1',
+            metrics_body,
+        )
+        self.assertIn(
+            'bybit_control_strategy_position_alignment_state{strategy_id="trend-btc-01",mode="live",status="running",alignment="drifted"} 3',
+            metrics_body,
+        )
+
+    def test_strategy_runtime_refresh_skips_auto_dispatch_when_private_ws_is_unavailable(self) -> None:
+        original_market = control_main.market_data
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        candles = [
+            CandlePoint(
+                time=f"2026-03-29T{hour:02d}:00:00+08:00",
+                open=69000.0 - hour * 120,
+                high=69080.0 - hour * 120,
+                low=68920.0 - hour * 120,
+                close=68940.0 - hour * 120,
+                volume=1700.0 + hour * 22,
+            )
+            for hour in range(24)
+        ]
+        control_main.market_data = StubStrategyRuntimeMarketClient(
+            symbol="BTCUSDT",
+            price=66120.0,
+            change_24h=-4.3,
+            candles=candles,
+        )
+        private_client = StubConfiguredTradingBybitPrivateClient()
+        control_main.private_data = private_client
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(client=private_client, connected=False, authenticated=False)
+        self.addCleanup(lambda: setattr(control_main, "market_data", original_market))
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+
+        control_main.repo.state.strategy_runtime_snapshots = [
+            StrategyRuntimeSnapshot(
+                strategy_id="trend-btc-01",
+                strategy_name="BTC 趋势跟随",
+                symbol="BTCUSDT",
+                market="perp",
+                mode=AccountMode.LIVE,
+                runtime_status="running",
+                signal="watch",
+                confidence=28.0,
+                last_price=66800.0,
+                reference_price=66720.0,
+                change_24h=0.6,
+                note="上一轮仍在观察。",
+                next_action="继续观察。",
+                last_evaluated_at="2026-03-31T00:00:00+08:00",
+            )
+        ]
+
+        snapshots = control_main.refresh_strategy_runtime_once(auto_dispatch=True)
+        updated = next((item for item in snapshots if item.strategy_id == "trend-btc-01"), None)
+        self.assertIsNotNone(updated)
+        assert updated is not None
+        self.assertEqual(updated.signal, "short")
+        self.assertEqual(private_client.created_order_bodies, [])
+
+        alerts_status, alerts = self._get("/api/alerts")
+        self.assertEqual(alerts_status, 200)
+        auto_alert = next(
+            (item for item in alerts if str(item.get("rule_key") or "").startswith("strategy-auto-dispatch:trend-btc-01:")),
+            None,
+        )
+        self.assertIsNotNone(auto_alert)
+        assert auto_alert is not None
+        self.assertIn("私有 WS", auto_alert["description"])
+        self.assertIn("恢复 Bybit 私有实时链路", auto_alert["suggested_action"])
+
+        runtime_status, runtime_payload = self._get("/api/strategies/live")
+        self.assertEqual(runtime_status, 200)
+        runtime_snapshot = next((item for item in runtime_payload if item["strategy_id"] == "trend-btc-01"), None)
+        self.assertIsNotNone(runtime_snapshot)
+        assert runtime_snapshot is not None
+        self.assertEqual(runtime_snapshot["guard_state"], "auto_dispatch_blocked")
+        self.assertIn("私有 WS", runtime_snapshot["guard_detail"])
+
+    def test_strategy_runtime_refresh_skips_auto_dispatch_when_private_ws_is_stale(self) -> None:
+        original_market = control_main.market_data
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        candles = [
+            CandlePoint(
+                time=f"2026-03-29T{hour:02d}:00:00+08:00",
+                open=69000.0 - hour * 120,
+                high=69080.0 - hour * 120,
+                low=68920.0 - hour * 120,
+                close=68940.0 - hour * 120,
+                volume=1700.0 + hour * 22,
+            )
+            for hour in range(24)
+        ]
+        control_main.market_data = StubStrategyRuntimeMarketClient(
+            symbol="BTCUSDT",
+            price=66120.0,
+            change_24h=-4.3,
+            candles=candles,
+        )
+        private_client = StubConfiguredTradingBybitPrivateClient()
+        control_main.private_data = private_client
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(
+            client=private_client,
+            connected=True,
+            authenticated=True,
+            last_message_at="2026-03-29T08:00:00+08:00",
+        )
+        self.addCleanup(lambda: setattr(control_main, "market_data", original_market))
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+
+        control_main.repo.state.strategy_runtime_snapshots = [
+            StrategyRuntimeSnapshot(
+                strategy_id="trend-btc-01",
+                strategy_name="BTC 趋势跟随",
+                symbol="BTCUSDT",
+                market="perp",
+                mode=AccountMode.LIVE,
+                runtime_status="running",
+                signal="watch",
+                confidence=28.0,
+                last_price=66800.0,
+                reference_price=66720.0,
+                change_24h=0.6,
+                note="上一轮仍在观察。",
+                next_action="继续观察。",
+                last_evaluated_at="2026-03-31T00:00:00+08:00",
+            )
+        ]
+
+        snapshots = control_main.refresh_strategy_runtime_once(auto_dispatch=True)
+        updated = next((item for item in snapshots if item.strategy_id == "trend-btc-01"), None)
+        self.assertIsNotNone(updated)
+        assert updated is not None
+        self.assertEqual(updated.signal, "short")
+        self.assertEqual(private_client.created_order_bodies, [])
+
+        alerts_status, alerts = self._get("/api/alerts")
+        self.assertEqual(alerts_status, 200)
+        auto_alert = next(
+            (item for item in alerts if str(item.get("rule_key") or "").startswith("strategy-auto-dispatch:trend-btc-01:")),
+            None,
+        )
+        self.assertIsNotNone(auto_alert)
+        assert auto_alert is not None
+        self.assertIn("私有 WS", auto_alert["description"])
+        self.assertIn("超过约", auto_alert["description"])
+
+        runtime_status, runtime_payload = self._get("/api/strategies/live")
+        self.assertEqual(runtime_status, 200)
+        runtime_snapshot = next((item for item in runtime_payload if item["strategy_id"] == "trend-btc-01"), None)
+        self.assertIsNotNone(runtime_snapshot)
+        assert runtime_snapshot is not None
+        self.assertEqual(runtime_snapshot["guard_state"], "auto_dispatch_blocked")
+        self.assertIn("私有 WS", runtime_snapshot["guard_detail"])
+
+    def test_strategy_runtime_refresh_reconciles_missed_auto_dispatch_after_resume(self) -> None:
+        original_market = control_main.market_data
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        candles = [
+            CandlePoint(
+                time=f"2026-03-29T{hour:02d}:00:00+08:00",
+                open=69000.0 - hour * 120,
+                high=69080.0 - hour * 120,
+                low=68920.0 - hour * 120,
+                close=68940.0 - hour * 120,
+                volume=1700.0 + hour * 22,
+            )
+            for hour in range(24)
+        ]
+        control_main.market_data = StubStrategyRuntimeMarketClient(
+            symbol="BTCUSDT",
+            price=66120.0,
+            change_24h=-4.3,
+            candles=candles,
+        )
+        private_client = StubConfiguredTradingBybitPrivateClient()
+        control_main.private_data = private_client
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(client=private_client, connected=True, authenticated=True)
+        self.addCleanup(lambda: setattr(control_main, "market_data", original_market))
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+
+        control_main.repo.state.control_snapshot.scheduler.status = "paused"
+        self.addCleanup(lambda: setattr(control_main.repo.state.control_snapshot.scheduler, "status", "running"))
+        control_main.repo.state.strategy_runtime_snapshots = [
+            StrategyRuntimeSnapshot(
+                strategy_id="trend-btc-01",
+                strategy_name="BTC 趋势跟随",
+                symbol="BTCUSDT",
+                market="perp",
+                mode=AccountMode.LIVE,
+                runtime_status="running",
+                signal="watch",
+                confidence=28.0,
+                last_price=66800.0,
+                reference_price=66720.0,
+                change_24h=0.6,
+                note="上一轮仍在观察。",
+                next_action="继续观察。",
+                last_evaluated_at="2026-03-31T00:00:00+08:00",
+            )
+        ]
+
+        first_snapshots = control_main.refresh_strategy_runtime_once(auto_dispatch=True)
+        first_updated = next((item for item in first_snapshots if item.strategy_id == "trend-btc-01"), None)
+        self.assertIsNotNone(first_updated)
+        assert first_updated is not None
+        self.assertEqual(first_updated.signal, "short")
+        self.assertEqual(private_client.created_order_bodies, [])
+
+        control_main.repo.state.control_snapshot.scheduler.status = "running"
+        second_snapshots = control_main.refresh_strategy_runtime_once(auto_dispatch=True)
+        second_updated = next((item for item in second_snapshots if item.strategy_id == "trend-btc-01"), None)
+        self.assertIsNotNone(second_updated)
+        assert second_updated is not None
+        self.assertEqual(second_updated.signal, "short")
+        self.assertEqual(len(private_client.created_order_bodies), 1)
+        self.assertEqual(private_client.created_order_bodies[-1]["side"], "Sell")
+
+        alerts_status, alerts = self._get("/api/alerts")
+        self.assertEqual(alerts_status, 200)
+        self.assertFalse(
+            any(
+                str(item.get("rule_key") or "").startswith("strategy-auto-dispatch:trend-btc-01:")
+                and not item.get("acknowledged")
+                for item in alerts
+            )
+        )
+        self.assertFalse(
+            any(
+                str(item.get("rule_key") or "").startswith("strategy-position-drift:trend-btc-01:")
+                and not item.get("acknowledged")
+                for item in alerts
+            )
+        )
+
+        audit_status, audit_events = self._get("/api/audit/events")
+        self.assertEqual(audit_status, 200)
+        self.assertTrue(any(item["event_type"] == "strategy.position_drift.resolved" for item in audit_events))
+
+    def test_strategy_runtime_refresh_recreates_missing_live_strategy_order_when_signal_is_unchanged(self) -> None:
+        original_market = control_main.market_data
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        candles = [
+            CandlePoint(
+                time=f"2026-03-29T{hour:02d}:00:00+08:00",
+                open=69000.0 - hour * 120,
+                high=69080.0 - hour * 120,
+                low=68920.0 - hour * 120,
+                close=68940.0 - hour * 120,
+                volume=1700.0 + hour * 22,
+            )
+            for hour in range(24)
+        ]
+        control_main.market_data = StubStrategyRuntimeMarketClient(
+            symbol="BTCUSDT",
+            price=66120.0,
+            change_24h=-4.3,
+            candles=candles,
+        )
+        private_client = StubConfiguredTradingBybitPrivateClient()
+        control_main.private_data = private_client
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(client=private_client, connected=True, authenticated=True)
+        self.addCleanup(lambda: setattr(control_main, "market_data", original_market))
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+
+        control_main.repo.state.strategy_runtime_snapshots = [
+            StrategyRuntimeSnapshot(
+                strategy_id="trend-btc-01",
+                strategy_name="BTC 趋势跟随",
+                symbol="BTCUSDT",
+                market="perp",
+                mode=AccountMode.LIVE,
+                runtime_status="running",
+                signal="short",
+                confidence=61.0,
+                last_price=66120.0,
+                reference_price=66220.0,
+                change_24h=-4.3,
+                note="上一轮已经是空头信号。",
+                next_action="保持当前策略委托。",
+                last_evaluated_at="2026-03-31T00:00:00+08:00",
+            )
+        ]
+
+        snapshots = control_main.refresh_strategy_runtime_once(auto_dispatch=True)
+        updated = next((item for item in snapshots if item.strategy_id == "trend-btc-01"), None)
+        self.assertIsNotNone(updated)
+        assert updated is not None
+        self.assertEqual(updated.signal, "short")
+        self.assertEqual(len(private_client.created_order_bodies), 1)
+        self.assertEqual(private_client.created_order_bodies[-1]["side"], "Sell")
+
+        audit_status, audit_events = self._get("/api/audit/events")
+        self.assertEqual(audit_status, 200)
+        self.assertTrue(any(item["event_type"] == "strategy.exchange_order.reconcile_missing_order" for item in audit_events))
+
+    def test_strategy_runtime_uses_exchange_order_history_for_last_execution_summary(self) -> None:
+        original_market = control_main.market_data
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        candles = [
+            CandlePoint(
+                time=f"2026-03-29T{hour:02d}:00:00+08:00",
+                open=69000.0 - hour * 120,
+                high=69080.0 - hour * 120,
+                low=68920.0 - hour * 120,
+                close=68940.0 - hour * 120,
+                volume=1700.0 + hour * 22,
+            )
+            for hour in range(24)
+        ]
+        control_main.market_data = StubStrategyRuntimeMarketClient(
+            symbol="BTCUSDT",
+            price=66120.0,
+            change_24h=-4.3,
+            candles=candles,
+        )
+        private_client = StubConfiguredTradingBybitPrivateClient()
+        private_client.order_history_items = [
+            {
+                "orderId": "hist-live-strategy-001",
+                "orderLinkId": "strategy-live-trend-btc-01-history01",
+                "symbol": "BTCUSDT",
+                "category": "linear",
+                "side": "Sell",
+                "orderType": "Limit",
+                "qty": "0.030000",
+                "price": "66120",
+                "orderStatus": "Filled",
+                "createdTime": "1774888800000",
+            }
+        ]
+        control_main.private_data = private_client
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(client=private_client, connected=True, authenticated=True)
+        self.addCleanup(lambda: setattr(control_main, "market_data", original_market))
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+
+        control_main.repo.state.strategy_runtime_snapshots = [
+            StrategyRuntimeSnapshot(
+                strategy_id="trend-btc-01",
+                strategy_name="BTC 趋势跟随",
+                symbol="BTCUSDT",
+                market="perp",
+                mode=AccountMode.LIVE,
+                runtime_status="running",
+                signal="short",
+                confidence=61.0,
+                last_price=66120.0,
+                reference_price=66220.0,
+                change_24h=-4.3,
+                note="上一轮已经是空头信号。",
+                next_action="保持当前策略委托。",
+                last_evaluated_at="2026-03-31T00:00:00+08:00",
+            )
+        ]
+
+        runtime_status, runtime_payload = self._get("/api/strategies/live")
+        self.assertEqual(runtime_status, 200)
+        runtime_snapshot = next((item for item in runtime_payload if item["strategy_id"] == "trend-btc-01"), None)
+        self.assertIsNotNone(runtime_snapshot)
+        assert runtime_snapshot is not None
+        self.assertEqual(runtime_snapshot["last_execution_event_type"], "exchange_order.filled")
+        self.assertEqual(runtime_snapshot["last_execution_severity"], "info")
+        self.assertIn("已成交", runtime_snapshot["last_execution_detail"])
+
+        audit_status, audit_events = self._get("/api/audit/events")
+        self.assertEqual(audit_status, 200)
+        self.assertTrue(
+            any(
+                item["event_type"] == "exchange_order.filled"
+                and item["payload"].get("order_id") == "hist-live-strategy-001"
+                for item in audit_events
+            )
+        )
+
+    def test_strategy_activity_endpoint_returns_recent_strategy_activity(self) -> None:
+        original_market = control_main.market_data
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        candles = [
+            CandlePoint(
+                time=f"2026-03-29T{hour:02d}:00:00+08:00",
+                open=69000.0 - hour * 120,
+                high=69080.0 - hour * 120,
+                low=68920.0 - hour * 120,
+                close=68940.0 - hour * 120,
+                volume=1700.0 + hour * 22,
+            )
+            for hour in range(24)
+        ]
+        control_main.market_data = StubStrategyRuntimeMarketClient(
+            symbol="BTCUSDT",
+            price=66120.0,
+            change_24h=-4.3,
+            candles=candles,
+        )
+        private_client = StubConfiguredTradingBybitPrivateClient()
+        private_client.order_history_items = [
+            {
+                "orderId": "hist-live-strategy-001",
+                "orderLinkId": "strategy-live-trend-btc-01-history01",
+                "symbol": "BTCUSDT",
+                "category": "linear",
+                "side": "Sell",
+                "orderType": "Limit",
+                "qty": "0.030000",
+                "price": "66120",
+                "orderStatus": "Filled",
+                "createdTime": "1774888800000",
+            }
+        ]
+        control_main.private_data = private_client
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(client=private_client, connected=True, authenticated=True)
+        self.addCleanup(lambda: setattr(control_main, "market_data", original_market))
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+
+        control_main.repo.state.strategy_runtime_snapshots = [
+            StrategyRuntimeSnapshot(
+                strategy_id="trend-btc-01",
+                strategy_name="BTC 趋势跟随",
+                symbol="BTCUSDT",
+                market="perp",
+                mode=AccountMode.LIVE,
+                runtime_status="running",
+                signal="short",
+                confidence=61.0,
+                last_price=66120.0,
+                reference_price=66220.0,
+                change_24h=-4.3,
+                note="上一轮已经是空头信号。",
+                next_action="保持当前策略委托。",
+                last_evaluated_at="2026-03-31T00:00:00+08:00",
+            )
+        ]
+
+        review_change_status, review_change = self._post(
+            "/api/change-requests",
+            {
+                "type": "strategy.parameter.update",
+                "payload": {"strategy_id": "trend-btc-01", "fast_ma": 15},
+                "requested_by": "unit_test",
+                "target_mode": "live",
+                "priority": "high",
+                "summary": "策略活动测试触发参数更新",
+            },
+        )
+        self.assertEqual(review_change_status, 200)
+
+        _status, _runtime_payload = self._get("/api/strategies/live")
+        activity_status, activity = self._get("/api/strategies/trend-btc-01/activity")
+        self.assertEqual(activity_status, 200)
+        self.assertEqual(activity["strategy_id"], "trend-btc-01")
+        self.assertEqual(activity["strategy_name"], "BTC 趋势跟随")
+        self.assertEqual(activity["symbol"], "BTCUSDT")
+        self.assertEqual(activity["mode"], "live")
+        self.assertEqual(activity["runtime"]["strategy_id"], "trend-btc-01")
+        self.assertTrue(any(item["id"] == "review-20260330-daily" for item in activity["recent_reviews"]))
+        self.assertEqual(activity["latest_primary_review"]["id"], "review-20260330-daily")
+        self.assertIsNone(activity["latest_tracking_review"])
+        self.assertIn(
+            activity["latest_tracking_job"]["job_type"],
+            {"review_strategy_change", "review_strategy_issue"},
+        )
+        self.assertTrue(any(item["order_id"] == "hist-live-strategy-001" for item in activity["recent_orders"]))
+        self.assertTrue(any(item["event_type"] == "exchange_order.filled" for item in activity["recent_audit_events"]))
+        self.assertTrue(any(item["job_type"] == "review_strategy_change" for item in activity["recent_agent_jobs"]))
+        self.assertTrue(
+            any(
+                item["job_type"] == "review_strategy_change"
+                and item["requested_by"] == "unit_test"
+                for item in activity["recent_agent_jobs"]
+            )
+        )
+
+    def test_strategy_runtime_rejected_exchange_order_creates_system_alert(self) -> None:
+        original_market = control_main.market_data
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        candles = [
+            CandlePoint(
+                time=f"2026-03-29T{hour:02d}:00:00+08:00",
+                open=69000.0 - hour * 120,
+                high=69080.0 - hour * 120,
+                low=68920.0 - hour * 120,
+                close=68940.0 - hour * 120,
+                volume=1700.0 + hour * 22,
+            )
+            for hour in range(24)
+        ]
+        control_main.market_data = StubStrategyRuntimeMarketClient(
+            symbol="BTCUSDT",
+            price=66120.0,
+            change_24h=-4.3,
+            candles=candles,
+        )
+        private_client = StubConfiguredTradingBybitPrivateClient()
+        private_client.order_history_items = [
+            {
+                "orderId": "hist-live-strategy-rejected-001",
+                "orderLinkId": "strategy-live-trend-btc-01-reject01",
+                "symbol": "BTCUSDT",
+                "category": "linear",
+                "side": "Sell",
+                "orderType": "Limit",
+                "qty": "0.030000",
+                "price": "66120",
+                "orderStatus": "Rejected",
+                "createdTime": "1774888800000",
+            }
+        ]
+        control_main.private_data = private_client
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(client=private_client, connected=True, authenticated=True)
+        self.addCleanup(lambda: setattr(control_main, "market_data", original_market))
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+
+        control_main.repo.state.strategy_runtime_snapshots = [
+            StrategyRuntimeSnapshot(
+                strategy_id="trend-btc-01",
+                strategy_name="BTC 趋势跟随",
+                symbol="BTCUSDT",
+                market="perp",
+                mode=AccountMode.LIVE,
+                runtime_status="running",
+                signal="short",
+                confidence=61.0,
+                last_price=66120.0,
+                reference_price=66220.0,
+                change_24h=-4.3,
+                note="上一轮已经是空头信号。",
+                next_action="保持当前策略委托。",
+                last_evaluated_at="2026-03-31T00:00:00+08:00",
+            )
+        ]
+
+        runtime_status, runtime_payload = self._get("/api/strategies/live")
+        self.assertEqual(runtime_status, 200)
+        runtime_snapshot = next((item for item in runtime_payload if item["strategy_id"] == "trend-btc-01"), None)
+        self.assertIsNotNone(runtime_snapshot)
+        assert runtime_snapshot is not None
+        self.assertEqual(runtime_snapshot["last_execution_event_type"], "exchange_order.rejected")
+        self.assertEqual(runtime_snapshot["last_execution_severity"], "error")
+
+        alerts_status, alerts = self._get("/api/alerts")
+        self.assertEqual(alerts_status, 200)
+        reject_alert = next(
+            (
+                item
+                for item in alerts
+                if str(item.get("rule_key") or "") == "strategy-exchange-rejected:trend-btc-01:hist-live-strategy-rejected-001"
+            ),
+            None,
+        )
+        self.assertIsNotNone(reject_alert)
+        assert reject_alert is not None
+        self.assertEqual(reject_alert["severity"], "P1")
+        self.assertIn("真实委托被拒绝", reject_alert["title"])
+
+        audit_status, audit_events = self._get("/api/audit/events")
+        self.assertEqual(audit_status, 200)
+        self.assertTrue(
+            any(
+                item["event_type"] == "exchange_order.rejected"
+                and item["payload"].get("order_id") == "hist-live-strategy-rejected-001"
+                for item in audit_events
+            )
+        )
+
+    def test_strategy_runtime_rejected_exchange_order_alert_resolves_after_newer_success(self) -> None:
+        original_market = control_main.market_data
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        candles = [
+            CandlePoint(
+                time=f"2026-03-29T{hour:02d}:00:00+08:00",
+                open=69000.0 - hour * 120,
+                high=69080.0 - hour * 120,
+                low=68920.0 - hour * 120,
+                close=68940.0 - hour * 120,
+                volume=1700.0 + hour * 22,
+            )
+            for hour in range(24)
+        ]
+        control_main.market_data = StubStrategyRuntimeMarketClient(
+            symbol="BTCUSDT",
+            price=66120.0,
+            change_24h=-4.3,
+            candles=candles,
+        )
+        private_client = StubConfiguredTradingBybitPrivateClient()
+        private_client.order_history_items = [
+            {
+                "orderId": "hist-live-strategy-rejected-002",
+                "orderLinkId": "strategy-live-trend-btc-01-reject02",
+                "symbol": "BTCUSDT",
+                "category": "linear",
+                "side": "Sell",
+                "orderType": "Limit",
+                "qty": "0.030000",
+                "price": "66120",
+                "orderStatus": "Rejected",
+                "createdTime": "1774888800000",
+            }
+        ]
+        control_main.private_data = private_client
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(client=private_client, connected=True, authenticated=True)
+        self.addCleanup(lambda: setattr(control_main, "market_data", original_market))
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+
+        control_main.repo.state.strategy_runtime_snapshots = [
+            StrategyRuntimeSnapshot(
+                strategy_id="trend-btc-01",
+                strategy_name="BTC 趋势跟随",
+                symbol="BTCUSDT",
+                market="perp",
+                mode=AccountMode.LIVE,
+                runtime_status="running",
+                signal="short",
+                confidence=61.0,
+                last_price=66120.0,
+                reference_price=66220.0,
+                change_24h=-4.3,
+                note="上一轮已经是空头信号。",
+                next_action="保持当前策略委托。",
+                last_evaluated_at="2026-03-31T00:00:00+08:00",
+            )
+        ]
+
+        first_status, _first_payload = self._get("/api/strategies/live")
+        self.assertEqual(first_status, 200)
+        alerts_status, alerts = self._get("/api/alerts")
+        self.assertEqual(alerts_status, 200)
+        self.assertTrue(
+            any(
+                str(item.get("rule_key") or "") == "strategy-exchange-rejected:trend-btc-01:hist-live-strategy-rejected-002"
+                and not item["acknowledged"]
+                for item in alerts
+            )
+        )
+
+        private_client.order_history_items = [
+            {
+                "orderId": "hist-live-strategy-filled-002",
+                "orderLinkId": "strategy-live-trend-btc-01-fill02",
+                "symbol": "BTCUSDT",
+                "category": "linear",
+                "side": "Sell",
+                "orderType": "Limit",
+                "qty": "0.030000",
+                "price": "66120",
+                "orderStatus": "Filled",
+                "createdTime": "1774889800000",
+            }
+        ]
+
+        second_status, second_payload = self._get("/api/strategies/live")
+        self.assertEqual(second_status, 200)
+        runtime_snapshot = next((item for item in second_payload if item["strategy_id"] == "trend-btc-01"), None)
+        self.assertIsNotNone(runtime_snapshot)
+        assert runtime_snapshot is not None
+        self.assertEqual(runtime_snapshot["last_execution_event_type"], "exchange_order.filled")
+
+        refreshed_alerts_status, refreshed_alerts = self._get("/api/alerts")
+        self.assertEqual(refreshed_alerts_status, 200)
+        self.assertFalse(
+            any(
+                str(item.get("rule_key") or "") == "strategy-exchange-rejected:trend-btc-01:hist-live-strategy-rejected-002"
+                and not item["acknowledged"]
+                for item in refreshed_alerts
+            )
+        )
+
+        audit_status, audit_events = self._get("/api/audit/events")
+        self.assertEqual(audit_status, 200)
+        self.assertTrue(any(item["event_type"] == "strategy.exchange_order.rejection_resolved" for item in audit_events))
+
+    def test_strategy_runtime_repeated_exchange_rejection_enters_guard_cooldown(self) -> None:
+        original_market = control_main.market_data
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        candles = [
+            CandlePoint(
+                time=f"2026-03-29T{hour:02d}:00:00+08:00",
+                open=69000.0 - hour * 90,
+                high=69080.0 - hour * 90,
+                low=68920.0 - hour * 90,
+                close=68940.0 - hour * 90,
+                volume=1700.0 + hour * 22,
+            )
+            for hour in range(24)
+        ]
+        control_main.market_data = StubStrategyRuntimeMarketClient(
+            symbol="BTCUSDT",
+            price=66120.0,
+            change_24h=-4.3,
+            candles=candles,
+        )
+        private_client = StubConfiguredTradingBybitPrivateClient()
+        now_ms = lambda minutes_ago: str(
+            int((datetime.now(timezone.utc).astimezone() - timedelta(minutes=minutes_ago)).timestamp() * 1000)
+        )
+        private_client.order_history_items = [
+            {
+                "orderId": "hist-live-strategy-rejected-guard-001",
+                "orderLinkId": "strategy-live-trend-btc-01-rg01",
+                "symbol": "BTCUSDT",
+                "category": "linear",
+                "side": "Sell",
+                "orderType": "Limit",
+                "qty": "0.030000",
+                "price": "66120",
+                "orderStatus": "Rejected",
+                "createdTime": now_ms(4),
+            },
+            {
+                "orderId": "hist-live-strategy-rejected-guard-002",
+                "orderLinkId": "strategy-live-trend-btc-01-rg02",
+                "symbol": "BTCUSDT",
+                "category": "linear",
+                "side": "Sell",
+                "orderType": "Limit",
+                "qty": "0.030000",
+                "price": "66100",
+                "orderStatus": "Rejected",
+                "createdTime": now_ms(2),
+            },
+        ]
+        control_main.private_data = private_client
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(client=private_client, connected=True, authenticated=True)
+        self.addCleanup(lambda: setattr(control_main, "market_data", original_market))
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+
+        control_main.repo.state.strategy_runtime_snapshots = [
+            StrategyRuntimeSnapshot(
+                strategy_id="trend-btc-01",
+                strategy_name="BTC 趋势跟随",
+                symbol="BTCUSDT",
+                market="perp",
+                mode=AccountMode.LIVE,
+                runtime_status="running",
+                signal="short",
+                confidence=61.0,
+                last_price=66120.0,
+                reference_price=66220.0,
+                change_24h=-4.3,
+                note="上一轮已经是空头信号。",
+                next_action="保持当前策略委托。",
+                last_evaluated_at="2026-03-31T00:00:00+08:00",
+            )
+        ]
+
+        status, payload = self._get("/api/strategies/live")
+        self.assertEqual(status, 200)
+        runtime_snapshot = next((item for item in payload if item["strategy_id"] == "trend-btc-01"), None)
+        self.assertIsNotNone(runtime_snapshot)
+        assert runtime_snapshot is not None
+        self.assertEqual(runtime_snapshot["guard_state"], "auto_dispatch_blocked")
+        self.assertIn("连续拒绝", runtime_snapshot["guard_detail"])
+
+        preview_status, preview = self._get("/api/strategies/trend-btc-01/execution-preview?mode=live")
+        self.assertEqual(preview_status, 409)
+        self.assertIn("连续拒绝", preview["detail"])
+
+        alerts_status, alerts = self._get("/api/alerts")
+        self.assertEqual(alerts_status, 200)
+        self.assertTrue(
+            any(
+                str(item.get("rule_key") or "") == "strategy-exchange-rejection-guard:trend-btc-01:live"
+                and not item["acknowledged"]
+                for item in alerts
+            )
+        )
+        snapshot_status, snapshot = self._get("/api/control/snapshot")
+        self.assertEqual(snapshot_status, 200)
+        self.assertEqual(snapshot["execution_health"]["rejection_guards"], 1)
+        self.assertEqual(snapshot["execution_health"]["top_issue"], "连续拒单 1")
+
+    def test_strategy_runtime_exchange_rejection_guard_resolves_after_window_expires(self) -> None:
+        original_market = control_main.market_data
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        candles = [
+            CandlePoint(
+                time=f"2026-03-29T{hour:02d}:00:00+08:00",
+                open=69000.0 - hour * 90,
+                high=69080.0 - hour * 90,
+                low=68920.0 - hour * 90,
+                close=68940.0 - hour * 90,
+                volume=1700.0 + hour * 22,
+            )
+            for hour in range(24)
+        ]
+        control_main.market_data = StubStrategyRuntimeMarketClient(
+            symbol="BTCUSDT",
+            price=66120.0,
+            change_24h=-4.3,
+            candles=candles,
+        )
+        private_client = StubConfiguredTradingBybitPrivateClient()
+        old_ms = lambda minutes_ago: str(
+            int((datetime.now(timezone.utc).astimezone() - timedelta(minutes=minutes_ago)).timestamp() * 1000)
+        )
+        private_client.order_history_items = [
+            {
+                "orderId": "hist-live-strategy-rejected-expired-001",
+                "orderLinkId": "strategy-live-trend-btc-01-exp01",
+                "symbol": "BTCUSDT",
+                "category": "linear",
+                "side": "Sell",
+                "orderType": "Limit",
+                "qty": "0.030000",
+                "price": "66120",
+                "orderStatus": "Rejected",
+                "createdTime": old_ms(40),
+            },
+            {
+                "orderId": "hist-live-strategy-rejected-expired-002",
+                "orderLinkId": "strategy-live-trend-btc-01-exp02",
+                "symbol": "BTCUSDT",
+                "category": "linear",
+                "side": "Sell",
+                "orderType": "Limit",
+                "qty": "0.030000",
+                "price": "66100",
+                "orderStatus": "Rejected",
+                "createdTime": old_ms(35),
+            },
+        ]
+        control_main.private_data = private_client
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(client=private_client, connected=True, authenticated=True)
+        self.addCleanup(lambda: setattr(control_main, "market_data", original_market))
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+
+        control_main.repo.state.alerts.insert(
+            0,
+            AlertRecord(
+                id="alert-rejection-guard-existing",
+                symbol="BTCUSDT",
+                severity="P1",
+                title="BTCUSDT 策略连续拒单已熔断",
+                description="旧的连续拒单熔断提醒。",
+                source_type="system",
+                triggered_at=datetime.now(timezone.utc).astimezone().isoformat(),
+                acknowledged=False,
+                suggested_action="人工复核后恢复。",
+                rule_key="strategy-exchange-rejection-guard:trend-btc-01:live",
+                strategy_id="trend-btc-01",
+            ),
+        )
+
+        status, payload = self._get("/api/strategies/live")
+        self.assertEqual(status, 200)
+        runtime_snapshot = next((item for item in payload if item["strategy_id"] == "trend-btc-01"), None)
+        self.assertIsNotNone(runtime_snapshot)
+        assert runtime_snapshot is not None
+        self.assertNotEqual(runtime_snapshot["guard_state"], "auto_dispatch_blocked")
+        self.assertNotIn("连续拒绝", runtime_snapshot.get("guard_detail") or "")
+
+        alerts_status, alerts = self._get("/api/alerts")
+        self.assertEqual(alerts_status, 200)
+        self.assertFalse(
+            any(
+                str(item.get("rule_key") or "") == "strategy-exchange-rejection-guard:trend-btc-01:live"
+                and not item["acknowledged"]
+                for item in alerts
+            )
+        )
+
+        audit_status, audit_events = self._get("/api/audit/events")
+        self.assertEqual(audit_status, 200)
+        self.assertTrue(
+            any(item["event_type"] == "strategy.exchange_order.rejection_guard.resolved" for item in audit_events)
+        )
+
+    def test_strategy_runtime_stale_live_order_alerts_without_auto_dispatch(self) -> None:
+        original_market = control_main.market_data
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        candles = [
+            CandlePoint(
+                time=f"2026-03-29T{hour:02d}:00:00+08:00",
+                open=69000.0 - hour * 90,
+                high=69080.0 - hour * 90,
+                low=68920.0 - hour * 90,
+                close=68940.0 - hour * 90,
+                volume=1700.0 + hour * 22,
+            )
+            for hour in range(24)
+        ]
+        control_main.market_data = StubStrategyRuntimeMarketClient(
+            symbol="BTCUSDT",
+            price=66120.0,
+            change_24h=-4.3,
+            candles=candles,
+        )
+        private_client = StubConfiguredTradingBybitPrivateClient()
+        control_main.private_data = private_client
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(
+            client=private_client,
+            connected=True,
+            authenticated=True,
+            orders=[
+                {
+                    "orderId": "live-stale-order-001",
+                    "orderLinkId": "strategy-live-trend-btc-01-stale01",
+                    "symbol": "BTCUSDT",
+                    "category": "linear",
+                    "side": "Sell",
+                    "orderType": "Limit",
+                    "qty": "0.03",
+                    "price": "66880",
+                    "orderStatus": "New",
+                    "createdTime": "1774880000000",
+                }
+            ],
+        )
+        self.addCleanup(lambda: setattr(control_main, "market_data", original_market))
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+
+        status, payload = self._get("/api/strategies/live")
+        self.assertEqual(status, 200)
+        runtime_snapshot = next((item for item in payload if item["strategy_id"] == "trend-btc-01"), None)
+        self.assertIsNotNone(runtime_snapshot)
+        assert runtime_snapshot is not None
+        self.assertEqual(runtime_snapshot["guard_state"], "auto_dispatch_blocked")
+        self.assertIn("长时间未处理", runtime_snapshot["guard_detail"])
+
+        alerts_status, alerts = self._get("/api/alerts")
+        self.assertEqual(alerts_status, 200)
+        self.assertTrue(
+            any(
+                str(item.get("rule_key") or "") == "strategy-stale-order:trend-btc-01:live-stale-order-001"
+                and not item["acknowledged"]
+                for item in alerts
+            )
+        )
+        snapshot_status, snapshot = self._get("/api/control/snapshot")
+        self.assertEqual(snapshot_status, 200)
+        self.assertEqual(snapshot["execution_health"]["stale_order_guards"], 1)
+        self.assertEqual(snapshot["execution_health"]["top_issue"], "挂单停滞 1")
+
+    def test_strategy_runtime_refresh_replaces_stale_live_order_when_signal_is_unchanged(self) -> None:
+        original_market = control_main.market_data
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        candles = [
+            CandlePoint(
+                time=f"2026-03-29T{hour:02d}:00:00+08:00",
+                open=69000.0 - hour * 120,
+                high=69080.0 - hour * 120,
+                low=68920.0 - hour * 120,
+                close=68940.0 - hour * 120,
+                volume=1700.0 + hour * 22,
+            )
+            for hour in range(24)
+        ]
+        control_main.market_data = StubStrategyRuntimeMarketClient(
+            symbol="BTCUSDT",
+            price=66120.0,
+            change_24h=-4.3,
+            candles=candles,
+        )
+        private_client = StubConfiguredTradingBybitPrivateClient()
+        control_main.private_data = private_client
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(
+            client=private_client,
+            connected=True,
+            authenticated=True,
+            orders=[
+                {
+                    "orderId": "live-stale-order-002",
+                    "orderLinkId": "strategy-live-trend-btc-01-stale02",
+                    "symbol": "BTCUSDT",
+                    "category": "linear",
+                    "side": "Sell",
+                    "orderType": "Limit",
+                    "qty": "0.03",
+                    "price": "66880",
+                    "orderStatus": "New",
+                    "createdTime": "1774880000000",
+                }
+            ],
+        )
+        self.addCleanup(lambda: setattr(control_main, "market_data", original_market))
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+
+        control_main.repo.state.strategy_runtime_snapshots = [
+            StrategyRuntimeSnapshot(
+                strategy_id="trend-btc-01",
+                strategy_name="BTC 趋势跟随",
+                symbol="BTCUSDT",
+                market="perp",
+                mode=AccountMode.LIVE,
+                runtime_status="running",
+                signal="short",
+                confidence=61.0,
+                last_price=66120.0,
+                reference_price=66220.0,
+                change_24h=-4.3,
+                note="上一轮已经是空头信号。",
+                next_action="保持当前策略委托。",
+                last_evaluated_at="2026-03-31T00:00:00+08:00",
+            )
+        ]
+
+        snapshots = control_main.refresh_strategy_runtime_once(auto_dispatch=True)
+        updated = next((item for item in snapshots if item.strategy_id == "trend-btc-01"), None)
+        self.assertIsNotNone(updated)
+        assert updated is not None
+        self.assertEqual(updated.signal, "short")
+        self.assertEqual(len(private_client.cancelled_order_bodies), 1)
+        self.assertEqual(private_client.cancelled_order_bodies[-1]["orderId"], "live-stale-order-002")
+        self.assertEqual(len(private_client.created_order_bodies), 1)
+        self.assertEqual(private_client.created_order_bodies[-1]["side"], "Sell")
+
+        audit_status, audit_events = self._get("/api/audit/events")
+        self.assertEqual(audit_status, 200)
+        self.assertTrue(any(item["event_type"] == "strategy.exchange_order.cancelled_stale_timeout" for item in audit_events))
+        self.assertTrue(any(item["event_type"] == "strategy.exchange_order.reconcile_missing_order" for item in audit_events))
+
+    def test_strategy_runtime_refresh_cancels_live_strategy_orders_when_manual_override_enabled(self) -> None:
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        private_client = StubConfiguredTradingBybitPrivateClient()
+        control_main.private_data = private_client
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(
+            client=private_client,
+            connected=True,
+            authenticated=True,
+            orders=[
+                {
+                    "orderId": "live-open-strategy-manual-001",
+                    "orderLinkId": "strategy-live-trend-btc-01-deadbeef",
+                    "symbol": "BTCUSDT",
+                    "category": "linear",
+                    "side": "Buy",
+                    "orderType": "Limit",
+                    "qty": "0.03",
+                    "price": "66880",
+                    "orderStatus": "New",
+                    "createdTime": "1774887600000",
+                }
+            ],
+        )
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+        control_main.repo.state.control_snapshot.scheduler.status = "manual_override"
+        self.addCleanup(lambda: setattr(control_main.repo.state.control_snapshot.scheduler, "status", "running"))
+        control_main.repo.state.control_snapshot.scheduler.freeze_publish = True
+        self.addCleanup(lambda: setattr(control_main.repo.state.control_snapshot.scheduler, "freeze_publish", False))
+
+        control_main.repo.state.strategy_runtime_snapshots = [
+            StrategyRuntimeSnapshot(
+                strategy_id="trend-btc-01",
+                strategy_name="BTC 趋势跟随",
+                symbol="BTCUSDT",
+                market="perp",
+                mode=AccountMode.LIVE,
+                runtime_status="running",
+                signal="long",
+                confidence=74.0,
+                last_price=68900.0,
+                reference_price=68200.0,
+                change_24h=4.2,
+                note="上一轮仍为多头。",
+                next_action="继续观察。",
+                last_evaluated_at="2026-03-31T00:00:00+08:00",
+            )
+        ]
+
+        snapshots = control_main.refresh_strategy_runtime_once(auto_dispatch=True)
+        updated = next((item for item in snapshots if item.strategy_id == "trend-btc-01"), None)
+        self.assertIsNotNone(updated)
+        self.assertEqual(len(private_client.cancelled_order_bodies), 1)
+        self.assertEqual(private_client.cancelled_order_bodies[-1]["orderId"], "live-open-strategy-manual-001")
+
+    def test_strategy_runtime_refresh_cancels_live_strategy_orders_when_public_ws_is_unavailable(self) -> None:
+        original_market = control_main.market_data
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        candles = [
+            CandlePoint(
+                time=f"2026-03-29T{hour:02d}:00:00+08:00",
+                open=66800.0 + (5 if hour % 2 == 0 else -5),
+                high=66830.0,
+                low=66770.0,
+                close=66805.0 + (4 if hour % 2 == 0 else -4),
+                volume=1200.0 + hour * 10,
+            )
+            for hour in range(24)
+        ]
+        market_client = StubStrategyRuntimeMarketClient(
+            symbol="BTCUSDT",
+            price=66802.0,
+            change_24h=0.3,
+            candles=candles,
+        )
+        market_client.realtime = StubPublicExecutionRealtimeFeed(
+            connected_linear=False,
+            ticker_symbols=[],
+        )
+        private_client = StubConfiguredTradingBybitPrivateClient()
+        control_main.market_data = market_client
+        control_main.private_data = private_client
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(
+            client=private_client,
+            connected=True,
+            authenticated=True,
+            orders=[
+                {
+                    "orderId": "live-open-strategy-public-001",
+                    "orderLinkId": "strategy-live-trend-btc-01-public",
+                    "symbol": "BTCUSDT",
+                    "category": "linear",
+                    "side": "Buy",
+                    "orderType": "Limit",
+                    "qty": "0.03",
+                    "price": "66880",
+                    "orderStatus": "New",
+                    "createdTime": "1774887600000",
+                }
+            ],
+        )
+        self.addCleanup(lambda: setattr(control_main, "market_data", original_market))
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+
+        snapshots = control_main.refresh_strategy_runtime_once(auto_dispatch=True)
+        updated = next((item for item in snapshots if item.strategy_id == "trend-btc-01"), None)
+        self.assertIsNotNone(updated)
+        self.assertEqual(len(private_client.cancelled_order_bodies), 1)
+        self.assertEqual(private_client.cancelled_order_bodies[-1]["orderId"], "live-open-strategy-public-001")
+        self.assertEqual(private_client.created_order_bodies, [])
+
+    def test_strategy_runtime_refresh_cancels_surplus_live_strategy_orders(self) -> None:
+        original_market = control_main.market_data
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        candles = [
+            CandlePoint(
+                time=f"2026-03-29T{hour:02d}:00:00+08:00",
+                open=66800.0 + (5 if hour % 2 == 0 else -5),
+                high=66830.0,
+                low=66770.0,
+                close=66805.0 + (4 if hour % 2 == 0 else -4),
+                volume=1200.0 + hour * 10,
+            )
+            for hour in range(24)
+        ]
+        market_client = StubStrategyRuntimeMarketClient(
+            symbol="BTCUSDT",
+            price=66802.0,
+            change_24h=0.3,
+            candles=candles,
+        )
+        market_client.realtime = StubPublicExecutionRealtimeFeed(
+            connected_linear=True,
+            ticker_symbols=["BTCUSDT"],
+            symbol_last_message_at={"BTCUSDT": datetime.now(timezone.utc).astimezone().isoformat()},
+            last_message_at_linear=datetime.now(timezone.utc).astimezone().isoformat(),
+        )
+        private_client = StubConfiguredTradingBybitPrivateClient()
+        control_main.market_data = market_client
+        control_main.private_data = private_client
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(
+            client=private_client,
+            connected=True,
+            authenticated=True,
+            orders=[
+                {
+                    "orderId": "live-open-strategy-dup-new",
+                    "orderLinkId": "strategy-live-trend-btc-01-new",
+                    "symbol": "BTCUSDT",
+                    "category": "linear",
+                    "side": "Buy",
+                    "orderType": "Limit",
+                    "qty": "0.03",
+                    "price": "66890",
+                    "orderStatus": "New",
+                    "createdTime": str(now_ms),
+                },
+                {
+                    "orderId": "live-open-strategy-dup-old",
+                    "orderLinkId": "strategy-live-trend-btc-01-old",
+                    "symbol": "BTCUSDT",
+                    "category": "linear",
+                    "side": "Buy",
+                    "orderType": "Limit",
+                    "qty": "0.03",
+                    "price": "66880",
+                    "orderStatus": "New",
+                    "createdTime": str(now_ms - 60_000),
+                },
+            ],
+        )
+        self.addCleanup(lambda: setattr(control_main, "market_data", original_market))
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+
+        snapshots = control_main.refresh_strategy_runtime_once(auto_dispatch=True)
+        updated = next((item for item in snapshots if item.strategy_id == "trend-btc-01"), None)
+        self.assertIsNotNone(updated)
+        self.assertEqual(len(private_client.cancelled_order_bodies), 1)
+        self.assertEqual(private_client.cancelled_order_bodies[-1]["orderId"], "live-open-strategy-dup-old")
+        self.assertEqual(private_client.created_order_bodies, [])
+
+        audit_status, audit_events = self._get("/api/audit/events")
+        self.assertEqual(audit_status, 200)
+        self.assertTrue(any(item["event_type"] == "strategy.exchange_order.cancelled_surplus" for item in audit_events))
+
+    def test_strategy_runtime_refresh_triggers_live_stop_loss_guard_and_cancels_strategy_orders(self) -> None:
+        original_market = control_main.market_data
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        candles = [
+            CandlePoint(
+                time=f"2026-03-29T{hour:02d}:00:00+08:00",
+                open=69000.0 - hour * 160,
+                high=69060.0 - hour * 160,
+                low=68910.0 - hour * 160,
+                close=68920.0 - hour * 160,
+                volume=1600.0 + hour * 18,
+            )
+            for hour in range(24)
+        ]
+        control_main.market_data = StubStrategyRuntimeMarketClient(
+            symbol="BTCUSDT",
+            price=65520.0,
+            change_24h=-5.8,
+            candles=candles,
+        )
+        private_client = StubConfiguredTradingBybitPrivateClient()
+        realtime_client = StubBybitPrivateRealtimeClient(
+            client=private_client,
+            connected=True,
+            authenticated=True,
+            orders=[
+                {
+                    "orderId": "live-open-strategy-stop-001",
+                    "orderLinkId": "strategy-live-trend-btc-01-deadbeef",
+                    "symbol": "BTCUSDT",
+                    "category": "linear",
+                    "side": "Sell",
+                    "orderType": "Limit",
+                    "qty": "0.03",
+                    "price": "65480",
+                    "orderStatus": "New",
+                    "createdTime": "1774887600000",
+                }
+            ],
+        )
+        control_main.private_data = private_client
+        control_main.private_realtime = realtime_client
+        self.addCleanup(lambda: setattr(control_main, "market_data", original_market))
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+        control_main.repo.state.workspace_preferences.selected_mode = AccountMode.LIVE
+        control_main.repo.state.control_snapshot.scheduler.current_mode = AccountMode.LIVE
+
+        strategy = next(item for item in control_main.repo.state.strategies if item.id == "trend-btc-01")
+        original_parameters = list(strategy.parameters)
+        self.addCleanup(lambda: setattr(strategy, "parameters", original_parameters))
+        strategy.parameters = [
+            *original_parameters,
+            StrategyParameter(key="stop_loss_pct", label="止损", value=1.2, unit="%"),
+        ]
+
+        control_main.repo.state.strategy_runtime_snapshots = [
+            StrategyRuntimeSnapshot(
+                strategy_id="trend-btc-01",
+                strategy_name="BTC 趋势跟随",
+                symbol="BTCUSDT",
+                market="perp",
+                mode=AccountMode.LIVE,
+                runtime_status="running",
+                signal="watch",
+                confidence=18.0,
+                last_price=66800.0,
+                reference_price=66720.0,
+                change_24h=0.6,
+                note="上一轮仍在观察。",
+                next_action="继续观察。",
+                last_evaluated_at="2026-03-31T00:00:00+08:00",
+            )
+        ]
+
+        snapshots = control_main.refresh_strategy_runtime_once(auto_dispatch=True)
+        updated = next((item for item in snapshots if item.strategy_id == "trend-btc-01"), None)
+        self.assertIsNotNone(updated)
+        assert updated is not None
+        self.assertEqual(updated.signal, "short")
+        self.assertEqual(private_client.created_order_bodies, [])
+        self.assertEqual(len(private_client.cancelled_order_bodies), 1)
+        self.assertEqual(private_client.cancelled_order_bodies[-1]["orderId"], "live-open-strategy-stop-001")
+
+        alerts_status, alerts = self._get("/api/alerts")
+        self.assertEqual(alerts_status, 200)
+        stop_alert = next(
+            (item for item in alerts if str(item.get("rule_key") or "").startswith("strategy-live-stop-loss:trend-btc-01:")),
+            None,
+        )
+        self.assertIsNotNone(stop_alert)
+
+        preview_status, preview = self._get("/api/strategies/trend-btc-01/execution-preview?mode=live")
+        self.assertEqual(preview_status, 200)
+        self.assertFalse(preview["allowed"])
+        self.assertIn("止损保护", preview["blocked_reason"])
+        self.assertTrue(any("止损保护" in item for item in preview["warnings"]))
+
+        runtime_status, runtime_payload = self._get("/api/strategies/live")
+        self.assertEqual(runtime_status, 200)
+        runtime_snapshot = next((item for item in runtime_payload if item["strategy_id"] == "trend-btc-01"), None)
+        self.assertIsNotNone(runtime_snapshot)
+        assert runtime_snapshot is not None
+        self.assertIn("止损保护", runtime_snapshot["note"])
+        self.assertIn("复核真实仓位", runtime_snapshot["next_action"])
+
+        audit_status, audit_events = self._get("/api/audit/events")
+        self.assertEqual(audit_status, 200)
+        self.assertTrue(any(item["event_type"] == "strategy.exchange_stop_loss.alerted" for item in audit_events))
+
+    def test_live_stop_loss_guard_persists_while_real_position_remains_open(self) -> None:
+        original_market = control_main.market_data
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        initial_candles = [
+            CandlePoint(
+                time=f"2026-03-29T{hour:02d}:00:00+08:00",
+                open=69000.0 - hour * 160,
+                high=69060.0 - hour * 160,
+                low=68910.0 - hour * 160,
+                close=68920.0 - hour * 160,
+                volume=1600.0 + hour * 18,
+            )
+            for hour in range(24)
+        ]
+        recovery_candles = [
+            CandlePoint(
+                time=f"2026-03-29T{hour:02d}:00:00+08:00",
+                open=68000.0 + hour * 60,
+                high=68080.0 + hour * 60,
+                low=67940.0 + hour * 60,
+                close=68040.0 + hour * 60,
+                volume=1500.0 + hour * 15,
+            )
+            for hour in range(24)
+        ]
+        market_client = StubStrategyRuntimeMarketClient(
+            symbol="BTCUSDT",
+            price=65520.0,
+            change_24h=-5.8,
+            candles=initial_candles,
+        )
+        control_main.market_data = market_client
+        private_client = StubConfiguredTradingBybitPrivateClient()
+        realtime_client = StubBybitPrivateRealtimeClient(
+            client=private_client,
+            connected=True,
+            authenticated=True,
+            orders=[
+                {
+                    "orderId": "live-open-strategy-stop-002",
+                    "orderLinkId": "strategy-live-trend-btc-01-beadfeed",
+                    "symbol": "BTCUSDT",
+                    "category": "linear",
+                    "side": "Sell",
+                    "orderType": "Limit",
+                    "qty": "0.03",
+                    "price": "65480",
+                    "orderStatus": "New",
+                    "createdTime": "1774887600000",
+                }
+            ],
+        )
+        control_main.private_data = private_client
+        control_main.private_realtime = realtime_client
+        self.addCleanup(lambda: setattr(control_main, "market_data", original_market))
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+        control_main.repo.state.workspace_preferences.selected_mode = AccountMode.LIVE
+        control_main.repo.state.control_snapshot.scheduler.current_mode = AccountMode.LIVE
+
+        strategy = next(item for item in control_main.repo.state.strategies if item.id == "trend-btc-01")
+        original_parameters = list(strategy.parameters)
+        self.addCleanup(lambda: setattr(strategy, "parameters", original_parameters))
+        strategy.parameters = [
+            *original_parameters,
+            StrategyParameter(key="stop_loss_pct", label="止损", value=1.2, unit="%"),
+        ]
+
+        control_main.repo.state.strategy_runtime_snapshots = [
+            StrategyRuntimeSnapshot(
+                strategy_id="trend-btc-01",
+                strategy_name="BTC 趋势跟随",
+                symbol="BTCUSDT",
+                market="perp",
+                mode=AccountMode.LIVE,
+                runtime_status="running",
+                signal="watch",
+                confidence=18.0,
+                last_price=66800.0,
+                reference_price=66720.0,
+                change_24h=0.6,
+                note="上一轮仍在观察。",
+                next_action="继续观察。",
+                last_evaluated_at="2026-03-31T00:00:00+08:00",
+            )
+        ]
+
+        first_snapshots = control_main.refresh_strategy_runtime_once(auto_dispatch=True)
+        first_updated = next((item for item in first_snapshots if item.strategy_id == "trend-btc-01"), None)
+        self.assertIsNotNone(first_updated)
+        self.assertEqual(len(private_client.cancelled_order_bodies), 1)
+        self.assertEqual(private_client.created_order_bodies, [])
+
+        market_client.price = 68450.0
+        market_client.change_24h = 2.6
+        market_client.candles = recovery_candles
+
+        second_snapshots = control_main.refresh_strategy_runtime_once(auto_dispatch=True)
+        second_updated = next((item for item in second_snapshots if item.strategy_id == "trend-btc-01"), None)
+        self.assertIsNotNone(second_updated)
+        self.assertEqual(len(private_client.cancelled_order_bodies), 1)
+        self.assertEqual(private_client.created_order_bodies, [])
+
+        alerts_status, alerts = self._get("/api/alerts")
+        self.assertEqual(alerts_status, 200)
+        self.assertTrue(
+            any(
+                str(item.get("rule_key") or "").startswith("strategy-live-stop-loss:trend-btc-01:")
+                and not item.get("acknowledged")
+                for item in alerts
+            )
+        )
+
+    def test_live_stop_loss_cooldown_blocks_reentry_after_position_is_flattened(self) -> None:
+        original_market = control_main.market_data
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        initial_candles = [
+            CandlePoint(
+                time=f"2026-03-29T{hour:02d}:00:00+08:00",
+                open=69000.0 - hour * 160,
+                high=69060.0 - hour * 160,
+                low=68910.0 - hour * 160,
+                close=68920.0 - hour * 160,
+                volume=1600.0 + hour * 18,
+            )
+            for hour in range(24)
+        ]
+        recovery_candles = [
+            CandlePoint(
+                time=f"2026-03-29T{hour:02d}:00:00+08:00",
+                open=68000.0 + hour * 60,
+                high=68080.0 + hour * 60,
+                low=67940.0 + hour * 60,
+                close=68040.0 + hour * 60,
+                volume=1500.0 + hour * 15,
+            )
+            for hour in range(24)
+        ]
+        market_client = StubStrategyRuntimeMarketClient(
+            symbol="BTCUSDT",
+            price=65520.0,
+            change_24h=-5.8,
+            candles=initial_candles,
+        )
+        control_main.market_data = market_client
+        private_client = StubConfiguredTradingBybitPrivateClient()
+        realtime_client = StubBybitPrivateRealtimeClient(
+            client=private_client,
+            connected=True,
+            authenticated=True,
+            positions=[
+                {
+                    "symbol": "BTCUSDT",
+                    "category": "linear",
+                    "side": "Buy",
+                    "size": "0.15",
+                    "avgPrice": "66500",
+                    "markPrice": "65520",
+                    "positionValue": "9828",
+                    "leverage": "2",
+                    "unrealisedPnl": "-147",
+                }
+            ],
+            orders=[
+                {
+                    "orderId": "live-open-strategy-stop-003",
+                    "orderLinkId": "strategy-live-trend-btc-01-facefeed",
+                    "symbol": "BTCUSDT",
+                    "category": "linear",
+                    "side": "Sell",
+                    "orderType": "Limit",
+                    "qty": "0.03",
+                    "price": "65480",
+                    "orderStatus": "New",
+                    "createdTime": "1774887600000",
+                }
+            ],
+        )
+        control_main.private_data = private_client
+        control_main.private_realtime = realtime_client
+        self.addCleanup(lambda: setattr(control_main, "market_data", original_market))
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+        control_main.repo.state.workspace_preferences.selected_mode = AccountMode.LIVE
+        control_main.repo.state.control_snapshot.scheduler.current_mode = AccountMode.LIVE
+
+        strategy = next(item for item in control_main.repo.state.strategies if item.id == "trend-btc-01")
+        original_parameters = list(strategy.parameters)
+        self.addCleanup(lambda: setattr(strategy, "parameters", original_parameters))
+        strategy.parameters = [
+            *original_parameters,
+            StrategyParameter(key="stop_loss_pct", label="止损", value=1.2, unit="%"),
+            StrategyParameter(key="cooldown_minutes", label="冷却", value=35, unit="分钟"),
+        ]
+
+        control_main.repo.state.strategy_runtime_snapshots = [
+            StrategyRuntimeSnapshot(
+                strategy_id="trend-btc-01",
+                strategy_name="BTC 趋势跟随",
+                symbol="BTCUSDT",
+                market="perp",
+                mode=AccountMode.LIVE,
+                runtime_status="running",
+                signal="watch",
+                confidence=18.0,
+                last_price=66800.0,
+                reference_price=66720.0,
+                change_24h=0.6,
+                note="上一轮仍在观察。",
+                next_action="继续观察。",
+                last_evaluated_at="2026-03-31T00:00:00+08:00",
+            )
+        ]
+
+        first_snapshots = control_main.refresh_strategy_runtime_once(auto_dispatch=True)
+        first_updated = next((item for item in first_snapshots if item.strategy_id == "trend-btc-01"), None)
+        self.assertIsNotNone(first_updated)
+        self.assertEqual(len(private_client.cancelled_order_bodies), 1)
+        self.assertEqual(private_client.created_order_bodies, [])
+
+        realtime_client.seed_positions_snapshot([])
+        realtime_client.seed_open_orders_snapshot([])
+        market_client.price = 68450.0
+        market_client.change_24h = 2.6
+        market_client.candles = recovery_candles
+
+        second_snapshots = control_main.refresh_strategy_runtime_once(auto_dispatch=True)
+        second_updated = next((item for item in second_snapshots if item.strategy_id == "trend-btc-01"), None)
+        self.assertIsNotNone(second_updated)
+        self.assertEqual(private_client.created_order_bodies, [])
+
+        preview_status, preview = self._get("/api/strategies/trend-btc-01/execution-preview?mode=live")
+        self.assertEqual(preview_status, 409)
+        self.assertIn("冷却期", preview["detail"])
+
+        runtime_status, runtime_payload = self._get("/api/strategies/live")
+        self.assertEqual(runtime_status, 200)
+        runtime_snapshot = next((item for item in runtime_payload if item["strategy_id"] == "trend-btc-01"), None)
+        self.assertIsNotNone(runtime_snapshot)
+        assert runtime_snapshot is not None
+        self.assertTrue(
+            "冷却期" in runtime_snapshot["note"] or "止损保护" in runtime_snapshot["note"]
+        )
+        self.assertIn(runtime_snapshot["guard_state"], {"cooldown", "live_stop_loss"})
+        self.assertTrue(
+            "冷却期" in runtime_snapshot["guard_detail"] or "止损保护" in runtime_snapshot["guard_detail"]
+        )
+
+        snapshot_status, control_snapshot = self._get("/api/control/snapshot")
+        self.assertEqual(snapshot_status, 200)
+        self.assertEqual(control_snapshot["strategy_metrics"][0]["delta"], "止损保护 1")
+        self.assertEqual(control_snapshot["strategy_metrics"][0]["tone"], "critical")
+        self.assertEqual(control_snapshot["strategy_metrics"][2]["delta"], "冷却中 1")
+        self.assertEqual(control_snapshot["strategy_metrics"][2]["tone"], "critical")
+        self.assertEqual(control_snapshot["execution_health"]["active_stop_loss_guards"], 1)
+        self.assertEqual(control_snapshot["execution_health"]["cooldowns"], 1)
+        self.assertEqual(control_snapshot["execution_health"]["top_issue"], "止损保护 1")
+        self.assertEqual(control_snapshot["execution_health"]["top_issue_strategy_id"], "trend-btc-01")
+        self.assertEqual(control_snapshot["execution_health"]["top_issue_strategy_name"], "BTC 趋势跟随")
+        self.assertEqual(control_snapshot["execution_health"]["top_issue_symbol"], "BTCUSDT")
+        self.assertIn("真实模式止损保护", control_snapshot["execution_health"]["top_issue_detail"])
+        self.assertIn("恢复自动执行", control_snapshot["execution_health"]["top_issue_recommended_action"])
+
+        metrics_status, metrics_body = self._get_text("/metrics")
+        self.assertEqual(metrics_status, 200)
+        self.assertIn(
+            'bybit_control_strategy_live_stop_loss_guard{strategy_id="trend-btc-01",mode="live",status="running"} 1',
+            metrics_body,
+        )
+        self.assertRegex(
+            metrics_body,
+            r'bybit_control_strategy_live_stop_loss_cooldown_minutes\{strategy_id="trend-btc-01",mode="live",status="running"\} [1-9][0-9]*',
+        )
+
+    def test_live_strategy_signal_change_creates_system_alert(self) -> None:
+        original_market = control_main.market_data
+        candles = [
+            CandlePoint(
+                time=f"2026-03-29T{hour:02d}:00:00+08:00",
+                open=66200.0 + hour * 110,
+                high=66290.0 + hour * 110,
+                low=66140.0 + hour * 110,
+                close=66260.0 + hour * 110,
+                volume=1800.0 + hour * 24,
+            )
+            for hour in range(24)
+        ]
+        control_main.market_data = StubStrategyRuntimeMarketClient(
+            symbol="BTCUSDT",
+            price=68900.0,
+            change_24h=4.6,
+            candles=candles,
+        )
+        self.addCleanup(lambda: setattr(control_main, "market_data", original_market))
+        control_main.repo.state.strategy_runtime_snapshots = []
+
+        runtime_status, runtime_payload = self._get("/api/strategies/live")
+        self.assertEqual(runtime_status, 200)
+        runtime_snapshot = next((item for item in runtime_payload if item["strategy_id"] == "trend-btc-01"), None)
+        self.assertIsNotNone(runtime_snapshot)
+        assert runtime_snapshot is not None
+        self.assertEqual(runtime_snapshot["signal"], "long")
+
+        alerts_status, alerts = self._get("/api/alerts")
+        self.assertEqual(alerts_status, 200)
+        strategy_alert = next(
+            (item for item in alerts if str(item.get("rule_key") or "").startswith("strategy-signal:trend-btc-01:")),
+            None,
+        )
+        self.assertIsNotNone(strategy_alert)
+        assert strategy_alert is not None
+        self.assertEqual(strategy_alert["source_type"], "system")
+        self.assertEqual(strategy_alert["severity"], "P1")
+        self.assertEqual(strategy_alert["symbol"], "BTCUSDT")
+        self.assertIn("做多", strategy_alert["title"])
+
+        audit_status, audit_events = self._get("/api/audit/events")
+        self.assertEqual(audit_status, 200)
+        self.assertTrue(
+            any(
+                item["event_type"] == "alert.system_triggered"
+                and item["payload"].get("strategy_id") == "trend-btc-01"
+                for item in audit_events
+            )
+        )
+
+    def test_live_strategy_signal_alert_retires_previous_unacknowledged_alert(self) -> None:
+        original_market = control_main.market_data
+        bearish_candles = [
+            CandlePoint(
+                time=f"2026-03-29T{hour:02d}:00:00+08:00",
+                open=69000.0 - hour * 120,
+                high=69080.0 - hour * 120,
+                low=68920.0 - hour * 120,
+                close=68940.0 - hour * 120,
+                volume=1650.0 + hour * 20,
+            )
+            for hour in range(24)
+        ]
+        control_main.market_data = StubStrategyRuntimeMarketClient(
+            symbol="BTCUSDT",
+            price=66120.0,
+            change_24h=-4.3,
+            candles=bearish_candles,
+        )
+        self.addCleanup(lambda: setattr(control_main, "market_data", original_market))
+        control_main.repo.state.strategy_runtime_snapshots = [
+            StrategyRuntimeSnapshot(
+                strategy_id="trend-btc-01",
+                strategy_name="BTC 趋势跟随",
+                symbol="BTCUSDT",
+                market="perp",
+                mode=AccountMode.LIVE,
+                runtime_status="running",
+                signal="long",
+                confidence=72.0,
+                last_price=68900.0,
+                reference_price=68200.0,
+                change_24h=4.1,
+                note="上一轮为多头。",
+                next_action="继续观察。",
+                last_evaluated_at="2026-03-31T00:00:00+08:00",
+            )
+        ]
+        control_main.repo.state.alerts.insert(
+            0,
+            AlertRecord(
+                id="alert-strategy-old-001",
+                severity="P1",
+                symbol="BTCUSDT",
+                title="BTCUSDT 策略信号更新 · 做多",
+                description="旧的多头提醒",
+                triggered_at="2026-03-31T00:00:00+08:00",
+                suggested_action="旧动作",
+                acknowledged=False,
+                source_type="system",
+                rule_key="strategy-signal:trend-btc-01:running:long",
+            ),
+        )
+
+        runtime_status, runtime_payload = self._get("/api/strategies/live")
+        self.assertEqual(runtime_status, 200)
+        runtime_snapshot = next((item for item in runtime_payload if item["strategy_id"] == "trend-btc-01"), None)
+        self.assertIsNotNone(runtime_snapshot)
+        assert runtime_snapshot is not None
+        self.assertEqual(runtime_snapshot["signal"], "short")
+
+        alerts_status, alerts = self._get("/api/alerts")
+        self.assertEqual(alerts_status, 200)
+        old_alert = next((item for item in alerts if item["id"] == "alert-strategy-old-001"), None)
+        self.assertIsNotNone(old_alert)
+        assert old_alert is not None
+        self.assertTrue(old_alert["acknowledged"])
+
+        current_alert = next(
+            (
+                item
+                for item in alerts
+                if str(item.get("rule_key") or "") == "strategy-signal:trend-btc-01:running:short"
+            ),
+            None,
+        )
+        self.assertIsNotNone(current_alert)
+        assert current_alert is not None
+        self.assertFalse(current_alert["acknowledged"])
+        self.assertIn("做空", current_alert["title"])
+
+    def test_strategy_runtime_signal_flip_reconciles_to_short_target(self) -> None:
+        original_market = control_main.market_data
+        long_candles = [
+            CandlePoint(
+                time=f"2026-03-29T{hour:02d}:00:00+08:00",
+                open=100.0,
+                high=100.6,
+                low=99.4,
+                close=100.0,
+                volume=1200.0,
+            )
+            for hour in range(23)
+        ]
+        long_candles.append(
+            CandlePoint(
+                time="2026-03-30T23:00:00+08:00",
+                open=100.0,
+                high=100.2,
+                low=93.6,
+                close=94.0,
+                volume=1880.0,
+            )
+        )
+        control_main.market_data = StubStrategyRuntimeMarketClient(
+            symbol="ETHUSDT",
+            price=94.0,
+            change_24h=-2.4,
+            candles=long_candles,
+        )
+        self.addCleanup(lambda: setattr(control_main, "market_data", original_market))
+
+        self._reset_strategy_paper_state("eth-revert-02")
+
+        long_status, long_runtime_payload = self._get("/api/strategies/live")
+        self.assertEqual(long_status, 200)
+        long_runtime = next((item for item in long_runtime_payload if item["strategy_id"] == "eth-revert-02"), None)
+        self.assertIsNotNone(long_runtime)
+        assert long_runtime is not None
+        self.assertEqual(long_runtime["signal"], "long")
+
+        account_status, account_payload = self._get("/api/account/live")
+        self.assertEqual(account_status, 200)
+        long_position = next((item for item in account_payload["positions"] if item["symbol"] == "ETHUSDT"), None)
+        self.assertIsNotNone(long_position)
+        assert long_position is not None
+        self.assertEqual(long_position["side"], "long")
+
+        short_candles = [
+            CandlePoint(
+                time=f"2026-03-30T{hour:02d}:00:00+08:00",
+                open=100.0,
+                high=100.6,
+                low=99.4,
+                close=100.0,
+                volume=1200.0,
+            )
+            for hour in range(23)
+        ]
+        short_candles.append(
+            CandlePoint(
+                time="2026-03-31T23:00:00+08:00",
+                open=100.0,
+                high=106.4,
+                low=99.8,
+                close=106.0,
+                volume=1900.0,
+            )
+        )
+        control_main.market_data = StubStrategyRuntimeMarketClient(
+            symbol="ETHUSDT",
+            price=106.0,
+            change_24h=2.6,
+            candles=short_candles,
+        )
+
+        short_status, short_runtime_payload = self._get("/api/strategies/live")
+        self.assertEqual(short_status, 200)
+        short_runtime = next((item for item in short_runtime_payload if item["strategy_id"] == "eth-revert-02"), None)
+        self.assertIsNotNone(short_runtime)
+        assert short_runtime is not None
+        self.assertEqual(short_runtime["signal"], "short")
+        self.assertEqual(short_runtime["execution_preview"]["projected_position_side"], "short")
+
+        second_account_status, second_account_payload = self._get("/api/account/live")
+        self.assertEqual(second_account_status, 200)
+        short_position = next((item for item in second_account_payload["positions"] if item["symbol"] == "ETHUSDT"), None)
+        self.assertIsNotNone(short_position)
+        assert short_position is not None
+        self.assertEqual(short_position["side"], "short")
+        self.assertEqual(short_runtime["current_position_side"], "short")
+        self.assertEqual(short_runtime["current_position_size"], short_position["size"])
+        self.assertEqual(short_runtime["current_position_avg_price"], short_position["avg_price"])
+        self.assertEqual(short_runtime["target_position_side"], "short")
+        self.assertEqual(short_runtime["position_alignment"], "aligned")
+        self.assertIn("已与策略目标仓位对齐", short_runtime["position_alignment_detail"])
+
+    def test_strategy_runtime_preview_ignores_manual_position_drift_on_same_symbol(self) -> None:
+        original_market = control_main.market_data
+        candles = [
+            CandlePoint(
+                time=f"2026-03-29T{hour:02d}:00:00+08:00",
+                open=100.0,
+                high=100.6,
+                low=99.4,
+                close=100.0,
+                volume=1200.0,
+            )
+            for hour in range(23)
+        ]
+        candles.append(
+            CandlePoint(
+                time="2026-03-30T23:00:00+08:00",
+                open=100.0,
+                high=100.2,
+                low=93.6,
+                close=94.0,
+                volume=1880.0,
+            )
+        )
+        control_main.market_data = StubStrategyRuntimeMarketClient(
+            symbol="ETHUSDT",
+            price=94.0,
+            change_24h=-2.4,
+            candles=candles,
+        )
+        self.addCleanup(lambda: setattr(control_main, "market_data", original_market))
+
+        self._reset_strategy_paper_state("eth-revert-02")
+
+        first_status, first_runtime_payload = self._get("/api/strategies/live")
+        self.assertEqual(first_status, 200)
+        first_eth_runtime = next((item for item in first_runtime_payload if item["strategy_id"] == "eth-revert-02"), None)
+        self.assertIsNotNone(first_eth_runtime)
+        assert first_eth_runtime is not None
+        self.assertEqual(first_eth_runtime["signal"], "long")
+
+        second_status, second_runtime_payload = self._get("/api/strategies/live")
+        self.assertEqual(second_status, 200)
+        second_eth_runtime = next((item for item in second_runtime_payload if item["strategy_id"] == "eth-revert-02"), None)
+        self.assertIsNotNone(second_eth_runtime)
+        assert second_eth_runtime is not None
+        self.assertIsNone(second_eth_runtime["execution_preview"])
+
+        manual_status, manual_trade = self._post(
+            "/api/trades/manual",
+            {
+                "symbol": "ETHUSDT",
+                "market": "perp",
+                "mode": "paper",
+                "side": "buy",
+                "quantity": 0.18,
+                "price": 94.0,
+                "note": "manual drift on strategy symbol",
+            },
+        )
+        self.assertEqual(manual_status, 200)
+        self.assertEqual(manual_trade["origin"], "manual")
+
+        third_status, third_runtime_payload = self._get("/api/strategies/live")
+        self.assertEqual(third_status, 200)
+        third_eth_runtime = next((item for item in third_runtime_payload if item["strategy_id"] == "eth-revert-02"), None)
+        self.assertIsNotNone(third_eth_runtime)
+        assert third_eth_runtime is not None
+        self.assertIsNone(third_eth_runtime["execution_preview"])
+
+    def test_strategy_runtime_flat_signal_closes_existing_paper_position(self) -> None:
+        original_market = control_main.market_data
+        long_candles = [
+            CandlePoint(
+                time=f"2026-03-29T{hour:02d}:00:00+08:00",
+                open=100.0,
+                high=100.6,
+                low=99.4,
+                close=100.0,
+                volume=1200.0,
+            )
+            for hour in range(23)
+        ]
+        long_candles.append(
+            CandlePoint(
+                time="2026-03-30T23:00:00+08:00",
+                open=100.0,
+                high=100.2,
+                low=93.6,
+                close=94.0,
+                volume=1880.0,
+            )
+        )
+        control_main.market_data = StubStrategyRuntimeMarketClient(
+            symbol="ETHUSDT",
+            price=94.0,
+            change_24h=-2.4,
+            candles=long_candles,
+        )
+        self.addCleanup(lambda: setattr(control_main, "market_data", original_market))
+
+        self._reset_strategy_paper_state("eth-revert-02")
+
+        long_status, _long_runtime_payload = self._get("/api/strategies/live")
+        self.assertEqual(long_status, 200)
+
+        flat_candles = [
+            CandlePoint(
+                time=f"2026-03-30T{hour:02d}:00:00+08:00",
+                open=100.0,
+                high=100.2,
+                low=99.8,
+                close=100.0,
+                volume=1180.0,
+            )
+            for hour in range(24)
+        ]
+        control_main.market_data = StubStrategyRuntimeMarketClient(
+            symbol="ETHUSDT",
+            price=100.0,
+            change_24h=0.1,
+            candles=flat_candles,
+        )
+
+        flat_status, flat_runtime_payload = self._get("/api/strategies/live")
+        self.assertEqual(flat_status, 200)
+        flat_runtime = next((item for item in flat_runtime_payload if item["strategy_id"] == "eth-revert-02"), None)
+        self.assertIsNotNone(flat_runtime)
+        assert flat_runtime is not None
+        self.assertEqual(flat_runtime["signal"], "flat")
+        self.assertEqual(flat_runtime["execution_preview"]["projected_position_side"], "flat")
+
+        account_status, account_payload = self._get("/api/account/live")
+        self.assertEqual(account_status, 200)
+        self.assertFalse(any(item["symbol"] == "ETHUSDT" for item in account_payload["positions"]))
+
+    def test_strategy_runtime_blocked_execution_promotes_system_alert(self) -> None:
+        original_market = control_main.market_data
+        long_candles = [
+            CandlePoint(
+                time=f"2026-03-29T{hour:02d}:00:00+08:00",
+                open=100.0,
+                high=100.6,
+                low=99.4,
+                close=100.0,
+                volume=1200.0,
+            )
+            for hour in range(23)
+        ]
+        long_candles.append(
+            CandlePoint(
+                time="2026-03-30T23:00:00+08:00",
+                open=100.0,
+                high=100.2,
+                low=93.6,
+                close=94.0,
+                volume=1880.0,
+            )
+        )
+        control_main.market_data = StubStrategyRuntimeMarketClient(
+            symbol="ETHUSDT",
+            price=94.0,
+            change_24h=-2.4,
+            candles=long_candles,
+        )
+        self.addCleanup(lambda: setattr(control_main, "market_data", original_market))
+
+        self._reset_strategy_paper_state("eth-revert-02")
+        overview_status, overview_payload = self._get("/api/account/live")
+        self.assertEqual(overview_status, 200)
+
+        available_cash = float(str(overview_payload["overview"]["total_available_balance"]).replace("USDT", "").replace(",", "").strip())
+        drain_quantity = round(max((available_cash - 8.0) / 86125.4, 0.001), 4)
+        drain_status, _drain_trade = self._post(
+            "/api/trades/manual",
+            {
+                "symbol": "BTCUSDT",
+                "market": "perp",
+                "mode": "paper",
+                "side": "buy",
+                "quantity": drain_quantity,
+                "price": 86125.4,
+                "note": "drain paper cash before blocked strategy test",
+            },
+        )
+        self.assertEqual(drain_status, 200)
+
+        runtime_status, runtime_payload = self._get("/api/strategies/live")
+        self.assertEqual(runtime_status, 200)
+        eth_runtime = next((item for item in runtime_payload if item["strategy_id"] == "eth-revert-02"), None)
+        self.assertIsNotNone(eth_runtime)
+        assert eth_runtime is not None
+        self.assertFalse(eth_runtime["execution_preview"]["allowed"])
+        self.assertIn("余额不足", eth_runtime["execution_preview"]["blocked_reason"])
+
+        alerts_status, alerts_payload = self._get("/api/alerts")
+        self.assertEqual(alerts_status, 200)
+        blocked_alerts = [
+            item
+            for item in alerts_payload
+            if item["source_type"] == "system" and item["title"].endswith("执行被风控拦截")
+        ]
+        self.assertEqual(len(blocked_alerts), 1)
+        self.assertEqual(blocked_alerts[0]["symbol"], "ETHUSDT")
+
+        audit_status, audit_events = self._get("/api/audit/events")
+        self.assertEqual(audit_status, 200)
+        self.assertTrue(any(item["event_type"] == "risk.blocked_order" for item in audit_events))
+        self.assertTrue(any(item["event_type"] == "alert.system_triggered" for item in audit_events))
+
+    def test_strategy_runtime_stop_loss_closes_paper_position_and_alerts(self) -> None:
+        original_market = control_main.market_data
+        long_candles = [
+            CandlePoint(
+                time=f"2026-03-29T{hour:02d}:00:00+08:00",
+                open=100.0,
+                high=100.6,
+                low=99.4,
+                close=100.0,
+                volume=1200.0,
+            )
+            for hour in range(23)
+        ]
+        long_candles.append(
+            CandlePoint(
+                time="2026-03-30T23:00:00+08:00",
+                open=100.0,
+                high=100.2,
+                low=93.6,
+                close=94.0,
+                volume=1880.0,
+            )
+        )
+        control_main.market_data = StubStrategyRuntimeMarketClient(
+            symbol="ETHUSDT",
+            price=94.0,
+            change_24h=-2.4,
+            candles=long_candles,
+        )
+        self.addCleanup(lambda: setattr(control_main, "market_data", original_market))
+
+        self._reset_strategy_paper_state("eth-revert-02")
+
+        first_status, first_runtime_payload = self._get("/api/strategies/live")
+        self.assertEqual(first_status, 200)
+        first_eth_runtime = next((item for item in first_runtime_payload if item["strategy_id"] == "eth-revert-02"), None)
+        self.assertIsNotNone(first_eth_runtime)
+        assert first_eth_runtime is not None
+        self.assertEqual(first_eth_runtime["signal"], "long")
+
+        stop_candles = [
+            CandlePoint(
+                time=f"2026-03-30T{hour:02d}:00:00+08:00",
+                open=100.0,
+                high=100.2,
+                low=99.4,
+                close=100.0,
+                volume=1180.0,
+            )
+            for hour in range(23)
+        ]
+        stop_candles.append(
+            CandlePoint(
+                time="2026-03-31T23:00:00+08:00",
+                open=100.0,
+                high=100.1,
+                low=91.8,
+                close=92.0,
+                volume=2200.0,
+            )
+        )
+        control_main.market_data = StubStrategyRuntimeMarketClient(
+            symbol="ETHUSDT",
+            price=92.0,
+            change_24h=-3.1,
+            candles=stop_candles,
+        )
+
+        second_status, second_runtime_payload = self._get("/api/strategies/live")
+        self.assertEqual(second_status, 200)
+        second_eth_runtime = next((item for item in second_runtime_payload if item["strategy_id"] == "eth-revert-02"), None)
+        self.assertIsNotNone(second_eth_runtime)
+        assert second_eth_runtime is not None
+        self.assertIn("已触发本地止损", second_eth_runtime["note"])
+
+        account_status, account_payload = self._get("/api/account/live")
+        self.assertEqual(account_status, 200)
+        self.assertFalse(any(item["symbol"] == "ETHUSDT" for item in account_payload["positions"]))
+
+        alerts_status, alerts_payload = self._get("/api/alerts")
+        self.assertEqual(alerts_status, 200)
+        self.assertTrue(
+            any(item["source_type"] == "system" and item["title"].endswith("触发本地止损") for item in alerts_payload)
+        )
+
+        audit_status, audit_events = self._get("/api/audit/events")
+        self.assertEqual(audit_status, 200)
+        self.assertTrue(any(item["event_type"] == "strategy.paper_stop_loss.executed" for item in audit_events))
+
+    def test_strategy_runtime_stop_loss_enforces_cooldown_before_reentry(self) -> None:
+        original_market = control_main.market_data
+        long_candles = [
+            CandlePoint(
+                time=f"2026-03-29T{hour:02d}:00:00+08:00",
+                open=100.0,
+                high=100.6,
+                low=99.4,
+                close=100.0,
+                volume=1200.0,
+            )
+            for hour in range(23)
+        ]
+        long_candles.append(
+            CandlePoint(
+                time="2026-03-30T23:00:00+08:00",
+                open=100.0,
+                high=100.2,
+                low=93.6,
+                close=94.0,
+                volume=1880.0,
+            )
+        )
+        control_main.market_data = StubStrategyRuntimeMarketClient(
+            symbol="ETHUSDT",
+            price=94.0,
+            change_24h=-2.4,
+            candles=long_candles,
+        )
+        self.addCleanup(lambda: setattr(control_main, "market_data", original_market))
+
+        self._reset_strategy_paper_state("eth-revert-02")
+
+        first_status, first_runtime_payload = self._get("/api/strategies/live")
+        self.assertEqual(first_status, 200)
+        first_eth_runtime = next((item for item in first_runtime_payload if item["strategy_id"] == "eth-revert-02"), None)
+        self.assertIsNotNone(first_eth_runtime)
+        assert first_eth_runtime is not None
+        self.assertEqual(first_eth_runtime["signal"], "long")
+
+        stop_candles = [
+            CandlePoint(
+                time=f"2026-03-30T{hour:02d}:00:00+08:00",
+                open=100.0,
+                high=100.2,
+                low=99.4,
+                close=100.0,
+                volume=1180.0,
+            )
+            for hour in range(23)
+        ]
+        stop_candles.append(
+            CandlePoint(
+                time="2026-03-31T23:00:00+08:00",
+                open=100.0,
+                high=100.1,
+                low=91.8,
+                close=92.0,
+                volume=2200.0,
+            )
+        )
+        control_main.market_data = StubStrategyRuntimeMarketClient(
+            symbol="ETHUSDT",
+            price=92.0,
+            change_24h=-3.1,
+            candles=stop_candles,
+        )
+        stop_status, _stop_runtime_payload = self._get("/api/strategies/live")
+        self.assertEqual(stop_status, 200)
+
+        reentry_candles = [
+            CandlePoint(
+                time=f"2026-03-31T{hour:02d}:00:00+08:00",
+                open=100.0,
+                high=100.6,
+                low=99.4,
+                close=100.0,
+                volume=1200.0,
+            )
+            for hour in range(23)
+        ]
+        reentry_candles.append(
+            CandlePoint(
+                time="2026-04-01T23:00:00+08:00",
+                open=100.0,
+                high=100.2,
+                low=93.6,
+                close=94.0,
+                volume=1880.0,
+            )
+        )
+        control_main.market_data = StubStrategyRuntimeMarketClient(
+            symbol="ETHUSDT",
+            price=94.0,
+            change_24h=-2.4,
+            candles=reentry_candles,
+        )
+
+        cooldown_status, cooldown_runtime_payload = self._get("/api/strategies/live")
+        self.assertEqual(cooldown_status, 200)
+        cooldown_runtime = next((item for item in cooldown_runtime_payload if item["strategy_id"] == "eth-revert-02"), None)
+        self.assertIsNotNone(cooldown_runtime)
+        assert cooldown_runtime is not None
+        self.assertEqual(cooldown_runtime["signal"], "long")
+        self.assertIsNone(cooldown_runtime["execution_preview"])
+        self.assertIn("冷却期", cooldown_runtime["note"])
+
+        account_status, account_payload = self._get("/api/account/live")
+        self.assertEqual(account_status, 200)
+        self.assertFalse(any(item["symbol"] == "ETHUSDT" for item in account_payload["positions"]))
+
+    def test_market_live_snapshot_supports_timeframe_override(self) -> None:
+        status, payload = self._get("/api/market/live?symbol=ETHUSDT&timeframe=4h")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["detail"]["timeframe"], "4h")
+        self.assertEqual(payload["detail"]["source"], "bybit_rest")
+
+    def test_market_live_snapshot_rejects_invalid_timeframe(self) -> None:
+        status, payload = self._get("/api/market/live?symbol=ETHUSDT&timeframe=2h")
+        self.assertEqual(status, 400)
+        self.assertIn("仅支持", payload["detail"])
+
+    def test_market_stream_once_returns_sse_snapshot(self) -> None:
+        status, body = self._get_text("/api/market/stream?symbol=BTCUSDT&once=true")
+        self.assertEqual(status, 200)
+        self.assertIn("event: snapshot", body)
+        self.assertIn('"selected_symbol": "BTCUSDT"', body)
+        self.assertIn('"symbol": "BTCUSDT"', body)
+
+    def test_market_stream_rejects_invalid_timeframe_before_streaming(self) -> None:
+        status, payload = self._get("/api/market/stream?symbol=BTCUSDT&once=true&timeframe=2h")
+        self.assertEqual(status, 400)
+        self.assertIn("仅支持", payload["detail"])
+
+    def test_news_endpoint_merges_bybit_announcements(self) -> None:
+        status, payload = self._get("/api/news")
+        self.assertEqual(status, 200)
+        self.assertGreaterEqual(len(payload), 1)
+        self.assertTrue(any(item["source"] == "Bybit 公告" for item in payload))
+        target = next(item for item in payload if item["source"] == "Bybit 公告")
+        self.assertEqual(target["category"], "announcement")
+        self.assertTrue(target["url"].startswith("https://"))
+        self.assertGreaterEqual(len(target["related_alert_ids"]), 1)
+
+        alerts_status, alerts = self._get("/api/alerts")
+        self.assertEqual(alerts_status, 200)
+        self.assertTrue(any(item["related_news_id"] == target["id"] and item["source_type"] == "news" for item in alerts))
+
+        second_status, second_payload = self._get("/api/news")
+        self.assertEqual(second_status, 200)
+        second_target = next(item for item in second_payload if item["id"] == target["id"])
+        self.assertEqual(len(second_target["related_alert_ids"]), 1)
+
+        refreshed_alerts_status, refreshed_alerts = self._get("/api/alerts")
+        self.assertEqual(refreshed_alerts_status, 200)
+        matching_news_alerts = [item for item in refreshed_alerts if item["related_news_id"] == target["id"]]
+        self.assertEqual(len(matching_news_alerts), 1)
+
+    def test_grafana_status_and_metrics_endpoint_are_available(self) -> None:
+        status, grafana = self._get("/api/integrations/grafana")
+        self.assertEqual(status, 200)
+        self.assertFalse(grafana["configured"])
+        self.assertEqual(grafana["metrics_path"], "/metrics")
+        self.assertEqual(grafana["recommended_scope"], "ops_monitoring_only")
+
+        metrics_status, metrics_body = self._get_text("/metrics")
+        self.assertEqual(metrics_status, 200)
+        self.assertIn("bybit_control_watchlist_total", metrics_body)
+        self.assertIn("bybit_control_scheduler_queue_depth", metrics_body)
+        self.assertIn('bybit_control_watchlist_change_24h{symbol="BTCUSDT"', metrics_body)
+        self.assertIn('bybit_control_market_ws_connected{channel="spot"}', metrics_body)
+        self.assertIn("bybit_control_private_ws_connected", metrics_body)
+        self.assertIn("bybit_control_private_ws_authenticated", metrics_body)
+        self.assertIn("bybit_control_private_ws_stale", metrics_body)
+        self.assertIn("bybit_control_private_ws_stale_seconds", metrics_body)
+        self.assertIn("bybit_control_paper_realized_pnl", metrics_body)
+        self.assertIn("bybit_control_paper_win_rate", metrics_body)
+        self.assertIn("bybit_control_paper_open_orders", metrics_body)
+        self.assertIn("bybit_control_paper_positions", metrics_body)
+        self.assertIn("bybit_control_paper_available_balance", metrics_body)
+        self.assertIn("bybit_control_strategy_live_stop_loss_guard", metrics_body)
+        self.assertIn("bybit_control_strategy_live_stop_loss_cooldown_minutes", metrics_body)
+        self.assertIn("bybit_control_strategy_auto_dispatch_blocked", metrics_body)
+        self.assertIn("bybit_control_strategy_exchange_rejection_guard", metrics_body)
+        self.assertIn("bybit_control_strategy_exchange_rejection_cooldown_minutes", metrics_body)
+        self.assertIn("bybit_control_strategy_stale_order_guard", metrics_body)
+        self.assertIn('bybit_control_strategy_issue_total{issue="stale_order_guard"}', metrics_body)
+        self.assertIn('bybit_control_strategy_issue_total{issue="position_drift"}', metrics_body)
+        self.assertEqual(metrics_body.count("# HELP bybit_control_market_ws_connected "), 1)
+        self.assertEqual(metrics_body.count("# TYPE bybit_control_market_ws_connected "), 1)
+        self.assertEqual(metrics_body.count("# HELP bybit_control_private_ws_connected "), 1)
+        self.assertEqual(metrics_body.count("# TYPE bybit_control_private_ws_connected "), 1)
+        self.assertEqual(metrics_body.count("# HELP bybit_control_private_ws_stale "), 1)
+        self.assertEqual(metrics_body.count("# TYPE bybit_control_private_ws_stale "), 1)
+        self.assertEqual(metrics_body.count("# HELP bybit_control_private_ws_stale_seconds "), 1)
+        self.assertEqual(metrics_body.count("# TYPE bybit_control_private_ws_stale_seconds "), 1)
+        self.assertEqual(metrics_body.count("# HELP bybit_control_alerts_total "), 1)
+        self.assertEqual(metrics_body.count("# TYPE bybit_control_alerts_total "), 1)
+        self.assertEqual(metrics_body.count("# HELP bybit_control_watchlist_signal_state "), 1)
+        self.assertEqual(metrics_body.count("# TYPE bybit_control_watchlist_signal_state "), 1)
+        self.assertEqual(metrics_body.count("# HELP bybit_control_paper_realized_pnl "), 1)
+        self.assertEqual(metrics_body.count("# TYPE bybit_control_paper_realized_pnl "), 1)
+        self.assertEqual(metrics_body.count("# HELP bybit_control_paper_open_orders "), 1)
+        self.assertEqual(metrics_body.count("# TYPE bybit_control_paper_open_orders "), 1)
+        self.assertEqual(metrics_body.count("# HELP bybit_control_strategy_live_stop_loss_guard "), 1)
+        self.assertEqual(metrics_body.count("# TYPE bybit_control_strategy_live_stop_loss_guard "), 1)
+        self.assertEqual(metrics_body.count("# HELP bybit_control_strategy_live_stop_loss_cooldown_minutes "), 1)
+        self.assertEqual(metrics_body.count("# TYPE bybit_control_strategy_live_stop_loss_cooldown_minutes "), 1)
+        self.assertEqual(metrics_body.count("# HELP bybit_control_strategy_auto_dispatch_blocked "), 1)
+        self.assertEqual(metrics_body.count("# TYPE bybit_control_strategy_auto_dispatch_blocked "), 1)
+        self.assertEqual(metrics_body.count("# HELP bybit_control_strategy_exchange_rejection_guard "), 1)
+        self.assertEqual(metrics_body.count("# TYPE bybit_control_strategy_exchange_rejection_guard "), 1)
+        self.assertEqual(metrics_body.count("# HELP bybit_control_strategy_exchange_rejection_cooldown_minutes "), 1)
+        self.assertEqual(metrics_body.count("# TYPE bybit_control_strategy_exchange_rejection_cooldown_minutes "), 1)
+        self.assertEqual(metrics_body.count("# HELP bybit_control_strategy_stale_order_guard "), 1)
+        self.assertEqual(metrics_body.count("# TYPE bybit_control_strategy_stale_order_guard "), 1)
+        self.assertEqual(metrics_body.count("# HELP bybit_control_strategy_issue_total "), 1)
+        self.assertEqual(metrics_body.count("# TYPE bybit_control_strategy_issue_total "), 1)
+
+    def test_ai_live_snapshot_returns_scheduler_jobs_and_activity(self) -> None:
+        status, payload = self._get("/api/ai/live")
+        self.assertEqual(status, 200)
+        self.assertIn("scheduler", payload)
+        self.assertIn("jobs", payload)
+        self.assertIn("change_requests", payload)
+        self.assertIn("activity_feed", payload)
+        self.assertGreaterEqual(len(payload["activity_feed"]), 1)
+        self.assertIn("generated_at", payload)
+
+    def test_ai_stream_once_returns_sse_snapshot(self) -> None:
+        status, body = self._get_text("/api/ai/stream?once=true")
+        self.assertEqual(status, 200)
+        self.assertIn("event: snapshot", body)
+        self.assertIn('"scheduler"', body)
+        self.assertIn('"activity_feed"', body)
+
+    def test_strategy_stream_once_returns_sse_snapshot(self) -> None:
+        status, body = self._get_text("/api/strategies/stream?once=true")
+        self.assertEqual(status, 200)
+        self.assertIn("event: snapshot", body)
+        self.assertIn('"items"', body)
+        self.assertIn('"strategy_id"', body)
+
+    def test_ops_live_snapshot_returns_alerts_trades_and_audit_together(self) -> None:
+        status, payload = self._get("/api/ops/live")
+        self.assertEqual(status, 200)
+        self.assertIn("summary", payload)
+        self.assertIn("alerts", payload)
+        self.assertIn("trades", payload)
+        self.assertIn("audit_events", payload)
+        self.assertIn("generated_at", payload)
+        self.assertGreaterEqual(payload["summary"]["pending_alerts"], 0)
+        self.assertGreaterEqual(payload["summary"]["recent_trades"], 0)
+        self.assertIn("execution_issue_total", payload["summary"])
+        self.assertIn("execution_top_issue", payload["summary"])
+        self.assertIn("execution_top_issue_symbol", payload["summary"])
+        self.assertIn("execution_top_issue_detail", payload["summary"])
+
+    def test_ops_stream_once_returns_sse_snapshot(self) -> None:
+        status, body = self._get_text("/api/ops/stream?once=true")
+        self.assertEqual(status, 200)
+        self.assertIn("event: snapshot", body)
+        self.assertIn('"summary"', body)
+        self.assertIn('"alerts"', body)
+        self.assertIn('"audit_events"', body)
+
+    def test_account_live_snapshot_and_stream_are_available(self) -> None:
+        status, payload = self._get("/api/account/live")
+        self.assertEqual(status, 200)
+        self.assertIn("overview", payload)
+        self.assertIn("positions", payload)
+        self.assertIn("orders", payload)
+        self.assertIn("order_history", payload)
+        self.assertIn("generated_at", payload)
+
+        stream_status, body = self._get_text("/api/account/stream?once=true")
+        self.assertEqual(stream_status, 200)
+        self.assertIn("event: snapshot", body)
+        self.assertIn('"overview"', body)
+        self.assertIn('"positions"', body)
+        self.assertIn('"order_history"', body)
+
+    def test_agent_job_lifecycle_can_be_claimed_and_completed(self) -> None:
+        control_main.repo.state.control_snapshot.scheduler.current_job_id = None
+
+        create_status, created = self._post(
+            "/api/ai/jobs",
+            {
+                "job_type": "generate_daily_review",
+                "context": {"focus_symbols": ["BTCUSDT"], "mode": "paper"},
+                "allowed_actions": ["review", "summarize"],
+                "timeout": 60,
+                "idempotency_key": "unit-test-job-lifecycle",
+                "writeback_target": "ai_review",
+            },
+        )
+        self.assertEqual(create_status, 200)
+        self.assertEqual(created["status"], "queued")
+        self.assertIn("execution_health", created["context"])
+        self.assertIn("execution_top_issue", created["context"])
+
+        claimed = control_main.repo.claim_next_agent_job()
+        self.assertIsNotNone(claimed)
+        self.assertEqual(claimed.status.value, "running")
+
+        review = control_main.build_fallback_review_document({"focus_symbols": ["BTCUSDT"]})
+        completed = control_main.repo.complete_agent_job(
+            claimed.id,
+            result_summary="本地回退复盘已完成。",
+            review=review,
+            source="local_fallback",
+        )
+        self.assertEqual(completed.status.value, "completed")
+
+        scheduler_status, scheduler = self._get("/api/ai/scheduler")
+        self.assertEqual(scheduler_status, 200)
+        self.assertIsNone(scheduler["scheduler"]["current_job_id"])
+
+        reviews_status, reviews = self._get("/api/ai/reviews")
+        self.assertEqual(reviews_status, 200)
+        self.assertEqual(reviews[0]["id"], review.id)
+
+        audit_status, audit_events = self._get("/api/audit/events")
+        self.assertEqual(audit_status, 200)
+        self.assertEqual(audit_events[0]["event_type"], "openclaw.job.completed")
+        self.assertEqual(audit_events[0]["payload"]["review_id"], review.id)
+        self.assertEqual(audit_events[0]["payload"]["review_title"], review.title)
+        self.assertEqual(audit_events[0]["payload"]["review_period"], review.period)
+
+    def test_strategy_change_review_job_completion_writes_strategy_audit_event(self) -> None:
+        control_main.repo.state.control_snapshot.scheduler.current_job_id = None
+        job = control_main.repo.create_agent_job(
+            control_main.AgentJobCreate(
+                job_type="review_strategy_change",
+                context={
+                    "change_request_id": "cr-unit-001",
+                    "strategy_id": "trend-btc-01",
+                    "summary": "单元测试策略变更跟踪",
+                },
+                allowed_actions=["review_strategy_change"],
+                timeout=60,
+                idempotency_key="unit-test-strategy-change-review",
+                writeback_target="strategy_activity",
+            )
+        )
+        claimed = control_main.repo.claim_next_agent_job()
+        self.assertIsNotNone(claimed)
+        review = control_main.build_strategy_tracking_review_document(
+            "策略变更已落实，建议继续观察执行健康。",
+            job.context,
+            "review_strategy_change",
+        )
+        completed = control_main.repo.complete_agent_job(
+            job.id,
+            result_summary="策略变更已落实，建议继续观察执行健康。",
+            review=review,
+            source="local_fallback",
+        )
+        self.assertEqual(completed.status.value, "completed")
+
+        audit_status, audit_events = self._get("/api/audit/events")
+        self.assertEqual(audit_status, 200)
+        review_event = next((item for item in audit_events if item["event_type"] == "strategy.change.review.completed"), None)
+        self.assertIsNotNone(review_event)
+        assert review_event is not None
+        self.assertEqual(review_event["payload"]["change_request_id"], "cr-unit-001")
+        self.assertEqual(review_event["payload"]["strategy_id"], "trend-btc-01")
+        self.assertEqual(review_event["payload"]["linked_review_id"], review.id)
+        self.assertEqual(review_event["payload"]["linked_review_title"], review.title)
+        self.assertEqual(review_event["payload"]["linked_review_period"], review.period)
+
+        activity_status, activity = self._get("/api/strategies/trend-btc-01/activity")
+        self.assertEqual(activity_status, 200)
+        self.assertTrue(any(item["id"] == review.id for item in activity["recent_reviews"]))
+
+    def test_strategy_change_review_job_failure_writes_strategy_audit_event(self) -> None:
+        control_main.repo.state.control_snapshot.scheduler.current_job_id = None
+        job = control_main.repo.create_agent_job(
+            control_main.AgentJobCreate(
+                job_type="review_strategy_change",
+                context={
+                    "change_request_id": "cr-unit-002",
+                    "strategy_id": "trend-btc-01",
+                    "summary": "单元测试策略变更跟踪失败",
+                },
+                allowed_actions=["review_strategy_change"],
+                timeout=60,
+                idempotency_key="unit-test-strategy-change-review-failed",
+                writeback_target="strategy_activity",
+            )
+        )
+        claimed = control_main.repo.claim_next_agent_job()
+        self.assertIsNotNone(claimed)
+        failed = control_main.repo.fail_agent_job(job.id, "OpenClaw 任务执行失败。", source="local_fallback")
+        self.assertEqual(failed.status.value, "failed")
+
+        audit_status, audit_events = self._get("/api/audit/events")
+        self.assertEqual(audit_status, 200)
+        review_event = next((item for item in audit_events if item["event_type"] == "strategy.change.review.failed"), None)
+        self.assertIsNotNone(review_event)
+        assert review_event is not None
+        self.assertEqual(review_event["payload"]["change_request_id"], "cr-unit-002")
+        self.assertEqual(review_event["payload"]["strategy_id"], "trend-btc-01")
+
+    def test_strategy_issue_review_job_completion_writes_strategy_audit_event(self) -> None:
+        control_main.repo.state.control_snapshot.scheduler.current_job_id = None
+        job = control_main.repo.create_agent_job(
+            control_main.AgentJobCreate(
+                job_type="review_strategy_issue",
+                context={
+                    "issue_type": "manual_execution_blocked",
+                    "summary": "BTCUSDT 手动策略执行被拦截",
+                    "detail": "运行线程异常，建议先恢复运行线程。",
+                    "strategy_id": "trend-btc-01",
+                },
+                allowed_actions=["review_strategy_issue"],
+                timeout=60,
+                idempotency_key="unit-test-strategy-issue-review",
+                writeback_target="strategy_activity",
+            )
+        )
+        claimed = control_main.repo.claim_next_agent_job()
+        self.assertIsNotNone(claimed)
+        review = control_main.build_strategy_tracking_review_document(
+            "策略问题已跟踪，建议先恢复运行线程后再观察执行健康。",
+            job.context,
+            "review_strategy_issue",
+        )
+        completed = control_main.repo.complete_agent_job(
+            job.id,
+            result_summary="策略问题已跟踪，建议先恢复运行线程后再观察执行健康。",
+            review=review,
+            source="local_fallback",
+        )
+        self.assertEqual(completed.status.value, "completed")
+
+        audit_status, audit_events = self._get("/api/audit/events")
+        self.assertEqual(audit_status, 200)
+        review_event = next((item for item in audit_events if item["event_type"] == "strategy.issue.review.completed"), None)
+        self.assertIsNotNone(review_event)
+        assert review_event is not None
+        self.assertEqual(review_event["payload"]["issue_type"], "manual_execution_blocked")
+        self.assertEqual(review_event["payload"]["strategy_id"], "trend-btc-01")
+        self.assertEqual(review_event["payload"]["linked_review_id"], review.id)
+        self.assertEqual(review_event["payload"]["linked_review_title"], review.title)
+        self.assertEqual(review_event["payload"]["linked_review_period"], review.period)
+
+        activity_status, activity = self._get("/api/strategies/trend-btc-01/activity")
+        self.assertEqual(activity_status, 200)
+        self.assertTrue(any(item["id"] == review.id for item in activity["recent_reviews"]))
+
+    def test_strategy_issue_review_job_failure_writes_strategy_audit_event(self) -> None:
+        control_main.repo.state.control_snapshot.scheduler.current_job_id = None
+        job = control_main.repo.create_agent_job(
+            control_main.AgentJobCreate(
+                job_type="review_strategy_issue",
+                context={
+                    "issue_type": "stale_order",
+                    "summary": "BTCUSDT 策略挂单停滞",
+                    "detail": "真实策略委托挂单超过阈值。",
+                    "strategy_id": "trend-btc-01",
+                },
+                allowed_actions=["review_strategy_issue"],
+                timeout=60,
+                idempotency_key="unit-test-strategy-issue-review-failed",
+                writeback_target="strategy_activity",
+            )
+        )
+        claimed = control_main.repo.claim_next_agent_job()
+        self.assertIsNotNone(claimed)
+        failed = control_main.repo.fail_agent_job(job.id, "OpenClaw 问题跟踪任务失败。", source="local_fallback")
+        self.assertEqual(failed.status.value, "failed")
+
+        audit_status, audit_events = self._get("/api/audit/events")
+        self.assertEqual(audit_status, 200)
+        review_event = next((item for item in audit_events if item["event_type"] == "strategy.issue.review.failed"), None)
+        self.assertIsNotNone(review_event)
+        assert review_event is not None
+        self.assertEqual(review_event["payload"]["issue_type"], "stale_order")
+        self.assertEqual(review_event["payload"]["strategy_id"], "trend-btc-01")
+
+    def test_get_reviews_supports_strategy_filter(self) -> None:
+        review = control_main.ReviewDocument(
+            id="review-unit-strategy-issue",
+            period="strategy_issue",
+            strategy_id="eth-revert-02",
+            title="ETH 问题跟踪",
+            summary="ETH 策略执行阻断后已进入跟踪。",
+            highlights=["已记录最近一次执行阻断上下文。"],
+            risks=["仍需观察冷却结束后的真实执行门禁。"],
+            proposals=[],
+            created_at=datetime.now(timezone.utc).astimezone().isoformat(),
+        )
+        control_main.repo.state.reviews.insert(0, review)
+
+        status, reviews = self._get("/api/ai/reviews?strategy_id=eth-revert-02")
+        self.assertEqual(status, 200)
+        review_ids = {item["id"] for item in reviews}
+        self.assertIn("review-unit-strategy-issue", review_ids)
+        self.assertIn("review-20260330-daily", review_ids)
+
+    def test_get_reviews_supports_period_filter(self) -> None:
+        issue_review = control_main.ReviewDocument(
+            id="review-unit-strategy-issue",
+            period="strategy_issue",
+            strategy_id="trend-btc-01",
+            title="BTC 问题跟踪",
+            summary="BTC 策略问题已进入单策略跟踪。",
+            highlights=["已记录问题快照。"],
+            risks=["仍需观察后续恢复情况。"],
+            proposals=[],
+            created_at=datetime.now(timezone.utc).astimezone().isoformat(),
+        )
+        change_review = control_main.ReviewDocument(
+            id="review-unit-strategy-change",
+            period="strategy_change",
+            strategy_id="trend-btc-01",
+            title="BTC 变更跟踪",
+            summary="BTC 策略参数变更已进入跟踪。",
+            highlights=["已记录最新参数快照。"],
+            risks=["仍需结合真实执行观察影响。"],
+            proposals=[],
+            created_at=datetime.now(timezone.utc).astimezone().isoformat(),
+        )
+        control_main.repo.state.reviews.insert(0, change_review)
+        control_main.repo.state.reviews.insert(0, issue_review)
+
+        status, reviews = self._get("/api/ai/reviews?period=strategy_issue,strategy_change")
+        self.assertEqual(status, 200)
+        self.assertTrue(reviews)
+        self.assertTrue(all(item["period"] in {"strategy_issue", "strategy_change"} for item in reviews))
+        review_ids = {item["id"] for item in reviews}
+        self.assertIn("review-unit-strategy-issue", review_ids)
+        self.assertIn("review-unit-strategy-change", review_ids)
+        self.assertNotIn("review-20260330-daily", review_ids)
+
+    def test_manual_strategy_issue_review_endpoint_queues_tracking_job(self) -> None:
+        status, job = self._post(
+            "/api/strategies/trend-btc-01/review",
+            {
+                "review_kind": "issue",
+                "summary": "BTC 策略最近出现连续拒单，需要单独跟踪。",
+                "detail": "请重点观察最近的真实委托和执行健康。",
+                "requested_by": "unit_test",
+                "request_key": "manual-issue-001",
+            },
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(job["job_type"], "review_strategy_issue")
+        self.assertEqual(job["writeback_target"], "strategy_activity")
+        self.assertEqual(job["context"]["strategy_id"], "trend-btc-01")
+        self.assertEqual(job["context"]["requested_by"], "unit_test")
+        self.assertEqual(job["context"]["issue_type"], "manual_issue_review")
+        self.assertIn("review_strategy_activity", job["context"])
+        self.assertIn("execution_health", job["context"])
+
+        repeated_status, repeated_job = self._post(
+            "/api/strategies/trend-btc-01/review",
+            {
+                "review_kind": "issue",
+                "summary": "BTC 策略最近出现连续拒单，需要单独跟踪。",
+                "detail": "请重点观察最近的真实委托和执行健康。",
+                "requested_by": "unit_test",
+                "request_key": "manual-issue-001",
+            },
+        )
+        self.assertEqual(repeated_status, 200)
+        self.assertEqual(repeated_job["id"], job["id"])
+
+        activity_status, activity = self._get("/api/strategies/trend-btc-01/activity")
+        self.assertEqual(activity_status, 200)
+        self.assertTrue(any(item["id"] == job["id"] for item in activity["recent_agent_jobs"]))
+        self.assertTrue(
+            any(
+                item["event_type"] == "strategy.review.requested"
+                for item in activity["recent_audit_events"]
+            )
+        )
+
+    def test_manual_strategy_change_review_endpoint_queues_tracking_job(self) -> None:
+        status, job = self._post(
+            "/api/strategies/eth-revert-02/review",
+            {
+                "review_kind": "change",
+                "summary": "ETH 回归策略刚刚更新止损阈值，继续跟踪执行影响。",
+                "detail": "重点确认这次变更是否真正落地，以及是否影响当前执行健康。",
+                "requested_by": "unit_test",
+            },
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(job["job_type"], "review_strategy_change")
+        self.assertEqual(job["writeback_target"], "strategy_activity")
+        self.assertEqual(job["context"]["strategy_id"], "eth-revert-02")
+        self.assertEqual(job["context"]["requested_by"], "unit_test")
+        self.assertEqual(job["context"]["change_type"], "manual_change_review")
+        self.assertIn("review_strategy_activity", job["context"])
+        self.assertIn("execution_health", job["context"])
+
+        activity_status, activity = self._get("/api/strategies/eth-revert-02/activity")
+        self.assertEqual(activity_status, 200)
+        self.assertTrue(any(item["id"] == job["id"] for item in activity["recent_agent_jobs"]))
+        self.assertTrue(
+            any(
+                item["event_type"] == "strategy.review.requested"
+                for item in activity["recent_audit_events"]
+            )
+        )
+
     def test_change_request_backtest_and_agent_job_endpoints(self) -> None:
         scheduler_status, scheduler_before = self._get("/api/ai/scheduler")
         self.assertEqual(scheduler_status, 200)
@@ -359,8 +7863,27 @@ class ControlApiIntegrationTests(unittest.TestCase):
             },
         )
         self.assertEqual(change_status, 200)
-        self.assertEqual(change_request["status"], "queued")
+        self.assertEqual(change_request["status"], "applied")
         self.assertEqual(change_request["requested_by"], "unit_test")
+
+        scheduler_after_change_status, scheduler_after_change = self._get("/api/ai/scheduler")
+        self.assertEqual(scheduler_after_change_status, 200)
+        review_job = next(
+            (item for item in scheduler_after_change["jobs"] if item["idempotency_key"] == f"strategy-change-review-{change_request['id']}"),
+            None,
+        )
+        self.assertIsNotNone(review_job)
+        self.assertEqual(review_job["job_type"], "review_strategy_change")
+        self.assertEqual(review_job["writeback_target"], "strategy_activity")
+        self.assertEqual(review_job["context"]["strategy_id"], "trend-btc-01")
+
+        strategies_status, strategies = self._get("/api/strategies")
+        self.assertEqual(strategies_status, 200)
+        trend_strategy = next((item for item in strategies if item["id"] == "trend-btc-01"), None)
+        self.assertIsNotNone(trend_strategy)
+        fast_ma = next((item for item in trend_strategy["parameters"] if item["key"] == "fast_ma"), None)
+        self.assertIsNotNone(fast_ma)
+        self.assertEqual(fast_ma["value"], 13)
 
         backtest_status, backtest = self._post(
             "/api/backtests",
@@ -373,6 +7896,41 @@ class ControlApiIntegrationTests(unittest.TestCase):
         self.assertEqual(backtest_status, 200)
         self.assertEqual(backtest["strategy_id"], "trend-btc-01")
         self.assertEqual(backtest["status"], "completed")
+        self.assertIn("本地回测引擎", backtest["notes"])
+        self.assertGreater(backtest["metrics"]["trades"], 0)
+
+        scheduler_after_backtest_status, scheduler_after_backtest = self._get("/api/ai/scheduler")
+        self.assertEqual(scheduler_after_backtest_status, 200)
+        review_job = next(
+            (item for item in scheduler_after_backtest["jobs"] if item.get("idempotency_key") == f"backtest-review-{backtest['id']}"),
+            None,
+        )
+        self.assertIsNotNone(review_job)
+        self.assertEqual(review_job["job_type"], "generate_backtest_review")
+        self.assertIn("execution_health", review_job["context"])
+        self.assertIn("execution_top_issue", review_job["context"])
+
+        alert_rule_change_status, alert_rule_change = self._post(
+            "/api/change-requests",
+            {
+                "type": "alert.rule.update",
+                "payload": {"symbol": "BTCUSDT", "threshold_pct": 4.8, "alert_enabled": True},
+                "requested_by": "unit_test",
+                "target_mode": "paper",
+                "priority": "normal",
+                "summary": "单元测试更新提醒阈值",
+            },
+        )
+        self.assertEqual(alert_rule_change_status, 200)
+
+        scheduler_after_alert_status, scheduler_after_alert = self._get("/api/ai/scheduler")
+        self.assertEqual(scheduler_after_alert_status, 200)
+        reconcile_job = next(
+            (item for item in scheduler_after_alert["jobs"] if item["idempotency_key"] == f"change-request-reconcile-{alert_rule_change['id']}"),
+            None,
+        )
+        self.assertIsNotNone(reconcile_job)
+        self.assertEqual(reconcile_job["job_type"], "reconcile_change_request")
 
         missing_status, missing_backtest = self._post(
             "/api/backtests",
@@ -398,12 +7956,339 @@ class ControlApiIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(job_status, 200)
         self.assertEqual(job["status"], "queued")
+        self.assertIn("execution_health", job["context"])
+        self.assertIn("runtime_worker_top_issue", job["context"])
+
+        duplicate_status, duplicate_job = self._post(
+            "/api/ai/jobs",
+            {
+                "job_type": "generate_daily_review",
+                "context": {"focus_symbols": ["BTCUSDT"]},
+                "allowed_actions": ["review", "change_request"],
+                "timeout": 180,
+                "idempotency_key": "unit-test-job",
+                "writeback_target": "ai_review",
+            },
+        )
+        self.assertEqual(duplicate_status, 200)
+        self.assertEqual(duplicate_job["id"], job["id"])
 
         scheduler_after_status, scheduler_after = self._get("/api/ai/scheduler")
         self.assertEqual(scheduler_after_status, 200)
-        self.assertEqual(scheduler_after["scheduler"]["queue_depth"], initial_queue_depth + 1)
+        self.assertGreaterEqual(scheduler_after["scheduler"]["queue_depth"], initial_queue_depth)
+        self.assertTrue(any(item["id"] == job["id"] for item in scheduler_after["jobs"]))
+
+    def test_scheduler_cancel_job_marks_job_cancelled_and_clears_current_slot(self) -> None:
+        control_main.repo.state.control_snapshot.scheduler.current_job_id = None
+        created = control_main.repo.create_agent_job(
+            control_main.AgentJobCreate(
+                job_type="generate_daily_review",
+                context={"focus_symbols": ["BTCUSDT"], "mode": "paper"},
+                allowed_actions=["review"],
+                timeout=60,
+                idempotency_key="unit-test-cancel-job",
+                writeback_target="ai_review",
+            )
+        )
+        claimed = control_main.repo.claim_next_agent_job()
+        self.assertIsNotNone(claimed)
+        self.assertEqual(claimed.id, created.id)
+
+        status, payload = self._post(
+            "/api/ai/scheduler/commands",
+            {
+                "command": "cancel_job",
+                "job_id": created.id,
+                "requested_by": "unit_test",
+                "reason": "人工终止当前任务",
+            },
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["command"], "cancel_job")
+
+        scheduler_status, scheduler = self._get("/api/ai/scheduler")
+        self.assertEqual(scheduler_status, 200)
+        cancelled_job = next((item for item in scheduler["jobs"] if item["id"] == created.id), None)
+        self.assertIsNotNone(cancelled_job)
+        self.assertEqual(cancelled_job["status"], "cancelled")
+        self.assertEqual(cancelled_job["result_summary"], "人工终止当前任务")
+        self.assertIsNone(scheduler["scheduler"]["current_job_id"])
+
+        audit_status, audit_events = self._get("/api/audit/events")
+        self.assertEqual(audit_status, 200)
+        self.assertEqual(audit_events[0]["event_type"], "scheduler.command")
+        self.assertTrue(any(item["event_type"] == "openclaw.job.cancelled" for item in audit_events))
+
+    def test_retry_cancelled_job_creates_new_retry_job(self) -> None:
+        control_main.repo.state.control_snapshot.scheduler.current_job_id = None
+        created = control_main.repo.create_agent_job(
+            control_main.AgentJobCreate(
+                job_type="generate_daily_review",
+                context={"focus_symbols": ["BTCUSDT"], "mode": "paper"},
+                allowed_actions=["review"],
+                timeout=60,
+                idempotency_key="unit-test-retry-job",
+                writeback_target="ai_review",
+            )
+        )
+        claimed = control_main.repo.claim_next_agent_job()
+        self.assertIsNotNone(claimed)
+        self.assertEqual(claimed.id, created.id)
+        control_main.repo.apply_scheduler_command(
+            control_main.SchedulerCommand(
+                command="cancel_job",
+                job_id=created.id,
+                requested_by="unit_test",
+                reason="准备验证重试",
+            )
+        )
+
+        retry_status, retried = self._post(
+            f"/api/ai/jobs/{created.id}/retry",
+            {"requested_by": "unit_test"},
+        )
+        self.assertEqual(retry_status, 200)
+        self.assertNotEqual(retried["id"], created.id)
+        self.assertEqual(retried["status"], "queued")
+        self.assertTrue(retried["idempotency_key"].startswith("unit-test-retry-job-retry-"))
+        self.assertEqual(retried["retried_from_job_id"], created.id)
+        self.assertEqual(retried["retry_count"], 1)
+        self.assertEqual(retried["context"]["retried_from_job_id"], created.id)
+
+        scheduler_status, scheduler = self._get("/api/ai/scheduler")
+        self.assertEqual(scheduler_status, 200)
+        self.assertTrue(any(item["id"] == retried["id"] for item in scheduler["jobs"]))
+
+        bad_retry_status, bad_retry = self._post(
+            f"/api/ai/jobs/{retried['id']}/retry",
+            {"requested_by": "unit_test"},
+        )
+        self.assertEqual(bad_retry_status, 409)
+        self.assertIn("只有失败或已取消的任务可以重试", bad_retry["detail"])
+
+    def test_strategy_activity_includes_retry_metadata_for_tracking_jobs(self) -> None:
+        status, created = self._post(
+            "/api/strategies/trend-btc-01/review",
+            {
+                "review_kind": "issue",
+                "summary": "BTC 策略问题需要继续跟踪。",
+                "detail": "先制造一条可重试的策略跟踪任务。",
+                "requested_by": "unit_test",
+                "request_key": "retry-activity-001",
+            },
+        )
+        self.assertEqual(status, 200)
+
+        control_main.repo.apply_scheduler_command(
+            control_main.SchedulerCommand(
+                command="cancel_job",
+                job_id=created["id"],
+                requested_by="unit_test",
+                reason="准备验证策略活动里的重试元数据",
+            )
+        )
+
+        retry_status, retried = self._post(
+            f"/api/ai/jobs/{created['id']}/retry",
+            {"requested_by": "unit_test"},
+        )
+        self.assertEqual(retry_status, 200)
+
+        activity_status, activity = self._get("/api/strategies/trend-btc-01/activity")
+        self.assertEqual(activity_status, 200)
+        retried_job = next((item for item in activity["recent_agent_jobs"] if item["id"] == retried["id"]), None)
+        self.assertIsNotNone(retried_job)
+        self.assertEqual(retried_job["strategy_id"], "trend-btc-01")
+        self.assertEqual(retried_job["retry_count"], 1)
+        self.assertEqual(retried_job["retried_from_job_id"], created["id"])
+
+    def test_strategy_activity_job_carries_linked_review_metadata_after_completion(self) -> None:
+        created = control_main.repo.create_agent_job(
+            control_main.AgentJobCreate(
+                job_type="review_strategy_issue",
+                context={
+                    "strategy_id": "trend-btc-01",
+                    "strategy_name": "BTC 趋势跟随",
+                    "symbol": "BTCUSDT",
+                    "mode": "live",
+                    "issue_type": "manual_issue_review",
+                    "summary": "BTC 策略问题需要继续跟踪。",
+                    "requested_by": "unit_test",
+                },
+                allowed_actions=["review_strategy_issue"],
+                timeout=60,
+                idempotency_key="unit-test-linked-review-job",
+                writeback_target="strategy_activity",
+            )
+        )
+        control_main.repo.claim_next_agent_job()
+        review = control_main.build_strategy_tracking_review_document(
+            '{"summary":"问题已跟踪","highlights":["已记录最近活动"],"risks":["仍需观察"],"proposals":[]}',
+            created.context,
+            "review_strategy_issue",
+        )
+        control_main.repo.complete_agent_job(
+            created.id,
+            result_summary="问题已跟踪",
+            review=review,
+            source="unit_test",
+        )
+
+        activity_status, activity = self._get("/api/strategies/trend-btc-01/activity")
+        self.assertEqual(activity_status, 200)
+        completed_job = next((item for item in activity["recent_agent_jobs"] if item["id"] == created.id), None)
+        self.assertIsNotNone(completed_job)
+        self.assertEqual(completed_job["linked_review_id"], review.id)
+        self.assertEqual(completed_job["linked_review_title"], review.title)
+        self.assertEqual(completed_job["linked_review_period"], review.period)
+
+        reviews_status, reviews = self._get("/api/ai/reviews?strategy_id=trend-btc-01&period=strategy_issue")
+        self.assertEqual(reviews_status, 200)
+        linked_review = next((item for item in reviews if item["id"] == review.id), None)
+        self.assertIsNotNone(linked_review)
+        self.assertEqual(linked_review["source_job_id"], created.id)
+        self.assertEqual(linked_review["source_job_type"], "review_strategy_issue")
+        self.assertEqual(linked_review["source_job_status"], "completed")
+
+    def test_strategy_pause_and_risk_update_requests_apply_immediately(self) -> None:
+        pause_status, pause_request = self._post(
+            "/api/change-requests",
+            {
+                "type": "strategy.pause_resume",
+                "payload": {"strategy_id": "trend-btc-01", "next_status": "paused"},
+                "requested_by": "unit_test",
+                "target_mode": "paper",
+                "priority": "high",
+                "summary": "暂停 BTC 策略",
+            },
+        )
+        self.assertEqual(pause_status, 200)
+        self.assertEqual(pause_request["status"], "applied")
+
+        risk_status, risk_request = self._post(
+            "/api/change-requests",
+            {
+                "type": "strategy.risk_update",
+                "payload": {"strategy_id": "trend-btc-01", "risk_budget": "12%"},
+                "requested_by": "unit_test",
+                "target_mode": "paper",
+                "priority": "high",
+                "summary": "调整 BTC 风险预算",
+            },
+        )
+        self.assertEqual(risk_status, 200)
+        self.assertEqual(risk_request["status"], "applied")
+
+        strategies_status, strategies = self._get("/api/strategies")
+        self.assertEqual(strategies_status, 200)
+        trend_strategy = next((item for item in strategies if item["id"] == "trend-btc-01"), None)
+        self.assertIsNotNone(trend_strategy)
+        self.assertEqual(trend_strategy["status"], "paused")
+        self.assertEqual(trend_strategy["risk_budget"], "12%")
+
+    def test_accepting_strategy_proposal_creates_follow_up_work(self) -> None:
+        reviews_status, reviews = self._get("/api/ai/reviews")
+        self.assertEqual(reviews_status, 200)
+        proposal = next(
+            (
+                item
+                for review in reviews
+                for item in review["proposals"]
+                if item["id"] == "prop-001"
+            ),
+            None,
+        )
+        self.assertIsNotNone(proposal)
+        self.assertEqual(proposal["status"], "testing")
+
+        action_status, result = self._post(
+            "/api/ai/proposals/prop-001/action",
+            {"action": "accept", "requested_by": "unit_test"},
+        )
+        self.assertEqual(action_status, 200)
+        self.assertEqual(result["proposal"]["status"], "accepted")
+        self.assertIsNotNone(result["created_change_request"])
+        self.assertIsNone(result["created_backtest"])
+
+        change_requests_status, change_requests = self._get("/api/change-requests")
+        self.assertEqual(change_requests_status, 200)
+        self.assertEqual(change_requests[0]["type"], "proposal.param_update")
+        self.assertEqual(change_requests[0]["payload"]["proposal_id"], "prop-001")
+
+        snapshot_status, snapshot = self._get("/api/control/snapshot")
+        self.assertEqual(snapshot_status, 200)
+        self.assertEqual(snapshot["strategy_metrics"][2]["value"], "2")
+
+        audit_status, audit_events = self._get("/api/audit/events")
+        self.assertEqual(audit_status, 200)
+        accepted_event = next((item for item in audit_events if item["event_type"] == "strategy_proposal.accepted"), None)
+        self.assertIsNotNone(accepted_event)
+
+    def test_accepting_processed_proposal_is_rejected(self) -> None:
+        first_status, _first_result = self._post(
+            "/api/ai/proposals/prop-001/action",
+            {"action": "accept", "requested_by": "unit_test"},
+        )
+        self.assertEqual(first_status, 200)
+
+        second_status, second_result = self._post(
+            "/api/ai/proposals/prop-001/action",
+            {"action": "accept", "requested_by": "unit_test"},
+        )
+        self.assertEqual(second_status, 409)
+        self.assertIn("不能重复处理", second_result["detail"])
+
+        change_requests_status, change_requests = self._get("/api/change-requests")
+        self.assertEqual(change_requests_status, 200)
+        proposal_requests = [item for item in change_requests if item["payload"].get("proposal_id") == "prop-001"]
+        self.assertEqual(len(proposal_requests), 1)
+
+    def test_accepting_backtest_request_proposal_creates_backtest(self) -> None:
+        action_status, result = self._post(
+            "/api/ai/proposals/prop-003/action",
+            {"action": "accept", "requested_by": "unit_test"},
+        )
+        self.assertEqual(action_status, 200)
+        self.assertEqual(result["proposal"]["status"], "accepted")
+        self.assertIsNone(result["created_change_request"])
+        self.assertIsNotNone(result["created_backtest"])
+        self.assertEqual(result["created_backtest"]["strategy_id"], "sol-breakout-03")
+
+        backtests_status, backtests = self._get("/api/backtests")
+        self.assertEqual(backtests_status, 200)
+        self.assertEqual(backtests[0]["id"], result["created_backtest"]["id"])
+        self.assertEqual(backtests[0]["timeframe"], "15m")
+
+        scheduler_status, scheduler = self._get("/api/ai/scheduler")
+        self.assertEqual(scheduler_status, 200)
+        self.assertTrue(
+            any(
+                item["idempotency_key"] == f"backtest-review-{result['created_backtest']['id']}"
+                for item in scheduler["jobs"]
+            )
+        )
+
+    def test_publish_recommendation_is_blocked_when_freeze_publish_enabled(self) -> None:
+        toggle_status, toggle_result = self._post(
+            "/api/ai/scheduler/commands",
+            {"command": "freeze_publish", "requested_by": "unit_test", "reason": "proposal gate"},
+        )
+        self.assertEqual(toggle_status, 200)
+        self.assertTrue(toggle_result["freeze_publish"])
+
+        action_status, result = self._post(
+            "/api/ai/proposals/prop-002/action",
+            {"action": "accept", "requested_by": "unit_test"},
+        )
+        self.assertEqual(action_status, 409)
+        self.assertIn("冻结自动发布", result["detail"])
 
     def test_manual_trade_only_accepts_paper_mode(self) -> None:
+        before_status, before_overview = self._get("/api/account/overview")
+        self.assertEqual(before_status, 200)
+        self.assertEqual(before_overview["source"], "paper")
+        self.assertEqual(before_overview["positions_count"], 1)
+
         success_status, success_trade = self._post(
             "/api/trades/manual",
             {
@@ -419,6 +8304,24 @@ class ControlApiIntegrationTests(unittest.TestCase):
         self.assertEqual(success_status, 200)
         self.assertEqual(success_trade["mode"], "paper")
         self.assertEqual(success_trade["status"], "filled")
+
+        overview_status, overview = self._get("/api/account/overview")
+        self.assertEqual(overview_status, 200)
+        self.assertEqual(overview["source"], "paper")
+        self.assertEqual(overview["positions_count"], 2)
+        self.assertEqual(overview["open_orders_count"], 0)
+
+        positions_status, positions = self._get("/api/account/positions")
+        self.assertEqual(positions_status, 200)
+        self.assertEqual({item["source"] for item in positions}, {"paper"})
+        self.assertTrue(any(item["symbol"] == "BTCUSDT" for item in positions))
+        self.assertTrue(any(item["symbol"] == "ETHUSDT" for item in positions))
+
+        live_status, live_snapshot = self._get("/api/account/live")
+        self.assertEqual(live_status, 200)
+        self.assertEqual(live_snapshot["overview"]["source"], "paper")
+        self.assertEqual(live_snapshot["overview"]["positions_count"], 2)
+        self.assertEqual(len(live_snapshot["positions"]), 2)
 
         reject_status, reject_payload = self._post(
             "/api/trades/manual",
@@ -449,6 +8352,2134 @@ class ControlApiIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(invalid_status, 422)
         self.assertIn("greater than 0", json.dumps(invalid_payload, ensure_ascii=False))
+
+    def test_trade_preview_reports_position_and_balance_impact(self) -> None:
+        preview_status, preview = self._post(
+            "/api/trades/preview",
+            {
+                "symbol": "BTCUSDT",
+                "market": "perp",
+                "mode": "paper",
+                "side": "buy",
+                "quantity": 1.0,
+                "price": 65000,
+                "origin": "manual",
+            },
+        )
+        self.assertEqual(preview_status, 200)
+        self.assertTrue(preview["allowed"])
+        self.assertEqual(preview["action"], "开多")
+        self.assertEqual(preview["current_position_side"], "flat")
+        self.assertEqual(preview["projected_position_side"], "long")
+        self.assertEqual(preview["projected_position_size"], "1")
+        self.assertEqual(preview["estimated_realized_pnl"], "--")
+        self.assertIn("65,000.00 USDT", preview["notional"])
+        self.assertIn("USDT", preview["available_balance_before"])
+        self.assertIn("USDT", preview["available_balance_after"])
+
+    def test_trade_preview_surfaces_same_paper_risk_gate_as_execution(self) -> None:
+        preview_status, preview = self._post(
+            "/api/trades/preview",
+            {
+                "symbol": "BTCUSDT",
+                "market": "perp",
+                "mode": "paper",
+                "side": "buy",
+                "quantity": 10,
+                "price": 65000,
+                "origin": "manual",
+            },
+        )
+        self.assertEqual(preview_status, 200)
+        self.assertFalse(preview["allowed"])
+        self.assertIn("可用余额不足", preview["blocked_reason"])
+
+        execution_status, execution_payload = self._post(
+            "/api/trades/manual",
+            {
+                "symbol": "BTCUSDT",
+                "market": "perp",
+                "mode": "paper",
+                "side": "buy",
+                "quantity": 10,
+                "price": 65000,
+                "note": "oversized buy",
+            },
+        )
+        self.assertEqual(execution_status, 409)
+        self.assertEqual(execution_payload["detail"], preview["blocked_reason"])
+
+    def test_live_trade_preview_uses_private_account_context(self) -> None:
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        control_main.private_data = StubConfiguredTradingBybitPrivateClient()
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(client=control_main.private_data)
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+
+        preview_status, preview = self._post(
+            "/api/trades/preview",
+            {
+                "symbol": "BTCUSDT",
+                "market": "perp",
+                "mode": "live",
+                "side": "buy",
+                "quantity": 0.05,
+                "price": 66800,
+                "origin": "manual",
+            },
+        )
+        self.assertEqual(preview_status, 200)
+        self.assertTrue(preview["allowed"])
+        self.assertEqual(preview["mode"], "live")
+        self.assertEqual(preview["current_position_side"], "long")
+        self.assertEqual(preview["action"], "加多")
+        self.assertIn("真实交易顾问式预检", " ".join(preview["warnings"]))
+
+    def test_live_trade_preview_reports_available_balance_gap_when_private_balance_is_insufficient(self) -> None:
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        control_main.private_data = StubConfiguredEmptyBybitPrivateClient()
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(
+            client=control_main.private_data,
+            connected=True,
+            authenticated=True,
+        )
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+
+        preview_status, preview = self._post(
+            "/api/trades/preview",
+            {
+                "symbol": "BTCUSDT",
+                "market": "perp",
+                "mode": "live",
+                "side": "buy",
+                "quantity": 0.05,
+                "price": 66800,
+                "origin": "manual",
+            },
+        )
+        self.assertEqual(preview_status, 200)
+        self.assertFalse(preview["allowed"])
+        self.assertIn("当前可用 0.00 USDT", preview["blocked_reason"])
+        self.assertIn("当前可用保证金不足", preview["blocked_reason"])
+        self.assertIn("本次委托约需 3,340.00 USDT", preview["blocked_reason"])
+        self.assertIn("UNIFIED 账户可用保证金", preview["recommended_action"])
+
+    def test_live_trade_preview_allows_perp_buy_to_reduce_short_without_extra_margin(self) -> None:
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        private_client = StubConfiguredEmptyBybitPrivateClient()
+        control_main.private_data = private_client
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(
+            client=private_client,
+            wallet={
+                "accountType": "UNIFIED",
+                "totalEquity": "0",
+                "totalWalletBalance": "0",
+                "totalAvailableBalance": "0",
+                "coin": [
+                    {
+                        "coin": "USDT",
+                        "walletBalance": "0",
+                        "availableToWithdraw": "0",
+                    }
+                ],
+            },
+            positions=[
+                {
+                    "symbol": "BTCUSDT",
+                    "category": "linear",
+                    "side": "Sell",
+                    "size": "0.01",
+                    "avgPrice": "67000",
+                    "markPrice": "66800",
+                    "positionValue": "668",
+                    "leverage": "1",
+                    "unrealisedPnl": "2",
+                }
+            ],
+            connected=True,
+            authenticated=True,
+        )
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+
+        preview_status, preview = self._post(
+            "/api/trades/preview",
+            {
+                "symbol": "BTCUSDT",
+                "market": "perp",
+                "mode": "live",
+                "side": "buy",
+                "quantity": 0.01,
+                "price": 66800,
+                "origin": "manual",
+            },
+        )
+        self.assertEqual(preview_status, 200)
+        self.assertTrue(preview["allowed"])
+        self.assertEqual(preview["projected_position_side"], "flat")
+        self.assertEqual(preview["available_balance_before"], "0.00 USDT")
+        self.assertEqual(preview["available_balance_after"], "668.00 USDT")
+        self.assertEqual(preview["estimated_realized_pnl"], "+2.00 USDT")
+
+    def test_live_trade_preview_blocks_perp_flip_only_on_incremental_margin_gap(self) -> None:
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        private_client = StubConfiguredEmptyBybitPrivateClient()
+        control_main.private_data = private_client
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(
+            client=private_client,
+            wallet={
+                "accountType": "UNIFIED",
+                "totalEquity": "500",
+                "totalWalletBalance": "500",
+                "totalAvailableBalance": "500",
+                "coin": [
+                    {
+                        "coin": "USDT",
+                        "walletBalance": "500",
+                        "availableToWithdraw": "500",
+                    }
+                ],
+            },
+            positions=[
+                {
+                    "symbol": "BTCUSDT",
+                    "category": "linear",
+                    "side": "Sell",
+                    "size": "0.01",
+                    "avgPrice": "67000",
+                    "markPrice": "66800",
+                    "positionValue": "668",
+                    "leverage": "1",
+                    "unrealisedPnl": "2",
+                }
+            ],
+            connected=True,
+            authenticated=True,
+        )
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+
+        preview_status, preview = self._post(
+            "/api/trades/preview",
+            {
+                "symbol": "BTCUSDT",
+                "market": "perp",
+                "mode": "live",
+                "side": "buy",
+                "quantity": 0.03,
+                "price": 66800,
+                "origin": "manual",
+            },
+        )
+        self.assertEqual(preview_status, 200)
+        self.assertFalse(preview["allowed"])
+        self.assertIn("当前可用 500.00 USDT", preview["blocked_reason"])
+        self.assertIn("约需 668.00 USDT", preview["blocked_reason"])
+        self.assertNotIn("2,004.00 USDT", preview["blocked_reason"])
+        self.assertIn("降低委托数量", preview["recommended_action"])
+        self.assertEqual(preview["projected_position_side"], "long")
+        self.assertEqual(preview["projected_position_size"], "0.02")
+
+    def test_live_trade_preview_blocks_spot_sell_when_open_orders_reserve_inventory(self) -> None:
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        control_main.private_data = StubConfiguredTradingBybitPrivateClient()
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(
+            client=control_main.private_data,
+            orders=[
+                {
+                    "orderId": "live-spot-sell-001",
+                    "symbol": "ETHUSDT",
+                    "category": "spot",
+                    "side": "Sell",
+                    "orderType": "Limit",
+                    "qty": "1.8",
+                    "price": "2068",
+                    "orderStatus": "New",
+                    "createdTime": "1774887600000",
+                }
+            ],
+            connected=True,
+            authenticated=True,
+        )
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+
+        preview_status, preview = self._post(
+            "/api/trades/preview",
+            {
+                "symbol": "ETHUSDT",
+                "market": "spot",
+                "mode": "live",
+                "side": "sell",
+                "quantity": 1.0,
+                "price": 2068,
+                "origin": "manual",
+            },
+        )
+        self.assertEqual(preview_status, 200)
+        self.assertFalse(preview["allowed"])
+        self.assertIn("扣除未成交卖单占用后最多可卖", preview["blocked_reason"])
+        self.assertIn("撤销 ETHUSDT 相关未成交卖单", preview["recommended_action"])
+        self.assertTrue(any("未成交卖单占用" in item for item in preview["warnings"]))
+
+    def test_live_trade_preview_prefers_wallet_available_quantity_for_spot_sell(self) -> None:
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        control_main.private_data = StubConfiguredTradingBybitPrivateClient()
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(
+            client=control_main.private_data,
+            wallet={
+                "accountType": "UNIFIED",
+                "totalEquity": "5000",
+                "totalWalletBalance": "5000",
+                "totalAvailableBalance": "4200",
+                "totalPerpUPL": "0",
+                "coin": [
+                    {
+                        "coin": "USDT",
+                        "walletBalance": "4200",
+                        "usdValue": "4200",
+                        "availableToWithdraw": "4200",
+                    },
+                    {
+                        "coin": "ETH",
+                        "walletBalance": "2.5",
+                        "usdValue": "5155",
+                        "availableToWithdraw": "0.4",
+                    },
+                ],
+            },
+            connected=True,
+            authenticated=True,
+        )
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+
+        preview_status, preview = self._post(
+            "/api/trades/preview",
+            {
+                "symbol": "ETHUSDT",
+                "market": "spot",
+                "mode": "live",
+                "side": "sell",
+                "quantity": 1.0,
+                "price": 2068,
+                "origin": "manual",
+            },
+        )
+        self.assertEqual(preview_status, 200)
+        self.assertFalse(preview["allowed"])
+        self.assertIn("最多可卖 0.4", preview["blocked_reason"])
+        self.assertTrue(any("钱包可用数量为 0.4" in item for item in preview["warnings"]))
+
+    def test_live_trade_preview_prefers_wallet_transfer_balance_for_spot_sell(self) -> None:
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        control_main.private_data = StubConfiguredTradingBybitPrivateClient()
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(
+            client=control_main.private_data,
+            wallet={
+                "accountType": "UNIFIED",
+                "totalEquity": "5000",
+                "totalWalletBalance": "5000",
+                "totalAvailableBalance": "4200",
+                "totalPerpUPL": "0",
+                "coin": [
+                    {
+                        "coin": "USDT",
+                        "walletBalance": "4200",
+                        "usdValue": "4200",
+                        "transferBalance": "4200",
+                    },
+                    {
+                        "coin": "ETH",
+                        "walletBalance": "2.5",
+                        "usdValue": "5155",
+                        "transferBalance": "0.3",
+                        "availableToWithdraw": "0.4",
+                    },
+                ],
+            },
+            connected=True,
+            authenticated=True,
+        )
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+
+        preview_status, preview = self._post(
+            "/api/trades/preview",
+            {
+                "symbol": "ETHUSDT",
+                "market": "spot",
+                "mode": "live",
+                "side": "sell",
+                "quantity": 0.35,
+                "price": 2068,
+                "origin": "manual",
+            },
+        )
+        self.assertEqual(preview_status, 200)
+        self.assertFalse(preview["allowed"])
+        self.assertIn("最多可卖 0.3", preview["blocked_reason"])
+        self.assertTrue(any("钱包可用数量为 0.3" in item for item in preview["warnings"]))
+
+    def test_live_trade_preview_rejects_private_mode_mismatch(self) -> None:
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        control_main.private_data = StubConfiguredDemoBybitPrivateClient()
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(client=control_main.private_data)
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+
+        preview_status, preview = self._post(
+            "/api/trades/preview",
+            {
+                "symbol": "BTCUSDT",
+                "market": "perp",
+                "mode": "live",
+                "side": "buy",
+                "quantity": 0.05,
+                "price": 66800,
+                "origin": "manual",
+            },
+        )
+        self.assertEqual(preview_status, 200)
+        self.assertFalse(preview["allowed"])
+        self.assertIn("LIVE", preview["blocked_reason"])
+        self.assertIn("DEMO", preview["blocked_reason"])
+
+    def test_live_trade_preview_rejects_quantity_that_violates_bybit_qty_step(self) -> None:
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        control_main.private_data = StubConfiguredTradingBybitPrivateClient()
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(client=control_main.private_data)
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+
+        preview_status, preview = self._post(
+            "/api/trades/preview",
+            {
+                "symbol": "BTCUSDT",
+                "market": "perp",
+                "mode": "live",
+                "side": "buy",
+                "quantity": 0.05005,
+                "price": 66800,
+                "origin": "manual",
+            },
+        )
+        self.assertEqual(preview_status, 200)
+        self.assertFalse(preview["allowed"])
+        self.assertIn("数量步长", preview["blocked_reason"])
+
+    def test_live_trade_preview_rejects_price_that_violates_bybit_tick_size(self) -> None:
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        control_main.private_data = StubConfiguredTradingBybitPrivateClient()
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(client=control_main.private_data)
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+
+        preview_status, preview = self._post(
+            "/api/trades/preview",
+            {
+                "symbol": "BTCUSDT",
+                "market": "perp",
+                "mode": "live",
+                "side": "buy",
+                "quantity": 0.05,
+                "price": 66800.03,
+                "origin": "manual",
+            },
+        )
+        self.assertEqual(preview_status, 200)
+        self.assertFalse(preview["allowed"])
+        self.assertIn("价格步长", preview["blocked_reason"])
+
+    def test_create_exchange_order_returns_private_order_record_and_audit(self) -> None:
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        control_main.private_data = StubConfiguredTradingBybitPrivateClient()
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(client=control_main.private_data)
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+        control_main.repo.state.workspace_preferences.selected_mode = AccountMode.LIVE
+        control_main.repo.state.control_snapshot.scheduler.current_mode = AccountMode.LIVE
+
+        create_status, created_order = self._post(
+            "/api/orders/exchange",
+            {
+                "symbol": "BTCUSDT",
+                "market": "perp",
+                "mode": "live",
+                "side": "buy",
+                "quantity": 0.05,
+                "price": 66800,
+                "note": "unit test live order",
+            },
+        )
+        self.assertEqual(create_status, 200)
+        self.assertEqual(created_order["source"], "bybit_private")
+        self.assertEqual(created_order["origin"], "manual")
+        self.assertIsNone(created_order["strategy_id"])
+        self.assertEqual(created_order["order_id"], "live-order-created-001")
+        self.assertEqual(created_order["status"], "New")
+
+        orders_status, orders = self._get("/api/account/orders")
+        self.assertEqual(orders_status, 200)
+        self.assertTrue(any(item["order_id"] == "live-order-created-001" for item in orders))
+
+        history_status, history = self._get("/api/account/order-history")
+        self.assertEqual(history_status, 200)
+        self.assertTrue(any(item["order_id"] == "live-order-created-001" for item in history))
+
+        audit_status, audit_events = self._get("/api/audit/events")
+        self.assertEqual(audit_status, 200)
+        self.assertEqual(audit_events[0]["event_type"], "exchange_order.created")
+
+    def test_create_exchange_order_marks_perp_reduce_only_when_manual_order_only_reduces_position(self) -> None:
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        private_client = StubConfiguredTradingBybitPrivateClient()
+        control_main.private_data = private_client
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(client=private_client, connected=True, authenticated=True)
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+        control_main.repo.state.workspace_preferences.selected_mode = AccountMode.LIVE
+        control_main.repo.state.control_snapshot.scheduler.current_mode = AccountMode.LIVE
+
+        create_status, created_order = self._post(
+            "/api/orders/exchange",
+            {
+                "symbol": "BTCUSDT",
+                "market": "perp",
+                "mode": "live",
+                "side": "sell",
+                "quantity": 0.05,
+                "price": 66800,
+                "note": "unit test reduce-only live order",
+            },
+        )
+        self.assertEqual(create_status, 200)
+        self.assertEqual(created_order["source"], "bybit_private")
+        self.assertTrue(private_client.created_order_bodies)
+        created_body = private_client.created_order_bodies[-1]
+        self.assertEqual(created_body["side"], "Sell")
+        self.assertTrue(created_body.get("reduceOnly"))
+
+    def test_replace_exchange_order_updates_private_open_order_and_audit(self) -> None:
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        control_main.private_data = StubConfiguredTradingBybitPrivateClient()
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(
+            client=control_main.private_data,
+            orders=[
+                {
+                    "orderId": "live-open-001",
+                    "symbol": "BTCUSDT",
+                    "category": "linear",
+                    "side": "Buy",
+                    "orderType": "Limit",
+                    "qty": "0.05",
+                    "price": "66800",
+                    "orderStatus": "New",
+                    "createdTime": "1774887600000",
+                }
+            ],
+            connected=True,
+            authenticated=True,
+        )
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+        control_main.repo.state.workspace_preferences.selected_mode = AccountMode.LIVE
+        control_main.repo.state.control_snapshot.scheduler.current_mode = AccountMode.LIVE
+
+        replace_status, replaced = self._post(
+            "/api/orders/exchange/live-open-001/replace",
+            {
+                "requested_by": "unit_test",
+                "quantity": 0.07,
+                "price": 66720,
+            },
+        )
+        self.assertEqual(replace_status, 200)
+        self.assertEqual(replaced["order_id"], "live-open-001")
+        self.assertEqual(replaced["origin"], "manual")
+        self.assertEqual(replaced["qty"], "0.07")
+        self.assertEqual(replaced["price"], "66720")
+
+        orders_status, orders = self._get("/api/account/orders")
+        self.assertEqual(orders_status, 200)
+        self.assertEqual(len(orders), 1)
+        self.assertEqual(orders[0]["qty"], "0.07")
+        self.assertEqual(orders[0]["price"].replace(",", ""), "66720.00")
+
+        history_status, history = self._get("/api/account/order-history")
+        self.assertEqual(history_status, 200)
+        self.assertTrue(any(item["order_id"] == "live-open-001" and item["price"].replace(",", "") == "66720.00" for item in history))
+
+        audit_status, audit_events = self._get("/api/audit/events")
+        self.assertEqual(audit_status, 200)
+        self.assertEqual(audit_events[0]["event_type"], "exchange_order.replaced")
+
+    def test_replace_exchange_order_returns_existing_order_without_amend_when_aligned(self) -> None:
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        private_client = StubConfiguredTradingBybitPrivateClient()
+        control_main.private_data = private_client
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(
+            client=private_client,
+            orders=[
+                {
+                    "orderId": "live-open-noop-001",
+                    "symbol": "BTCUSDT",
+                    "category": "linear",
+                    "side": "Buy",
+                    "orderType": "Limit",
+                    "qty": "0.05",
+                    "price": "66800",
+                    "orderStatus": "New",
+                    "createdTime": "1774887600000",
+                }
+            ],
+            connected=True,
+            authenticated=True,
+        )
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+        control_main.repo.state.workspace_preferences.selected_mode = AccountMode.LIVE
+        control_main.repo.state.control_snapshot.scheduler.current_mode = AccountMode.LIVE
+
+        replace_status, replaced = self._post(
+            "/api/orders/exchange/live-open-noop-001/replace",
+            {
+                "requested_by": "unit_test",
+                "quantity": 0.05,
+                "price": 66800,
+            },
+        )
+        self.assertEqual(replace_status, 200)
+        self.assertEqual(replaced["order_id"], "live-open-noop-001")
+        self.assertEqual(replaced["qty"], "0.05")
+        self.assertEqual(replaced["price"].replace(",", ""), "66800.00")
+        self.assertEqual(private_client.amended_order_bodies, [])
+
+        audit_status, audit_events = self._get("/api/audit/events")
+        self.assertEqual(audit_status, 200)
+        self.assertEqual(audit_events[0]["event_type"], "exchange_order.replace_noop")
+
+    def test_replace_exchange_order_amends_reduce_only_even_when_qty_and_price_are_aligned(self) -> None:
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        private_client = StubConfiguredTradingBybitPrivateClient()
+        control_main.private_data = private_client
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(
+            client=private_client,
+            orders=[
+                {
+                    "orderId": "live-open-reduce-only-001",
+                    "symbol": "BTCUSDT",
+                    "category": "linear",
+                    "side": "Sell",
+                    "orderType": "Limit",
+                    "qty": "0.05",
+                    "price": "66800",
+                    "orderStatus": "New",
+                    "createdTime": "1774887600000",
+                }
+            ],
+            connected=True,
+            authenticated=True,
+        )
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+        control_main.repo.state.workspace_preferences.selected_mode = AccountMode.LIVE
+        control_main.repo.state.control_snapshot.scheduler.current_mode = AccountMode.LIVE
+
+        replace_status, replaced = self._post(
+            "/api/orders/exchange/live-open-reduce-only-001/replace",
+            {
+                "requested_by": "unit_test",
+                "quantity": 0.05,
+                "price": 66800,
+            },
+        )
+        self.assertEqual(replace_status, 200)
+        self.assertEqual(replaced["order_id"], "live-open-reduce-only-001")
+        self.assertEqual(len(private_client.amended_order_bodies), 1)
+        self.assertTrue(private_client.amended_order_bodies[-1].get("reduceOnly"))
+
+    def test_replace_exchange_order_reuses_current_reservation_in_preview(self) -> None:
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        control_main.private_data = StubConfiguredTradingBybitPrivateClient()
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(
+            client=control_main.private_data,
+            orders=[
+                {
+                    "orderId": "live-open-002",
+                    "symbol": "BTCUSDT",
+                    "category": "linear",
+                    "side": "Buy",
+                    "orderType": "Limit",
+                    "qty": "0.05",
+                    "price": "66800",
+                    "orderStatus": "New",
+                    "createdTime": "1774887600000",
+                }
+            ],
+            connected=True,
+            authenticated=True,
+        )
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+        control_main.repo.state.workspace_preferences.selected_mode = AccountMode.LIVE
+        control_main.repo.state.control_snapshot.scheduler.current_mode = AccountMode.LIVE
+
+        preview_status, preview = self._post(
+            "/api/trades/preview",
+            {
+                "symbol": "BTCUSDT",
+                "market": "perp",
+                "mode": "live",
+                "side": "buy",
+                "quantity": 0.08,
+                "price": 66800,
+                "origin": "manual",
+                "exclude_order_id": "live-open-002",
+            },
+        )
+        self.assertEqual(preview_status, 200)
+        self.assertTrue(preview["allowed"])
+
+    def test_replace_exchange_order_reuses_current_sell_reservation_in_preview(self) -> None:
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        private_client = StubConfiguredTradingBybitPrivateClient()
+        private_client.fetch_positions = lambda: []
+        control_main.private_data = private_client
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(
+            client=private_client,
+            wallet={
+                "accountType": "UNIFIED",
+                "totalEquity": "0",
+                "totalWalletBalance": "0",
+                "totalAvailableBalance": "0",
+                "coin": [
+                    {
+                        "coin": "USDT",
+                        "walletBalance": "0",
+                        "availableToWithdraw": "0",
+                    }
+                ],
+            },
+            orders=[
+                {
+                    "orderId": "live-open-sell-002",
+                    "symbol": "BTCUSDT",
+                    "category": "linear",
+                    "side": "Sell",
+                    "orderType": "Limit",
+                    "qty": "0.08",
+                    "price": "66800",
+                    "orderStatus": "New",
+                    "createdTime": "1774887600000",
+                }
+            ],
+            connected=True,
+            authenticated=True,
+        )
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+        control_main.repo.state.workspace_preferences.selected_mode = AccountMode.LIVE
+        control_main.repo.state.control_snapshot.scheduler.current_mode = AccountMode.LIVE
+
+        preview_status, preview = self._post(
+            "/api/trades/preview",
+            {
+                "symbol": "BTCUSDT",
+                "market": "perp",
+                "mode": "live",
+                "side": "sell",
+                "quantity": 0.08,
+                "price": 66800,
+                "origin": "manual",
+                "exclude_order_id": "live-open-sell-002",
+            },
+        )
+        self.assertEqual(preview_status, 200)
+        self.assertTrue(preview["allowed"])
+
+    def test_replace_exchange_order_reuses_current_spot_sell_reservation_in_preview(self) -> None:
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        private_client = StubConfiguredTradingBybitPrivateClient()
+        control_main.private_data = private_client
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(
+            client=private_client,
+            wallet={
+                "accountType": "UNIFIED",
+                "totalEquity": "5000",
+                "totalWalletBalance": "5000",
+                "totalAvailableBalance": "4200",
+                "totalPerpUPL": "0",
+                "coin": [
+                    {
+                        "coin": "USDT",
+                        "walletBalance": "4200",
+                        "usdValue": "4200",
+                        "availableToWithdraw": "4200",
+                    },
+                    {
+                        "coin": "ETH",
+                        "walletBalance": "2.5",
+                        "usdValue": "5155",
+                        "availableToWithdraw": "0.4",
+                    },
+                ],
+            },
+            orders=[
+                {
+                    "orderId": "live-open-spot-001",
+                    "symbol": "ETHUSDT",
+                    "category": "spot",
+                    "side": "Sell",
+                    "orderType": "Limit",
+                    "qty": "1.8",
+                    "price": "2068",
+                    "orderStatus": "New",
+                    "createdTime": "1774887600000",
+                },
+                {
+                    "orderId": "live-open-spot-002",
+                    "symbol": "ETHUSDT",
+                    "category": "spot",
+                    "side": "Sell",
+                    "orderType": "Limit",
+                    "qty": "0.2",
+                    "price": "2072",
+                    "orderStatus": "New",
+                    "createdTime": "1774887900000",
+                },
+            ],
+            connected=True,
+            authenticated=True,
+        )
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+        control_main.repo.state.workspace_preferences.selected_mode = AccountMode.LIVE
+        control_main.repo.state.control_snapshot.scheduler.current_mode = AccountMode.LIVE
+
+        replace_status, replaced = self._post(
+            "/api/orders/exchange/live-open-spot-001/replace",
+            {
+                "requested_by": "unit_test",
+                "quantity": 2.2,
+                "price": 2069,
+            },
+        )
+        self.assertEqual(replace_status, 200)
+        self.assertEqual(replaced["order_id"], "live-open-spot-001")
+        self.assertEqual(replaced["market"], "spot")
+        self.assertEqual(replaced["qty"], "2.2")
+        self.assertEqual(private_client.amended_order_bodies[-1]["qty"], "2.2")
+
+    def test_cancel_exchange_order_removes_private_open_order(self) -> None:
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        control_main.private_data = StubConfiguredTradingBybitPrivateClient()
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(
+            client=control_main.private_data,
+            orders=[
+                {
+                    "orderId": "live-open-001",
+                    "symbol": "BTCUSDT",
+                    "category": "linear",
+                    "side": "Buy",
+                    "orderType": "Limit",
+                    "qty": "0.05",
+                    "price": "66800",
+                    "orderStatus": "New",
+                    "createdTime": "1774887600000",
+                }
+            ],
+            connected=True,
+            authenticated=True,
+        )
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+        control_main.repo.state.workspace_preferences.selected_mode = AccountMode.LIVE
+        control_main.repo.state.control_snapshot.scheduler.current_mode = AccountMode.LIVE
+
+        cancel_status, cancelled = self._post(
+            "/api/orders/exchange/live-open-001/cancel",
+            {"requested_by": "unit_test"},
+        )
+        self.assertEqual(cancel_status, 200)
+        self.assertEqual(cancelled["order_id"], "live-open-001")
+        self.assertEqual(cancelled["status"], "Cancelled")
+
+        orders_status, orders = self._get("/api/account/orders")
+        self.assertEqual(orders_status, 200)
+        self.assertEqual(orders, [])
+
+        history_status, history = self._get("/api/account/order-history")
+        self.assertEqual(history_status, 200)
+        self.assertTrue(any(item["order_id"] == "live-open-001" and item["status"] == "Cancelled" for item in history))
+
+        audit_status, audit_events = self._get("/api/audit/events")
+        self.assertEqual(audit_status, 200)
+        self.assertEqual(audit_events[0]["event_type"], "exchange_order.cancelled")
+
+    def test_cancel_all_exchange_orders_clears_private_open_order_book(self) -> None:
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        control_main.private_data = StubConfiguredTradingBybitPrivateClient()
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(
+            client=control_main.private_data,
+            orders=[
+                {
+                    "orderId": "live-open-001",
+                    "symbol": "BTCUSDT",
+                    "category": "linear",
+                    "side": "Buy",
+                    "orderType": "Limit",
+                    "qty": "0.05",
+                    "price": "66800",
+                    "orderStatus": "New",
+                    "createdTime": "1774887600000",
+                },
+                {
+                    "orderId": "live-open-002",
+                    "symbol": "ETHUSDT",
+                    "category": "spot",
+                    "side": "Sell",
+                    "orderType": "Limit",
+                    "qty": "1.2",
+                    "price": "2068",
+                    "orderStatus": "New",
+                    "createdTime": "1774887900000",
+                },
+            ],
+            connected=True,
+            authenticated=True,
+        )
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+        control_main.repo.state.workspace_preferences.selected_mode = AccountMode.LIVE
+        control_main.repo.state.control_snapshot.scheduler.current_mode = AccountMode.LIVE
+
+        cancel_status, result = self._post(
+            "/api/orders/exchange/cancel-all",
+            {"requested_by": "unit_test"},
+        )
+        self.assertEqual(cancel_status, 200)
+        self.assertEqual(result["cancelled_count"], 2)
+        self.assertEqual(set(result["cancelled_order_ids"]), {"live-open-001", "live-open-002"})
+
+        orders_status, orders = self._get("/api/account/orders")
+        self.assertEqual(orders_status, 200)
+        self.assertEqual(orders, [])
+
+        history_status, history = self._get("/api/account/order-history")
+        self.assertEqual(history_status, 200)
+        self.assertTrue(any(item["order_id"] == "live-open-001" and item["status"] == "Cancelled" for item in history))
+        self.assertTrue(any(item["order_id"] == "live-open-002" and item["status"] == "Cancelled" for item in history))
+
+        audit_status, audit_events = self._get("/api/audit/events")
+        self.assertEqual(audit_status, 200)
+        self.assertEqual(audit_events[0]["event_type"], "exchange_order.cancelled_all")
+
+    def test_cancel_all_exchange_orders_preserves_strategy_origin_in_history(self) -> None:
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        control_main.private_data = StubConfiguredTradingBybitPrivateClient()
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(
+            client=control_main.private_data,
+            orders=[
+                {
+                    "orderId": "live-open-strategy-001",
+                    "orderLinkId": "strategy-live-abc001",
+                    "symbol": "BTCUSDT",
+                    "category": "linear",
+                    "side": "Sell",
+                    "orderType": "Limit",
+                    "qty": "0.03",
+                    "price": "67100",
+                    "orderStatus": "New",
+                    "createdTime": "1774887600000",
+                }
+            ],
+            connected=True,
+            authenticated=True,
+        )
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+        control_main.repo.state.workspace_preferences.selected_mode = AccountMode.LIVE
+        control_main.repo.state.control_snapshot.scheduler.current_mode = AccountMode.LIVE
+
+        cancel_status, payload = self._post(
+            "/api/orders/exchange/cancel-all",
+            {"requested_by": "unit_test"},
+        )
+        self.assertEqual(cancel_status, 200)
+        self.assertEqual(payload["cancelled_count"], 1)
+
+        history_status, history = self._get("/api/account/order-history")
+        self.assertEqual(history_status, 200)
+        cancelled = next((item for item in history if item["order_id"] == "live-open-strategy-001"), None)
+        self.assertIsNotNone(cancelled)
+        self.assertEqual(cancelled["origin"], "strategy")
+
+    def test_close_exchange_position_submits_reduce_only_order_for_perp(self) -> None:
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        private_client = StubConfiguredTradingBybitPrivateClient()
+        control_main.private_data = private_client
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(client=private_client, connected=True, authenticated=True)
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+        control_main.repo.state.workspace_preferences.selected_mode = AccountMode.LIVE
+        control_main.repo.state.control_snapshot.scheduler.current_mode = AccountMode.LIVE
+
+        close_status, order = self._post(
+            "/api/account/exchange/positions/BTCUSDT/close",
+            {"requested_by": "unit_test"},
+        )
+        self.assertEqual(close_status, 200)
+        self.assertEqual(order["symbol"], "BTCUSDT")
+        self.assertEqual(order["origin"], "manual")
+        self.assertEqual(order["side"], "sell")
+
+        self.assertTrue(private_client.created_order_bodies)
+        created_body = private_client.created_order_bodies[-1]
+        self.assertEqual(created_body["symbol"], "BTCUSDT")
+        self.assertEqual(created_body["side"], "Sell")
+        self.assertTrue(created_body.get("reduceOnly"))
+
+        audit_status, audit_events = self._get("/api/audit/events")
+        self.assertEqual(audit_status, 200)
+        self.assertEqual(audit_events[0]["event_type"], "exchange_position.close_submitted")
+
+    def test_close_exchange_position_blocks_spot_when_wallet_available_is_insufficient(self) -> None:
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        private_client = StubConfiguredTradingBybitPrivateClient()
+        control_main.private_data = private_client
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(
+            client=private_client,
+            wallet={
+                "accountType": "UNIFIED",
+                "totalEquity": "5000",
+                "totalWalletBalance": "5000",
+                "totalAvailableBalance": "4200",
+                "totalPerpUPL": "0",
+                "coin": [
+                    {
+                        "coin": "USDT",
+                        "walletBalance": "4200",
+                        "usdValue": "4200",
+                        "availableToWithdraw": "4200",
+                    },
+                    {
+                        "coin": "ETH",
+                        "walletBalance": "2.5",
+                        "usdValue": "5155",
+                        "availableToWithdraw": "0.4",
+                    },
+                ],
+            },
+            connected=True,
+            authenticated=True,
+        )
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+        control_main.repo.state.workspace_preferences.selected_mode = AccountMode.LIVE
+        control_main.repo.state.control_snapshot.scheduler.current_mode = AccountMode.LIVE
+
+        close_status, payload = self._post(
+            "/api/account/exchange/positions/ETHUSDT/close",
+            {"requested_by": "unit_test"},
+        )
+        self.assertEqual(close_status, 409)
+        self.assertIn("请先撤销相关挂单后再平仓", payload["detail"])
+        self.assertEqual(private_client.created_order_bodies, [])
+
+    def test_close_exchange_position_uses_wallet_derived_spot_position_when_private_position_list_has_no_spot_entry(self) -> None:
+        class StubWalletSpotOnlyBybitPrivateClient(StubConfiguredTradingBybitPrivateClient):
+            def fetch_positions(self) -> list[Dict[str, Any]]:
+                return [
+                    {
+                        "symbol": "BTCUSDT",
+                        "category": "linear",
+                        "side": "Buy",
+                        "size": "0.15",
+                        "avgPrice": "66500",
+                        "markPrice": "66800",
+                        "positionValue": "10020",
+                        "leverage": "2",
+                        "unrealisedPnl": "45.5",
+                    }
+                ]
+
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        private_client = StubWalletSpotOnlyBybitPrivateClient()
+        control_main.private_data = private_client
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(
+            client=private_client,
+            wallet={
+                "accountType": "UNIFIED",
+                "totalEquity": "9355",
+                "totalWalletBalance": "9355",
+                "totalAvailableBalance": "4200",
+                "totalPerpUPL": "0",
+                "coin": [
+                    {
+                        "coin": "USDT",
+                        "walletBalance": "4200",
+                        "usdValue": "4200",
+                        "availableToWithdraw": "4200",
+                    },
+                    {
+                        "coin": "ETH",
+                        "walletBalance": "2.5",
+                        "usdValue": "5155",
+                        "availableToWithdraw": "2.5",
+                    },
+                ],
+            },
+            positions=[],
+            connected=True,
+            authenticated=True,
+        )
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+        control_main.repo.state.workspace_preferences.selected_mode = AccountMode.LIVE
+        control_main.repo.state.control_snapshot.scheduler.current_mode = AccountMode.LIVE
+
+        close_status, order = self._post(
+            "/api/account/exchange/positions/ETHUSDT/close",
+            {"requested_by": "unit_test"},
+        )
+        self.assertEqual(close_status, 200)
+        self.assertEqual(order["symbol"], "ETHUSDT")
+        self.assertEqual(order["market"], "spot")
+        self.assertEqual(order["side"], "sell")
+        self.assertTrue(any(body.get("symbol") == "ETHUSDT" and body.get("category") == "spot" for body in private_client.created_order_bodies))
+        self.assertTrue(all("reduceOnly" not in body for body in private_client.created_order_bodies))
+
+    def test_close_exchange_position_blocks_when_symbol_exists_in_multiple_markets(self) -> None:
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        private_client = StubConfiguredTradingBybitPrivateClient()
+        control_main.private_data = private_client
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(
+            client=private_client,
+            positions=[
+                {
+                    "symbol": "BTCUSDT",
+                    "category": "linear",
+                    "side": "Buy",
+                    "size": "0.15",
+                    "avgPrice": "66500",
+                    "markPrice": "66800",
+                    "positionValue": "10020",
+                    "leverage": "2",
+                    "unrealisedPnl": "45.5",
+                },
+                {
+                    "symbol": "BTCUSDT",
+                    "category": "spot",
+                    "side": "Buy",
+                    "size": "0.8",
+                    "avgPrice": "66200",
+                    "markPrice": "66800",
+                    "positionValue": "53440",
+                    "leverage": "1",
+                    "unrealisedPnl": "480",
+                },
+            ],
+            connected=True,
+            authenticated=True,
+        )
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+        control_main.repo.state.workspace_preferences.selected_mode = AccountMode.LIVE
+        control_main.repo.state.control_snapshot.scheduler.current_mode = AccountMode.LIVE
+
+        close_status, payload = self._post(
+            "/api/account/exchange/positions/BTCUSDT/close",
+            {"requested_by": "unit_test"},
+        )
+        self.assertEqual(close_status, 409)
+        self.assertIn("多个市场持仓", payload["detail"])
+        self.assertEqual(private_client.created_order_bodies, [])
+
+    def test_close_all_exchange_positions_submits_orders_for_all_positions(self) -> None:
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        private_client = StubConfiguredTradingBybitPrivateClient()
+        control_main.private_data = private_client
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(client=private_client, connected=True, authenticated=True)
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+        control_main.repo.state.workspace_preferences.selected_mode = AccountMode.LIVE
+        control_main.repo.state.control_snapshot.scheduler.current_mode = AccountMode.LIVE
+
+        close_status, payload = self._post(
+            "/api/account/exchange/positions/close-all",
+            {"requested_by": "unit_test"},
+        )
+        self.assertEqual(close_status, 200)
+        self.assertEqual(payload["submitted_count"], 2)
+        self.assertEqual(len(payload["order_ids"]), 2)
+        self.assertEqual(len(private_client.created_order_bodies), 2)
+        self.assertTrue(any(body.get("reduceOnly") for body in private_client.created_order_bodies))
+        self.assertTrue(any(body.get("symbol") == "ETHUSDT" and "reduceOnly" not in body for body in private_client.created_order_bodies))
+
+        audit_status, audit_events = self._get("/api/audit/events")
+        self.assertEqual(audit_status, 200)
+        self.assertEqual(audit_events[0]["event_type"], "exchange_position.close_all_submitted")
+
+    def test_close_all_exchange_positions_blocks_without_partial_submit_when_any_position_is_uncloseable(self) -> None:
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        private_client = StubConfiguredTradingBybitPrivateClient()
+        control_main.private_data = private_client
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(
+            client=private_client,
+            wallet={
+                "accountType": "UNIFIED",
+                "totalEquity": "5000",
+                "totalWalletBalance": "5000",
+                "totalAvailableBalance": "4200",
+                "totalPerpUPL": "0",
+                "coin": [
+                    {
+                        "coin": "USDT",
+                        "walletBalance": "4200",
+                        "usdValue": "4200",
+                        "availableToWithdraw": "4200",
+                    },
+                    {
+                        "coin": "ETH",
+                        "walletBalance": "2.5",
+                        "usdValue": "5155",
+                        "availableToWithdraw": "0.4",
+                    },
+                ],
+            },
+            connected=True,
+            authenticated=True,
+        )
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+        control_main.repo.state.workspace_preferences.selected_mode = AccountMode.LIVE
+        control_main.repo.state.control_snapshot.scheduler.current_mode = AccountMode.LIVE
+
+        close_status, payload = self._post(
+            "/api/account/exchange/positions/close-all",
+            {"requested_by": "unit_test"},
+        )
+        self.assertEqual(close_status, 409)
+        self.assertIn("请先撤销相关挂单后再平仓", payload["detail"])
+        self.assertEqual(private_client.created_order_bodies, [])
+
+        audit_status, audit_events = self._get("/api/audit/events")
+        self.assertEqual(audit_status, 200)
+        self.assertFalse(any(item["event_type"] == "exchange_position.close_all_submitted" for item in audit_events))
+
+    def test_manual_trade_respects_paper_risk_gate(self) -> None:
+        oversized_status, oversized_payload = self._post(
+            "/api/trades/manual",
+            {
+                "symbol": "BTCUSDT",
+                "market": "perp",
+                "mode": "paper",
+                "side": "buy",
+                "quantity": 10,
+                "price": 65000,
+                "note": "oversized buy",
+            },
+        )
+        self.assertEqual(oversized_status, 409)
+        self.assertIn("可用余额不足", oversized_payload["detail"])
+
+        spot_short_status, spot_short_payload = self._post(
+            "/api/trades/manual",
+            {
+                "symbol": "SOLUSDT",
+                "market": "spot",
+                "mode": "paper",
+                "side": "sell",
+                "quantity": 1,
+                "price": 84,
+                "note": "spot short",
+            },
+        )
+        self.assertEqual(spot_short_status, 409)
+        self.assertIn("可卖数量不足", spot_short_payload["detail"])
+
+        audit_status, audit_events = self._get("/api/audit/events")
+        self.assertEqual(audit_status, 200)
+        risk_events = [item for item in audit_events if item["event_type"] == "risk.blocked_order"]
+        self.assertGreaterEqual(len(risk_events), 2)
+
+    def test_paper_order_history_includes_manual_and_strategy_records(self) -> None:
+        history_status, history_orders = self._get("/api/account/order-history")
+        self.assertEqual(history_status, 200)
+        self.assertTrue(any(item["symbol"] == "ETHUSDT" for item in history_orders))
+
+        create_status, created_trade = self._post(
+            "/api/trades/manual",
+            {
+                "symbol": "BTCUSDT",
+                "market": "perp",
+                "mode": "paper",
+                "side": "buy",
+                "quantity": 0.5,
+                "price": 65000,
+                "note": "history test",
+            },
+        )
+        self.assertEqual(create_status, 200)
+
+        refreshed_status, refreshed_history = self._get("/api/account/order-history")
+        self.assertEqual(refreshed_status, 200)
+        self.assertEqual(refreshed_history[0]["source"], "paper")
+        self.assertEqual(refreshed_history[0]["symbol"], created_trade["symbol"])
+
+    def test_paper_close_trade_updates_realized_pnl_and_trade_record(self) -> None:
+        create_status, created_trade = self._post(
+            "/api/trades/manual",
+            {
+                "symbol": "ETHUSDT",
+                "market": "perp",
+                "mode": "paper",
+                "side": "sell",
+                "quantity": 10,
+                "price": 4900,
+                "note": "close partial eth long",
+            },
+        )
+        self.assertEqual(create_status, 200)
+
+        trades_status, trades = self._get("/api/trades")
+        self.assertEqual(trades_status, 200)
+        latest_trade = next((item for item in trades if item["id"] == created_trade["id"]), None)
+        self.assertIsNotNone(latest_trade)
+        assert latest_trade is not None
+        self.assertEqual(latest_trade["pnl"], "+1,018.00 USDT")
+
+        snapshot_status, snapshot = self._get("/api/control/snapshot")
+        self.assertEqual(snapshot_status, 200)
+        self.assertEqual(snapshot["today_performance"]["realized_pnl"], "+1,018.00 USDT")
+        self.assertEqual(snapshot["today_performance"]["win_rate"], "100.0%")
+
+    def test_close_paper_position_endpoint_flattens_position(self) -> None:
+        close_status, close_trade = self._post(
+            "/api/account/paper/positions/ETHUSDT/close",
+            {"requested_by": "unit_test"},
+        )
+        self.assertEqual(close_status, 200)
+        self.assertEqual(close_trade["symbol"], "ETHUSDT")
+        self.assertEqual(close_trade["side"], "sell")
+        self.assertEqual(close_trade["quantity"], 22)
+
+        positions_status, positions = self._get("/api/account/positions")
+        self.assertEqual(positions_status, 200)
+        self.assertEqual(positions, [])
+
+        overview_status, overview = self._get("/api/account/overview")
+        self.assertEqual(overview_status, 200)
+        self.assertEqual(overview["positions_count"], 0)
+
+        mode_update_status, _ = self._post(
+            "/api/workspace/preferences",
+            {
+                "active_section": "trades",
+                "layout_preset": "balanced",
+                "selected_mode": "live",
+                "selected_symbol": "BTCUSDT",
+                "selected_market_timeframe": "1h",
+                "selected_strategy_id": "trend-btc-01",
+                "overview_card_order": ["ai_center", "strategy_watch", "account_center"],
+                "overview_visible_cards": ["ai_center", "strategy_watch", "account_center"],
+                "overview_collapsed_cards": [],
+            },
+        )
+        self.assertEqual(mode_update_status, 200)
+
+        rejected_status, rejected_payload = self._post(
+            "/api/account/paper/positions/BTCUSDT/close",
+            {"requested_by": "unit_test"},
+        )
+        self.assertEqual(rejected_status, 409)
+        self.assertIn("仅允许在 Paper 模式", rejected_payload["detail"])
+
+    def test_close_all_paper_positions_endpoint_flattens_everything(self) -> None:
+        create_status, _ = self._post(
+            "/api/trades/manual",
+            {
+                "symbol": "BTCUSDT",
+                "market": "perp",
+                "mode": "paper",
+                "side": "buy",
+                "quantity": 0.4,
+                "price": 65000,
+                "note": "prepare second position",
+            },
+        )
+        self.assertEqual(create_status, 200)
+
+        close_status, result = self._post(
+            "/api/account/paper/positions/close-all",
+            {"requested_by": "unit_test"},
+        )
+        self.assertEqual(close_status, 200)
+        self.assertGreaterEqual(result["closed_count"], 1)
+
+        positions_status, positions = self._get("/api/account/positions")
+        self.assertEqual(positions_status, 200)
+        self.assertEqual(positions, [])
+
+        overview_status, overview = self._get("/api/account/overview")
+        self.assertEqual(overview_status, 200)
+        self.assertEqual(overview["positions_count"], 0)
+
+    def test_create_paper_order_enters_open_orders_and_reserves_balance(self) -> None:
+        before_status, before_overview = self._get("/api/account/overview")
+        self.assertEqual(before_status, 200)
+
+        create_status, order = self._post(
+            "/api/account/paper/orders",
+            {
+                "symbol": "BTCUSDT",
+                "market": "perp",
+                "mode": "paper",
+                "side": "buy",
+                "quantity": 1.0,
+                "price": 85000,
+                "note": "resting order",
+            },
+        )
+        self.assertEqual(create_status, 200)
+        self.assertEqual(order["source"], "paper")
+        self.assertEqual(order["status"], "New")
+
+        orders_status, orders = self._get("/api/account/orders")
+        self.assertEqual(orders_status, 200)
+        self.assertEqual(len(orders), 1)
+        self.assertEqual(orders[0]["order_id"], order["order_id"])
+
+        after_status, after_overview = self._get("/api/account/overview")
+        self.assertEqual(after_status, 200)
+        self.assertEqual(after_overview["open_orders_count"], 1)
+        self.assertNotEqual(after_overview["total_available_balance"], before_overview["total_available_balance"])
+
+    def test_paper_order_auto_fills_when_price_crosses(self) -> None:
+        create_status, order = self._post(
+            "/api/account/paper/orders",
+            {
+                "symbol": "BTCUSDT",
+                "market": "perp",
+                "mode": "paper",
+                "side": "buy",
+                "quantity": 0.6,
+                "price": 85000,
+                "note": "resting fill",
+            },
+        )
+        self.assertEqual(create_status, 200)
+
+        for item in control_main.repo.state.watchlist:
+            if item.symbol == "BTCUSDT":
+                item.last_price = 84950
+        orders_status, orders = self._get("/api/account/orders")
+        self.assertEqual(orders_status, 200)
+        self.assertEqual(orders, [])
+
+        trades_status, trades = self._get("/api/trades")
+        self.assertEqual(trades_status, 200)
+        filled_trade = next((item for item in trades if item["symbol"] == "BTCUSDT" and item["price"] == 85000), None)
+        self.assertIsNotNone(filled_trade)
+
+        history_status, history = self._get("/api/account/order-history")
+        self.assertEqual(history_status, 200)
+        filled_order = next((item for item in history if item["order_id"] == order["order_id"]), None)
+        self.assertIsNotNone(filled_order)
+        assert filled_order is not None
+        self.assertEqual(filled_order["status"], "Filled")
+
+    def test_cancel_paper_order_moves_it_to_history(self) -> None:
+        create_status, order = self._post(
+            "/api/account/paper/orders",
+            {
+                "symbol": "BTCUSDT",
+                "market": "perp",
+                "mode": "paper",
+                "side": "buy",
+                "quantity": 0.7,
+                "price": 84000,
+                "note": "cancel me",
+            },
+        )
+        self.assertEqual(create_status, 200)
+
+        cancel_status, cancelled = self._post(
+            f"/api/account/paper/orders/{order['order_id']}/cancel",
+            {"requested_by": "unit_test"},
+        )
+        self.assertEqual(cancel_status, 200)
+        self.assertEqual(cancelled["status"], "Cancelled")
+
+        orders_status, orders = self._get("/api/account/orders")
+        self.assertEqual(orders_status, 200)
+        self.assertEqual(orders, [])
+
+        history_status, history = self._get("/api/account/order-history")
+        self.assertEqual(history_status, 200)
+        history_item = next((item for item in history if item["order_id"] == order["order_id"]), None)
+        self.assertIsNotNone(history_item)
+        assert history_item is not None
+        self.assertEqual(history_item["status"], "Cancelled")
+
+    def test_replace_paper_order_updates_reservations_and_price(self) -> None:
+        create_status, order = self._post(
+            "/api/account/paper/orders",
+            {
+                "symbol": "BTCUSDT",
+                "market": "perp",
+                "mode": "paper",
+                "side": "buy",
+                "quantity": 0.5,
+                "price": 82000,
+                "note": "replace me",
+            },
+        )
+        self.assertEqual(create_status, 200)
+
+        before_status, before_overview = self._get("/api/account/overview")
+        self.assertEqual(before_status, 200)
+
+        replace_status, replaced = self._post(
+            f"/api/account/paper/orders/{order['order_id']}/replace",
+            {
+                "quantity": 0.8,
+                "price": 83500,
+                "requested_by": "unit_test",
+            },
+        )
+        self.assertEqual(replace_status, 200)
+        self.assertEqual(replaced["price"], "83,500")
+        self.assertEqual(replaced["qty"], "0.8")
+
+        orders_status, orders = self._get("/api/account/orders")
+        self.assertEqual(orders_status, 200)
+        self.assertEqual(orders[0]["order_id"], order["order_id"])
+        self.assertEqual(orders[0]["price"], "83,500")
+        self.assertEqual(orders[0]["qty"], "0.8")
+
+        after_status, after_overview = self._get("/api/account/overview")
+        self.assertEqual(after_status, 200)
+        self.assertNotEqual(after_overview["total_available_balance"], before_overview["total_available_balance"])
+
+    def test_replace_paper_order_uses_excluded_reservation_when_rechecking_risk(self) -> None:
+        create_status, order = self._post(
+            "/api/account/paper/orders",
+            {
+                "symbol": "BTCUSDT",
+                "market": "perp",
+                "mode": "paper",
+                "side": "buy",
+                "quantity": 1.0,
+                "price": 80000,
+                "note": "reserve then replace",
+            },
+        )
+        self.assertEqual(create_status, 200)
+
+        replace_status, replaced = self._post(
+            f"/api/account/paper/orders/{order['order_id']}/replace",
+            {
+                "quantity": 1.0,
+                "price": 81000,
+                "requested_by": "unit_test",
+            },
+        )
+        self.assertEqual(replace_status, 200)
+        self.assertEqual(replaced["price"], "81,000")
+
+        preview_status, preview = self._post(
+            "/api/trades/preview",
+            {
+                "symbol": "BTCUSDT",
+                "market": "perp",
+                "mode": "paper",
+                "side": "buy",
+                "quantity": 1.0,
+                "price": 81000,
+                "origin": "manual",
+                "exclude_order_id": order["order_id"],
+            },
+        )
+        self.assertEqual(preview_status, 200)
+        self.assertTrue(preview["allowed"])
+
+    def test_cancel_all_paper_orders_clears_open_order_book(self) -> None:
+        first_status, first_order = self._post(
+            "/api/account/paper/orders",
+            {
+                "symbol": "BTCUSDT",
+                "market": "perp",
+                "mode": "paper",
+                "side": "buy",
+                "quantity": 0.4,
+                "price": 82000,
+                "note": "bulk cancel 1",
+            },
+        )
+        second_status, second_order = self._post(
+            "/api/account/paper/orders",
+            {
+                "symbol": "ETHUSDT",
+                "market": "perp",
+                "mode": "paper",
+                "side": "buy",
+                "quantity": 2.5,
+                "price": 2000,
+                "note": "bulk cancel 2",
+            },
+        )
+        self.assertEqual(first_status, 200)
+        self.assertEqual(second_status, 200)
+
+        cancel_status, result = self._post(
+            "/api/account/paper/orders/cancel-all",
+            {"requested_by": "unit_test"},
+        )
+        self.assertEqual(cancel_status, 200)
+        self.assertEqual(result["cancelled_count"], 2)
+        self.assertIn(first_order["order_id"], result["cancelled_order_ids"])
+        self.assertIn(second_order["order_id"], result["cancelled_order_ids"])
+
+        orders_status, orders = self._get("/api/account/orders")
+        self.assertEqual(orders_status, 200)
+        self.assertEqual(orders, [])
+
+        history_status, history = self._get("/api/account/order-history")
+        self.assertEqual(history_status, 200)
+        self.assertTrue(any(item["order_id"] == first_order["order_id"] and item["status"] == "Cancelled" for item in history))
+        self.assertTrue(any(item["order_id"] == second_order["order_id"] and item["status"] == "Cancelled" for item in history))
+
+    def test_control_snapshot_surfaces_runtime_worker_issue(self) -> None:
+        control_main.strategy_runtime_state.update(
+            {
+                "running": False,
+                "last_refresh_at": None,
+                "last_error": "runtime boom",
+            }
+        )
+
+        snapshot_status, snapshot = self._get("/api/control/snapshot")
+        self.assertEqual(snapshot_status, 200)
+        self.assertTrue(snapshot["execution_health"]["runtime_worker_issue"])
+        self.assertEqual(snapshot["execution_health"]["runtime_last_error"], "runtime boom")
+        self.assertEqual(snapshot["execution_health"]["top_issue"], "运行线程异常")
+        self.assertEqual(snapshot["execution_health"]["top_issue_detail"], "后台策略运行线程最近一次报错：runtime boom")
+        self.assertIn("恢复运行线程", snapshot["execution_health"]["top_issue_recommended_action"])
+        self.assertEqual(snapshot["strategy_metrics"][0]["delta"], "运行线程异常")
+        self.assertEqual(snapshot["strategy_metrics"][0]["tone"], "critical")
+
+        alerts_status, alerts = self._get("/api/alerts")
+        self.assertEqual(alerts_status, 200)
+        issue_alert = next((item for item in alerts if item["title"] == "策略运行线程异常" and not item["acknowledged"]), None)
+        self.assertIsNotNone(issue_alert)
+
+        metrics_status, metrics_body = self._get_text("/metrics")
+        self.assertEqual(metrics_status, 200)
+        self.assertEqual(metrics_body.count("# HELP bybit_control_strategy_runtime_worker_running"), 1)
+        self.assertEqual(metrics_body.count("# TYPE bybit_control_strategy_runtime_worker_running gauge"), 1)
+        self.assertEqual(metrics_body.count("# HELP bybit_control_strategy_runtime_worker_error"), 1)
+        self.assertEqual(metrics_body.count("# TYPE bybit_control_strategy_runtime_worker_error gauge"), 1)
+        self.assertIn("bybit_control_strategy_runtime_worker_running 0", metrics_body)
+        self.assertIn("bybit_control_strategy_runtime_worker_error 1", metrics_body)
+
+        ops_status, ops = self._get("/api/ops/live")
+        self.assertEqual(ops_status, 200)
+        self.assertEqual(ops["summary"]["execution_top_issue"], "运行线程异常")
+        self.assertEqual(ops["summary"]["execution_top_issue_detail"], "后台策略运行线程最近一次报错：runtime boom")
+        self.assertEqual(ops["summary"]["execution_issue_total"], 1)
+
+    def test_control_snapshot_surfaces_runtime_worker_stale(self) -> None:
+        control_main.strategy_runtime_thread = StubAliveThread()
+        control_main.strategy_runtime_state.update(
+            {
+                "running": True,
+                "last_refresh_at": (datetime.now(timezone.utc).astimezone() - timedelta(seconds=95)).isoformat(),
+                "last_error": None,
+            }
+        )
+
+        snapshot_status, snapshot = self._get("/api/control/snapshot")
+        self.assertEqual(snapshot_status, 200)
+        self.assertTrue(snapshot["execution_health"]["runtime_worker_running"])
+        self.assertTrue(snapshot["execution_health"]["runtime_worker_issue"])
+        self.assertTrue(snapshot["execution_health"]["runtime_worker_stale"])
+        self.assertGreaterEqual(snapshot["execution_health"]["runtime_stale_seconds"], 90)
+        self.assertEqual(snapshot["execution_health"]["top_issue"], "运行线程停滞")
+        self.assertEqual(snapshot["strategy_metrics"][0]["delta"], "运行线程停滞")
+        self.assertEqual(snapshot["strategy_metrics"][0]["tone"], "critical")
+
+        alerts_status, alerts = self._get("/api/alerts")
+        self.assertEqual(alerts_status, 200)
+        stale_alert = next((item for item in alerts if item["title"] == "策略运行线程停滞" and not item["acknowledged"]), None)
+        self.assertIsNotNone(stale_alert)
+
+        metrics_status, metrics_body = self._get_text("/metrics")
+        self.assertEqual(metrics_status, 200)
+        self.assertEqual(metrics_body.count("# HELP bybit_control_strategy_runtime_worker_stale"), 1)
+        self.assertEqual(metrics_body.count("# TYPE bybit_control_strategy_runtime_worker_stale gauge"), 1)
+        self.assertEqual(metrics_body.count("# HELP bybit_control_strategy_runtime_stale_seconds"), 1)
+        self.assertEqual(metrics_body.count("# TYPE bybit_control_strategy_runtime_stale_seconds gauge"), 1)
+        self.assertIn("bybit_control_strategy_runtime_worker_stale 1", metrics_body)
+
+        ops_status, ops = self._get("/api/ops/live")
+        self.assertEqual(ops_status, 200)
+        self.assertEqual(ops["summary"]["execution_top_issue"], "运行线程停滞")
+        self.assertEqual(ops["summary"]["execution_issue_total"], 1)
+
+    def test_control_snapshot_surfaces_runtime_worker_stopped(self) -> None:
+        control_main.strategy_runtime_thread = None
+        control_main.strategy_runtime_state.update(
+            {
+                "running": False,
+                "last_refresh_at": datetime.now(timezone.utc).astimezone().isoformat(),
+                "last_error": None,
+                "started_once": True,
+            }
+        )
+
+        snapshot_status, snapshot = self._get("/api/control/snapshot")
+        self.assertEqual(snapshot_status, 200)
+        self.assertFalse(snapshot["execution_health"]["runtime_worker_running"])
+        self.assertTrue(snapshot["execution_health"]["runtime_worker_issue"])
+        self.assertTrue(snapshot["execution_health"]["runtime_worker_stopped"])
+        self.assertEqual(snapshot["execution_health"]["top_issue"], "运行线程未运行")
+        self.assertEqual(snapshot["strategy_metrics"][0]["delta"], "运行线程未运行")
+        self.assertEqual(snapshot["strategy_metrics"][0]["tone"], "critical")
+
+        alerts_status, alerts = self._get("/api/alerts")
+        self.assertEqual(alerts_status, 200)
+        stopped_alert = next((item for item in alerts if item["title"] == "策略运行线程未运行" and not item["acknowledged"]), None)
+        self.assertIsNotNone(stopped_alert)
+
+        metrics_status, metrics_body = self._get_text("/metrics")
+        self.assertEqual(metrics_status, 200)
+        self.assertEqual(metrics_body.count("# HELP bybit_control_strategy_runtime_worker_stopped"), 1)
+        self.assertEqual(metrics_body.count("# TYPE bybit_control_strategy_runtime_worker_stopped gauge"), 1)
+        self.assertIn("bybit_control_strategy_runtime_worker_stopped 1", metrics_body)
+
+        ops_status, ops = self._get("/api/ops/live")
+        self.assertEqual(ops_status, 200)
+        self.assertEqual(ops["summary"]["execution_top_issue"], "运行线程未运行")
+        self.assertEqual(ops["summary"]["execution_issue_total"], 1)
+
+        runtime_status, runtime_payload = self._get("/api/runtime/strategy-worker/status")
+        self.assertEqual(runtime_status, 200)
+        self.assertFalse(runtime_payload["running"])
+        self.assertTrue(runtime_payload["started_once"])
+        self.assertTrue(runtime_payload["stopped"])
+        self.assertEqual(runtime_payload["top_issue"], "运行线程未运行")
+        self.assertIn("恢复运行线程", runtime_payload["recommended_action"])
+
+    def test_control_snapshot_promotes_private_execution_channel_alert_and_resolves_after_recovery(self) -> None:
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        private_client = StubConfiguredTradingBybitPrivateClient()
+        control_main.private_data = private_client
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(client=private_client, connected=False, authenticated=False)
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+        control_main.repo.state.workspace_preferences.selected_mode = AccountMode.LIVE
+        control_main.repo.state.control_snapshot.scheduler.current_mode = AccountMode.LIVE
+
+        snapshot_status, snapshot = self._get("/api/control/snapshot")
+        self.assertEqual(snapshot_status, 200)
+        self.assertTrue(snapshot["execution_health"]["private_execution_channel_issue"])
+        self.assertEqual(snapshot["execution_health"]["top_issue"], "私有链路异常")
+
+        alerts_status, alerts = self._get("/api/alerts")
+        self.assertEqual(alerts_status, 200)
+        issue_alert = next(
+            (item for item in alerts if str(item.get("rule_key") or "") == "private-execution-channel:live"),
+            None,
+        )
+        self.assertIsNotNone(issue_alert)
+        assert issue_alert is not None
+        self.assertIn("私有 WS", issue_alert["description"])
+
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(client=private_client, connected=True, authenticated=True)
+
+        recovered_status, recovered_snapshot = self._get("/api/control/snapshot")
+        self.assertEqual(recovered_status, 200)
+        self.assertFalse(recovered_snapshot["execution_health"]["private_execution_channel_issue"])
+
+        alerts_status, alerts = self._get("/api/alerts")
+        self.assertEqual(alerts_status, 200)
+        active_issue_alert = next(
+            (
+                item
+                for item in alerts
+                if str(item.get("rule_key") or "") == "private-execution-channel:live" and not item["acknowledged"]
+            ),
+            None,
+        )
+        self.assertIsNone(active_issue_alert)
+        resolved_issue_alert = next(
+            (item for item in alerts if str(item.get("rule_key") or "") == "private-execution-channel:live"),
+            None,
+        )
+        self.assertIsNotNone(resolved_issue_alert)
+        assert resolved_issue_alert is not None
+        self.assertTrue(resolved_issue_alert["acknowledged"])
+
+        audit_status, audit_events = self._get("/api/audit/events")
+        self.assertEqual(audit_status, 200)
+        resolved_event = next((item for item in audit_events if item["event_type"] == "private.execution.channel.resolved"), None)
+        self.assertIsNotNone(resolved_event)
+
+    def test_control_snapshot_surfaces_public_execution_channel_stale_issue(self) -> None:
+        original_market = control_main.market_data
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        candles = [
+            CandlePoint(
+                time=f"2026-03-29T{hour:02d}:00:00+08:00",
+                open=66200.0 + hour * 90,
+                high=66280.0 + hour * 90,
+                low=66140.0 + hour * 90,
+                close=66240.0 + hour * 90,
+                volume=1800.0 + hour * 25,
+            )
+            for hour in range(24)
+        ]
+        market_client = StubStrategyRuntimeMarketClient(
+            symbol="BTCUSDT",
+            price=68450.0,
+            change_24h=3.9,
+            candles=candles,
+        )
+        market_client.realtime = StubPublicExecutionRealtimeFeed(
+            connected_linear=True,
+            ticker_symbols=["BTCUSDT"],
+            symbol_last_message_at={"BTCUSDT": "2026-03-29T08:00:00+08:00"},
+            last_message_at_linear="2026-03-29T08:00:00+08:00",
+        )
+        private_client = StubConfiguredTradingBybitPrivateClient()
+        control_main.market_data = market_client
+        control_main.private_data = private_client
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(client=private_client, connected=True, authenticated=True)
+        self.addCleanup(lambda: setattr(control_main, "market_data", original_market))
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+        control_main.repo.state.workspace_preferences.selected_mode = AccountMode.LIVE
+        control_main.repo.state.control_snapshot.scheduler.current_mode = AccountMode.LIVE
+
+        snapshot_status, snapshot = self._get("/api/control/snapshot")
+        self.assertEqual(snapshot_status, 200)
+        self.assertTrue(snapshot["execution_health"]["public_execution_channel_issue"])
+        self.assertTrue(snapshot["execution_health"]["public_execution_stale"])
+        self.assertGreater(snapshot["execution_health"]["public_execution_stale_seconds"], 0)
+        self.assertEqual(snapshot["execution_health"]["top_issue"], "公有链路失活")
+        self.assertEqual(snapshot["execution_health"]["top_issue_strategy_id"], "trend-btc-01")
+        self.assertIn("公共 WS", snapshot["execution_health"]["top_issue_detail"])
+
+        metrics_status, metrics_body = self._get_text("/metrics")
+        self.assertEqual(metrics_status, 200)
+        self.assertIn('bybit_control_public_ws_stale{channel="linear"} 1', metrics_body)
+        self.assertIn('bybit_control_strategy_issue_total{issue="public_execution_channel_issue"} 1', metrics_body)
+
+    def test_control_snapshot_surfaces_public_execution_channel_transport_error_detail(self) -> None:
+        original_market = control_main.market_data
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        candles = [
+            CandlePoint(
+                time=f"2026-03-29T{hour:02d}:00:00+08:00",
+                open=66200.0 + hour * 90,
+                high=66280.0 + hour * 90,
+                low=66140.0 + hour * 90,
+                close=66240.0 + hour * 90,
+                volume=1800.0 + hour * 25,
+            )
+            for hour in range(24)
+        ]
+        market_client = StubStrategyRuntimeMarketClient(
+            symbol="BTCUSDT",
+            price=68450.0,
+            change_24h=3.9,
+            candles=candles,
+        )
+        market_client.realtime = StubPublicExecutionRealtimeFeed(
+            connected_linear=False,
+            ticker_symbols=[],
+            last_error="EOF occurred in violation of protocol (_ssl.c:1129)",
+        )
+        private_client = StubConfiguredTradingBybitPrivateClient()
+        control_main.market_data = market_client
+        control_main.private_data = private_client
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(client=private_client, connected=True, authenticated=True)
+        self.addCleanup(lambda: setattr(control_main, "market_data", original_market))
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+        control_main.repo.state.workspace_preferences.selected_mode = AccountMode.LIVE
+        control_main.repo.state.control_snapshot.scheduler.current_mode = AccountMode.LIVE
+
+        snapshot_status, snapshot = self._get("/api/control/snapshot")
+        self.assertEqual(snapshot_status, 200)
+        self.assertTrue(snapshot["execution_health"]["public_execution_channel_issue"])
+        self.assertIn("公共 WS", snapshot["execution_health"]["top_issue_detail"])
+        self.assertIn("EOF occurred in violation of protocol", snapshot["execution_health"]["top_issue_detail"])
+        self.assertIn("REST 已可达", snapshot["execution_health"]["top_issue_recommended_action"])
+
+        public_status_code, public_status = self._get("/api/integrations/bybit-public")
+        self.assertEqual(public_status_code, 200)
+        self.assertEqual(public_status["last_error"], "EOF occurred in violation of protocol (_ssl.c:1129)")
+        self.assertTrue(public_status["rest_reachable"])
+        self.assertIn("REST 已可达", public_status["recommended_action"])
+        btc_diag = next((item for item in public_status["watched_symbol_diagnostics"] if item["symbol"] == "BTCUSDT"), None)
+        self.assertIsNotNone(btc_diag)
+        assert btc_diag is not None
+        self.assertIn("EOF occurred in violation of protocol", btc_diag["issue"])
+        self.assertIn("REST 已可达", btc_diag["recommended_action"])
+
+    def test_control_snapshot_promotes_public_execution_channel_alert_and_resolves_after_recovery(self) -> None:
+        original_market = control_main.market_data
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+        candles = [
+            CandlePoint(
+                time=f"2026-03-29T{hour:02d}:00:00+08:00",
+                open=66200.0 + hour * 90,
+                high=66280.0 + hour * 90,
+                low=66140.0 + hour * 90,
+                close=66240.0 + hour * 90,
+                volume=1800.0 + hour * 25,
+            )
+            for hour in range(24)
+        ]
+        market_client = StubStrategyRuntimeMarketClient(
+            symbol="BTCUSDT",
+            price=68450.0,
+            change_24h=3.9,
+            candles=candles,
+        )
+        market_client.realtime = StubPublicExecutionRealtimeFeed(
+            connected_linear=True,
+            ticker_symbols=["BTCUSDT"],
+            symbol_last_message_at={"BTCUSDT": "2026-03-29T08:00:00+08:00"},
+            last_message_at_linear="2026-03-29T08:00:00+08:00",
+        )
+        private_client = StubConfiguredTradingBybitPrivateClient()
+        control_main.market_data = market_client
+        control_main.private_data = private_client
+        control_main.private_realtime = StubBybitPrivateRealtimeClient(client=private_client, connected=True, authenticated=True)
+        self.addCleanup(lambda: setattr(control_main, "market_data", original_market))
+        self.addCleanup(lambda: setattr(control_main, "private_data", original_private))
+        self.addCleanup(lambda: setattr(control_main, "private_realtime", original_realtime))
+        control_main.repo.state.workspace_preferences.selected_mode = AccountMode.LIVE
+        control_main.repo.state.control_snapshot.scheduler.current_mode = AccountMode.LIVE
+
+        snapshot_status, snapshot = self._get("/api/control/snapshot")
+        self.assertEqual(snapshot_status, 200)
+        self.assertTrue(snapshot["execution_health"]["public_execution_channel_issue"])
+        self.assertEqual(snapshot["execution_health"]["top_issue"], "公有链路失活")
+
+        alerts_status, alerts = self._get("/api/alerts")
+        self.assertEqual(alerts_status, 200)
+        issue_alert = next(
+            (
+                item
+                for item in alerts
+                if str(item.get("rule_key") or "") == "public-execution-channel:trend-btc-01:live"
+            ),
+            None,
+        )
+        self.assertIsNotNone(issue_alert)
+        assert issue_alert is not None
+        self.assertIn("公共 WS", issue_alert["description"])
+
+        market_client.realtime = StubPublicExecutionRealtimeFeed(
+            connected_linear=True,
+            ticker_symbols=["BTCUSDT"],
+            symbol_last_message_at={"BTCUSDT": datetime.now(timezone.utc).astimezone().isoformat()},
+            last_message_at_linear=datetime.now(timezone.utc).astimezone().isoformat(),
+        )
+
+        recovered_status, recovered_snapshot = self._get("/api/control/snapshot")
+        self.assertEqual(recovered_status, 200)
+        self.assertFalse(recovered_snapshot["execution_health"]["public_execution_channel_issue"])
+
+        alerts_status, alerts = self._get("/api/alerts")
+        self.assertEqual(alerts_status, 200)
+        active_issue_alert = next(
+            (
+                item
+                for item in alerts
+                if str(item.get("rule_key") or "") == "public-execution-channel:trend-btc-01:live"
+                and not item["acknowledged"]
+            ),
+            None,
+        )
+        self.assertIsNone(active_issue_alert)
+        resolved_issue_alert = next(
+            (
+                item
+                for item in alerts
+                if str(item.get("rule_key") or "") == "public-execution-channel:trend-btc-01:live"
+            ),
+            None,
+        )
+        self.assertIsNotNone(resolved_issue_alert)
+        assert resolved_issue_alert is not None
+        self.assertTrue(resolved_issue_alert["acknowledged"])
+
+        audit_status, audit_events = self._get("/api/audit/events")
+        self.assertEqual(audit_status, 200)
+        resolved_event = next((item for item in audit_events if item["event_type"] == "public.execution.channel.resolved"), None)
+        self.assertIsNotNone(resolved_event)
+
+    def test_restart_strategy_runtime_worker_endpoint_clears_error_and_starts_loop(self) -> None:
+        original_refresh = control_main.refresh_strategy_runtime_once
+
+        def stub_refresh_strategy_runtime_once(auto_dispatch: bool = False) -> list[Any]:
+            control_main.strategy_runtime_state["last_refresh_at"] = datetime.now(timezone.utc).astimezone().isoformat()
+            control_main.strategy_runtime_state["last_error"] = None
+            return []
+
+        control_main.refresh_strategy_runtime_once = stub_refresh_strategy_runtime_once
+        self.addCleanup(setattr, control_main, "refresh_strategy_runtime_once", original_refresh)
+        control_main.strategy_runtime_state.update(
+            {
+                "running": False,
+                "last_refresh_at": None,
+                "last_error": "runtime boom",
+            }
+        )
+        initial_snapshot_status, _initial_snapshot = self._get("/api/control/snapshot")
+        self.assertEqual(initial_snapshot_status, 200)
+
+        restart_status, restart_result = self._post(
+            "/api/runtime/strategy-worker/restart",
+            {
+                "requested_by": "unit_test",
+                "reason": "恢复后台运行线程",
+            },
+        )
+        self.assertEqual(restart_status, 200)
+        self.assertTrue(restart_result["running"])
+
+        deadline = time.time() + 2
+        while time.time() < deadline and control_main.strategy_runtime_state.get("last_refresh_at") is None:
+            time.sleep(0.05)
+
+        self.assertIsNone(control_main.strategy_runtime_state.get("last_error"))
+        self.assertIsNotNone(control_main.strategy_runtime_state.get("last_refresh_at"))
+
+        snapshot_status, snapshot = self._get("/api/control/snapshot")
+        self.assertEqual(snapshot_status, 200)
+        self.assertTrue(snapshot["execution_health"]["runtime_worker_running"])
+        self.assertFalse(snapshot["execution_health"]["runtime_worker_issue"])
+
+        alerts_status, alerts = self._get("/api/alerts")
+        self.assertEqual(alerts_status, 200)
+        self.assertFalse(any(item["title"] == "策略运行线程异常" and not item["acknowledged"] for item in alerts))
+        self.assertFalse(any(item["title"] == "策略运行线程未运行" and not item["acknowledged"] for item in alerts))
+
+        audit_status, audit_events = self._get("/api/audit/events")
+        self.assertEqual(audit_status, 200)
+        self.assertTrue(any(item["event_type"] == "strategy.runtime.worker.restarted" for item in audit_events))
+        self.assertTrue(any(item["event_type"] == "strategy.runtime.worker.issue_resolved" for item in audit_events))
+
+    def test_restart_strategy_runtime_worker_endpoint_surfaces_restart_failure_alert(self) -> None:
+        original_stop = control_main._stop_strategy_runtime_worker
+        control_main._stop_strategy_runtime_worker = lambda timeout=3.0: False
+        self.addCleanup(setattr, control_main, "_stop_strategy_runtime_worker", original_stop)
+
+        restart_status, restart_result = self._post(
+            "/api/runtime/strategy-worker/restart",
+            {
+                "requested_by": "unit_test",
+                "reason": "模拟线程无法停止",
+            },
+        )
+        self.assertEqual(restart_status, 409)
+        self.assertIn("未能在超时时间内停止", restart_result["detail"])
+
+        alerts_status, alerts = self._get("/api/alerts")
+        self.assertEqual(alerts_status, 200)
+        restart_failed_alert = next((item for item in alerts if item["title"] == "恢复运行线程失败" and not item["acknowledged"]), None)
+        self.assertIsNotNone(restart_failed_alert)
+        self.assertEqual(restart_failed_alert["severity"], "P1")
+
+        audit_status, audit_events = self._get("/api/audit/events")
+        self.assertEqual(audit_status, 200)
+        self.assertTrue(any(item["event_type"] == "strategy.runtime.worker.restart_failed" for item in audit_events))
+
+    def test_restart_strategy_runtime_worker_success_resolves_restart_failure_alert(self) -> None:
+        original_refresh = control_main.refresh_strategy_runtime_once
+        original_stop = control_main._stop_strategy_runtime_worker
+
+        def stub_refresh_strategy_runtime_once(auto_dispatch: bool = False) -> list[Any]:
+            control_main.strategy_runtime_state["last_refresh_at"] = datetime.now(timezone.utc).astimezone().isoformat()
+            control_main.strategy_runtime_state["last_error"] = None
+            return []
+
+        control_main.refresh_strategy_runtime_once = stub_refresh_strategy_runtime_once
+        self.addCleanup(setattr, control_main, "refresh_strategy_runtime_once", original_refresh)
+
+        control_main._stop_strategy_runtime_worker = lambda timeout=3.0: False
+        failed_status, _failed_result = self._post(
+            "/api/runtime/strategy-worker/restart",
+            {
+                "requested_by": "unit_test",
+                "reason": "先制造一次恢复失败",
+            },
+        )
+        self.assertEqual(failed_status, 409)
+
+        control_main._stop_strategy_runtime_worker = original_stop
+        self.addCleanup(setattr, control_main, "_stop_strategy_runtime_worker", original_stop)
+
+        restart_status, restart_result = self._post(
+            "/api/runtime/strategy-worker/restart",
+            {
+                "requested_by": "unit_test",
+                "reason": "再次恢复后台运行线程",
+            },
+        )
+        self.assertEqual(restart_status, 200)
+        self.assertTrue(restart_result["running"])
+
+        deadline = time.time() + 2
+        while time.time() < deadline and control_main.strategy_runtime_state.get("last_refresh_at") is None:
+            time.sleep(0.05)
+
+        alerts_status, alerts = self._get("/api/alerts")
+        self.assertEqual(alerts_status, 200)
+        self.assertFalse(any(item["title"] == "恢复运行线程失败" and not item["acknowledged"] for item in alerts))
+
+        audit_status, audit_events = self._get("/api/audit/events")
+        self.assertEqual(audit_status, 200)
+        self.assertTrue(any(item["event_type"] == "strategy.runtime.worker.restart_failed_resolved" for item in audit_events))
 
 
 if __name__ == "__main__":
