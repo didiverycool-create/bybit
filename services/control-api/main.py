@@ -72,10 +72,27 @@ except ModuleNotFoundError:
             return None
 
 try:
-    from backtest_engine import candle_limit_for_range, run_local_backtest
+    from backtest_engine import (
+        BACKTEST_ENGINE_MAX_CANDLES,
+        candle_limit_for_range,
+        estimate_candle_count_for_range,
+        resolve_data_range_bounds,
+        run_local_backtest,
+    )
 except ModuleNotFoundError:
+    BACKTEST_ENGINE_MAX_CANDLES = 48
+
+    def estimate_candle_count_for_range(data_range: str, timeframe: str) -> int:
+        return 48
+
     def candle_limit_for_range(data_range: str, timeframe: str) -> int:
         return 48
+
+    def resolve_data_range_bounds(
+        data_range: str,
+        now: Optional[datetime] = None,
+    ) -> tuple[Optional[str], Optional[str]]:
+        return None, None
 
     run_local_backtest = None
 try:
@@ -102,9 +119,11 @@ from models import (
     ExecutionPreview,
     ExecutionPreviewRequest,
     ExchangePositionBulkCloseResult,
+    ExecutionEvent,
     EventSeverity,
     ExecutionHealthSummary,
     GrafanaIntegrationStatus,
+    LatestSchedulerCommand,
     ManualOrderRequest,
     MarketDetail,
     MarketLiveSnapshot,
@@ -123,6 +142,10 @@ from models import (
     RuntimeWorkerActionResult,
     RuntimeWorkerStatus,
     SchedulerCommand,
+    SchedulerCommandType,
+    SchedulerSnapshot,
+    SettingsPayload,
+    SettingsUpdatePayload,
     StrategyActivityReviewSummary,
     StrategyExecutionRequest,
     StrategyExecutionResult,
@@ -140,6 +163,7 @@ from models import (
     WatchlistRemoveResult,
     WorkspacePreferences,
     WorkspacePreferencesUpdate,
+    normalize_backtest_timeframe,
 )
 from openclaw_client import OpenClawGatewayClient
 from repository import AppRepository
@@ -206,6 +230,11 @@ class BacktestCreate(BaseModel):
     strategy_id: str
     data_range: str = "2026-01-01 ~ 2026-03-29"
     timeframe: str = "1h"
+    source_change_request_id: Optional[str] = None
+    source_backtest_id: Optional[str] = None
+    source_review_id: Optional[str] = None
+    source_proposal_id: Optional[str] = None
+    trigger_reason: Optional[str] = None
 
 
 class AgentJobRetryPayload(BaseModel):
@@ -2822,6 +2851,114 @@ def build_prometheus_metrics() -> str:
     return "\n".join(lines) + "\n"
 
 
+def _non_empty_string(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        normalized = value.strip()
+        return normalized or None
+    normalized = str(value).strip()
+    return normalized or None
+
+
+def _non_empty_string_list(value: Any) -> List[str]:
+    if not isinstance(value, list):
+        return []
+    items: List[str] = []
+    for item in value:
+        normalized = _non_empty_string(item)
+        if normalized and normalized not in items:
+            items.append(normalized)
+    return items
+
+
+def _single_or_none(items: List[str]) -> Optional[str]:
+    return items[0] if len(items) == 1 else None
+
+
+def _build_scheduler_command_impact_detail(payload: Dict[str, Any]) -> Optional[str]:
+    job_types = _non_empty_string_list(payload.get("cancelled_job_types"))
+    strategy_ids = _non_empty_string_list(payload.get("cancelled_strategy_ids"))
+    backtest_ids = _non_empty_string_list(payload.get("cancelled_backtest_ids"))
+    source_change_request_ids = _non_empty_string_list(payload.get("cancelled_source_change_request_ids"))
+    source_backtest_ids = _non_empty_string_list(payload.get("cancelled_source_backtest_ids"))
+    source_review_ids = _non_empty_string_list(payload.get("cancelled_source_review_ids"))
+    source_proposal_ids = _non_empty_string_list(payload.get("cancelled_source_proposal_ids"))
+    trigger_reasons = _non_empty_string_list(payload.get("cancelled_trigger_reasons"))
+    decision_readiness_values = _non_empty_string_list(payload.get("cancelled_decision_readiness_values"))
+    parts: List[str] = []
+    if job_types:
+        parts.append(f"任务 {' / '.join(job_types)}")
+    if strategy_ids:
+        parts.append(f"策略 {strategy_ids[0]}" if len(strategy_ids) == 1 else f"策略 {len(strategy_ids)} 条")
+    if backtest_ids:
+        parts.append(f"回测 {backtest_ids[0]}" if len(backtest_ids) == 1 else f"回测 {len(backtest_ids)} 轮")
+    if source_change_request_ids:
+        parts.append(
+            f"来源变更 {source_change_request_ids[0]}"
+            if len(source_change_request_ids) == 1
+            else f"来源变更 {len(source_change_request_ids)} 条"
+        )
+    if source_backtest_ids:
+        parts.append(
+            f"来源回测 {source_backtest_ids[0]}"
+            if len(source_backtest_ids) == 1
+            else f"来源回测 {len(source_backtest_ids)} 轮"
+        )
+    if source_review_ids:
+        parts.append(
+            f"来源复盘 {source_review_ids[0]}"
+            if len(source_review_ids) == 1
+            else f"来源复盘 {len(source_review_ids)} 条"
+        )
+    if source_proposal_ids:
+        parts.append(
+            f"来源提案 {source_proposal_ids[0]}"
+            if len(source_proposal_ids) == 1
+            else f"来源提案 {len(source_proposal_ids)} 条"
+        )
+    if trigger_reasons:
+        parts.append(f"触发 {' / '.join(trigger_reasons)}")
+    if decision_readiness_values:
+        parts.append(f"门禁 {' / '.join(decision_readiness_values)}")
+    return " · ".join(parts) if parts else None
+
+
+def _build_latest_scheduler_command(audit_events: List[ExecutionEvent]) -> Optional[LatestSchedulerCommand]:
+    event = next((item for item in audit_events if item.event_type == "scheduler.command"), None)
+    if event is None:
+        return None
+    payload = event.payload if isinstance(event.payload, dict) else {}
+    command_text = _non_empty_string(payload.get("command"))
+    command = None
+    if command_text:
+        try:
+            command = SchedulerCommandType(command_text)
+        except ValueError:
+            command = None
+    return LatestSchedulerCommand(
+        command=command,
+        summary=_non_empty_string(payload.get("summary")) or f"已执行调度命令：{command_text or 'unknown'}",
+        impact_detail=_build_scheduler_command_impact_detail(payload),
+        job_id=_non_empty_string(payload.get("retry_job_id")) or _non_empty_string(payload.get("job_id")),
+        strategy_id=_non_empty_string(payload.get("strategy_id"))
+        or _single_or_none(_non_empty_string_list(payload.get("cancelled_strategy_ids"))),
+        linked_review_id=_non_empty_string(payload.get("linked_review_id")) or _non_empty_string(payload.get("review_id")),
+        backtest_id=_non_empty_string(payload.get("backtest_id"))
+        or _single_or_none(_non_empty_string_list(payload.get("cancelled_backtest_ids"))),
+        source_change_request_id=_non_empty_string(payload.get("source_change_request_id"))
+        or _single_or_none(_non_empty_string_list(payload.get("cancelled_source_change_request_ids"))),
+        source_backtest_id=_non_empty_string(payload.get("source_backtest_id"))
+        or _single_or_none(_non_empty_string_list(payload.get("cancelled_source_backtest_ids"))),
+        source_review_id=_non_empty_string(payload.get("source_review_id"))
+        or _single_or_none(_non_empty_string_list(payload.get("cancelled_source_review_ids"))),
+        source_proposal_id=_non_empty_string(payload.get("source_proposal_id"))
+        or _single_or_none(_non_empty_string_list(payload.get("cancelled_source_proposal_ids"))),
+        occurred_at=event.occurred_at,
+        severity=event.severity,
+    )
+
+
 def _build_control_snapshot_response() -> ControlSnapshot:
     state = repo.snapshot()
     snapshot = state.control_snapshot
@@ -3025,7 +3162,13 @@ def _build_control_snapshot_response() -> ControlSnapshot:
         top_issue_detail=top_issue_context.get("top_issue_detail"),
         top_issue_recommended_action=top_issue_context.get("top_issue_recommended_action"),
     )
-    return snapshot.model_copy(update={"strategy_metrics": strategy_metrics, "execution_health": execution_health})
+    return snapshot.model_copy(
+        update={
+            "strategy_metrics": strategy_metrics,
+            "execution_health": execution_health,
+            "latest_scheduler_command": _build_latest_scheduler_command(state.audit_events),
+        }
+    )
 
 
 def build_runtime_worker_status() -> RuntimeWorkerStatus:
@@ -3139,10 +3282,20 @@ def build_backtest_payload(strategy: Any, data_range: str, timeframe: str) -> Op
         return None
     state = repo.snapshot()
     market = _resolve_strategy_primary_market(state, strategy)
+    requested_range_start, requested_range_end = resolve_data_range_bounds(data_range)
+    requested_candle_estimate = estimate_candle_count_for_range(data_range, timeframe)
     limit = candle_limit_for_range(data_range, timeframe)
     candles = []
+    history_source = "exchange_history"
+    history_source_reason = "none"
+    history_source_detail: Optional[str] = None
+    history_source_recommended_data_range: Optional[str] = None
+    history_source_recommended_timeframe: Optional[str] = None
+    history_source_recommended_action: Optional[str] = None
     try:
-        if hasattr(market_data, "get_candles_cached"):
+        if hasattr(market_data, "get_candles_history"):
+            candles = market_data.get_candles_history(symbol, market, timeframe=timeframe, limit=limit)
+        elif hasattr(market_data, "get_candles_cached"):
             candles = market_data.get_candles_cached(symbol, market, timeframe=timeframe, limit=limit)
         else:
             interval = {
@@ -3152,19 +3305,165 @@ def build_backtest_payload(strategy: Any, data_range: str, timeframe: str) -> Op
                 "1d": "D",
             }.get(str(timeframe).lower(), "60")
             candles = market_data.get_candles(symbol, market, interval=interval, limit=limit)
-    except RuntimeError:
+    except RuntimeError as exc:
         fallback_detail = state.market_details.get(symbol)
         candles = list(fallback_detail.candles if fallback_detail else [])
+        if candles:
+            history_source = "market_detail_fallback"
+            history_source_reason = "exchange_fetch_failed"
+            history_source_detail = str(exc)
     if len(candles) < 30:
+        exchange_sample_count = len(candles)
         fallback_detail = state.market_details.get(symbol)
         if fallback_detail:
             candles = list(fallback_detail.candles)
+            if candles:
+                history_source = "market_detail_fallback"
+                if history_source_reason == "none":
+                    history_source_reason = "insufficient_exchange_samples"
+                    history_source_detail = (
+                        f"交易所历史仅返回 {exchange_sample_count} 根样本，低于最小回测门槛 30 根。"
+                    )
     if len(candles) < 30:
         return None
     computation = run_local_backtest(strategy, candles, timeframe, data_range)
+    if history_source == "market_detail_fallback":
+        history_source_plan = _resolve_history_source_recommendation(
+            {
+                "data_range": data_range,
+                "timeframe": timeframe,
+                "history_source": history_source,
+                "history_source_reason": history_source_reason,
+            }
+        )
+        history_source_recommended_data_range = history_source_plan["data_range"]
+        history_source_recommended_timeframe = history_source_plan["timeframe"]
+        history_source_recommended_action = history_source_plan["recommended_action"]
+    history_target = min(requested_candle_estimate, limit)
+    history_gap_reason = "none"
+    if computation.history_truncated or requested_candle_estimate > limit:
+        history_gap_reason = "sample_cap"
+    elif history_target > 0 and computation.retrieved_candle_count < history_target:
+        history_gap_reason = "insufficient_history"
+    history_truncated = bool(
+        computation.history_truncated
+        or requested_candle_estimate > limit
+        or (history_target > 0 and computation.retrieved_candle_count < history_target)
+    )
+    retrieved_window_completion_pct = 0.0
+    used_window_completion_pct = 0.0
+    if requested_candle_estimate > 0:
+        retrieved_window_completion_pct = round(
+            min(max(computation.retrieved_candle_count / requested_candle_estimate * 100.0, 0.0), 100.0),
+            2,
+        )
+        used_window_completion_pct = round(
+            min(max(computation.used_candle_count / requested_candle_estimate * 100.0, 0.0), 100.0),
+            2,
+        )
+    full_window_recommended_data_range: Optional[str] = None
+    full_window_recommended_timeframe: Optional[str] = None
+    full_window_recommended_action: Optional[str] = None
+    if history_truncated:
+        if history_gap_reason == "insufficient_history":
+            full_window_recommended_data_range = _build_available_history_data_range_from_bounds(
+                computation.retrieved_range_start,
+                computation.retrieved_range_end,
+                timeframe,
+            )
+            full_window_recommended_timeframe = timeframe
+            if full_window_recommended_data_range:
+                full_window_recommended_action = (
+                    f"当前交易所可用历史仅覆盖 {full_window_recommended_data_range}，"
+                    f"建议先缩短到该可用区间并保持 {timeframe} 重新回测。"
+                )
+        else:
+            full_window_plan = _build_full_window_backtest_plan(data_range, timeframe)
+            recommended_payload = full_window_plan["payload"]
+            full_window_recommended_data_range = str(recommended_payload.get("data_range") or data_range)
+            full_window_recommended_timeframe = str(recommended_payload.get("timeframe") or timeframe)
+            if full_window_plan["can_cover_full_window"]:
+                full_window_recommended_action = (
+                    f"保持当前区间，切换到 {full_window_recommended_timeframe} 补足完整样本窗口。"
+                )
+            else:
+                full_window_recommended_action = (
+                    f"当前区间即使切到最粗周期也无法完整覆盖，建议先缩短到 {full_window_recommended_data_range}，"
+                    f"并使用 {full_window_recommended_timeframe} 重新回测。"
+                )
+    notes = computation.notes
+    if history_gap_reason == "sample_cap" and requested_candle_estimate > limit:
+        notes += (
+            f" 按当前回测样本上限，本次目标区间理论需要约 {requested_candle_estimate} 根 K 线，"
+            f"当前最多仅能覆盖最近 {limit} 根样本。"
+        )
+    elif history_gap_reason == "insufficient_history":
+        notes += (
+            f" 本次目标区间理论需要约 {requested_candle_estimate} 根 K 线，"
+            f"当前计划覆盖 {history_target} 根，但交易所实际仅返回 {computation.retrieved_candle_count} 根样本。"
+        )
+    else:
+        notes = computation.notes
+    if history_source == "market_detail_fallback":
+        notes += " 当前交易所历史 K 线不可直接用于本次回测，已回退到工作台行情快照样本，仅供研究参考。"
+        if history_source_detail:
+            notes += f" 回退原因：{history_source_detail}"
+        if history_source_recommended_action:
+            notes += f" 建议动作：{history_source_recommended_action}"
+    decision_context = {
+        "data_range": data_range,
+        "timeframe": timeframe,
+        "metrics": computation.metrics.model_dump(mode="json"),
+        "reference_only": computation.reference_only,
+        "sample_quality": computation.sample_quality,
+        "history_source": history_source,
+        "history_source_reason": history_source_reason,
+        "history_source_detail": history_source_detail,
+        "history_source_recommended_data_range": history_source_recommended_data_range,
+        "history_source_recommended_timeframe": history_source_recommended_timeframe,
+        "history_source_recommended_action": history_source_recommended_action,
+        "history_truncated": history_truncated,
+        "history_gap_reason": history_gap_reason,
+        "full_window_recommended_data_range": full_window_recommended_data_range,
+        "full_window_recommended_timeframe": full_window_recommended_timeframe,
+        "full_window_recommended_action": full_window_recommended_action,
+        "requested_candle_estimate": requested_candle_estimate,
+        "requested_candle_limit": limit,
+    }
+    decision_readiness = _resolve_backtest_decision_readiness(decision_context)
     return {
         "metrics": computation.metrics,
-        "notes": computation.notes,
+        "reference_only": computation.reference_only,
+        "sample_quality": computation.sample_quality,
+        "history_source": history_source,
+        "history_source_reason": history_source_reason,
+        "history_source_detail": history_source_detail,
+        "history_source_recommended_data_range": history_source_recommended_data_range,
+        "history_source_recommended_timeframe": history_source_recommended_timeframe,
+        "history_source_recommended_action": history_source_recommended_action,
+        "decision_readiness": decision_readiness["decision_readiness"],
+        "decision_readiness_detail": decision_readiness["decision_readiness_detail"],
+        "decision_recommended_data_range": decision_readiness["decision_recommended_data_range"],
+        "decision_recommended_timeframe": decision_readiness["decision_recommended_timeframe"],
+        "decision_readiness_action": decision_readiness["decision_readiness_action"],
+        "requested_candle_estimate": requested_candle_estimate,
+        "requested_candle_limit": limit,
+        "requested_range_start": requested_range_start,
+        "requested_range_end": requested_range_end,
+        "retrieved_window_completion_pct": retrieved_window_completion_pct,
+        "used_window_completion_pct": used_window_completion_pct,
+        "retrieved_candle_count": computation.retrieved_candle_count,
+        "used_candle_count": computation.used_candle_count,
+        "retrieved_range_start": computation.retrieved_range_start,
+        "retrieved_range_end": computation.retrieved_range_end,
+        "used_range_start": computation.used_range_start,
+        "used_range_end": computation.used_range_end,
+        "history_truncated": history_truncated,
+        "history_gap_reason": history_gap_reason,
+        "full_window_recommended_data_range": full_window_recommended_data_range,
+        "full_window_recommended_timeframe": full_window_recommended_timeframe,
+        "full_window_recommended_action": full_window_recommended_action,
+        "notes": notes,
         "parameter_snapshot": computation.parameter_snapshot,
         "symbol_scope": computation.symbol_scope,
         "data_granularity": computation.data_granularity,
@@ -3389,6 +3688,15 @@ def build_strategy_activity_payload(strategy_id: str) -> StrategyActivitySnapsho
         StrategyActivityReviewSummary(
             id=review.id,
             period=review.period,
+            backtest_id=review.backtest_id,
+            source_job_id=review.source_job_id,
+            source_job_type=review.source_job_type,
+            source_job_status=review.source_job_status,
+            source_change_request_id=review.source_change_request_id,
+            source_backtest_id=review.source_backtest_id,
+            source_review_id=review.source_review_id,
+            source_proposal_id=review.source_proposal_id,
+            trigger_reason=review.trigger_reason,
             title=review.title,
             summary=review.summary,
             proposal_count=sum(1 for proposal in review.proposals if proposal.strategy_id == strategy_id),
@@ -7073,17 +7381,29 @@ def restart_strategy_runtime_worker(payload: RuntimeWorkerActionPayload) -> Runt
     )
 
 
+def build_scheduler_snapshot_payload() -> SchedulerSnapshot:
+    state = repo.snapshot()
+    return SchedulerSnapshot(
+        scheduler=state.control_snapshot.scheduler,
+        jobs=state.agent_jobs,
+        change_requests=state.change_requests[:8],
+        latest_scheduler_command=_build_latest_scheduler_command(state.audit_events),
+    )
+
+
 def build_ai_live_snapshot_payload() -> AiLiveSnapshot:
     state = repo.snapshot()
+    scheduler_snapshot = build_scheduler_snapshot_payload()
     activity_feed = [
         event
         for event in state.audit_events
         if event.source in {"openclaw", "desktop"}
     ][:10]
     return AiLiveSnapshot(
-        scheduler=state.control_snapshot.scheduler,
-        jobs=state.agent_jobs,
-        change_requests=state.change_requests[:8],
+        scheduler=scheduler_snapshot.scheduler,
+        jobs=scheduler_snapshot.jobs,
+        change_requests=scheduler_snapshot.change_requests,
+        latest_scheduler_command=scheduler_snapshot.latest_scheduler_command,
         activity_feed=activity_feed,
         generated_at=datetime.now(timezone.utc).astimezone().isoformat(),
     )
@@ -7097,6 +7417,7 @@ def build_ops_live_snapshot_payload() -> OpsLiveSnapshot:
     trades = parse_trades()
     audit_events = state.audit_events[:80]
     execution_health = _build_control_snapshot_response().execution_health
+    latest_scheduler_command = _build_latest_scheduler_command(state.audit_events)
 
     return OpsLiveSnapshot(
         summary=OpsLiveSummary(
@@ -7127,6 +7448,7 @@ def build_ops_live_snapshot_payload() -> OpsLiveSnapshot:
         alerts=alerts,
         trades=trades,
         audit_events=audit_events,
+        latest_scheduler_command=latest_scheduler_command,
         generated_at=datetime.now(timezone.utc).astimezone().isoformat(),
     )
 
@@ -7256,14 +7578,105 @@ def build_review_health_context() -> Dict[str, Any]:
     }
 
 
-def enrich_review_job_context(context: Dict[str, Any]) -> Dict[str, Any]:
-    health_context = build_review_health_context()
+def _derive_review_health_context_from_context(
+    context: Dict[str, Any],
+    include_strategy_activity: bool = True,
+) -> Dict[str, Any]:
+    execution_health = context.get("execution_health") if isinstance(context.get("execution_health"), dict) else {}
+    execution_top_issue_strategy_id = (
+        context.get("execution_top_issue_strategy_id")
+        or execution_health.get("top_issue_strategy_id")
+        or context.get("strategy_id")
+        or ""
+    )
+    top_issue_strategy_activity = context.get("execution_top_issue_strategy_activity")
+    if include_strategy_activity and top_issue_strategy_activity is None and execution_top_issue_strategy_id:
+        top_issue_strategy_activity = _build_strategy_activity_review_context(str(execution_top_issue_strategy_id))
+    return {
+        "execution_top_issue": context.get("execution_top_issue", execution_health.get("top_issue")),
+        "execution_top_issue_strategy_id": execution_top_issue_strategy_id or None,
+        "execution_top_issue_strategy_name": context.get(
+            "execution_top_issue_strategy_name",
+            execution_health.get("top_issue_strategy_name"),
+        ),
+        "execution_top_issue_symbol": context.get(
+            "execution_top_issue_symbol",
+            execution_health.get("top_issue_symbol"),
+        ),
+        "execution_top_issue_detail": context.get(
+            "execution_top_issue_detail",
+            execution_health.get("top_issue_detail"),
+        ),
+        "execution_top_issue_recommended_action": context.get(
+            "execution_top_issue_recommended_action",
+            execution_health.get("top_issue_recommended_action"),
+        ),
+        "execution_top_issue_strategy_activity": top_issue_strategy_activity,
+        "execution_issue_total": context.get("execution_issue_total", execution_health.get("issue_total", 0)),
+        "runtime_worker_top_issue": context.get("runtime_worker_top_issue"),
+        "runtime_worker_recommended_action": context.get("runtime_worker_recommended_action"),
+    }
+
+
+def _has_meaningful_review_health_context(context: Dict[str, Any]) -> bool:
+    execution_health = context.get("execution_health") if isinstance(context.get("execution_health"), dict) else {}
+    meaningful_keys = (
+        "top_issue",
+        "top_issue_detail",
+        "top_issue_recommended_action",
+        "top_issue_strategy_id",
+        "top_issue_symbol",
+        "runtime_worker_top_issue",
+        "runtime_worker_recommended_action",
+        "execution_top_issue",
+        "execution_top_issue_detail",
+        "execution_top_issue_recommended_action",
+    )
+    for key in meaningful_keys:
+        value = context.get(key)
+        if value is None:
+            value = execution_health.get(key)
+        if isinstance(value, str) and value.strip():
+            return True
+        if isinstance(value, (int, float)) and value:
+            return True
+    return False
+
+
+def enrich_review_job_context(
+    context: Dict[str, Any],
+    prefer_live_health: bool = False,
+    allow_strategy_activity_autofill: bool = True,
+) -> Dict[str, Any]:
+    health_context = (
+        _derive_review_health_context_from_context(
+            context,
+            include_strategy_activity=prefer_live_health or allow_strategy_activity_autofill,
+        )
+        if context.get("execution_health") is not None
+        or context.get("execution_top_issue") is not None
+        or context.get("runtime_worker_top_issue") is not None
+        else build_review_health_context()
+        if prefer_live_health
+        else {
+            "execution_top_issue": None,
+            "execution_top_issue_strategy_id": None,
+            "execution_top_issue_strategy_name": None,
+            "execution_top_issue_symbol": None,
+            "execution_top_issue_detail": None,
+            "execution_top_issue_recommended_action": None,
+            "execution_top_issue_strategy_activity": None,
+            "execution_issue_total": 0,
+            "runtime_worker_top_issue": None,
+            "runtime_worker_recommended_action": None,
+        }
+    )
     top_issue_strategy_activity = context.get(
         "execution_top_issue_strategy_activity",
         health_context.get("execution_top_issue_strategy_activity"),
     )
     review_strategy_activity = context.get("review_strategy_activity")
-    if review_strategy_activity is None:
+    if review_strategy_activity is None and allow_strategy_activity_autofill:
         review_strategy_id = str(
             context.get("strategy_id")
             or health_context.get("execution_top_issue_strategy_id")
@@ -7288,7 +7701,11 @@ def enrich_review_job_context(context: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def build_agent_job_prompt(job_type: str, context: Dict[str, Any]) -> str:
-    review_context = enrich_review_job_context(dict(context))
+    review_context = enrich_review_job_context(
+        dict(context),
+        prefer_live_health=job_type == "generate_daily_review",
+        allow_strategy_activity_autofill=job_type != "generate_backtest_review",
+    )
     if job_type == "generate_daily_review":
         focus_symbols = ", ".join(review_context.get("focus_symbols", [])) or "BTCUSDT, ETHUSDT"
         mode = review_context.get("mode", "paper")
@@ -7325,6 +7742,101 @@ def build_agent_job_prompt(job_type: str, context: Dict[str, Any]) -> str:
             review_context.get("review_strategy_activity"),
             ensure_ascii=False,
         )
+        source_change_request_id = str(review_context.get("source_change_request_id") or "").strip()
+        source_backtest_id = str(review_context.get("source_backtest_id") or "").strip()
+        source_review_id = str(review_context.get("source_review_id") or "").strip()
+        source_proposal_id = str(review_context.get("source_proposal_id") or "").strip()
+        trigger_reason = str(review_context.get("trigger_reason") or "").strip()
+        source_parts = []
+        if trigger_reason:
+            source_parts.append(f"触发原因={trigger_reason}")
+        if source_change_request_id:
+            source_parts.append(f"来源变更={source_change_request_id}")
+        if source_backtest_id:
+            source_parts.append(f"来源回测={source_backtest_id}")
+        if source_review_id:
+            source_parts.append(f"来源复盘={source_review_id}")
+        if source_proposal_id:
+            source_parts.append(f"来源提案={source_proposal_id}")
+        source_lineage = "；".join(source_parts) if source_parts else "手动创建"
+        reference_only = _is_reference_only_backtest_context(review_context)
+        low_sample = _is_low_sample_backtest_context(review_context)
+        trade_count = _get_backtest_trade_count(review_context)
+        history_source = str(review_context.get("history_source") or "exchange_history").strip().lower()
+        history_source_reason = _get_backtest_history_source_reason(review_context)
+        history_source_detail = str(review_context.get("history_source_detail") or "").strip()
+        history_source_plan = _resolve_history_source_recommendation(review_context)
+        decision_readiness = _resolve_backtest_decision_readiness(review_context)
+        requested_candle_estimate = int(review_context.get("requested_candle_estimate") or 0)
+        requested_candle_limit = int(review_context.get("requested_candle_limit") or 0)
+        requested_range_start = str(review_context.get("requested_range_start") or "").strip()
+        requested_range_end = str(review_context.get("requested_range_end") or "").strip()
+        retrieved_window_completion_pct = float(review_context.get("retrieved_window_completion_pct") or 0.0)
+        used_window_completion_pct = float(review_context.get("used_window_completion_pct") or 0.0)
+        retrieved_candle_count = int(review_context.get("retrieved_candle_count") or 0)
+        used_candle_count = int(review_context.get("used_candle_count") or 0)
+        retrieved_range_start = str(review_context.get("retrieved_range_start") or "").strip()
+        retrieved_range_end = str(review_context.get("retrieved_range_end") or "").strip()
+        used_range_start = str(review_context.get("used_range_start") or "").strip()
+        used_range_end = str(review_context.get("used_range_end") or "").strip()
+        history_truncated = bool(review_context.get("history_truncated"))
+        history_gap_reason = str(review_context.get("history_gap_reason") or "none").strip().lower()
+        truncated_plan = _resolve_full_window_recommendation(review_context)
+        sample_label = "包含真实成交样本"
+        sample_requirement = ""
+        truncation_requirement = ""
+        source_label = "交易所历史 K 线"
+        source_requirement = ""
+        if history_source == "market_detail_fallback":
+            source_label = "行情快照回退"
+            source_requirement = (
+                "若本次回测样本来自工作台行情快照回退，而不是交易所完整历史 K 线，请明确说明当前结果仅适合研究排障，"
+                "不要把收益率、回撤或 Sharpe 直接视为正式历史回测结论；若输出 proposals，请优先建议恢复交易所历史后重跑。"
+            )
+            if history_source_reason == "exchange_fetch_failed":
+                source_label = "行情快照回退（历史拉取报错）"
+            elif history_source_reason == "insufficient_exchange_samples":
+                source_label = "行情快照回退（交易所样本不足）"
+        if reference_only:
+            sample_label = "仅参考路径（未命中真实入场信号）"
+            sample_requirement = (
+                "若样本性质为仅参考路径，请明确说明当前没有真实成交样本，不要把收益率、胜率或 Sharpe 直接解读为可上线结论，"
+                "优先建议补样本、延长区间或切换周期继续验证。若输出 proposals，请优先只给 backtest_request，"
+                "不要给 risk_update、param_update、pause_resume、publish_recommendation 或 script_patch_proposal。"
+                "若当前区间已是最近 180 天，请优先改成更高频周期继续补样本，例如 1d->4h、4h->1h、1h->15m。"
+            )
+        elif low_sample:
+            sample_label = f"低样本真实成交（仅 {trade_count} 笔）"
+            sample_requirement = (
+                "若真实成交样本少于 5 笔，请明确说明样本量偏小，不要直接给出上线结论，"
+                "优先建议扩展区间、补充更多周期或继续观察。若输出 proposals，请优先只给 backtest_request，"
+                "不要给 risk_update、param_update、pause_resume、publish_recommendation 或 script_patch_proposal。"
+                "若当前区间已是最近 180 天，请优先改成更高频周期继续补样本，例如 1d->4h、4h->1h、1h->15m。"
+            )
+        if history_truncated:
+            if history_gap_reason == "insufficient_history":
+                truncation_requirement = (
+                    "若样本窗口不足是因为交易所当前可用历史不够，请明确说明当前请求区间尚未被真实历史完整覆盖，"
+                    "不要直接给调参、风控放宽或上线倾向结论。若输出 proposals，请优先只给 backtest_request，"
+                    f"并优先缩短 data_range 到当前已取到的历史范围。建议动作：{truncated_plan['recommended_action']}"
+                )
+            elif truncated_plan["can_cover_full_window"]:
+                truncation_requirement = (
+                    "若样本窗口已截断，请明确说明当前请求区间尚未被完整覆盖，不要直接给调参、风控放宽或上线倾向结论。"
+                    f"若输出 proposals，请优先只给 backtest_request，并优先保持当前 data_range，切换到能覆盖完整区间的更粗周期。建议动作：{truncated_plan['recommended_action']}"
+                )
+            else:
+                recommended_payload = truncated_plan["payload"]
+                truncation_requirement = (
+                    "若样本窗口已截断，且当前请求区间即使切到最粗周期也无法完整覆盖，请明确说明当前回测样本上限仍不足，"
+                    "不要直接给调参、风控放宽或上线倾向结论。若输出 proposals，请优先只给 backtest_request，"
+                    f"并优先缩短 data_range 到可完整覆盖的窗口，例如 {recommended_payload.get('data_range')} @ {recommended_payload.get('timeframe')}。建议动作：{truncated_plan['recommended_action']}"
+                )
+        decision_readiness_label = {
+            "research_only": "仅供研究参考",
+            "sample_incomplete": "样本待补",
+            "ready": "可继续判断",
+        }.get(str(decision_readiness["decision_readiness"]), "可继续判断")
         return (
             "请生成一份中文回测复盘，不要使用 markdown。\n"
             "优先直接输出一个 JSON 对象，不要加代码块，字段为：\n"
@@ -7345,11 +7857,25 @@ def build_agent_job_prompt(job_type: str, context: Dict[str, Any]) -> str:
             f"关注品种：{', '.join(review_context.get('focus_symbols', [])) or '主观察列表'}\n"
             f"回测区间：{review_context.get('data_range', '未提供')}\n"
             f"时间粒度：{review_context.get('timeframe', '1h')}\n"
+            f"来源链路：{source_lineage}\n"
+            f"样本性质：{sample_label}\n"
+            f"样本来源：{source_label}\n"
+            f"来源细节：{history_source_detail or '--'}\n"
+            f"来源建议：{history_source_plan['recommended_action'] or '--'}\n"
+            f"结论门禁：{decision_readiness_label}\n"
+            f"门禁详情：{decision_readiness['decision_readiness_detail'] or '--'}\n"
+            f"门禁重跑：{decision_readiness['decision_recommended_data_range'] or '--'} @ {decision_readiness['decision_recommended_timeframe'] or '--'}\n"
+            f"门禁建议：{decision_readiness['decision_readiness_action'] or '--'}\n"
+            f"请求窗口：{requested_range_start or '--'} -> {requested_range_end or '--'}\n"
+            f"窗口覆盖：取样 {retrieved_window_completion_pct:.2f}% · 回测 {used_window_completion_pct:.2f}%\n"
+            f"取样窗口：理论需要 {requested_candle_estimate or '--'} 根，当前上限 {requested_candle_limit or '--'} 根，取到 {retrieved_candle_count or '--'} 根，实际使用 {used_candle_count or '--'} 根，截断状态 {'是' if history_truncated else '否'}\n"
+            f"样本覆盖：取到 {retrieved_range_start or '--'} -> {retrieved_range_end or '--'}；实际回测 {used_range_start or '--'} -> {used_range_end or '--'}\n"
             f"关键指标：{metrics}\n"
             f"参数快照：{parameters}\n"
             f"执行健康：{health_context}\n"
             f"策略最近活动：{review_strategy_activity}\n"
             "要求：聚焦收益质量、回撤、风险边界，并给出下一步验证建议。"
+            f"{sample_requirement}{truncation_requirement}{source_requirement}"
         )
     if job_type == "review_strategy_change":
         execution_health = json.dumps(review_context.get("execution_health"), ensure_ascii=False)
@@ -7535,10 +8061,107 @@ def build_review_proposals(job_type: str, context: Dict[str, Any]) -> List[Strat
     max_drawdown = parse_percent_value(metrics.get("max_drawdown"))
     annual_return = parse_percent_value(metrics.get("annual_return"))
     win_rate = parse_percent_value(metrics.get("win_rate"))
+    try:
+        trade_count = max(int(metrics.get("trades", 0)), 0)
+    except (TypeError, ValueError):
+        trade_count = 0
     timeframe = str(context.get("timeframe") or "1h")
+    raw_data_range = context.get("data_range")
+    data_range = str(raw_data_range or "最近 180 天")
     strategy_name = str(context.get("strategy_name") or strategy_id)
     proposals: List[StrategyProposal] = []
     now = datetime.now(timezone.utc).astimezone().isoformat()
+    sample_validation_payload = _build_sample_validation_backtest_payload(
+        data_range,
+        timeframe,
+        prefer_finer_timeframe=raw_data_range is not None,
+    )
+    full_window_plan = _resolve_full_window_recommendation(context)
+
+    if _is_reference_only_backtest_context(context):
+        proposals.append(
+            StrategyProposal(
+                id=f"prop-{uuid4().hex[:6]}",
+                proposal_type="backtest_request",
+                strategy_id=strategy_id,
+                title=f"{strategy_name} 扩大样本验证",
+                description="本次回测区间未命中真实入场信号，建议先扩大回测区间或补充更高频周期，优先补足真实样本。",
+                created_at=now,
+                status="pending",
+                expected_impact="优先拿到真实成交样本，再判断收益质量、回撤与信号稳定性。",
+                payload=sample_validation_payload,
+            )
+        )
+        return proposals[:1]
+
+    if 0 < trade_count < 5:
+        proposals.append(
+            StrategyProposal(
+                id=f"prop-{uuid4().hex[:6]}",
+                proposal_type="backtest_request",
+                strategy_id=strategy_id,
+                title=f"{strategy_name} 扩大样本验证",
+                description=f"本次回测仅产生 {trade_count} 笔真实成交，样本量偏小，建议先扩大回测区间继续补样本。",
+                created_at=now,
+                status="pending",
+                expected_impact="先提升样本量，再判断当前收益、胜率与 Sharpe 是否稳定。",
+                payload=sample_validation_payload,
+            )
+        )
+        return proposals[:1]
+
+    if _is_market_detail_fallback_backtest_context(context):
+        history_source_plan = _resolve_history_source_recommendation(context)
+        history_source_reason = _get_backtest_history_source_reason(context)
+        fallback_title = f"{strategy_name} 恢复交易所历史后重跑"
+        fallback_description = "本次回测样本来自工作台行情快照回退，建议先恢复交易所历史 K 线拉取后，再用同一区间重跑确认结果。"
+        if history_source_reason == "insufficient_exchange_samples":
+            fallback_title = f"{strategy_name} 补足交易所历史样本"
+            fallback_description = history_source_plan["recommended_action"]
+        proposals.append(
+            StrategyProposal(
+                id=f"prop-{uuid4().hex[:6]}",
+                proposal_type="backtest_request",
+                strategy_id=strategy_id,
+                title=fallback_title,
+                description=fallback_description,
+                created_at=now,
+                status="pending",
+                expected_impact="先拿到正式历史样本，再判断当前收益、回撤与 Sharpe 是否足以支持调参或上线结论。",
+                payload={
+                    "data_range": history_source_plan["data_range"],
+                    "timeframe": history_source_plan["timeframe"],
+                },
+            )
+        )
+        return proposals[:1]
+
+    if _is_truncated_backtest_context(context):
+        if full_window_plan["can_cover_full_window"]:
+            title = f"{strategy_name} 补足完整样本窗口"
+            description = "当前回测请求区间未被完整覆盖，建议先切换到可覆盖完整区间的更粗周期，再判断收益质量、回撤与 Sharpe。"
+            expected_impact = "先补足完整时间窗口，再判断当前回测结果是否足以支持调参或上线结论。"
+        else:
+            title = f"{strategy_name} 缩短区间以补足样本窗口"
+            description = (
+                "当前回测请求区间即使切到最粗周期也无法完整覆盖，建议先缩短到当前回测样本上限内可完整覆盖的窗口，"
+                "再判断收益质量、回撤与 Sharpe。"
+            )
+            expected_impact = "先拿到完整时间窗口样本，再判断当前回测结果是否足以支持调参或上线结论。"
+        proposals.append(
+            StrategyProposal(
+                id=f"prop-{uuid4().hex[:6]}",
+                proposal_type="backtest_request",
+                strategy_id=strategy_id,
+                title=title,
+                description=description,
+                created_at=now,
+                status="pending",
+                expected_impact=expected_impact,
+                payload=dict(full_window_plan["payload"]),
+            )
+        )
+        return proposals[:1]
 
     if max_drawdown is not None and abs(max_drawdown) >= 5:
         proposals.append(
@@ -7579,9 +8202,415 @@ def build_review_proposals(job_type: str, context: Dict[str, Any]) -> List[Strat
     return proposals[:2]
 
 
-def _merge_execution_health_review_risks(risks: List[str]) -> List[str]:
+def _build_sample_validation_backtest_payload(
+    data_range: str,
+    timeframe: str,
+    prefer_finer_timeframe: bool = True,
+) -> Dict[str, str]:
+    normalized_range = str(data_range or "最近 180 天")
+    normalized_timeframe = str(timeframe or "1h").strip().lower() or "1h"
+    next_range = "最近 180 天" if normalized_range != "最近 180 天" else normalized_range
+    next_timeframe = normalized_timeframe
+    if prefer_finer_timeframe and next_range == normalized_range == "最近 180 天":
+        next_timeframe = {
+            "1d": "4h",
+            "4h": "1h",
+            "1h": "15m",
+        }.get(normalized_timeframe, normalized_timeframe)
+    return {
+        "data_range": next_range,
+        "timeframe": next_timeframe,
+    }
+
+
+def _resolve_history_source_recommendation(context: Dict[str, Any]) -> Dict[str, str]:
+    current_range = str(context.get("data_range") or "最近 180 天").strip() or "最近 180 天"
+    current_timeframe = str(context.get("timeframe") or "1h").strip().lower() or "1h"
+    reason = _get_backtest_history_source_reason(context)
+    recommended_range = str(context.get("history_source_recommended_data_range") or "").strip()
+    raw_recommended_timeframe = str(context.get("history_source_recommended_timeframe") or "").strip().lower()
+    recommended_action = str(context.get("history_source_recommended_action") or "").strip()
+    if recommended_range and raw_recommended_timeframe in {"15m", "1h", "4h", "1d"}:
+        if not recommended_action:
+            if reason == "insufficient_exchange_samples":
+                if recommended_range == current_range and raw_recommended_timeframe == current_timeframe:
+                    recommended_action = (
+                        f"当前交易所历史样本不足，建议先等待更多交易所历史积累后，再按当前区间 {current_range} "
+                        f"和周期 {current_timeframe} 重跑。"
+                    )
+                elif recommended_range == current_range:
+                    recommended_action = (
+                        f"当前交易所历史样本不足，建议先保持 {current_range}，切到 {raw_recommended_timeframe} "
+                        "补样本后再重跑。"
+                    )
+                elif raw_recommended_timeframe == current_timeframe:
+                    recommended_action = (
+                        f"当前交易所历史样本不足，建议先改用 {recommended_range}，并保持 "
+                        f"{current_timeframe} 补样本后再重跑。"
+                    )
+                else:
+                    recommended_action = (
+                        f"当前交易所历史样本不足，建议先改用 {recommended_range} @ {raw_recommended_timeframe} "
+                        "补样本后再重跑。"
+                    )
+            else:
+                recommended_action = (
+                    f"请先恢复交易所历史 K 线拉取，再按当前区间 {current_range} 和周期 "
+                    f"{current_timeframe} 重跑。"
+                )
+        return {
+            "data_range": recommended_range,
+            "timeframe": raw_recommended_timeframe,
+            "recommended_action": recommended_action,
+        }
+    if reason == "insufficient_exchange_samples":
+        payload = _build_sample_validation_backtest_payload(
+            current_range,
+            current_timeframe,
+            prefer_finer_timeframe=True,
+        )
+        recommended_range = payload["data_range"]
+        raw_recommended_timeframe = payload["timeframe"]
+        if recommended_range == current_range and raw_recommended_timeframe == current_timeframe:
+            recommended_action = (
+                f"当前交易所历史样本不足，建议先等待更多交易所历史积累后，再按当前区间 {current_range} "
+                f"和周期 {current_timeframe} 重跑。"
+            )
+        elif recommended_range == current_range:
+            recommended_action = (
+                f"当前交易所历史样本不足，建议先保持 {current_range}，切到 {raw_recommended_timeframe} "
+                "补样本后再重跑。"
+            )
+        elif raw_recommended_timeframe == current_timeframe:
+            recommended_action = (
+                f"当前交易所历史样本不足，建议先改用 {recommended_range}，并保持 "
+                f"{current_timeframe} 补样本后再重跑。"
+            )
+        else:
+            recommended_action = (
+                f"当前交易所历史样本不足，建议先改用 {recommended_range} @ {raw_recommended_timeframe} "
+                "补样本后再重跑。"
+            )
+        return {
+            "data_range": recommended_range,
+            "timeframe": raw_recommended_timeframe,
+            "recommended_action": recommended_action,
+        }
+    return {
+        "data_range": current_range,
+        "timeframe": current_timeframe,
+        "recommended_action": (
+            f"请先恢复交易所历史 K 线拉取，再按当前区间 {current_range} 和周期 {current_timeframe} 重跑。"
+        ),
+    }
+
+
+def _max_coverable_days_for_timeframe(timeframe: str) -> int:
+    hours_per_bar = {
+        "15m": 0.25,
+        "1h": 1.0,
+        "4h": 4.0,
+        "1d": 24.0,
+    }.get(str(timeframe or "1h").strip().lower(), 1.0)
+    return max(int(((BACKTEST_ENGINE_MAX_CANDLES - 5) * hours_per_bar) // 24), 1)
+
+
+def _build_coverable_backtest_range(data_range: str, timeframe: str) -> str:
+    normalized_range = str(data_range or "最近 180 天").strip() or "最近 180 天"
+    max_days = _max_coverable_days_for_timeframe(timeframe)
+    if " ~ " in normalized_range or "~" in normalized_range:
+        try:
+            start_text, end_text = [part.strip() for part in normalized_range.split("~", 1)]
+            start_dt = datetime.fromisoformat(start_text)
+            end_dt = datetime.fromisoformat(end_text)
+            shortened_start = max(start_dt, end_dt - timedelta(days=max_days))
+            include_time = any("T" in part for part in (start_text, end_text))
+            if include_time:
+                start_rendered = shortened_start.isoformat(timespec="seconds")
+                end_rendered = end_dt.isoformat(timespec="seconds")
+            else:
+                start_rendered = shortened_start.date().isoformat()
+                end_rendered = end_dt.date().isoformat()
+            return f"{start_rendered} ~ {end_rendered}"
+        except Exception:
+            pass
+
+    compact_relative = normalized_range.replace(" ", "")
+    if compact_relative.startswith("最近") and compact_relative.endswith("天"):
+        return f"最近 {max_days} 天"
+
+    return f"最近 {max_days} 天"
+
+
+def _build_available_history_data_range_from_bounds(
+    start_iso: Optional[str],
+    end_iso: Optional[str],
+    timeframe: str,
+) -> Optional[str]:
+    if not start_iso or not end_iso:
+        return None
+    try:
+        start_dt = datetime.fromisoformat(start_iso)
+        end_dt = datetime.fromisoformat(end_iso)
+    except Exception:
+        return None
+    normalized_timeframe = str(timeframe or "1h").strip().lower()
+    if normalized_timeframe == "1d":
+        return f"{start_dt.date().isoformat()} ~ {end_dt.date().isoformat()}"
+    return f"{start_dt.isoformat(timespec='seconds')} ~ {end_dt.isoformat(timespec='seconds')}"
+
+
+def _build_full_window_backtest_plan(
+    data_range: str,
+    timeframe: str,
+) -> Dict[str, Any]:
+    normalized_range = str(data_range or "最近 180 天")
+    normalized_timeframe = str(timeframe or "1h").strip().lower() or "1h"
+    ordered_timeframes = ["15m", "1h", "4h", "1d"]
+    try:
+        start_index = ordered_timeframes.index(normalized_timeframe)
+    except ValueError:
+        start_index = 1
+        normalized_timeframe = "1h"
+    candidates = ordered_timeframes[start_index + 1 :] or [normalized_timeframe]
+    for candidate in candidates:
+        candidate_estimate = estimate_candle_count_for_range(normalized_range, candidate)
+        if candidate_estimate <= candle_limit_for_range(normalized_range, candidate):
+            return {
+                "payload": {
+                    "data_range": normalized_range,
+                    "timeframe": candidate,
+                },
+                "can_cover_full_window": True,
+                "target_timeframe": candidate,
+            }
+    fallback_timeframe = candidates[-1]
+    return {
+        "payload": {
+            "data_range": _build_coverable_backtest_range(normalized_range, fallback_timeframe),
+            "timeframe": fallback_timeframe,
+        },
+        "can_cover_full_window": False,
+        "target_timeframe": fallback_timeframe,
+    }
+
+
+def _resolve_full_window_recommendation(context: Dict[str, Any]) -> Dict[str, Any]:
+    resolved_current_range = str(context.get("data_range") or "最近 180 天").strip() or "最近 180 天"
+    resolved_current_timeframe = str(context.get("timeframe") or "1h").strip().lower() or "1h"
+    recommended_range = str(context.get("full_window_recommended_data_range") or "").strip()
+    raw_recommended_timeframe = str(context.get("full_window_recommended_timeframe") or "").strip().lower()
+    recommended_action = str(context.get("full_window_recommended_action") or "").strip()
+    history_gap_reason = str(context.get("history_gap_reason") or "none").strip().lower()
+    if recommended_range and raw_recommended_timeframe in {"15m", "1h", "4h", "1d"}:
+        can_cover_full_window = recommended_range == resolved_current_range and history_gap_reason != "insufficient_history"
+        if not recommended_action:
+            if can_cover_full_window:
+                recommended_action = f"保持当前区间，切换到 {raw_recommended_timeframe} 补足完整样本窗口。"
+            elif history_gap_reason == "insufficient_history":
+                recommended_action = (
+                    f"当前交易所可用历史仅覆盖 {recommended_range}，建议先缩短到该可用区间，"
+                    f"并使用 {raw_recommended_timeframe} 重新回测。"
+                )
+            else:
+                recommended_action = (
+                    f"当前区间即使切到最粗周期也无法完整覆盖，建议先缩短到 {recommended_range}，"
+                    f"并使用 {raw_recommended_timeframe} 重新回测。"
+                )
+        return {
+            "payload": {
+                "data_range": recommended_range,
+                "timeframe": raw_recommended_timeframe,
+            },
+            "can_cover_full_window": can_cover_full_window,
+            "target_timeframe": raw_recommended_timeframe,
+            "recommended_action": recommended_action,
+        }
+    resolved_plan = _build_full_window_backtest_plan(resolved_current_range, resolved_current_timeframe)
+    recommended_payload = resolved_plan["payload"]
+    if resolved_plan["can_cover_full_window"]:
+        resolved_plan["recommended_action"] = (
+            f"保持当前区间，切换到 {recommended_payload.get('timeframe')} 补足完整样本窗口。"
+        )
+    else:
+        resolved_plan["recommended_action"] = (
+            f"当前区间即使切到最粗周期也无法完整覆盖，建议先缩短到 {recommended_payload.get('data_range')}，"
+            f"并使用 {recommended_payload.get('timeframe')} 重新回测。"
+        )
+    return resolved_plan
+
+
+def _render_sample_validation_action(
+    current_range: str,
+    current_timeframe: str,
+    payload: Dict[str, str],
+) -> str:
+    next_range = str(payload.get("data_range") or current_range).strip() or current_range
+    next_timeframe = str(payload.get("timeframe") or current_timeframe).strip().lower() or current_timeframe
+    if next_range == current_range and next_timeframe == current_timeframe:
+        return f"建议先继续积累更多真实样本后，再按当前区间 {current_range} @ {current_timeframe} 重跑。"
+    return f"建议先改用 {next_range} @ {next_timeframe} 补真实样本后，再继续判断收益、回撤与 Sharpe。"
+
+
+def _resolve_backtest_decision_readiness(context: Dict[str, Any]) -> Dict[str, Optional[str]]:
+    current_range = str(context.get("data_range") or "最近 180 天").strip() or "最近 180 天"
+    current_timeframe = str(context.get("timeframe") or "1h").strip().lower() or "1h"
+    if _is_market_detail_fallback_backtest_context(context):
+        history_source_reason = _get_backtest_history_source_reason(context)
+        history_source_plan = _resolve_history_source_recommendation(context)
+        if history_source_reason == "insufficient_exchange_samples":
+            detail = "当前交易所历史样本不足，结果仍依赖工作台行情快照回退，暂不建议直接用于调参或上线判断。"
+        else:
+            detail = "当前交易所历史拉取仍未恢复，结果仍依赖工作台行情快照回退，仅适合研究排障。"
+        return {
+            "decision_readiness": "research_only",
+            "decision_readiness_detail": detail,
+            "decision_recommended_data_range": history_source_plan["data_range"],
+            "decision_recommended_timeframe": history_source_plan["timeframe"],
+            "decision_readiness_action": history_source_plan["recommended_action"],
+        }
+    if _is_reference_only_backtest_context(context):
+        payload = _build_sample_validation_backtest_payload(
+            current_range,
+            current_timeframe,
+            prefer_finer_timeframe=True,
+        )
+        return {
+            "decision_readiness": "research_only",
+            "decision_readiness_detail": "当前区间未命中真实入场信号，收益、回撤与 Sharpe 仅基于参考路径，暂不建议直接用于调参或上线判断。",
+            "decision_recommended_data_range": payload["data_range"],
+            "decision_recommended_timeframe": payload["timeframe"],
+            "decision_readiness_action": _render_sample_validation_action(
+                current_range,
+                current_timeframe,
+                payload,
+            ),
+        }
+    if _is_truncated_backtest_context(context):
+        truncated_plan = _resolve_full_window_recommendation(context)
+        return {
+            "decision_readiness": "sample_incomplete",
+            "decision_readiness_detail": "当前请求窗口尚未被完整覆盖，样本窗口仍不完整，建议先补足完整样本后再继续做调参与结论判断。",
+            "decision_recommended_data_range": str(truncated_plan["payload"].get("data_range") or current_range),
+            "decision_recommended_timeframe": str(truncated_plan["payload"].get("timeframe") or current_timeframe),
+            "decision_readiness_action": truncated_plan["recommended_action"],
+        }
+    if _is_low_sample_backtest_context(context):
+        payload = _build_sample_validation_backtest_payload(
+            current_range,
+            current_timeframe,
+            prefer_finer_timeframe=True,
+        )
+        trade_count = _get_backtest_trade_count(context)
+        return {
+            "decision_readiness": "sample_incomplete",
+            "decision_readiness_detail": f"当前仅产生 {trade_count} 笔真实成交，样本量偏小，暂不建议直接用于调参或上线判断。",
+            "decision_recommended_data_range": payload["data_range"],
+            "decision_recommended_timeframe": payload["timeframe"],
+            "decision_readiness_action": _render_sample_validation_action(
+                current_range,
+                current_timeframe,
+                payload,
+            ),
+        }
+    return {
+        "decision_readiness": "ready",
+        "decision_readiness_detail": "当前样本来源、样本量与窗口覆盖已达到最小门槛，可继续结合策略上下文做调参与人工复核。",
+        "decision_recommended_data_range": None,
+        "decision_recommended_timeframe": None,
+        "decision_readiness_action": None,
+    }
+
+
+def _filter_sample_quality_guarded_parsed_proposals(
+    proposals: List[StrategyProposal],
+    context: Dict[str, Any],
+) -> List[StrategyProposal]:
+    for proposal in proposals:
+        if proposal.proposal_type != "backtest_request":
+            continue
+        normalized_payload = _extract_safe_sample_validation_payload(proposal.payload, context)
+        if normalized_payload is None:
+            continue
+        return [
+            proposal.model_copy(
+                update={
+                    "payload": normalized_payload,
+                }
+            )
+        ]
+    return []
+
+
+def _extract_safe_sample_validation_payload(
+    payload: Dict[str, Any],
+    context: Dict[str, Any],
+) -> Optional[Dict[str, str]]:
+    if not isinstance(payload, dict):
+        return None
+    truncated_context = _is_truncated_backtest_context(context)
+    history_gap_reason = str(context.get("history_gap_reason") or "none").strip().lower()
+    current_range = str(context.get("data_range") or "").strip()
+    current_timeframe = str(context.get("timeframe") or "1h").strip().lower() or "1h"
+    resolved_current_range = current_range or "最近 180 天"
+    truncated_plan = _resolve_full_window_recommendation(
+        {
+            **context,
+            "data_range": resolved_current_range,
+            "timeframe": current_timeframe,
+        }
+    )
+    current_estimate = int(context.get("requested_candle_estimate") or 0) or estimate_candle_count_for_range(
+        resolved_current_range,
+        current_timeframe,
+    )
+    raw_next_range = str(payload.get("data_range") or "").strip()
+    raw_next_timeframe = str(payload.get("timeframe") or "").strip().lower()
+    next_timeframe = raw_next_timeframe if raw_next_timeframe in {"15m", "1h", "4h", "1d"} else ""
+    next_range = raw_next_range or resolved_current_range
+    next_resolved_timeframe = next_timeframe or current_timeframe
+    next_estimate = estimate_candle_count_for_range(next_range, next_resolved_timeframe)
+
+    if raw_next_range and raw_next_range != resolved_current_range:
+        if truncated_context and truncated_plan["can_cover_full_window"]:
+            return None
+        if history_gap_reason == "insufficient_history" and next_timeframe and next_timeframe != current_timeframe:
+            return None
+        if truncated_context and next_estimate > candle_limit_for_range(next_range, next_resolved_timeframe):
+            return None
+        if next_estimate >= current_estimate:
+            return None
+        return {
+            "data_range": raw_next_range,
+            "timeframe": next_timeframe or current_timeframe,
+        }
+
+    if next_timeframe and next_timeframe != current_timeframe:
+        if history_gap_reason == "insufficient_history":
+            return None
+        if truncated_context and truncated_plan["can_cover_full_window"] and next_estimate >= current_estimate:
+            return None
+        if (
+            truncated_context
+            and not truncated_plan["can_cover_full_window"]
+            and next_estimate > candle_limit_for_range(resolved_current_range, next_timeframe)
+        ):
+            return None
+        return {
+            "data_range": resolved_current_range,
+            "timeframe": next_timeframe,
+        }
+
+    return None
+
+
+def _merge_execution_health_review_risks(risks: List[str], context: Optional[Dict[str, Any]] = None) -> List[str]:
     merged = [str(item).strip() for item in risks if str(item).strip()]
-    review_health_context = build_review_health_context()
+    review_health_context = (
+        _derive_review_health_context_from_context(context, include_strategy_activity=False)
+        if context is not None
+        else build_review_health_context()
+    )
     execution_top_issue = str(review_health_context.get("execution_top_issue") or "").strip()
     execution_top_issue_detail = str(review_health_context.get("execution_top_issue_detail") or "").strip()
     execution_top_issue_recommended_action = str(
@@ -7626,12 +8655,136 @@ def _merge_execution_health_review_risks(risks: List[str]) -> List[str]:
     return merged[:4]
 
 
+def _is_reference_only_backtest_context(context: Dict[str, Any]) -> bool:
+    sample_quality = str(context.get("sample_quality") or "").strip().lower()
+    if sample_quality == "reference_only":
+        return True
+    if sample_quality in {"low_sample", "sufficient"}:
+        return False
+    value = context.get("reference_only")
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return False
+
+
+def _get_backtest_trade_count(context: Dict[str, Any]) -> int:
+    metrics = context.get("metrics", {}) if isinstance(context.get("metrics"), dict) else {}
+    try:
+        return max(int(metrics.get("trades", 0)), 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _is_low_sample_backtest_context(context: Dict[str, Any]) -> bool:
+    sample_quality = str(context.get("sample_quality") or "").strip().lower()
+    if sample_quality == "low_sample":
+        return True
+    if sample_quality in {"reference_only", "sufficient"}:
+        return False
+    return not _is_reference_only_backtest_context(context) and 0 < _get_backtest_trade_count(context) < 5
+
+
+def _is_truncated_backtest_context(context: Dict[str, Any]) -> bool:
+    value = context.get("history_truncated")
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    requested_candle_estimate = int(context.get("requested_candle_estimate") or 0)
+    requested_candle_limit = int(context.get("requested_candle_limit") or 0)
+    if requested_candle_estimate > 0 and requested_candle_limit > 0:
+        return requested_candle_estimate > requested_candle_limit
+    return False
+
+
+def _is_market_detail_fallback_backtest_context(context: Dict[str, Any]) -> bool:
+    return str(context.get("history_source") or "exchange_history").strip().lower() == "market_detail_fallback"
+
+
+def _get_backtest_history_source_reason(context: Dict[str, Any]) -> str:
+    reason = str(context.get("history_source_reason") or "none").strip().lower()
+    if reason in {"exchange_fetch_failed", "insufficient_exchange_samples"}:
+        return reason
+    return "none"
+
+
+def _merge_backtest_review_risks(risks: List[str], context: Dict[str, Any]) -> List[str]:
+    merged = [str(item).strip() for item in risks if str(item).strip()]
+    if _is_reference_only_backtest_context(context):
+        reference_risk = "样本质量提示：本次回测区间未命中真实入场信号，当前收益、回撤与 Sharpe 仅基于参考路径，不应直接视为可上线结论。"
+        if not any("未命中真实入场信号" in item or "样本质量提示" in item for item in merged):
+            merged.append(reference_risk)
+    elif _is_low_sample_backtest_context(context):
+        trade_count = _get_backtest_trade_count(context)
+        low_sample_risk = f"样本质量提示：本次回测仅产生 {trade_count} 笔真实成交，样本量偏小，当前收益、胜率与 Sharpe 仍不足以直接支持上线判断。"
+        if not any("样本量偏小" in item or "仅产生" in item for item in merged):
+            merged.append(low_sample_risk)
+    if _is_market_detail_fallback_backtest_context(context):
+        history_source_detail = str(context.get("history_source_detail") or "").strip()
+        fallback_risk = "样本来源提示：本次回测样本来自工作台行情快照回退，而不是交易所完整历史 K 线，当前收益、回撤与 Sharpe 仅适合研究排障，不应直接视为正式历史回测结论。"
+        if history_source_detail:
+            fallback_risk = f"{fallback_risk} 原因：{history_source_detail}"
+        if not any("行情快照回退" in item or "样本来源提示" in item for item in merged):
+            merged.append(fallback_risk)
+    if _is_truncated_backtest_context(context):
+        requested_candle_estimate = int(context.get("requested_candle_estimate") or 0)
+        used_candle_count = int(context.get("used_candle_count") or 0)
+        history_gap_reason = str(context.get("history_gap_reason") or "none").strip().lower()
+        retrieved_range_start = str(context.get("retrieved_range_start") or "").strip()
+        retrieved_range_end = str(context.get("retrieved_range_end") or "").strip()
+        truncated_plan = _resolve_full_window_recommendation(context)
+        if history_gap_reason == "insufficient_history":
+            available_range = (
+                _build_available_history_data_range_from_bounds(
+                    retrieved_range_start,
+                    retrieved_range_end,
+                    str(context.get("timeframe") or "1h"),
+                )
+                or "当前可用历史区间"
+            )
+            truncated_risk = (
+                f"样本窗口提示：本次请求区间理论需要约 {requested_candle_estimate} 根 K 线，"
+                f"当前交易所仅提供 {used_candle_count} 根样本，实际可用历史覆盖 {available_range}，"
+                f"建议先缩短到该可用区间后再判断收益质量与调参方向。"
+            )
+        elif truncated_plan["can_cover_full_window"]:
+            truncated_risk = (
+                f"样本窗口提示：本次请求区间理论需要约 {requested_candle_estimate} 根 K 线，"
+                f"当前回测仅使用最近 {used_candle_count} 根样本，请先补足完整样本窗口，再判断收益质量与调参方向。"
+            )
+        else:
+            recommended_payload = truncated_plan["payload"]
+            truncated_risk = (
+                f"样本窗口提示：本次请求区间理论需要约 {requested_candle_estimate} 根 K 线，"
+                f"当前回测仅使用最近 {used_candle_count} 根样本；即使切到最粗周期，当前区间仍无法在当前回测样本上限内完整覆盖，"
+                f"建议先缩短到 {recommended_payload.get('data_range')} 再判断收益质量与调参方向。"
+            )
+        if truncated_plan.get("recommended_action"):
+            truncated_risk = f"{truncated_risk} 建议动作：{truncated_plan['recommended_action']}"
+        if not any("样本窗口提示" in item or "补足完整样本窗口" in item for item in merged):
+            merged.append(truncated_risk)
+    return _merge_execution_health_review_risks(merged, context)
+
+
 def build_review_document_from_text(text: str, context: Dict[str, Any], source: str, job_type: str) -> ReviewDocument:
     parsed = parse_review_text(text)
     now = datetime.now(timezone.utc).astimezone()
     now_iso = now.isoformat()
+    sample_quality_guarded = (
+        job_type == "generate_backtest_review"
+        and (
+            _is_reference_only_backtest_context(context)
+            or _is_low_sample_backtest_context(context)
+            or _is_truncated_backtest_context(context)
+            or _is_market_detail_fallback_backtest_context(context)
+        )
+    )
     parsed_proposals = build_parsed_review_proposals(parsed, context, now_iso)
-    heuristic_proposals = build_review_proposals(job_type, context)
+    if sample_quality_guarded:
+        parsed_proposals = _filter_sample_quality_guarded_parsed_proposals(parsed_proposals, context)
+    heuristic_proposals = [] if sample_quality_guarded and parsed_proposals else build_review_proposals(job_type, context)
     proposals: List[StrategyProposal] = []
     seen_keys = set()
     for proposal in [*parsed_proposals, *heuristic_proposals]:
@@ -7645,14 +8798,45 @@ def build_review_document_from_text(text: str, context: Dict[str, Any], source: 
         if job_type == "generate_backtest_review"
         else f"{now.strftime('%Y-%m-%d')} 日度 AI 复盘"
     )
+    decision_readiness: Optional[Dict[str, Optional[str]]] = None
+    source_change_request_id: Optional[str] = None
+    source_backtest_id: Optional[str] = None
+    source_review_id: Optional[str] = None
+    source_proposal_id: Optional[str] = None
+    trigger_reason: Optional[str] = None
+    if job_type == "generate_backtest_review":
+        decision_readiness = _resolve_backtest_decision_readiness(context)
+        source_change_request_id = str(context.get("source_change_request_id") or "").strip() or None
+        source_backtest_id = str(context.get("source_backtest_id") or "").strip() or None
+        source_review_id = str(context.get("source_review_id") or "").strip() or None
+        source_proposal_id = str(context.get("source_proposal_id") or "").strip() or None
+        trigger_reason = str(context.get("trigger_reason") or "").strip() or None
     return ReviewDocument(
         id=f"review-{uuid4().hex[:10]}",
         period="backtest" if job_type == "generate_backtest_review" else "daily",
         strategy_id=str(context.get("strategy_id") or "") or None,
+        backtest_id=str(context.get("backtest_id") or "") or None if job_type == "generate_backtest_review" else None,
+        source_change_request_id=source_change_request_id,
+        source_backtest_id=source_backtest_id,
+        source_review_id=source_review_id,
+        source_proposal_id=source_proposal_id,
+        trigger_reason=trigger_reason,
+        decision_readiness=decision_readiness["decision_readiness"] if decision_readiness else None,
+        decision_readiness_detail=decision_readiness["decision_readiness_detail"] if decision_readiness else None,
+        decision_recommended_data_range=decision_readiness["decision_recommended_data_range"] if decision_readiness else None,
+        decision_recommended_timeframe=decision_readiness["decision_recommended_timeframe"] if decision_readiness else None,
+        decision_readiness_action=decision_readiness["decision_readiness_action"] if decision_readiness else None,
         title=title,
         summary=str(parsed["summary"]),
         highlights=[str(item) for item in parsed["highlights"]],
-        risks=_merge_execution_health_review_risks([str(item) for item in parsed["risks"]]),
+        risks=(
+            _merge_backtest_review_risks([str(item) for item in parsed["risks"]], context)
+            if job_type == "generate_backtest_review"
+            else _merge_execution_health_review_risks(
+                [str(item) for item in parsed["risks"]],
+                context if _has_meaningful_review_health_context(context) else None,
+            )
+        ),
         proposals=proposals,
         created_at=now_iso,
     )
@@ -7674,7 +8858,10 @@ def build_strategy_tracking_review_document(text: str, context: Dict[str, Any], 
         title=title,
         summary=str(parsed["summary"]),
         highlights=[str(item) for item in parsed["highlights"]],
-        risks=_merge_execution_health_review_risks([str(item) for item in parsed["risks"]]),
+        risks=_merge_execution_health_review_risks(
+            [str(item) for item in parsed["risks"]],
+            context if _has_meaningful_review_health_context(context) else None,
+        ),
         proposals=[],
         created_at=now.isoformat(),
     )
@@ -7688,20 +8875,101 @@ def build_fallback_review_document(job_context: Dict[str, Any], job_type: str = 
     if job_type == "generate_backtest_review":
         strategy_name = str(job_context.get("strategy_name") or "策略")
         metrics = job_context.get("metrics", {}) if isinstance(job_context.get("metrics"), dict) else {}
+        reference_only = _is_reference_only_backtest_context(job_context)
+        low_sample = _is_low_sample_backtest_context(job_context)
+        trade_count = _get_backtest_trade_count(job_context)
+        history_source = str(job_context.get("history_source") or "exchange_history").strip().lower()
+        history_source_reason = _get_backtest_history_source_reason(job_context)
+        history_source_detail = str(job_context.get("history_source_detail") or "").strip()
+        history_source_plan = _resolve_history_source_recommendation(job_context)
+        decision_readiness = _resolve_backtest_decision_readiness(job_context)
+        requested_candle_estimate = int(job_context.get("requested_candle_estimate") or 0)
+        requested_candle_limit = int(job_context.get("requested_candle_limit") or 0)
+        requested_range_start = str(job_context.get("requested_range_start") or "").strip()
+        requested_range_end = str(job_context.get("requested_range_end") or "").strip()
+        retrieved_window_completion_pct = float(job_context.get("retrieved_window_completion_pct") or 0.0)
+        used_window_completion_pct = float(job_context.get("used_window_completion_pct") or 0.0)
+        retrieved_candle_count = int(job_context.get("retrieved_candle_count") or 0)
+        used_candle_count = int(job_context.get("used_candle_count") or 0)
+        history_truncated = bool(job_context.get("history_truncated"))
+        source_change_request_id = str(job_context.get("source_change_request_id") or "").strip()
+        source_backtest_id = str(job_context.get("source_backtest_id") or "").strip()
+        source_review_id = str(job_context.get("source_review_id") or "").strip()
+        source_proposal_id = str(job_context.get("source_proposal_id") or "").strip()
+        trigger_reason = str(job_context.get("trigger_reason") or "").strip()
+        highlights = [
+            f"回测区间 {job_context.get('data_range', '未提供')}，时间粒度 {job_context.get('timeframe', '1h')}。",
+            f"年化收益 {metrics.get('annual_return', '--')}，胜率 {metrics.get('win_rate', '--')}。",
+        ]
+        lineage_parts = []
+        if trigger_reason:
+            lineage_parts.append(f"触发原因 {trigger_reason}")
+        if source_change_request_id:
+            lineage_parts.append(f"来源变更 {source_change_request_id}")
+        if source_backtest_id:
+            lineage_parts.append(f"来源回测 {source_backtest_id}")
+        if source_review_id:
+            lineage_parts.append(f"来源复盘 {source_review_id}")
+        if source_proposal_id:
+            lineage_parts.append(f"来源提案 {source_proposal_id}")
+        if lineage_parts:
+            highlights.insert(1, f"来源链路：{'；'.join(lineage_parts)}。")
+        if requested_range_start and requested_range_end:
+            highlights.insert(2 if lineage_parts else 1, f"请求窗口 {requested_range_start} -> {requested_range_end}。")
+        if history_source == "market_detail_fallback":
+            fallback_highlight = "本次历史样本来自工作台行情快照回退，仍需在交易所历史恢复后重跑确认。"
+            if history_source_reason == "exchange_fetch_failed":
+                fallback_highlight = "本次交易所历史拉取报错，已回退到工作台行情快照样本，仍需在交易所历史恢复后重跑确认。"
+            elif history_source_reason == "insufficient_exchange_samples":
+                fallback_highlight = "本次交易所历史样本不足，已回退到工作台行情快照样本，仍需在补足样本后重跑确认。"
+            if history_source_detail:
+                fallback_highlight = f"{fallback_highlight} 原因：{history_source_detail}"
+            highlights.append(fallback_highlight)
+            if history_source_plan["recommended_action"]:
+                highlights.append(f"来源建议：{history_source_plan['recommended_action']}")
+        if retrieved_window_completion_pct > 0 or used_window_completion_pct > 0:
+            highlights.append(
+                f"窗口覆盖率：取样 {retrieved_window_completion_pct:.2f}% ，实际回测 {used_window_completion_pct:.2f}%。"
+            )
+        if reference_only:
+            highlights[-1] = f"当前区间未命中真实入场信号，参考路径年化 {metrics.get('annual_return', '--')}。"
+        elif low_sample:
+            highlights[-1] = f"当前仅产生 {trade_count} 笔真实成交，样本量偏小，年化 {metrics.get('annual_return', '--')} 仍需继续验证。"
+        if history_truncated and used_candle_count > 0:
+            highlights.append(
+                f"本次目标区间理论需要约 {requested_candle_estimate or requested_candle_limit or retrieved_candle_count} 根 K 线，"
+                f"当前回测样本上限为 {requested_candle_limit or retrieved_candle_count} 根，最终使用最近 {used_candle_count} 根样本。"
+            )
+        if decision_readiness["decision_readiness_detail"]:
+            highlights.append(f"结论门禁：{decision_readiness['decision_readiness_detail']}")
+        if decision_readiness["decision_recommended_data_range"] and decision_readiness["decision_recommended_timeframe"]:
+            highlights.append(
+                f"门禁重跑：{decision_readiness['decision_recommended_data_range']} @ {decision_readiness['decision_recommended_timeframe']}。"
+            )
+        if decision_readiness["decision_readiness_action"]:
+            highlights.append(f"门禁建议：{decision_readiness['decision_readiness_action']}")
         return ReviewDocument(
             id=f"review-{uuid4().hex[:10]}",
             period="backtest",
             strategy_id=str(job_context.get("strategy_id") or "") or None,
+            backtest_id=str(job_context.get("backtest_id") or "") or None,
+            source_change_request_id=source_change_request_id or None,
+            source_backtest_id=source_backtest_id or None,
+            source_review_id=source_review_id or None,
+            source_proposal_id=source_proposal_id or None,
+            trigger_reason=trigger_reason or None,
+            decision_readiness=decision_readiness["decision_readiness"],
+            decision_readiness_detail=decision_readiness["decision_readiness_detail"],
+            decision_recommended_data_range=decision_readiness["decision_recommended_data_range"],
+            decision_recommended_timeframe=decision_readiness["decision_recommended_timeframe"],
+            decision_readiness_action=decision_readiness["decision_readiness_action"],
             title=f"{now.strftime('%Y-%m-%d')} 回测 AI 复盘",
             summary=f"{strategy_name} 的回测已完成，本地回退逻辑已生成风险与后续验证建议。",
-            highlights=[
-                f"回测区间 {job_context.get('data_range', '未提供')}，时间粒度 {job_context.get('timeframe', '1h')}。",
-                f"年化收益 {metrics.get('annual_return', '--')}，胜率 {metrics.get('win_rate', '--')}。",
-            ],
-            risks=_merge_execution_health_review_risks([
+            highlights=highlights,
+            risks=_merge_backtest_review_risks([
                 f"最大回撤 {metrics.get('max_drawdown', '--')}，需要结合真实滑点继续验证。",
                 "当前复盘来自本地回退逻辑，建议后续再由 OpenClaw 补全策略建议。",
-            ]),
+            ], job_context),
             proposals=build_review_proposals(job_type, job_context),
             created_at=now.isoformat(),
         )
@@ -8108,7 +9376,19 @@ def get_backtests():
 @app.post("/api/backtests")
 def create_backtest(payload: BacktestCreate):
     try:
-        return repo.create_backtest(payload.strategy_id, payload.data_range, payload.timeframe)
+        normalized_timeframe = normalize_backtest_timeframe(payload.timeframe)
+        return repo.create_backtest(
+            payload.strategy_id,
+            payload.data_range,
+            normalized_timeframe,
+            source_change_request_id=payload.source_change_request_id,
+            source_backtest_id=payload.source_backtest_id,
+            source_review_id=payload.source_review_id,
+            source_proposal_id=payload.source_proposal_id,
+            trigger_reason=payload.trigger_reason,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=f"策略不存在: {exc}") from exc
 
@@ -8123,14 +9403,9 @@ def create_change_request(payload: ChangeRequestCreate):
     return repo.create_change_request(payload)
 
 
-@app.get("/api/ai/scheduler")
+@app.get("/api/ai/scheduler", response_model=SchedulerSnapshot)
 def get_scheduler():
-    state = repo.snapshot()
-    return {
-        "scheduler": state.control_snapshot.scheduler,
-        "jobs": state.agent_jobs,
-        "change_requests": state.change_requests[:8],
-    }
+    return build_scheduler_snapshot_payload()
 
 
 @app.get("/api/ai/live", response_model=AiLiveSnapshot)
@@ -8216,7 +9491,11 @@ def retry_agent_job(job_id: str, payload: AgentJobRetryPayload):
 
 
 @app.get("/api/ai/reviews")
-def get_reviews(strategy_id: Optional[str] = None, period: Optional[str] = None):
+def get_reviews(
+    strategy_id: Optional[str] = None,
+    period: Optional[str] = None,
+    backtest_id: Optional[str] = None,
+):
     reviews = repo.snapshot().reviews
 
     if strategy_id:
@@ -8227,6 +9506,9 @@ def get_reviews(strategy_id: Optional[str] = None, period: Optional[str] = None)
             if review.strategy_id == needle
             or any(proposal.strategy_id == needle for proposal in review.proposals)
         ]
+    if backtest_id:
+        needle = backtest_id.strip()
+        reviews = [review for review in reviews if review.backtest_id == needle]
 
     if period:
         allowed_periods = {item.strip() for item in period.split(",") if item.strip()}
@@ -8417,9 +9699,32 @@ def get_audit_events():
     return repo.snapshot().audit_events
 
 
-@app.get("/api/settings")
+@app.get("/api/settings", response_model=SettingsPayload)
 def get_settings():
     return repo.snapshot().settings
+
+
+@app.post("/api/settings", response_model=SettingsPayload)
+def update_settings(payload: SettingsUpdatePayload):
+    try:
+        settings = repo.update_settings(payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    market_data.base_url = settings.api_base_url.rstrip("/")
+    if hasattr(market_data, "_candle_cache"):
+        market_data._candle_cache.clear()  # type: ignore[attr-defined]
+    if hasattr(market_data, "_recent_trade_cache"):
+        market_data._recent_trade_cache.clear()  # type: ignore[attr-defined]
+    if hasattr(market_data, "_announcement_cache"):
+        market_data._announcement_cache.clear()  # type: ignore[attr-defined]
+    if hasattr(market_data, "_instrument_cache"):
+        market_data._instrument_cache.clear()  # type: ignore[attr-defined]
+    if hasattr(market_data, "_connectivity_probe_cache"):
+        market_data._connectivity_probe_cache = None  # type: ignore[attr-defined]
+    if hasattr(market_data, "_candle_history_cache"):
+        market_data._candle_history_cache.clear()  # type: ignore[attr-defined]
+    return settings
 
 
 @app.get("/api/workspace/preferences", response_model=WorkspacePreferences)

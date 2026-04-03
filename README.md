@@ -42,7 +42,10 @@
 - 行情页已支持“自选管理”二级窗口，可新增或移除关注品种，并自动刷新当前自选列表
 - 自选管理窗口当前已支持为单个品种开启/关闭波动提醒，并调整提醒阈值百分比
 - 已把模式切换、调度控制、首页模块开关和布局同步收进单独的“设置”页
+- 设置页当前也支持直接编辑并保存 `bybit_web_entry / api_base_url / default_mode / notification_channels / notification_quiet_hours_* / product_language / grafana_*`，保存后会立即刷新公共链路、Grafana 接入状态与审计视图
+- 同内容的普通桌面通知当前会自动做 2 分钟短时去重，避免同类提醒短时间重复刷屏；测试通知与 `critical` 级提醒继续直通，不受这条去重影响
 - 设置页与“账户详情”窗口当前也会直接展示 Bybit 公共/私有链路诊断；当出现“REST 正常但 WS/TLS 失败”时，会直接给出本机代理、VPN、防火墙、企业网关与 TLS 配置方向的恢复建议
+- 设置页当前也会直接展示 Bybit 私有只读配置文件路径、仓库示例文件路径，以及 OpenClaw 本机配置路径与命令可用性；在 Electron 桌面端里还可直接打开配置目录或示例文件，避免排查时只知道“未配置”却不知道该去哪里补
 - 左侧导航中的大模块保持整页切换；弹窗能力后续优先用于模块内部的次级操作和详情窗口
 - 左侧导航已按“交易观察 / 策略研究 / 运行控制 / 记录审计”重新分组，减少平铺式菜单堆叠
 - 已有 `ChangeRequest`、`Backtest`、`SchedulerCommand`、`AgentJob`、`ManualOrder` 等控制链路
@@ -123,10 +126,45 @@
 - `/metrics` 和 `GET /api/control/snapshot` 也会同步这层状态：当前已暴露 `bybit_control_strategy_position_alignment_state`，总览摘要会直接提示“偏离 N”
 - 当真实策略仓位处于 `drifted` 且仍在 `running` 时，系统当前会自动生成 `strategy-position-drift:*` 的 `system` 来源提醒；重新对齐后会自动收起并写入恢复审计事件
 - 回测页已改成研究工作台，支持按策略筛选、选择周期和区间发起回测，并查看参数快照、AI 提案和当前策略对比
+- 回测页“关联 AI 上下文”当前也支持直接打开这轮回测对应的 AI 复盘结果、来源任务，并可在同一处就地接受/拒绝这轮复盘带出的提案，减少在策略页、AI 复盘页和回测页之间来回切换
+- 若在任意页面接受的是 `backtest_request`，桌面端当前也会自动聚焦到新生成的回测结果，不再只提示“已创建回测”后让用户手动再找一次
 - `POST /api/backtests` 当前已不再写固定 mock 结果，而是会基于 Bybit 历史 K 线走本地最小回测引擎生成结果
+- `POST /api/backtests` 与接受 `backtest_request` 提案时，回测周期当前都会统一校验为 `15m / 1h / 4h / 1d`，避免无效周期把脏参数带进回测链路
+- `POST /api/backtests` 的 `data_range` 当前既支持 ISO 区间，也支持 `最近 45/90/180 天` 这类相对中文区间，并会真实驱动 K 线取数窗口，而不是一律回退默认 90 天
+- 桌面端回测页当前也已改用 `最近 30/90/180 天` 相对区间 preset；若“按建议重跑”给出 `1d` 或自定义区间，表单会直接保留并显示这组推荐参数
+- `BacktestRun` 当前还会显式返回 `requested_range_start / requested_range_end`，把 `最近 180 天` 这类相对区间在回测创建时固化成绝对请求窗口，便于后续 AI 复盘、桌面端和人工排查复用同一时间基准
+- `BacktestRun` 当前还会显式返回 `retrieved_window_completion_pct / used_window_completion_pct`，分别表示“实际取样窗口”与“最终回测窗口”相对目标请求窗口的覆盖率，便于桌面端和 AI 直接判断这次样本覆盖到了多少
+- `BacktestRun` 当前还会显式返回 `history_source=exchange_history|market_detail_fallback`，用于区分本次结果是否来自交易所历史 K 线，还是因为历史拉取失败/样本不足而回退到工作台行情快照样本
+- `BacktestRun` 当前还会显式返回 `history_source_reason=none|exchange_fetch_failed|insufficient_exchange_samples` 与 `history_source_detail`，用于说明这次为何回退到工作台行情快照样本，便于桌面端、AI 复盘和人工排障直接看到“是历史接口报错，还是交易所历史样本本身不足”
+- `BacktestRun` 当前还会显式返回 `history_source_recommended_data_range / history_source_recommended_timeframe / history_source_recommended_action`，把这类“快照回退”下一步该怎么补样本或恢复后重跑也结构化出来，不再只藏在备注文案里
+- `BacktestRun` 当前还会显式返回 `decision_readiness=ready|sample_incomplete|research_only`、`decision_readiness_detail`、`decision_recommended_data_range / decision_recommended_timeframe` 与 `decision_readiness_action`，把“这次结果能不能直接用于调参/上线判断”以及“该按什么参数重跑”都收成统一门禁，便于桌面端、AI 和人工排查直接复用
+- `BacktestRun` 当前还会显式返回 `source_change_request_id / source_backtest_id / source_review_id / source_proposal_id / trigger_reason`，把这轮回测的来源链路结构化保留下来，明确区分“手动创建 / 由哪条变更触发 / 门禁重跑 / 复盘建议重跑 / 接受提案”
+- 本地回测入口当前会优先按目标窗口分页拉取 Bybit 历史 K 线；`requested_candle_limit` 表示当前回测样本上限，而不是单页接口上限
+- 若目标区间在当前周期下理论需要的 K 线数量超过当前回测样本上限，`BacktestRun` 当前会显式返回 `requested_candle_estimate / requested_candle_limit / retrieved_candle_count / used_candle_count / history_truncated`，提醒本次回测样本窗口已被截断
+- `BacktestRun.history_gap_reason` 当前会显式区分 `sample_cap` 和 `insufficient_history`：前者表示被当前回测样本上限截断，后者表示交易所当前可用历史本身不足
+- `BacktestRun` 当前还会显式返回 `retrieved_range_start / retrieved_range_end / used_range_start / used_range_end`，用于说明本次实际取到的历史样本覆盖到了哪段时间，以及最终参与本地回测的窗口起止
+- 若样本窗口已被截断，`BacktestRun` 当前还会显式返回 `full_window_recommended_data_range / full_window_recommended_timeframe / full_window_recommended_action`，让桌面端和人工排查直接知道当前应是“保持区间改粗周期”还是“先缩短区间再回测”
+- 桌面端回测页和策略页“最新回测”摘要当前也会直接展示这类“样本截断”提示，不必再从备注文案里手动辨认
+- 本地回测引擎当前也会按持仓逐 bar 盯市生成权益曲线，`max_drawdown` 不再只按平仓后的已实现权益计算
+- 本地回测引擎当前会按逐 bar 权益收益率年化 `Sharpe`，不再按成交笔数近似
+- 当回测区间内没有真实触发入场信号时，本地回测引擎当前也会按基础价格路径生成连续 fallback 权益曲线，而不是只在最后一根 K 线跳变
+- 这类 fallback 参考路径当前不会再被记成 1 笔真实交易，`trades / win_rate` 会保持为 `0`，并在回测备注里明确标注“仅供研究参考”
+- 当回测结果属于 `reference_only` 时，回测 AI 启发式提案当前不会再给激进调参建议，而是会默认回退成“扩大样本验证”的保守回测请求
+- `BacktestRun` 当前也会显式返回 `reference_only`，桌面端回测列表和详情可直接区分“真实成交样本”与“仅参考路径”
+- `BacktestRun` 当前也会显式返回 `sample_quality=reference_only|low_sample|sufficient`，供桌面端和后续 AI 直接复用统一样本质量口径
+- 当 `history_truncated=true` 时，回测 AI 复盘与默认提案当前也会把它视为“样本窗口未完整覆盖”的保守门禁：若仍有更粗周期可完整覆盖，就优先保持同一 `data_range` 并切周期；若连最粗周期也无法完整覆盖，则会明确改成“缩短到当前回测样本上限内可完整覆盖的区间”，而不是继续给误导性的调参或上线倾向结论
+- `generate_backtest_review` 当前也会显式带上 `reference_only` 上下文；当样本仅为参考路径时，AI 复盘提示词和默认风险项都会明确要求“不要把收益率 / 胜率 / Sharpe 直接视为可上线结论”
+- 即使不是 `reference_only`，当真实成交样本少于 `5` 笔时，回测 AI 启发式提案当前也不会直接给风控/上线倾向建议，而是会默认回退成“扩大样本验证”的保守回测请求；复盘提示词和默认风险项会明确标注“低样本真实成交”
+- 若 `reference_only / low_sample` 回测复盘的模型输出仍夹带 `risk_update / param_update / publish_recommendation` 等激进 JSON 提案，后端当前也会直接过滤；若模型同时给出了确实推进样本收集的 `backtest_request`，则会保留这条安全请求
+- 若 `history_source=market_detail_fallback`，回测 AI 复盘当前也会自动进入同一套保守门禁：优先提示“恢复交易所历史后重跑”，不直接放行激进调参或上线倾向提案；若同时带有 `history_source_reason / history_source_detail`，prompt、fallback review 与桌面端会继续显示具体回退原因
+- 若 `history_source=market_detail_fallback`，默认保守 `backtest_request` 当前也会按 `history_source_reason` 自动细分：历史拉取报错时保持原区间/周期等待恢复后重跑；交易所样本不足时优先给出补样本用的区间/周期建议
+- 桌面端和 `generate_backtest_review` prompt 当前也会直接展示这条 `decision_readiness` 门禁，不必再手动综合 `reference_only / low_sample / history_truncated / history_source` 四组字段
+- 当这类保守补样本请求发现当前区间已经是 `最近 180 天` 时，后端当前会自动切到更高频周期继续补样本，避免重复提交完全相同的回测请求
 - `POST /api/backtests` 当前会自动排队 `generate_backtest_review`，回测完成后由 OpenClaw 继续生成“回测 AI 复盘”
 - 已有工作台布局、默认页面、默认模式、卡片顺序的本地持久化和服务端同步
 - 工作台状态当前也会保存主盯盘品种的 K 线周期，重开桌面端后会恢复你上次看的 `15m / 1h / 4h / 1d`
+- 工作台状态当前也会继续保存回测页聚焦回测、`仅当前策略/全策略` 回测筛选、复盘跟踪范围，以及提醒/成交/审计筛选器与审计搜索词，便于重开桌面端或新线程接手后直接恢复上次的排障上下文
+- Electron 桌面壳当前也会保存主窗口大小、位置和最大化状态；若上次窗口落在已经不存在的显示器区域，启动时会自动回退到安全默认尺寸
 - `services/control-api` 已有 FastAPI 本地控制服务
 - 行情接口已接入 Bybit 公共 REST + 公共 WebSocket，REST 继续承担首帧与回退职责
 - 已新增 `/api/market/live` 聚合快照接口，总览页和行情页会在本地高频拉取，用于近实时联动自选与主图
@@ -141,6 +179,7 @@
 - 已新增 `/api/market/stream`、`/api/ai/stream` 与 `/api/ops/stream` 本地 SSE 流，总览/行情/AI 调度/提醒/记录页优先走流式更新
 - 已新增 `/api/account/stream` 本地 SSE 流，交易记录页优先用它同步账户总览、持仓和委托
 - 桌面端当前会基于 `ops` / `ai` 实时流触发原生系统通知，用于提示新的 `P0 / P1` 未处理提醒、AI 任务失败/取消和调度降级
+- 对 `scheduler.command.cancel_all` 这类批量调度命令，桌面端系统通知当前也会附带结构化影响面摘要，不再只弹一条泛化“命令已执行”
 - `paper_order.filled`、`paper_order.cancelled_all` 与 `manual_trade.positions_closed_all` 当前也会复用同一套桌面通知桥接，直接提示本地 `paper` 委托和批量平仓结果
 - Electron 桌面壳当前已支持托盘常驻，可通过托盘菜单快速显示/隐藏窗口或退出应用
 - 行情详情当前已补入 Bybit 公共最近成交流，桌面端会把盘口和最近成交放在同一块盯盘区
@@ -206,16 +245,35 @@
 - `AI 调度` 页中的任务队列当前也会直接复用 `linked_review_* / retry_* / strategy_id` 这些顶层字段，便于近场重试和结果直达，不必再从 `context` 猜测
 - `AI 调度` 页的任务队列当前也支持从任务直接 `打开策略`，方便从结果或任务就近回到单策略排障
 - 总览页与 `AI 调度` 页里的实时 AI 事件流当前也支持直接打开关联复盘结果；若事件没有结果但带 `strategy_id`，则可直接跳到对应策略活动
+- 对 `generate_backtest_review` 完成事件，系统日志/审计页当前也会直接复用 `backtest_id / source_* / trigger_reason / decision_*` 顶层字段，允许从完成日志就地打开这轮回测、来源链路与复盘结果
+- 对 `generate_backtest_review` 的 `started / failed / cancelled` 生命周期事件，系统日志/审计页当前也会继续复用同一组 `backtest_id / source_* / trigger_reason / decision_*` 顶层字段，便于在任务尚未完成时就近排障和追溯来源
+- 当上述回测复盘任务被人工或系统请求重试时，`openclaw.job.retry_requested` 当前也会补齐同一组 `backtest_id / source_* / trigger_reason / decision_*` 顶层字段，方便从“请求重试”这一步开始就近追溯来源链路
+- 对 `generate_backtest_review` 的 `openclaw.job.queued` 入队事件，当前也会补齐同一组 `backtest_id / source_* / trigger_reason / decision_*` 顶层字段；同一 `idempotency_key` 的重复创建不会重复写入新的 `queued` 事件
+- `scheduler.command` 针对单任务的取消/人工接管命令当前也会补齐同一组 `backtest_id / source_change_request_id / source_* / trigger_reason / decision_*` 顶层字段，并附带 `cancelled_job_ids / cancelled_job_count / scheduler_status / freeze_publish`，方便日志页直接近场排障
+- `scheduler.command` 的 `cancel_all` 当前还会额外补齐 `cancelled_job_types / cancelled_strategy_ids / cancelled_backtest_ids / cancelled_source_change_request_ids / cancelled_source_* / cancelled_trigger_reasons / cancelled_decision_readiness_values`，并把摘要收成“本次终止了哪些任务类型、影响了哪些回测链路”
+- `POST /api/ai/scheduler/commands` 当前返回的回执也会直接带 `summary / cancelled_* / source_change_request_id / source_* / decision_*`，桌面端发送命令后会优先展示这条结构化影响面，而不是只回显原始 reason
+- `AI 调度` 页里的任务队列、实时 AI 事件流，以及策略活动二级窗中的任务列表，当前也会直接复用 `backtest_id / source_*` 元数据，允许从任务或完成事件就地打开这轮回测、来源回测、来源复盘和来源提案
+- 总览页“AI 实时日志”当前也会直接复用当前任务与审计事件里的 `job_id / backtest_id / source_* / cancelled_*`，允许从首页近场打开任务、回测、来源链路和单策略活动
+- 状态窗口与 `AI 调度` 页顶部当前也会直接展示最近一次 `scheduler.command` 的结构化摘要、影响面与近场跳转，不必再先翻实时流或审计列表
+- `GET /api/control/snapshot`、`GET /api/ai/scheduler`、`GET /api/ai/live`、`GET /api/ops/live` 当前也会统一返回 `latest_scheduler_command`；桌面端状态窗口与 `AI 调度` 页顶部优先消费这条后端快照字段，并支持直接跳到来源变更，不再只靠前端从审计流临时派生
 - 复盘结果详情小窗当前也会直接显示 `source_job_*` 元数据，并支持从结果反向打开对应 AI 任务，便于顺着“结果 -> 任务 -> 策略”活动链排查
 - 策略活动二级窗与 `AI 复盘` 页里的跟踪复盘列表当前也支持直接 `打开任务`，不需要先点进结果详情再反查
+- 策略活动二级窗里的最近审计事件当前也会直接复用 `job_id / linked_review_id / backtest_id / source_* / cancelled_*`，允许从单策略排障窗口就地打开任务、复盘结果、回测与来源链路
 - AI 调度页当前已支持对 `failed` / `cancelled` 的任务直接发起重试，并保留源任务关联与重试次数
 - AI 复盘当前已支持结构化 JSON 输出解析；OpenClaw 若返回 `summary / highlights / risks / proposals`，系统会直接落库并与本地启发式提案合并
-- `GET /api/ai/reviews` 当前已支持按 `strategy_id / period` 过滤，后续复盘页若切到服务端过滤可直接复用
+- `GET /api/ai/reviews` 当前已支持按 `strategy_id / backtest_id / period` 过滤，后续复盘页与回测页都可直接复用服务端过滤，不必退回前端全量筛
 - 策略页、回测页与 `AI 复盘` 页当前都已开始优先复用 `GET /api/ai/reviews?strategy_id=...` 这类服务端过滤，而不是只在前端全量筛选
+- 回测页“关联 AI 上下文”当前已按 `backtest_id` 对齐到当前选中的回测结果，不再复用策略级最新复盘去误显示上一轮回测或日报
+- 策略页“最新回测”和回测详情当前也会直接展示这轮 `BacktestRun` 的“来源链路”，便于追溯它到底是手动发起、由哪条 `ChangeRequest` 触发、按门禁建议重跑，还是由某条 `backtest_request` 提案触发
+- 回测 `ReviewDocument` 当前也会显式保留 `source_change_request_id / source_backtest_id / source_review_id / source_proposal_id / trigger_reason`，`AI 复盘` 页、复盘结果详情和策略活动二级窗都能直接显示并跳转这条“来源链路”；若来源是某条变更或提案，前端也能直接跳回对应入口
+- 对带 `decision_readiness* / decision_recommended_*` 的回测复盘，复盘结果详情与策略活动二级窗当前也会直接显示“结论门禁”并支持就地“按建议重跑”，不必强制绕回回测页再继续推进
+- 复盘结果详情小窗当前也会像主复盘页一样直接展示这轮结果附带的提案，并支持就地“接受 / 拒绝 / 查看生成回测 / 查看生成复盘”，不需要再先切回 `AI 复盘` 页
+- 若这轮回测对应的 `generate_backtest_review` 任务还没写回复盘结果，桌面端当前也会直接显示对应 AI 任务状态，并支持一键打开 AI 调度或重试失败任务
 - AI 复盘当前还会自动把 `execution_health.top_issue` 与运行线程问题并入风险列表，避免复盘只看到收益结果而漏掉真实执行门禁
 - 当前发给 OpenClaw 的日度复盘 / 回测复盘提示词，也会显式附带执行健康摘要与运行线程状态，避免模型只基于收益数字做总结
 - 同时写入任务队列的 `generate_daily_review / generate_backtest_review` 上下文当前也会带 `execution_health / execution_top_issue / execution_top_issue_symbol / execution_top_issue_detail / runtime_worker_top_issue`，方便后续审计和重试定位
 - 这两类复盘上下文当前还会附带 `execution_top_issue_strategy_activity / review_strategy_activity`，把问题策略或当前复盘策略最近的运行态、提醒、委托、成交与审计事件压成紧凑摘要，便于 OpenClaw 直接引用
+- 回测复盘任务当前会在入队时就固化 `review_strategy_activity`；生成 `generate_backtest_review` 提示词和写回 `ReviewDocument` 时会优先复用这份上下文，不再因稀疏上下文临时拉取 Bybit 实时链路。仅 `generate_daily_review` 仍保留最新执行健康兜底
 - 这份紧凑策略活动摘要当前也会显式带 `runtime.next_action` 和结构化 `execution_preview` 关键信息，包括 `recommended_action` 与 `sizing_*` 资金门槛字段，便于后续复盘与排障直接读取当前阻断建议和余额缺口
 - 当前已提供 `GET /api/strategies/{strategy_id}/activity`，可按单条策略聚合最近运行态、真实/纸面委托、成交、提醒和审计事件，后续策略页二级小窗与 AI 复盘可直接复用
 - 当工作台当前 `selected_mode` 与该策略自身模式不一致时，这条活动接口当前也会优先补齐“按策略自身模式生成的 `execution_preview`”，避免查看单策略排障时还要手动切工作台模式
@@ -224,9 +282,23 @@
 - 同时这条接口当前也会带最近的单策略 AI 复盘摘要，便于在同一个二级窗里同时查看“最近复盘 + 最近任务 + 最近执行”
 - 这条策略活动接口当前还会额外带 `latest_primary_review / latest_tracking_review / latest_tracking_job`，前端无需再手动切整份列表就能做轻摘要
 - 前端当前会根据 `freeze_publish` / `manual_override` 直接禁用发布建议的“接受”动作，并给出明确提示
+- `publish_recommendation` 当前在后端接受时也要求 payload 带有效 `recommendation`；若缺失结构化建议，后端会直接拒绝，不会把提案状态提前打成 `accepted`
+- `script_patch_proposal` 当前接受后会明确转成 `queued` 状态的 `ChangeRequest`，并补写 `change_request.manual_followup_required` 审计事件，表示这类脚本补丁仍需后续人工或编排链落实，不会再被误认为“已自动应用”
+- `ChangeRequest` 当前也会显式保留 `source_review_id / source_proposal_id / trigger_reason`；策略页“待落实 ChangeRequest”列表在接受提案后会直接定位到新建变更，并支持一键跳回来源提案
+- `ChangeRequest` 当前也会继续保留 `source_backtest_id`；如果这条变更来自某轮回测复盘，策略页“待落实 ChangeRequest”列表可直接打开来源回测、来源复盘和来源提案
+- 对 `ChangeRequest(type=backtest.launch)` 而言，后端当前也会继续写回 `linked_backtest_id / linked_backtest_timeframe / linked_backtest_data_range`；策略页“待落实 ChangeRequest”列表可直接打开这轮刚生成的回测，不必再去回测列表反查
+- 对这类 `backtest.launch` 变更，当前卡片的主跟踪任务也会直接指向 `generate_backtest_review`，而不是泛化的 `reconcile_change_request`；后续重试、执行中、失败与完成状态都会围绕这轮回测复盘更新
+- 这类变更当前也会继续写回关联回测的 `sample_quality / decision_readiness / decision_recommended_* / decision_readiness_action`；策略页“待落实 ChangeRequest”卡片可直接看到这轮回测当前是“样本达标 / 待补样本 / 研究参考”，并支持就地“按建议重跑”
+- 若这轮关联回测当前没有 `decision_recommended_*`，但已经给出了 `full_window_recommended_*` 或 `history_source_recommended_*`，策略页“待落实 ChangeRequest”卡片当前也会继续复用这组结构化样本建议，直接显示“样本窗口”提示并支持就地“按建议重跑”
+- 同一张 `ChangeRequest(backtest.launch)` 卡片当前也会继续镜像关联回测的 `requested_* / retrieved_* / used_*` 样本窗口覆盖字段；即使本地暂时拿不到那轮 `BacktestRun` 详情，也能继续显示“请求 / 取样 / 回测”窗口事实，而不只剩一条泛化建议
+- `ChangeRequest` 当前也会继续写回 `follow_up_job_id / follow_up_job_type / follow_up_job_status / follow_up_result_summary / linked_review_*`，让策略页和后续审计直接看到这条变更后续排了哪条跟踪任务、当前跑到哪一步、是否已经生成跟踪复盘
+- 若这条 `backtest.launch` 变更后续又产出了 `generate_backtest_review` 结果，后端当前也会把这条回测复盘继续挂回同一条 `ChangeRequest.linked_review_*`，让策略页可直接从“待落实变更”一路点到结果
+- 若这条跟踪任务失败或被取消，策略页当前也支持直接在 `ChangeRequest` 卡片上重试；后端会把 `follow_up_job_*` 切到新的重试任务，并清空旧的失败摘要与旧结果引用，避免误读
+- 上述来源链当前也会继续带进后续 `reconcile_change_request / review_strategy_change` 任务上下文，以及 `strategy.change.review.completed / failed` 审计事件，避免从提案到变更跟踪中间断档
 - 策略类 `ChangeRequest` 当前在落地后会自动排一个 `reconcile_change_request`，用于补齐 AI 执行记录
 - 已有 Grafana-ready 监控接入：本地服务暴露 `/metrics` Prometheus 指标端点，并提供 Grafana 集成状态接口
 - 前端当前在“设置”页展示 Grafana 接入配置，并在“AI 调度”页提供监控预览小窗
+- `POST /api/settings` 当前会把本地设置持久化到控制端状态，并写入 `settings.updated` 审计事件；其中通知静默时段会直接作用于桌面端普通系统通知，`critical` 级提醒继续放行；OpenClaw `gateway_url / agent` 仍由本机外部配置驱动，设置页继续只读展示，避免出现“UI 已改但运行态未切换”
 - 提醒中心、交易记录、系统日志/审计三页已开始共用统一 ops 实时事件流，并支持筛选当前品种 / 状态 / 来源
 - `alert.rule.update` 当前会直接落地到自选品种，并在实际涨跌超过阈值时自动生成去重后的市场提醒
 - 市场提醒当前会同步维护独立 `AlertRule`，记录阈值、冷却时间、最近一次触发时间与触发幅度
@@ -268,9 +340,10 @@ python3 services/control-api/main.py
 
 ```bash
 pnpm dev:desktop
+pnpm dev:desktop:repair
 ```
 
-这条命令会同时启动本地控制服务、Vite 渲染进程和 Electron 桌面壳。
+`pnpm dev:desktop` 会同时启动本地控制服务、Vite 渲染进程和 Electron 桌面壳；若 `127.0.0.1:8787` 已被不健康的旧 control-api 进程占住，可改用 `pnpm dev:desktop:repair`，它会在命令行匹配 `services/control-api/main.py` 且健康检查持续失败时，显式替换旧进程后再继续启动。
 
 ### 5. 执行验证命令
 

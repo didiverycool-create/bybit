@@ -5,6 +5,7 @@
   "main": "dist-electron/main/main.js",
   "scripts": {
     "dev": "concurrently -k \"node ./scripts/dev-reuse-or-run.mjs http http://127.0.0.1:8787/health python3 ../../services/control-api/main.py\" \"node ./scripts/dev-reuse-or-run.mjs http http://localhost:5173 vite --strictPort\" \"tsc -p tsconfig.electron.json -w\" \"wait-on http://127.0.0.1:8787/health http://localhost:5173 dist-electron/main/main.js && electron .\"",
+    "dev:repair": "concurrently -k \"node ./scripts/dev-reuse-or-run.mjs --replace-unhealthy ../../services/control-api/main.py http http://127.0.0.1:8787/health python3 ../../services/control-api/main.py\" \"node ./scripts/dev-reuse-or-run.mjs http http://localhost:5173 vite --strictPort\" \"tsc -p tsconfig.electron.json -w\" \"wait-on http://127.0.0.1:8787/health http://localhost:5173 dist-electron/main/main.js && electron .\"",
     "build": "npm run build:renderer && npm run build:electron",
     "build:renderer": "vite build",
     "build:electron": "tsc -p tsconfig.electron.json",

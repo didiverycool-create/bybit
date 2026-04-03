@@ -11,4 +11,10 @@ contextBridge.exposeInMainWorld("bybitApp", {
   }) {
     return ipcRenderer.invoke("desktop-notification:show", payload);
   },
+  openPath(payload: {
+    path?: string;
+    revealInFolder?: boolean;
+  }) {
+    return ipcRenderer.invoke("desktop-path:open", payload);
+  },
 });

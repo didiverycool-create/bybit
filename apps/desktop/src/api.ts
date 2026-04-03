@@ -14,6 +14,7 @@ import type {
   ExecutionPreview,
   ExchangePositionBulkCloseResult,
   GrafanaIntegrationStatus,
+  LatestSchedulerCommand,
   MarketDetail,
   MarketLiveSnapshot,
   MarketRecentTrade,
@@ -25,6 +26,7 @@ import type {
   ReviewDocument,
   RuntimeWorkerStatus,
   RuntimeWorkerActionResult,
+  SchedulerCommandResult,
   SchedulerCommandType,
   SchedulerPayload,
   ServiceHealth,
@@ -115,11 +117,15 @@ async function deleteJson<T>(path: string): Promise<T> {
 
 function buildReviewQueryString(options?: {
   strategyId?: string | null
+  backtestId?: string | null
   periods?: string[]
 }) {
   const query = new URLSearchParams()
   if (options?.strategyId) {
     query.set('strategy_id', options.strategyId)
+  }
+  if (options?.backtestId) {
+    query.set('backtest_id', options.backtestId)
   }
   if (options?.periods?.length) {
     query.set('period', options.periods.join(','))
@@ -132,6 +138,7 @@ function filterFallbackReviews(
   reviews: ReviewDocument[],
   options?: {
     strategyId?: string | null
+    backtestId?: string | null
     periods?: string[]
   },
 ) {
@@ -150,6 +157,10 @@ function filterFallbackReviews(
     next = next.filter((review) => allowed.has(review.period))
   }
 
+  if (options?.backtestId) {
+    next = next.filter((review) => review.backtest_id === options.backtestId)
+  }
+
   return next
 }
 
@@ -159,6 +170,22 @@ export async function getServiceHealth(): Promise<ServiceHealth> {
     throw new Error(`本地服务不可用: ${response.status}`)
   }
   return (await response.json()) as ServiceHealth
+}
+
+const fallbackLatestSchedulerCommand: LatestSchedulerCommand = {
+  command: 'enter_manual_override',
+  summary: '已请求人工接管当前任务。',
+  impact_detail: '策略 sol-breakout-03',
+  job_id: 'job-oc-001',
+  strategy_id: 'sol-breakout-03',
+  linked_review_id: null,
+  backtest_id: null,
+  source_change_request_id: null,
+  source_backtest_id: null,
+  source_review_id: null,
+  source_proposal_id: null,
+  occurred_at: new Date().toISOString(),
+  severity: 'warning',
 }
 
 const fallbackSnapshot: ControlSnapshot = {
@@ -194,6 +221,7 @@ const fallbackSnapshot: ControlSnapshot = {
     win_rate: '63.8%',
     best_strategy: 'BTC 趋势跟随',
   },
+  latest_scheduler_command: fallbackLatestSchedulerCommand,
   execution_health: {
     runtime_worker_running: true,
     runtime_worker_issue: false,
@@ -395,6 +423,11 @@ const fallbackBacktests: BacktestRun[] = [
     id: 'bt-001',
     strategy_id: 'trend-btc-01',
     strategy_name: 'BTC 趋势跟随',
+    source_change_request_id: null,
+    source_backtest_id: null,
+    source_review_id: null,
+    source_proposal_id: null,
+    trigger_reason: 'manual_create',
     status: 'completed',
     started_at: new Date().toISOString(),
     finished_at: new Date().toISOString(),
@@ -413,6 +446,36 @@ const fallbackBacktests: BacktestRun[] = [
       pnl: '+152,000 USDT',
       trades: 134,
     },
+    reference_only: false,
+    sample_quality: 'sufficient',
+    history_source: 'exchange_history',
+    history_source_reason: 'none',
+    history_source_detail: null,
+    history_source_recommended_data_range: null,
+    history_source_recommended_timeframe: null,
+    history_source_recommended_action: null,
+    decision_readiness: 'ready',
+    decision_readiness_detail: '当前样本来源、样本量与窗口覆盖已达到最小门槛，可继续结合策略上下文做调参与人工复核。',
+    decision_recommended_data_range: null,
+    decision_recommended_timeframe: null,
+    decision_readiness_action: null,
+    requested_candle_estimate: 0,
+    requested_candle_limit: 0,
+    requested_range_start: null,
+    requested_range_end: null,
+    retrieved_window_completion_pct: 0,
+    used_window_completion_pct: 0,
+    retrieved_candle_count: 0,
+    used_candle_count: 0,
+    retrieved_range_start: null,
+    retrieved_range_end: null,
+    used_range_start: null,
+    used_range_end: null,
+    history_truncated: false,
+    history_gap_reason: 'none',
+    full_window_recommended_data_range: null,
+    full_window_recommended_timeframe: null,
+    full_window_recommended_action: null,
     notes: 'Fallback 回测结果。',
   },
 ]
@@ -440,6 +503,9 @@ const fallbackScheduler: SchedulerPayload = {
       type: 'strategy.parameter.update',
       payload: { strategy_id: 'trend-btc-01', stop_loss_pct: 1.2 },
       requested_by: 'desktop_operator',
+      source_review_id: null,
+      source_proposal_id: null,
+      trigger_reason: 'manual_create',
       target_mode: 'paper',
       priority: 'high',
       status: 'queued',
@@ -449,6 +515,7 @@ const fallbackScheduler: SchedulerPayload = {
       summary: '更新 BTC 趋势策略止损参数',
     },
   ],
+  latest_scheduler_command: fallbackLatestSchedulerCommand,
 }
 
 const fallbackNews: NewsEvent[] = [
@@ -702,6 +769,9 @@ const fallbackSettings: SettingsPayload = {
   openclaw_agent: 'codex',
   default_mode: 'paper',
   notification_channels: ['desktop', 'telegram', 'email'],
+  notification_quiet_hours_enabled: false,
+  notification_quiet_hours_start: '23:00',
+  notification_quiet_hours_end: '08:00',
   product_language: 'zh-CN',
   grafana_base_url: null,
   grafana_dashboard_uid: null,
@@ -734,6 +804,7 @@ bybit_control_openclaw_connected 1
 
 const fallbackAiLive: AiLiveSnapshot = {
   ...fallbackScheduler,
+  latest_scheduler_command: fallbackLatestSchedulerCommand,
   activity_feed: fallbackAudit,
   generated_at: new Date().toISOString(),
 }
@@ -752,11 +823,15 @@ const fallbackOpsLive: OpsLiveSnapshot = {
   alerts: fallbackAlerts,
   trades: fallbackTrades,
   audit_events: fallbackAudit,
+  latest_scheduler_command: fallbackLatestSchedulerCommand,
   generated_at: new Date().toISOString(),
 }
 
 const fallbackOpenClawStatus: OpenClawStatus = {
   configured: true,
+  config_path: '~/.openclaw/openclaw.json',
+  config_exists: false,
+  command_available: false,
   gateway_url: 'ws://127.0.0.1:18789',
   auth_mode: 'token',
   default_agent: 'codex',
@@ -768,6 +843,9 @@ const fallbackBybitPrivateStatus: BybitPrivateStatus = {
   configured: false,
   can_query_private: false,
   source: 'none',
+  config_path: '~/.bybit-control/private-api.json',
+  config_exists: false,
+  example_config_path: '/Users/leo/Desktop/Work/bybit/services/control-api/private-api.example.json',
   api_base_url: 'https://api.bybit.com',
   account_type: 'UNIFIED',
   mode: 'live',
@@ -812,6 +890,19 @@ const fallbackWorkspacePreferences: WorkspacePreferences = {
   selected_symbol: 'BTCUSDT',
   selected_market_timeframe: '1h',
   selected_strategy_id: 'trend-btc-01',
+  selected_backtest_id: null,
+  backtest_filter: 'selected',
+  replay_tracking_scope: 'all',
+  alert_severity_filter: 'all',
+  alert_status_filter: 'pending',
+  alert_scope_filter: 'all',
+  trade_mode_filter: 'all',
+  trade_origin_filter: 'all',
+  trade_scope_filter: 'all',
+  audit_severity_filter: 'all',
+  audit_source_filter: 'all',
+  audit_scope_filter: 'all',
+  audit_search: '',
   overview_card_order: ['ai_center', 'strategy_watch', 'account_center'],
   overview_visible_cards: ['ai_center', 'strategy_watch', 'account_center'],
   overview_collapsed_cards: [],
@@ -943,10 +1034,24 @@ export const api = {
   getAccountOrders: () => fetchJson('/api/account/orders', fallbackOrders),
   getAccountOrderHistory: () => fetchJson('/api/account/order-history', fallbackOrders),
   getTrades: () => fetchJson('/api/trades', fallbackTrades),
-  getReviews: (options?: { strategyId?: string | null; periods?: string[] }) =>
+  getReviews: (options?: { strategyId?: string | null; backtestId?: string | null; periods?: string[] }) =>
     fetchJson(`/api/ai/reviews${buildReviewQueryString(options)}`, filterFallbackReviews(fallbackReviews, options)),
   getAuditEvents: () => fetchJson('/api/audit/events', fallbackAudit),
   getSettings: () => fetchJson('/api/settings', fallbackSettings),
+  updateSettings: (payload: {
+    bybit_web_entry?: string
+    api_base_url?: string
+    default_mode?: 'paper' | 'demo' | 'live'
+    notification_channels?: string[]
+    notification_quiet_hours_enabled?: boolean
+    notification_quiet_hours_start?: string
+    notification_quiet_hours_end?: string
+    product_language?: string
+    grafana_base_url?: string | null
+    grafana_dashboard_uid?: string | null
+    grafana_org_id?: number
+    grafana_theme?: 'dark' | 'light'
+  }) => postJson<SettingsPayload>('/api/settings', payload),
   getGrafanaStatus: () => fetchJson('/api/integrations/grafana', fallbackGrafanaStatus),
   getPrometheusMetrics: () => fetchText('/metrics', fallbackPrometheusMetrics),
   getWorkspacePreferences: () => fetchJson('/api/workspace/preferences', fallbackWorkspacePreferences),
@@ -963,7 +1068,16 @@ export const api = {
     priority?: 'low' | 'normal' | 'high' | 'critical'
     summary: string
   }) => postJson<ChangeRequest>('/api/change-requests', payload),
-  createBacktest: (payload: { strategy_id: string; data_range: string; timeframe: string }) =>
+  createBacktest: (payload: {
+    strategy_id: string
+    data_range: string
+    timeframe: string
+    source_change_request_id?: string | null
+    source_backtest_id?: string | null
+    source_review_id?: string | null
+    source_proposal_id?: string | null
+    trigger_reason?: string | null
+  }) =>
     postJson<BacktestRun>('/api/backtests', payload),
   executeStrategySignal: (
     strategyId: string,
@@ -1068,7 +1182,7 @@ export const api = {
     requested_by?: string
     reason?: string
   }) =>
-    postJson<{ status: string; command: SchedulerCommandType; freeze_publish?: boolean }>(
+    postJson<SchedulerCommandResult>(
       '/api/ai/scheduler/commands',
       payload,
     ),
@@ -1079,6 +1193,19 @@ export const api = {
     selected_symbol: string
     selected_market_timeframe: '15m' | '1h' | '4h' | '1d'
     selected_strategy_id?: string | null
+    selected_backtest_id?: string | null
+    backtest_filter: 'selected' | 'all'
+    replay_tracking_scope: 'all' | 'selected'
+    alert_severity_filter: 'all' | 'P0' | 'P1' | 'P2'
+    alert_status_filter: 'all' | 'pending' | 'acknowledged'
+    alert_scope_filter: 'all' | 'selected'
+    trade_mode_filter: 'all' | 'paper' | 'demo' | 'live'
+    trade_origin_filter: 'all' | 'manual' | 'strategy' | 'exchange'
+    trade_scope_filter: 'all' | 'selected'
+    audit_severity_filter: 'all' | 'info' | 'warning' | 'error' | 'critical'
+    audit_source_filter: string
+    audit_scope_filter: 'all' | 'selected'
+    audit_search: string
     overview_card_order: string[]
     overview_visible_cards: string[]
     overview_collapsed_cards: string[]

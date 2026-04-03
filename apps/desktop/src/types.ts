@@ -60,6 +60,60 @@ export interface SchedulerState {
   current_mode: Mode
 }
 
+export interface SchedulerCommandResult {
+  status: string
+  command: SchedulerCommandType
+  freeze_publish?: boolean
+  summary?: string
+  scheduler_status?: SchedulerStatus
+  job_id?: string | null
+  strategy_id?: string | null
+  review_id?: string | null
+  review_title?: string | null
+  review_period?: string | null
+  linked_review_id?: string | null
+  linked_review_title?: string | null
+  linked_review_period?: string | null
+  backtest_id?: string | null
+  source_change_request_id?: string | null
+  source_backtest_id?: string | null
+  source_review_id?: string | null
+  source_proposal_id?: string | null
+  trigger_reason?: string | null
+  decision_readiness?: string | null
+  decision_readiness_detail?: string | null
+  decision_recommended_data_range?: string | null
+  decision_recommended_timeframe?: string | null
+  decision_readiness_action?: string | null
+  cancelled_job_ids?: string[]
+  cancelled_job_count?: number
+  cancelled_job_types?: string[]
+  cancelled_strategy_ids?: string[]
+  cancelled_backtest_ids?: string[]
+  cancelled_source_change_request_ids?: string[]
+  cancelled_source_backtest_ids?: string[]
+  cancelled_source_review_ids?: string[]
+  cancelled_source_proposal_ids?: string[]
+  cancelled_trigger_reasons?: string[]
+  cancelled_decision_readiness_values?: string[]
+}
+
+export interface LatestSchedulerCommand {
+  command?: SchedulerCommandType | null
+  summary: string
+  impact_detail?: string | null
+  job_id?: string | null
+  strategy_id?: string | null
+  linked_review_id?: string | null
+  backtest_id?: string | null
+  source_change_request_id?: string | null
+  source_backtest_id?: string | null
+  source_review_id?: string | null
+  source_proposal_id?: string | null
+  occurred_at: string
+  severity: Severity
+}
+
 export interface ExecutionHealthSummary {
   runtime_worker_running: boolean
   runtime_worker_issue: boolean
@@ -116,6 +170,7 @@ export interface ControlSnapshot {
   pending_tasks: TaskSummary[]
   today_performance: Record<string, string>
   execution_health: ExecutionHealthSummary
+  latest_scheduler_command?: LatestSchedulerCommand | null
 }
 
 export interface WatchlistInstrument {
@@ -205,6 +260,7 @@ export interface OpsLiveSnapshot {
   alerts: AlertRecord[]
   trades: TradeRecord[]
   audit_events: ExecutionEvent[]
+  latest_scheduler_command?: LatestSchedulerCommand | null
   generated_at: string
 }
 
@@ -293,6 +349,15 @@ export interface StrategyActivitySnapshot {
 export interface StrategyActivityReviewSummary {
   id: string
   period: string
+  backtest_id?: string | null
+  source_job_id?: string | null
+  source_job_type?: string | null
+  source_job_status?: string | null
+  source_change_request_id?: string | null
+  source_backtest_id?: string | null
+  source_review_id?: string | null
+  source_proposal_id?: string | null
+  trigger_reason?: string | null
   title: string
   summary: string
   proposal_count: number
@@ -340,6 +405,11 @@ export interface BacktestRun {
   id: string
   strategy_id: string
   strategy_name: string
+  source_change_request_id?: string | null
+  source_backtest_id?: string | null
+  source_review_id?: string | null
+  source_proposal_id?: string | null
+  trigger_reason?: string | null
   status: 'queued' | 'running' | 'completed' | 'failed'
   started_at: string
   finished_at?: string | null
@@ -351,6 +421,36 @@ export interface BacktestRun {
   slippage_model: string
   parameter_snapshot: Record<string, unknown>
   metrics: BacktestMetrics
+  reference_only: boolean
+  sample_quality: 'reference_only' | 'low_sample' | 'sufficient'
+  history_source?: 'exchange_history' | 'market_detail_fallback'
+  history_source_reason?: 'none' | 'exchange_fetch_failed' | 'insufficient_exchange_samples'
+  history_source_detail?: string | null
+  history_source_recommended_data_range?: string | null
+  history_source_recommended_timeframe?: string | null
+  history_source_recommended_action?: string | null
+  decision_readiness?: 'ready' | 'sample_incomplete' | 'research_only'
+  decision_readiness_detail?: string
+  decision_recommended_data_range?: string | null
+  decision_recommended_timeframe?: string | null
+  decision_readiness_action?: string | null
+  requested_candle_estimate: number
+  requested_candle_limit: number
+  requested_range_start?: string | null
+  requested_range_end?: string | null
+  retrieved_window_completion_pct?: number
+  used_window_completion_pct?: number
+  retrieved_candle_count: number
+  used_candle_count: number
+  retrieved_range_start?: string | null
+  retrieved_range_end?: string | null
+  used_range_start?: string | null
+  used_range_end?: string | null
+  history_truncated: boolean
+  history_gap_reason?: 'none' | 'sample_cap' | 'insufficient_history'
+  full_window_recommended_data_range?: string | null
+  full_window_recommended_timeframe?: string | null
+  full_window_recommended_action?: string | null
   notes: string
 }
 
@@ -359,10 +459,53 @@ export interface ChangeRequest {
   type: string
   payload: Record<string, unknown>
   requested_by: string
+  source_backtest_id?: string | null
+  source_review_id?: string | null
+  source_proposal_id?: string | null
+  trigger_reason?: string | null
   target_mode: Mode
   priority: 'low' | 'normal' | 'high' | 'critical'
   status: ChangeRequestStatus
   correlation_id: string
+  linked_backtest_id?: string | null
+  linked_backtest_timeframe?: string | null
+  linked_backtest_data_range?: string | null
+  linked_backtest_sample_quality?: 'reference_only' | 'low_sample' | 'sufficient' | null
+  linked_backtest_decision_readiness?: 'ready' | 'sample_incomplete' | 'research_only' | null
+  linked_backtest_decision_readiness_detail?: string | null
+  linked_backtest_decision_recommended_data_range?: string | null
+  linked_backtest_decision_recommended_timeframe?: string | null
+  linked_backtest_decision_readiness_action?: string | null
+  linked_backtest_history_source?: 'exchange_history' | 'market_detail_fallback' | null
+  linked_backtest_history_source_reason?: 'none' | 'exchange_fetch_failed' | 'insufficient_exchange_samples' | null
+  linked_backtest_history_source_detail?: string | null
+  linked_backtest_history_source_recommended_data_range?: string | null
+  linked_backtest_history_source_recommended_timeframe?: string | null
+  linked_backtest_history_source_recommended_action?: string | null
+  linked_backtest_requested_candle_estimate?: number
+  linked_backtest_requested_candle_limit?: number
+  linked_backtest_requested_range_start?: string | null
+  linked_backtest_requested_range_end?: string | null
+  linked_backtest_retrieved_window_completion_pct?: number
+  linked_backtest_used_window_completion_pct?: number
+  linked_backtest_retrieved_candle_count?: number
+  linked_backtest_used_candle_count?: number
+  linked_backtest_retrieved_range_start?: string | null
+  linked_backtest_retrieved_range_end?: string | null
+  linked_backtest_used_range_start?: string | null
+  linked_backtest_used_range_end?: string | null
+  linked_backtest_history_truncated?: boolean | null
+  linked_backtest_history_gap_reason?: 'none' | 'sample_cap' | 'insufficient_history' | null
+  linked_backtest_full_window_recommended_data_range?: string | null
+  linked_backtest_full_window_recommended_timeframe?: string | null
+  linked_backtest_full_window_recommended_action?: string | null
+  follow_up_job_id?: string | null
+  follow_up_job_type?: string | null
+  follow_up_job_status?: AgentJob['status'] | null
+  follow_up_result_summary?: string | null
+  linked_review_id?: string | null
+  linked_review_title?: string | null
+  linked_review_period?: string | null
   created_at: string
   updated_at: string
   summary: string
@@ -572,9 +715,20 @@ export interface ReviewDocument {
   id: string
   period: string
   strategy_id?: string | null
+  backtest_id?: string | null
+  source_change_request_id?: string | null
+  source_backtest_id?: string | null
+  source_review_id?: string | null
+  source_proposal_id?: string | null
+  trigger_reason?: string | null
   source_job_id?: string | null
   source_job_type?: string | null
   source_job_status?: string | null
+  decision_readiness?: 'ready' | 'sample_incomplete' | 'research_only' | null
+  decision_readiness_detail?: string | null
+  decision_recommended_data_range?: string | null
+  decision_recommended_timeframe?: string | null
+  decision_readiness_action?: string | null
   title: string
   summary: string
   highlights: string[]
@@ -602,6 +756,9 @@ export interface SettingsPayload {
   openclaw_agent: string
   default_mode: Mode
   notification_channels: string[]
+  notification_quiet_hours_enabled: boolean
+  notification_quiet_hours_start: string
+  notification_quiet_hours_end: string
   product_language: string
   grafana_base_url?: string | null
   grafana_dashboard_uid?: string | null
@@ -628,6 +785,19 @@ export interface WorkspacePreferences {
   selected_symbol: string
   selected_market_timeframe: '15m' | '1h' | '4h' | '1d'
   selected_strategy_id?: string | null
+  selected_backtest_id?: string | null
+  backtest_filter: 'selected' | 'all'
+  replay_tracking_scope: 'all' | 'selected'
+  alert_severity_filter: 'all' | 'P0' | 'P1' | 'P2'
+  alert_status_filter: 'all' | 'pending' | 'acknowledged'
+  alert_scope_filter: 'all' | 'selected'
+  trade_mode_filter: 'all' | Mode
+  trade_origin_filter: 'all' | 'manual' | 'strategy' | 'exchange'
+  trade_scope_filter: 'all' | 'selected'
+  audit_severity_filter: 'all' | 'info' | 'warning' | 'error' | 'critical'
+  audit_source_filter: string
+  audit_scope_filter: 'all' | 'selected'
+  audit_search: string
   overview_card_order: string[]
   overview_visible_cards: string[]
   overview_collapsed_cards: string[]
@@ -636,6 +806,9 @@ export interface WorkspacePreferences {
 
 export interface OpenClawStatus {
   configured: boolean
+  config_path?: string | null
+  config_exists?: boolean
+  command_available?: boolean
   gateway_url?: string | null
   auth_mode?: string | null
   default_agent?: string | null
@@ -656,6 +829,9 @@ export interface BybitPrivateStatus {
   configured: boolean
   can_query_private: boolean
   source: 'env' | 'file' | 'none'
+  config_path?: string | null
+  config_exists?: boolean
+  example_config_path?: string | null
   api_base_url: string
   account_type: string
   mode: Mode
@@ -737,6 +913,7 @@ export interface SchedulerPayload {
   scheduler: SchedulerState
   jobs: AgentJob[]
   change_requests: ChangeRequest[]
+  latest_scheduler_command?: LatestSchedulerCommand | null
 }
 
 export interface AiLiveSnapshot extends SchedulerPayload {

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
@@ -18,6 +19,8 @@ from models import (
     AgentJobCreate,
     AppState,
     BacktestMetrics,
+    derive_backtest_sample_quality,
+    normalize_backtest_timeframe,
     BacktestRun,
     ChangeRequest,
     ChangeRequestCreate,
@@ -44,6 +47,8 @@ from models import (
     WatchlistInstrument,
     WatchlistRemoveResult,
     ReviewDocument,
+    SettingsPayload,
+    SettingsUpdatePayload,
     WorkspacePreferences,
     WorkspacePreferencesUpdate,
 )
@@ -85,6 +90,54 @@ class AppRepository:
 
     def snapshot(self) -> AppState:
         return self.state
+
+    @staticmethod
+    def _normalize_setting_url(value: Optional[str], *, field_label: str) -> Optional[str]:
+        if value is None:
+            return None
+        normalized = str(value).strip()
+        if not normalized:
+            return None
+        if not normalized.startswith(("http://", "https://")):
+            raise ValueError(f"{field_label} 必须以 http:// 或 https:// 开头。")
+        return normalized.rstrip("/")
+
+    @staticmethod
+    def _normalize_optional_string(value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        normalized = str(value).strip()
+        return normalized or None
+
+    @staticmethod
+    def _normalize_quiet_hours_time(value: Optional[str], *, field_label: str) -> str:
+        normalized = str(value or "").strip()
+        if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", normalized):
+            raise ValueError(f"{field_label} 必须使用 HH:MM 的 24 小时格式。")
+        return normalized
+
+    @staticmethod
+    def _normalize_notification_channels(channels: Optional[list[str]]) -> Optional[list[str]]:
+        if channels is None:
+            return None
+        allowed = {"desktop", "telegram", "email"}
+        normalized: list[str] = []
+        for item in channels:
+            candidate = str(item or "").strip().lower()
+            if not candidate:
+                continue
+            if candidate not in allowed:
+                raise ValueError("通知渠道仅支持 desktop / telegram / email。")
+            if candidate not in normalized:
+                normalized.append(candidate)
+        if not normalized:
+            raise ValueError("至少保留一个通知渠道。")
+        return normalized
+
+    @staticmethod
+    def _normalize_workspace_filter_value(value: Optional[str], *, fallback: str = "all") -> str:
+        normalized = str(value or "").strip()
+        return normalized or fallback
 
     def _recompute_alert_summary(self) -> None:
         summary = {"P0": 0, "P1": 0, "P2": 0}
@@ -158,6 +211,370 @@ class AppRepository:
             return datetime.fromisoformat(value)
         except ValueError:
             return datetime.min.replace(tzinfo=timezone.utc)
+
+    @staticmethod
+    def _require_proposal_target_mode(
+        payload: Dict[str, Any],
+        message: str,
+        default_mode: Optional[AccountMode] = None,
+    ) -> AccountMode:
+        raw_mode = str(payload.get("target_mode") or (default_mode.value if default_mode is not None else "")).strip().lower()
+        if raw_mode not in {"paper", "demo", "live"}:
+            raise ValueError(message)
+        return AccountMode(raw_mode)
+
+    @staticmethod
+    def _build_script_patch_change_summary(proposal: StrategyProposal, payload: Dict[str, Any]) -> str:
+        payload_summary = str(payload.get("summary") or payload.get("patch_summary") or "").strip()
+        if payload_summary:
+            return f"接受脚本补丁提案：{proposal.title} - {payload_summary}"
+        description = str(proposal.description or "").strip()
+        if description:
+            return f"接受脚本补丁提案：{proposal.title} - {description}"
+        return f"接受脚本补丁提案：{proposal.title}"
+
+    @staticmethod
+    def _merge_event_payload_value(payload: Dict[str, Any], key: str, value: Any) -> None:
+        existing = payload.get(key)
+        if isinstance(existing, str):
+            if existing.strip():
+                return
+        elif existing is not None:
+            return
+        if value is None:
+            return
+        if isinstance(value, str):
+            value = value.strip()
+            if not value:
+                return
+        payload[key] = value
+
+    @staticmethod
+    def _dedupe_non_empty_strings(values: list[Any]) -> list[str]:
+        normalized: list[str] = []
+        for value in values:
+            if value is None:
+                continue
+            text = str(value).strip()
+            if text and text not in normalized:
+                normalized.append(text)
+        return normalized
+
+    def _enrich_agent_job_event_payload(
+        self,
+        payload: Dict[str, Any],
+        job: AgentJob,
+        review: Optional[ReviewDocument] = None,
+    ) -> Dict[str, Any]:
+        context = job.context if isinstance(job.context, dict) else {}
+        self._merge_event_payload_value(payload, "job_id", job.id)
+        self._merge_event_payload_value(payload, "job_type", job.job_type)
+        self._merge_event_payload_value(payload, "strategy_id", context.get("strategy_id"))
+        self._merge_event_payload_value(
+            payload,
+            "review_id",
+            review.id if review is not None and getattr(review, "id", None) else context.get("linked_review_id"),
+        )
+        self._merge_event_payload_value(
+            payload,
+            "review_title",
+            review.title if review is not None and getattr(review, "title", None) else context.get("linked_review_title"),
+        )
+        self._merge_event_payload_value(
+            payload,
+            "review_period",
+            review.period if review is not None and getattr(review, "period", None) else context.get("linked_review_period"),
+        )
+        self._merge_event_payload_value(
+            payload,
+            "linked_review_id",
+            review.id if review is not None and getattr(review, "id", None) else context.get("linked_review_id"),
+        )
+        self._merge_event_payload_value(
+            payload,
+            "linked_review_title",
+            review.title if review is not None and getattr(review, "title", None) else context.get("linked_review_title"),
+        )
+        self._merge_event_payload_value(
+            payload,
+            "linked_review_period",
+            review.period if review is not None and getattr(review, "period", None) else context.get("linked_review_period"),
+        )
+        self._merge_event_payload_value(
+            payload,
+            "backtest_id",
+            review.backtest_id if review is not None and getattr(review, "backtest_id", None) else context.get("backtest_id"),
+        )
+        self._merge_event_payload_value(
+            payload,
+            "source_change_request_id",
+            review.source_change_request_id
+            if review is not None and getattr(review, "source_change_request_id", None)
+            else context.get("source_change_request_id"),
+        )
+        self._merge_event_payload_value(
+            payload,
+            "source_backtest_id",
+            review.source_backtest_id
+            if review is not None and getattr(review, "source_backtest_id", None)
+            else context.get("source_backtest_id"),
+        )
+        self._merge_event_payload_value(
+            payload,
+            "source_review_id",
+            review.source_review_id
+            if review is not None and getattr(review, "source_review_id", None)
+            else context.get("source_review_id"),
+        )
+        self._merge_event_payload_value(
+            payload,
+            "source_proposal_id",
+            review.source_proposal_id
+            if review is not None and getattr(review, "source_proposal_id", None)
+            else context.get("source_proposal_id"),
+        )
+        self._merge_event_payload_value(
+            payload,
+            "trigger_reason",
+            review.trigger_reason if review is not None and getattr(review, "trigger_reason", None) else context.get("trigger_reason"),
+        )
+        self._merge_event_payload_value(
+            payload,
+            "decision_readiness",
+            review.decision_readiness
+            if review is not None and getattr(review, "decision_readiness", None)
+            else context.get("decision_readiness"),
+        )
+        self._merge_event_payload_value(
+            payload,
+            "decision_readiness_detail",
+            review.decision_readiness_detail
+            if review is not None and getattr(review, "decision_readiness_detail", None)
+            else context.get("decision_readiness_detail"),
+        )
+        self._merge_event_payload_value(
+            payload,
+            "decision_recommended_data_range",
+            review.decision_recommended_data_range
+            if review is not None and getattr(review, "decision_recommended_data_range", None)
+            else context.get("decision_recommended_data_range"),
+        )
+        self._merge_event_payload_value(
+            payload,
+            "decision_recommended_timeframe",
+            review.decision_recommended_timeframe
+            if review is not None and getattr(review, "decision_recommended_timeframe", None)
+            else context.get("decision_recommended_timeframe"),
+        )
+        self._merge_event_payload_value(
+            payload,
+            "decision_readiness_action",
+            review.decision_readiness_action
+            if review is not None and getattr(review, "decision_readiness_action", None)
+            else context.get("decision_readiness_action"),
+        )
+        return payload
+
+    def _enrich_agent_job_collection_payload(
+        self,
+        payload: Dict[str, Any],
+        jobs: list[AgentJob],
+        prefix: str,
+    ) -> Dict[str, Any]:
+        if not jobs:
+            return payload
+        contexts = [job.context if isinstance(job.context, dict) else {} for job in jobs]
+        payload[f"{prefix}_job_ids"] = self._dedupe_non_empty_strings([job.id for job in jobs])
+        payload[f"{prefix}_job_types"] = self._dedupe_non_empty_strings([job.job_type for job in jobs])
+        payload[f"{prefix}_strategy_ids"] = self._dedupe_non_empty_strings([context.get("strategy_id") for context in contexts])
+        payload[f"{prefix}_backtest_ids"] = self._dedupe_non_empty_strings([context.get("backtest_id") for context in contexts])
+        payload[f"{prefix}_source_change_request_ids"] = self._dedupe_non_empty_strings(
+            [context.get("source_change_request_id") for context in contexts]
+        )
+        payload[f"{prefix}_source_backtest_ids"] = self._dedupe_non_empty_strings(
+            [context.get("source_backtest_id") for context in contexts]
+        )
+        payload[f"{prefix}_source_review_ids"] = self._dedupe_non_empty_strings(
+            [context.get("source_review_id") for context in contexts]
+        )
+        payload[f"{prefix}_source_proposal_ids"] = self._dedupe_non_empty_strings(
+            [context.get("source_proposal_id") for context in contexts]
+        )
+        payload[f"{prefix}_trigger_reasons"] = self._dedupe_non_empty_strings(
+            [context.get("trigger_reason") for context in contexts]
+        )
+        payload[f"{prefix}_decision_readiness_values"] = self._dedupe_non_empty_strings(
+            [context.get("decision_readiness") for context in contexts]
+        )
+        return payload
+
+    @staticmethod
+    def _summarize_job_type_breakdown(jobs: list[AgentJob]) -> str:
+        counts: Dict[str, int] = {}
+        order: list[str] = []
+        for job in jobs:
+            job_type = str(job.job_type or "").strip()
+            if not job_type:
+                continue
+            if job_type not in counts:
+                counts[job_type] = 0
+                order.append(job_type)
+            counts[job_type] += 1
+        parts = [f"{job_type} {counts[job_type]} 个" for job_type in order]
+        return "、".join(parts)
+
+    @staticmethod
+    def _build_scheduler_command_summary(
+        command: SchedulerCommand,
+        target_job: Optional[AgentJob],
+        cancelled_jobs: list[AgentJob],
+        scheduler_status: str,
+        freeze_publish: bool,
+    ) -> str:
+        if command.command == SchedulerCommandType.PAUSE:
+            return "AI 调度已暂停。"
+        if command.command == SchedulerCommandType.RESUME:
+            return "AI 调度已恢复运行。"
+        if command.command == SchedulerCommandType.FREEZE_PUBLISH:
+            return "自动发布已冻结。" if freeze_publish else "自动发布已恢复。"
+        if command.command == SchedulerCommandType.CANCEL_JOB:
+            if target_job is not None:
+                return f"已终止任务：{target_job.job_type}"
+            return "已请求终止指定任务。"
+        if command.command == SchedulerCommandType.CANCEL_ALL:
+            if cancelled_jobs:
+                breakdown = AppRepository._summarize_job_type_breakdown(cancelled_jobs)
+                if breakdown:
+                    return f"已终止 {len(cancelled_jobs)} 个任务，其中 {breakdown}。"
+                return f"已终止 {len(cancelled_jobs)} 个任务。"
+            return "已请求终止全部任务。"
+        if command.command == SchedulerCommandType.ENTER_MANUAL_OVERRIDE:
+            if target_job is not None:
+                return f"已进入人工接管，并终止当前任务：{target_job.job_type}"
+            return "已进入人工接管。"
+        return f"已执行调度命令：{command.command}"
+
+    @staticmethod
+    def _summarize_review_execution_preview(preview: Optional[ExecutionPreview]) -> Optional[Dict[str, Any]]:
+        if preview is None:
+            return None
+        return {
+            "action": preview.action,
+            "allowed": preview.allowed,
+            "blocked_reason": preview.blocked_reason,
+            "recommended_action": preview.recommended_action,
+            "projected_position_side": preview.projected_position_side,
+            "projected_position_size": preview.projected_position_size,
+            "available_balance_after": preview.available_balance_after,
+            "sizing_risk_budget": preview.sizing_risk_budget,
+            "sizing_budget_notional": preview.sizing_budget_notional,
+            "sizing_minimum_required_notional": preview.sizing_minimum_required_notional,
+            "sizing_available_balance_gap": preview.sizing_available_balance_gap,
+        }
+
+    def _build_review_strategy_activity_context_locked(self, strategy_id: str) -> Optional[Dict[str, Any]]:
+        strategy = next((item for item in self.state.strategies if item.id == strategy_id), None)
+        if strategy is None:
+            return None
+
+        snapshot = next((item for item in self.state.strategy_runtime_snapshots if item.strategy_id == strategy_id), None)
+        symbol = snapshot.symbol if snapshot is not None else (strategy.symbols[0] if strategy.symbols else "--")
+        market = (
+            snapshot.market
+            if snapshot is not None
+            else next((item.market for item in self.state.watchlist if item.symbol == symbol), "perp")
+        )
+
+        def matches_order(order: OrderRecord) -> bool:
+            return (
+                order.origin == "strategy"
+                and order.symbol == symbol
+                and order.market == market
+                and order.strategy_id in {strategy_id, None}
+            )
+
+        def matches_trade(trade: TradeRecord) -> bool:
+            return (
+                trade.origin == "strategy"
+                and trade.symbol == symbol
+                and trade.market == market
+                and trade.strategy_id in {strategy_id, None}
+            )
+
+        def matches_alert(alert: AlertRecord) -> bool:
+            if alert.source_type != "system":
+                return False
+            rule_key = str(getattr(alert, "rule_key", None) or "")
+            strategy_prefixes = (
+                f"strategy-auto-dispatch:{strategy_id}:",
+                f"strategy-blocked-execution:{strategy_id}:",
+                f"strategy-manual-execution:{strategy_id}:",
+                f"strategy-position-drift:{strategy_id}:",
+                f"strategy-live-stop-loss:{strategy_id}:",
+                f"strategy-exchange-rejected:{strategy_id}:",
+                f"strategy-exchange-rejection-guard:{strategy_id}:",
+                f"strategy-stale-order:{strategy_id}:",
+            )
+            return rule_key.startswith(strategy_prefixes) or alert.symbol == symbol
+
+        def matches_event(event: ExecutionEvent) -> bool:
+            if event.strategy_id == strategy_id:
+                return True
+            if event.symbol != symbol:
+                return False
+            return event.event_type.startswith("strategy.") or event.event_type.startswith("exchange_order.")
+
+        def summarize_order(order: OrderRecord) -> str:
+            return f"{order.symbol} {order.side.value} {order.qty}@{order.price} · {order.status} · {order.source}"
+
+        def summarize_trade(trade: TradeRecord) -> str:
+            return (
+                f"{trade.symbol} {trade.side.value} {trade.quantity}@{trade.price} · "
+                f"{trade.status} · pnl {trade.pnl}"
+            )
+
+        def summarize_alert(alert: AlertRecord) -> str:
+            return f"{alert.severity} {alert.title} · {alert.description}"
+
+        def summarize_event(event: ExecutionEvent) -> str:
+            return f"{event.event_type} · {event.source}"
+
+        active_orders = [item for item in self.state.paper_orders if matches_order(item)]
+        recent_orders = [item for item in self.state.paper_order_history if matches_order(item)]
+        recent_trades = [item for item in self.state.trades if matches_trade(item)]
+        recent_alerts = [item for item in self.state.alerts if matches_alert(item)]
+        recent_audit_events = [item for item in self.state.audit_events if matches_event(item)]
+
+        runtime = (
+            {
+                "signal": snapshot.signal,
+                "guard_state": snapshot.guard_state,
+                "guard_detail": snapshot.guard_detail,
+                "note": snapshot.note,
+                "next_action": snapshot.next_action,
+                "position_alignment": snapshot.position_alignment,
+                "position_alignment_detail": snapshot.position_alignment_detail,
+                "last_execution_event_type": snapshot.last_execution_event_type,
+                "execution_preview": self._summarize_review_execution_preview(snapshot.execution_preview),
+            }
+            if snapshot is not None
+            else None
+        )
+
+        return {
+            "strategy_id": strategy.id,
+            "strategy_name": strategy.name,
+            "symbol": symbol,
+            "mode": strategy.mode.value,
+            "generated_at": now_iso(),
+            "runtime": runtime,
+            "active_order_count": len(active_orders),
+            "active_orders": [summarize_order(order) for order in active_orders[:3]],
+            "recent_orders": [summarize_order(order) for order in recent_orders[:3]],
+            "recent_trades": [summarize_trade(trade) for trade in recent_trades[:3]],
+            "recent_alerts": [summarize_alert(alert) for alert in recent_alerts[:3]],
+            "recent_audit_events": [summarize_event(event) for event in recent_audit_events[:4]],
+        }
 
     def _resolve_mark_price_locked(self, symbol: str, fallback_price: float) -> float:
         watch_item = next((item for item in self.state.watchlist if item.symbol == symbol), None)
@@ -1223,6 +1640,10 @@ class AppRepository:
             type=payload.type,
             payload=payload.payload,
             requested_by=payload.requested_by,
+            source_backtest_id=payload.source_backtest_id,
+            source_review_id=payload.source_review_id,
+            source_proposal_id=payload.source_proposal_id,
+            trigger_reason=payload.trigger_reason or "manual_create",
             target_mode=payload.target_mode,
             priority=payload.priority,
             status=ChangeRequestStatus.QUEUED,
@@ -1240,6 +1661,132 @@ class AppRepository:
             symbol=payload.payload.get("symbol"),
             strategy_id=payload.payload.get("strategy_id"),
         )
+        return record
+
+    def _sync_change_request_follow_up_locked(
+        self,
+        change_request_id: Optional[str],
+        *,
+        job: Optional[AgentJob] = None,
+        backtest: Optional[BacktestRun] = None,
+        review: Optional[ReviewDocument] = None,
+        result_summary: Optional[str] = None,
+    ) -> Optional[ChangeRequest]:
+        change_request_key = str(change_request_id or "").strip()
+        if not change_request_key:
+            return None
+        record = next((item for item in self.state.change_requests if item.id == change_request_key), None)
+        if record is None:
+            return None
+        if job is not None and record.type == "backtest.launch" and job.job_type == "reconcile_change_request":
+            if backtest is not None:
+                record.linked_backtest_id = backtest.id
+                record.linked_backtest_timeframe = backtest.timeframe
+                record.linked_backtest_data_range = backtest.data_range
+                record.linked_backtest_sample_quality = backtest.sample_quality
+                record.linked_backtest_decision_readiness = backtest.decision_readiness
+                record.linked_backtest_decision_readiness_detail = backtest.decision_readiness_detail
+                record.linked_backtest_decision_recommended_data_range = backtest.decision_recommended_data_range
+                record.linked_backtest_decision_recommended_timeframe = backtest.decision_recommended_timeframe
+                record.linked_backtest_decision_readiness_action = backtest.decision_readiness_action
+                record.linked_backtest_history_source = backtest.history_source
+                record.linked_backtest_history_source_reason = backtest.history_source_reason
+                record.linked_backtest_history_source_detail = backtest.history_source_detail
+                record.linked_backtest_history_source_recommended_data_range = (
+                    backtest.history_source_recommended_data_range
+                )
+                record.linked_backtest_history_source_recommended_timeframe = (
+                    backtest.history_source_recommended_timeframe
+                )
+                record.linked_backtest_history_source_recommended_action = backtest.history_source_recommended_action
+                record.linked_backtest_requested_candle_estimate = backtest.requested_candle_estimate
+                record.linked_backtest_requested_candle_limit = backtest.requested_candle_limit
+                record.linked_backtest_requested_range_start = backtest.requested_range_start
+                record.linked_backtest_requested_range_end = backtest.requested_range_end
+                record.linked_backtest_retrieved_window_completion_pct = backtest.retrieved_window_completion_pct
+                record.linked_backtest_used_window_completion_pct = backtest.used_window_completion_pct
+                record.linked_backtest_retrieved_candle_count = backtest.retrieved_candle_count
+                record.linked_backtest_used_candle_count = backtest.used_candle_count
+                record.linked_backtest_retrieved_range_start = backtest.retrieved_range_start
+                record.linked_backtest_retrieved_range_end = backtest.retrieved_range_end
+                record.linked_backtest_used_range_start = backtest.used_range_start
+                record.linked_backtest_used_range_end = backtest.used_range_end
+                record.linked_backtest_history_truncated = backtest.history_truncated
+                record.linked_backtest_history_gap_reason = backtest.history_gap_reason
+                record.linked_backtest_full_window_recommended_data_range = (
+                    backtest.full_window_recommended_data_range
+                )
+                record.linked_backtest_full_window_recommended_timeframe = (
+                    backtest.full_window_recommended_timeframe
+                )
+                record.linked_backtest_full_window_recommended_action = backtest.full_window_recommended_action
+            if review is not None:
+                record.linked_review_id = review.id
+                record.linked_review_title = review.title
+                record.linked_review_period = review.period
+            record.updated_at = now_iso()
+            return record
+        if job is not None:
+            record.follow_up_job_id = job.id
+            record.follow_up_job_type = job.job_type
+            record.follow_up_job_status = job.status
+        if backtest is not None:
+            record.linked_backtest_id = backtest.id
+            record.linked_backtest_timeframe = backtest.timeframe
+            record.linked_backtest_data_range = backtest.data_range
+            record.linked_backtest_sample_quality = backtest.sample_quality
+            record.linked_backtest_decision_readiness = backtest.decision_readiness
+            record.linked_backtest_decision_readiness_detail = backtest.decision_readiness_detail
+            record.linked_backtest_decision_recommended_data_range = backtest.decision_recommended_data_range
+            record.linked_backtest_decision_recommended_timeframe = backtest.decision_recommended_timeframe
+            record.linked_backtest_decision_readiness_action = backtest.decision_readiness_action
+            record.linked_backtest_history_source = backtest.history_source
+            record.linked_backtest_history_source_reason = backtest.history_source_reason
+            record.linked_backtest_history_source_detail = backtest.history_source_detail
+            record.linked_backtest_history_source_recommended_data_range = (
+                backtest.history_source_recommended_data_range
+            )
+            record.linked_backtest_history_source_recommended_timeframe = (
+                backtest.history_source_recommended_timeframe
+            )
+            record.linked_backtest_history_source_recommended_action = backtest.history_source_recommended_action
+            record.linked_backtest_requested_candle_estimate = backtest.requested_candle_estimate
+            record.linked_backtest_requested_candle_limit = backtest.requested_candle_limit
+            record.linked_backtest_requested_range_start = backtest.requested_range_start
+            record.linked_backtest_requested_range_end = backtest.requested_range_end
+            record.linked_backtest_retrieved_window_completion_pct = backtest.retrieved_window_completion_pct
+            record.linked_backtest_used_window_completion_pct = backtest.used_window_completion_pct
+            record.linked_backtest_retrieved_candle_count = backtest.retrieved_candle_count
+            record.linked_backtest_used_candle_count = backtest.used_candle_count
+            record.linked_backtest_retrieved_range_start = backtest.retrieved_range_start
+            record.linked_backtest_retrieved_range_end = backtest.retrieved_range_end
+            record.linked_backtest_used_range_start = backtest.used_range_start
+            record.linked_backtest_used_range_end = backtest.used_range_end
+            record.linked_backtest_history_truncated = backtest.history_truncated
+            record.linked_backtest_history_gap_reason = backtest.history_gap_reason
+            record.linked_backtest_full_window_recommended_data_range = (
+                backtest.full_window_recommended_data_range
+            )
+            record.linked_backtest_full_window_recommended_timeframe = (
+                backtest.full_window_recommended_timeframe
+            )
+            record.linked_backtest_full_window_recommended_action = backtest.full_window_recommended_action
+        if result_summary is not None:
+            record.follow_up_result_summary = result_summary
+        elif job is not None:
+            if job.result_summary is not None:
+                record.follow_up_result_summary = job.result_summary
+            elif job.status in {JobStatus.QUEUED, JobStatus.RUNNING, JobStatus.WAITING}:
+                record.follow_up_result_summary = None
+        if review is not None:
+            record.linked_review_id = review.id
+            record.linked_review_title = review.title
+            record.linked_review_period = review.period
+        elif job is not None and job.status in {JobStatus.QUEUED, JobStatus.RUNNING, JobStatus.WAITING, JobStatus.FAILED, JobStatus.CANCELLED}:
+            record.linked_review_id = None
+            record.linked_review_title = None
+            record.linked_review_period = None
+        record.updated_at = now_iso()
         return record
 
     def _create_agent_job_locked(self, payload: AgentJobCreate, source: str = "desktop") -> AgentJob:
@@ -1270,17 +1817,20 @@ class AppRepository:
         )
         self.state.agent_jobs.insert(0, record)
         self._recompute_scheduler_queue_depth()
+        queued_event_payload = record.model_dump(mode="json")
+        queued_event_payload["summary"] = f"任务已入队：{record.job_type}"
+        self._enrich_agent_job_event_payload(queued_event_payload, record)
         self.add_event(
             event_type="openclaw.job.queued",
             source=source,
             severity=EventSeverity.INFO,
-            payload=record.model_dump(mode="json"),
+            payload=queued_event_payload,
             strategy_id=payload.context.get("strategy_id"),
         )
         return record
 
     def _queue_change_request_reconcile_locked(self, record: ChangeRequest) -> AgentJob:
-        return self._create_agent_job_locked(
+        job = self._create_agent_job_locked(
             AgentJobCreate(
                 job_type="reconcile_change_request",
                 context={
@@ -1290,6 +1840,10 @@ class AppRepository:
                     "strategy_id": record.payload.get("strategy_id"),
                     "symbol": record.payload.get("symbol"),
                     "requested_by": record.requested_by,
+                    "source_backtest_id": record.source_backtest_id,
+                    "source_review_id": record.source_review_id,
+                    "source_proposal_id": record.source_proposal_id,
+                    "trigger_reason": record.trigger_reason,
                     "target_mode": record.target_mode.value,
                     "payload": record.payload,
                 },
@@ -1300,9 +1854,11 @@ class AppRepository:
             ),
             source="mock-orchestrator",
         )
+        self._sync_change_request_follow_up_locked(record.id, job=job)
+        return job
 
     def _queue_strategy_change_review_locked(self, record: ChangeRequest) -> AgentJob:
-        return self._create_agent_job_locked(
+        job = self._create_agent_job_locked(
             AgentJobCreate(
                 job_type="review_strategy_change",
                 context={
@@ -1312,6 +1868,10 @@ class AppRepository:
                     "strategy_id": record.payload.get("strategy_id"),
                     "symbol": record.payload.get("symbol"),
                     "requested_by": record.requested_by,
+                    "source_backtest_id": record.source_backtest_id,
+                    "source_review_id": record.source_review_id,
+                    "source_proposal_id": record.source_proposal_id,
+                    "trigger_reason": record.trigger_reason,
                     "target_mode": record.target_mode.value,
                     "payload": record.payload,
                 },
@@ -1322,6 +1882,8 @@ class AppRepository:
             ),
             source="mock-orchestrator",
         )
+        self._sync_change_request_follow_up_locked(record.id, job=job)
+        return job
 
     @staticmethod
     def _should_queue_strategy_change_review(record: ChangeRequest) -> bool:
@@ -1339,21 +1901,37 @@ class AppRepository:
             "proposal.script_patch_proposal",
         }
 
-    def _create_backtest_locked(self, strategy_id: str, data_range: str, timeframe: str) -> BacktestRun:
+    def _create_backtest_locked(
+        self,
+        strategy_id: str,
+        data_range: str,
+        timeframe: str,
+        source_change_request_id: Optional[str] = None,
+        source_backtest_id: Optional[str] = None,
+        source_review_id: Optional[str] = None,
+        source_proposal_id: Optional[str] = None,
+        trigger_reason: Optional[str] = None,
+    ) -> BacktestRun:
         strategy = next((item for item in self.state.strategies if item.id == strategy_id), None)
         if strategy is None:
             raise KeyError(strategy_id)
+        normalized_timeframe = normalize_backtest_timeframe(timeframe)
         timestamp = now_iso()
-        computed = self.backtest_runner(strategy, data_range, timeframe) if self.backtest_runner else None
+        computed = self.backtest_runner(strategy, data_range, normalized_timeframe) if self.backtest_runner else None
         record = BacktestRun(
             id=f"bt-{uuid4().hex[:6]}",
             strategy_id=strategy.id,
             strategy_name=strategy.name,
+            source_change_request_id=source_change_request_id,
+            source_backtest_id=source_backtest_id,
+            source_review_id=source_review_id,
+            source_proposal_id=source_proposal_id,
+            trigger_reason=trigger_reason or "manual_create",
             status="completed",
             started_at=timestamp,
             finished_at=timestamp,
             symbol_scope=list(computed.get("symbol_scope", strategy.symbols)) if computed else strategy.symbols,
-            timeframe=timeframe,
+            timeframe=normalized_timeframe,
             data_range=data_range,
             data_granularity=str(computed.get("data_granularity", "kline+trade" if strategy.category == "python" else "kline")) if computed else ("kline+trade" if strategy.category == "python" else "kline"),
             fee_model="bybit-v5-standard",
@@ -1366,6 +1944,151 @@ class AppRepository:
                 win_rate="59.8%",
                 pnl="+52,400 USDT",
                 trades=112,
+            ),
+            reference_only=bool(computed.get("reference_only")) if computed else False,
+            sample_quality=(
+                str(computed.get("sample_quality"))
+                if computed and computed.get("sample_quality")
+                else derive_backtest_sample_quality(
+                    bool(computed.get("reference_only")) if computed else False,
+                    int(computed.get("metrics").trades) if computed and computed.get("metrics") else 112,
+                )
+            ),
+            history_source=(
+                str(computed.get("history_source"))
+                if computed and computed.get("history_source")
+                else "exchange_history"
+            ),
+            history_source_reason=(
+                str(computed.get("history_source_reason"))
+                if computed and computed.get("history_source_reason")
+                else "none"
+            ),
+            history_source_detail=(
+                str(computed.get("history_source_detail"))
+                if computed and computed.get("history_source_detail")
+                else None
+            ),
+            history_source_recommended_data_range=(
+                str(computed.get("history_source_recommended_data_range"))
+                if computed and computed.get("history_source_recommended_data_range")
+                else None
+            ),
+            history_source_recommended_timeframe=(
+                str(computed.get("history_source_recommended_timeframe"))
+                if computed and computed.get("history_source_recommended_timeframe")
+                else None
+            ),
+            history_source_recommended_action=(
+                str(computed.get("history_source_recommended_action"))
+                if computed and computed.get("history_source_recommended_action")
+                else None
+            ),
+            decision_readiness=(
+                str(computed.get("decision_readiness"))
+                if computed and computed.get("decision_readiness")
+                else "ready"
+            ),
+            decision_readiness_detail=(
+                str(computed.get("decision_readiness_detail"))
+                if computed and computed.get("decision_readiness_detail")
+                else ""
+            ),
+            decision_recommended_data_range=(
+                str(computed.get("decision_recommended_data_range"))
+                if computed and computed.get("decision_recommended_data_range")
+                else None
+            ),
+            decision_recommended_timeframe=(
+                str(computed.get("decision_recommended_timeframe"))
+                if computed and computed.get("decision_recommended_timeframe")
+                else None
+            ),
+            decision_readiness_action=(
+                str(computed.get("decision_readiness_action"))
+                if computed and computed.get("decision_readiness_action")
+                else None
+            ),
+            requested_candle_estimate=(
+                int(computed.get("requested_candle_estimate"))
+                if computed and computed.get("requested_candle_estimate") is not None
+                else 0
+            ),
+            requested_candle_limit=(
+                int(computed.get("requested_candle_limit"))
+                if computed and computed.get("requested_candle_limit") is not None
+                else 0
+            ),
+            requested_range_start=(
+                str(computed.get("requested_range_start"))
+                if computed and computed.get("requested_range_start")
+                else None
+            ),
+            requested_range_end=(
+                str(computed.get("requested_range_end"))
+                if computed and computed.get("requested_range_end")
+                else None
+            ),
+            retrieved_window_completion_pct=(
+                float(computed.get("retrieved_window_completion_pct"))
+                if computed and computed.get("retrieved_window_completion_pct") is not None
+                else 0.0
+            ),
+            used_window_completion_pct=(
+                float(computed.get("used_window_completion_pct"))
+                if computed and computed.get("used_window_completion_pct") is not None
+                else 0.0
+            ),
+            retrieved_candle_count=(
+                int(computed.get("retrieved_candle_count"))
+                if computed and computed.get("retrieved_candle_count") is not None
+                else 0
+            ),
+            used_candle_count=(
+                int(computed.get("used_candle_count"))
+                if computed and computed.get("used_candle_count") is not None
+                else 0
+            ),
+            retrieved_range_start=(
+                str(computed.get("retrieved_range_start"))
+                if computed and computed.get("retrieved_range_start")
+                else None
+            ),
+            retrieved_range_end=(
+                str(computed.get("retrieved_range_end"))
+                if computed and computed.get("retrieved_range_end")
+                else None
+            ),
+            used_range_start=(
+                str(computed.get("used_range_start"))
+                if computed and computed.get("used_range_start")
+                else None
+            ),
+            used_range_end=(
+                str(computed.get("used_range_end"))
+                if computed and computed.get("used_range_end")
+                else None
+            ),
+            history_truncated=bool(computed.get("history_truncated")) if computed else False,
+            history_gap_reason=(
+                str(computed.get("history_gap_reason"))
+                if computed and computed.get("history_gap_reason")
+                else "none"
+            ),
+            full_window_recommended_data_range=(
+                str(computed.get("full_window_recommended_data_range"))
+                if computed and computed.get("full_window_recommended_data_range")
+                else None
+            ),
+            full_window_recommended_timeframe=(
+                str(computed.get("full_window_recommended_timeframe"))
+                if computed and computed.get("full_window_recommended_timeframe")
+                else None
+            ),
+            full_window_recommended_action=(
+                str(computed.get("full_window_recommended_action"))
+                if computed and computed.get("full_window_recommended_action")
+                else None
             ),
             notes=str(computed.get("notes")) if computed else "由控制端发起的即时回测，当前为 mock 结果用于联调。",
         )
@@ -1391,18 +2114,55 @@ class AppRepository:
         payload = AgentJobCreate(
             job_type="generate_backtest_review",
             context={
+                "change_request_id": backtest.source_change_request_id,
                 "strategy_id": backtest.strategy_id,
                 "strategy_name": backtest.strategy_name,
                 "focus_symbols": backtest.symbol_scope,
                 "timeframe": backtest.timeframe,
                 "data_range": backtest.data_range,
                 "metrics": backtest.metrics.model_dump(mode="json"),
+                "reference_only": backtest.reference_only,
+                "sample_quality": backtest.sample_quality,
+                "history_source": backtest.history_source,
+                "history_source_reason": backtest.history_source_reason,
+                "history_source_detail": backtest.history_source_detail,
+                "history_source_recommended_data_range": backtest.history_source_recommended_data_range,
+                "history_source_recommended_timeframe": backtest.history_source_recommended_timeframe,
+                "history_source_recommended_action": backtest.history_source_recommended_action,
+                "decision_readiness": backtest.decision_readiness,
+                "decision_readiness_detail": backtest.decision_readiness_detail,
+                "decision_recommended_data_range": backtest.decision_recommended_data_range,
+                "decision_recommended_timeframe": backtest.decision_recommended_timeframe,
+                "decision_readiness_action": backtest.decision_readiness_action,
+                "requested_candle_estimate": backtest.requested_candle_estimate,
+                "requested_candle_limit": backtest.requested_candle_limit,
+                "requested_range_start": backtest.requested_range_start,
+                "requested_range_end": backtest.requested_range_end,
+                "retrieved_window_completion_pct": backtest.retrieved_window_completion_pct,
+                "used_window_completion_pct": backtest.used_window_completion_pct,
+                "retrieved_candle_count": backtest.retrieved_candle_count,
+                "used_candle_count": backtest.used_candle_count,
+                "retrieved_range_start": backtest.retrieved_range_start,
+                "retrieved_range_end": backtest.retrieved_range_end,
+                "used_range_start": backtest.used_range_start,
+                "used_range_end": backtest.used_range_end,
+                "history_truncated": backtest.history_truncated,
+                "history_gap_reason": backtest.history_gap_reason,
+                "full_window_recommended_data_range": backtest.full_window_recommended_data_range,
+                "full_window_recommended_timeframe": backtest.full_window_recommended_timeframe,
+                "full_window_recommended_action": backtest.full_window_recommended_action,
                 "parameter_snapshot": backtest.parameter_snapshot,
                 "requested_by": requested_by,
                 "mode": strategy.mode.value,
                 "backtest_id": backtest.id,
+                "source_change_request_id": backtest.source_change_request_id,
+                "source_backtest_id": backtest.source_backtest_id,
+                "source_review_id": backtest.source_review_id,
+                "source_proposal_id": backtest.source_proposal_id,
+                "trigger_reason": backtest.trigger_reason,
                 "execution_health": execution_health,
                 "execution_top_issue": execution_health.get("top_issue"),
+                "review_strategy_activity": self._build_review_strategy_activity_context_locked(backtest.strategy_id),
             },
             allowed_actions=["review_backtest", "propose_next_step"],
             timeout=90,
@@ -1416,6 +2176,13 @@ class AppRepository:
             for proposal in review.proposals:
                 if proposal.id == proposal_id:
                     return proposal
+        raise KeyError(proposal_id)
+
+    def _find_review_for_proposal(self, proposal_id: str) -> ReviewDocument:
+        for review in self.state.reviews:
+            for proposal in review.proposals:
+                if proposal.id == proposal_id:
+                    return review
         raise KeyError(proposal_id)
 
     def _find_strategy(self, strategy_id: str):
@@ -1508,8 +2275,14 @@ class AppRepository:
                 strategy_id=strategy_id,
                 data_range=str(payload.get("data_range", "2025-12-01 ~ 2026-03-29")),
                 timeframe=str(payload.get("timeframe", "1h")),
+                source_change_request_id=record.id,
+                source_review_id=record.source_review_id,
+                source_proposal_id=record.source_proposal_id,
+                trigger_reason=record.trigger_reason,
             )
-            self._queue_backtest_review_locked(created_backtest, requested_by=record.requested_by)
+            self._sync_change_request_follow_up_locked(record.id, backtest=created_backtest)
+            backtest_review_job = self._queue_backtest_review_locked(created_backtest, requested_by=record.requested_by)
+            self._sync_change_request_follow_up_locked(record.id, job=backtest_review_job, backtest=created_backtest)
             applied = True
         elif change_type == "alert.rule.update":
             symbol = str(payload.get("symbol") or "").upper()
@@ -1558,6 +2331,106 @@ class AppRepository:
             self._refresh_derived_state()
             self._persist()
             return record
+
+    def update_settings(self, payload: SettingsUpdatePayload) -> SettingsPayload:
+        with self._lock:
+            current = self.state.settings
+            bybit_web_entry = (
+                self._normalize_setting_url(payload.bybit_web_entry, field_label="网页入口")
+                if payload.bybit_web_entry is not None
+                else current.bybit_web_entry
+            )
+            api_base_url = (
+                self._normalize_setting_url(payload.api_base_url, field_label="API Base URL")
+                if payload.api_base_url is not None
+                else current.api_base_url
+            )
+            product_language = (
+                self._normalize_optional_string(payload.product_language)
+                if payload.product_language is not None
+                else current.product_language
+            )
+            if not product_language:
+                raise ValueError("产品语言不能为空。")
+            grafana_base_url = (
+                self._normalize_setting_url(payload.grafana_base_url, field_label="Grafana Base URL")
+                if payload.grafana_base_url is not None
+                else current.grafana_base_url
+            )
+            grafana_dashboard_uid = (
+                self._normalize_optional_string(payload.grafana_dashboard_uid)
+                if payload.grafana_dashboard_uid is not None
+                else current.grafana_dashboard_uid
+            )
+            grafana_org_id = payload.grafana_org_id if payload.grafana_org_id is not None else current.grafana_org_id
+            if grafana_org_id < 1:
+                raise ValueError("Grafana Org ID 必须大于等于 1。")
+            notification_channels = (
+                self._normalize_notification_channels(payload.notification_channels)
+                if payload.notification_channels is not None
+                else list(current.notification_channels)
+            )
+            notification_quiet_hours_enabled = (
+                payload.notification_quiet_hours_enabled
+                if payload.notification_quiet_hours_enabled is not None
+                else current.notification_quiet_hours_enabled
+            )
+            notification_quiet_hours_start = (
+                self._normalize_quiet_hours_time(
+                    payload.notification_quiet_hours_start,
+                    field_label="通知静默开始时间",
+                )
+                if payload.notification_quiet_hours_start is not None
+                else current.notification_quiet_hours_start
+            )
+            notification_quiet_hours_end = (
+                self._normalize_quiet_hours_time(
+                    payload.notification_quiet_hours_end,
+                    field_label="通知静默结束时间",
+                )
+                if payload.notification_quiet_hours_end is not None
+                else current.notification_quiet_hours_end
+            )
+            if notification_quiet_hours_enabled and notification_quiet_hours_start == notification_quiet_hours_end:
+                raise ValueError("通知静默开始和结束时间不能相同。")
+            next_settings = SettingsPayload(
+                bybit_web_entry=bybit_web_entry or current.bybit_web_entry,
+                api_base_url=api_base_url or current.api_base_url,
+                openclaw_gateway_url=current.openclaw_gateway_url,
+                openclaw_agent=current.openclaw_agent,
+                default_mode=payload.default_mode or current.default_mode,
+                notification_channels=notification_channels,
+                notification_quiet_hours_enabled=notification_quiet_hours_enabled,
+                notification_quiet_hours_start=notification_quiet_hours_start,
+                notification_quiet_hours_end=notification_quiet_hours_end,
+                product_language=product_language,
+                grafana_base_url=grafana_base_url,
+                grafana_dashboard_uid=grafana_dashboard_uid,
+                grafana_org_id=grafana_org_id,
+                grafana_theme=payload.grafana_theme or current.grafana_theme,
+            )
+            self.state.settings = next_settings
+            self.add_event(
+                event_type="settings.updated",
+                source="desktop",
+                severity=EventSeverity.INFO,
+                payload={
+                    "summary": "本地设置已更新。",
+                    "bybit_web_entry": next_settings.bybit_web_entry,
+                    "api_base_url": next_settings.api_base_url,
+                    "default_mode": next_settings.default_mode.value,
+                    "notification_channels": next_settings.notification_channels,
+                    "notification_quiet_hours_enabled": next_settings.notification_quiet_hours_enabled,
+                    "notification_quiet_hours_start": next_settings.notification_quiet_hours_start,
+                    "notification_quiet_hours_end": next_settings.notification_quiet_hours_end,
+                    "grafana_base_url": next_settings.grafana_base_url,
+                    "grafana_dashboard_uid": next_settings.grafana_dashboard_uid,
+                    "grafana_org_id": next_settings.grafana_org_id,
+                    "grafana_theme": next_settings.grafana_theme,
+                },
+            )
+            self._persist()
+            return next_settings
 
     def acknowledge_alert(self, alert_id: str, payload: AlertAcknowledgePayload) -> AlertRecord:
         with self._lock:
@@ -1613,15 +2486,24 @@ class AppRepository:
             )
             retried_job.retried_from_job_id = job.id
             retried_job.retry_count = retry_count
+            self._sync_change_request_follow_up_locked(
+                str(retried_job.context.get("change_request_id") or "") or None,
+                job=retried_job,
+            )
+            retry_requested_payload = {
+                "previous_job_id": job.id,
+                "retry_job_id": retried_job.id,
+                "requested_by": requested_by,
+                "retried_from_job_id": job.id,
+                "retry_count": retry_count,
+                "summary": f"已请求重试任务：{job.job_type}",
+            }
+            self._enrich_agent_job_event_payload(retry_requested_payload, retried_job)
             self.add_event(
                 event_type="openclaw.job.retry_requested",
                 source="desktop",
                 severity=EventSeverity.INFO,
-                payload={
-                    "previous_job_id": job.id,
-                    "retry_job_id": retried_job.id,
-                    "requested_by": requested_by,
-                },
+                payload=retry_requested_payload,
                 strategy_id=str(job.context.get("strategy_id") or "") or None,
             )
             self._persist()
@@ -1642,11 +2524,18 @@ class AppRepository:
             scheduler.current_job_id = next_job.id
             scheduler.last_heartbeat_at = now_iso()
             self._recompute_scheduler_queue_depth()
+            self._sync_change_request_follow_up_locked(
+                str(next_job.context.get("change_request_id") or "") or None,
+                job=next_job,
+            )
+            started_event_payload = next_job.model_dump(mode="json")
+            started_event_payload["summary"] = f"任务开始执行：{next_job.job_type}"
+            self._enrich_agent_job_event_payload(started_event_payload, next_job)
             self.add_event(
                 event_type="openclaw.job.started",
                 source="openclaw",
                 severity=EventSeverity.INFO,
-                payload=next_job.model_dump(mode="json"),
+                payload=started_event_payload,
                 strategy_id=str(next_job.context.get("strategy_id") or "") or None,
             )
             self._persist()
@@ -1685,19 +2574,97 @@ class AppRepository:
                 job.linked_review_title = review.title
                 job.linked_review_period = review.period
                 self.state.reviews.insert(0, review)
+            self._sync_change_request_follow_up_locked(
+                str(job.context.get("change_request_id") or "") or None,
+                job=job,
+                review=review,
+                result_summary=result_summary,
+            )
+            if job.job_type == "generate_backtest_review":
+                linked_backtest_id = (
+                    review.backtest_id
+                    if review is not None and getattr(review, "backtest_id", None)
+                    else str(job.context.get("backtest_id") or "").strip() or None
+                )
+                linked_backtest = next(
+                    (item for item in self.state.backtests if item.id == linked_backtest_id),
+                    None,
+                )
+                self._sync_change_request_follow_up_locked(
+                    str(job.context.get("source_change_request_id") or "") or None,
+                    backtest=linked_backtest,
+                    review=review,
+                )
             self._recompute_scheduler_queue_depth()
+            completed_event_payload = {
+                "job_id": job.id,
+                "job_type": job.job_type,
+                "result_summary": result_summary,
+                "review_id": review.id if review else None,
+                "review_title": review.title if review else None,
+                "review_period": review.period if review else None,
+            }
+            if job.job_type == "generate_backtest_review":
+                completed_event_payload.update(
+                    {
+                        "backtest_id": (
+                            review.backtest_id
+                            if review and review.backtest_id
+                            else job.context.get("backtest_id")
+                        ),
+                        "source_backtest_id": (
+                            review.source_backtest_id
+                            if review and review.source_backtest_id
+                            else job.context.get("source_backtest_id")
+                        ),
+                        "source_review_id": (
+                            review.source_review_id
+                            if review and review.source_review_id
+                            else job.context.get("source_review_id")
+                        ),
+                        "source_proposal_id": (
+                            review.source_proposal_id
+                            if review and review.source_proposal_id
+                            else job.context.get("source_proposal_id")
+                        ),
+                        "trigger_reason": (
+                            review.trigger_reason
+                            if review and review.trigger_reason
+                            else job.context.get("trigger_reason")
+                        ),
+                        "decision_readiness": (
+                            review.decision_readiness
+                            if review and review.decision_readiness
+                            else job.context.get("decision_readiness")
+                        ),
+                        "decision_readiness_detail": (
+                            review.decision_readiness_detail
+                            if review and review.decision_readiness_detail
+                            else job.context.get("decision_readiness_detail")
+                        ),
+                        "decision_recommended_data_range": (
+                            review.decision_recommended_data_range
+                            if review and review.decision_recommended_data_range
+                            else job.context.get("decision_recommended_data_range")
+                        ),
+                        "decision_recommended_timeframe": (
+                            review.decision_recommended_timeframe
+                            if review and review.decision_recommended_timeframe
+                            else job.context.get("decision_recommended_timeframe")
+                        ),
+                        "decision_readiness_action": (
+                            review.decision_readiness_action
+                            if review and review.decision_readiness_action
+                            else job.context.get("decision_readiness_action")
+                        ),
+                    }
+                )
+            self._enrich_agent_job_event_payload(completed_event_payload, job, review=review)
             self.add_event(
                 event_type="openclaw.job.completed",
                 source=source,
                 severity=EventSeverity.INFO,
-                payload={
-                    "job_id": job.id,
-                    "job_type": job.job_type,
-                    "result_summary": result_summary,
-                    "review_id": review.id if review else None,
-                    "review_title": review.title if review else None,
-                    "review_period": review.period if review else None,
-                },
+                payload=completed_event_payload,
                 strategy_id=str(job.context.get("strategy_id") or "") or None,
             )
             if job.job_type == "review_strategy_change":
@@ -1709,6 +2676,10 @@ class AppRepository:
                         "job_id": job.id,
                         "change_request_id": job.context.get("change_request_id"),
                         "strategy_id": job.context.get("strategy_id"),
+                        "source_backtest_id": job.context.get("source_backtest_id"),
+                        "source_review_id": job.context.get("source_review_id"),
+                        "source_proposal_id": job.context.get("source_proposal_id"),
+                        "trigger_reason": job.context.get("trigger_reason"),
                         "summary": result_summary,
                         "writeback_target": job.writeback_target,
                         "linked_review_id": review.id if review else None,
@@ -1752,15 +2723,23 @@ class AppRepository:
                 scheduler.current_job_id = None
             scheduler.last_heartbeat_at = now_iso()
             self._recompute_scheduler_queue_depth()
+            failed_event_payload = {
+                "job_id": job.id,
+                "job_type": job.job_type,
+                "error": error,
+                "summary": error,
+            }
+            self._sync_change_request_follow_up_locked(
+                str(job.context.get("change_request_id") or "") or None,
+                job=job,
+                result_summary=error,
+            )
+            self._enrich_agent_job_event_payload(failed_event_payload, job)
             self.add_event(
                 event_type="openclaw.job.failed",
                 source=source,
                 severity=EventSeverity.WARNING,
-                payload={
-                    "job_id": job.id,
-                    "job_type": job.job_type,
-                    "error": error,
-                },
+                payload=failed_event_payload,
                 strategy_id=str(job.context.get("strategy_id") or "") or None,
             )
             if job.job_type == "review_strategy_change":
@@ -1772,6 +2751,10 @@ class AppRepository:
                         "job_id": job.id,
                         "change_request_id": job.context.get("change_request_id"),
                         "strategy_id": job.context.get("strategy_id"),
+                        "source_backtest_id": job.context.get("source_backtest_id"),
+                        "source_review_id": job.context.get("source_review_id"),
+                        "source_proposal_id": job.context.get("source_proposal_id"),
+                        "trigger_reason": job.context.get("trigger_reason"),
                         "error": error,
                     },
                     strategy_id=str(job.context.get("strategy_id") or "") or None,
@@ -1810,16 +2793,24 @@ class AppRepository:
         scheduler = self.state.control_snapshot.scheduler
         if scheduler.current_job_id == job.id:
             scheduler.current_job_id = None
+        self._sync_change_request_follow_up_locked(
+            str(job.context.get("change_request_id") or "") or None,
+            job=job,
+            result_summary=job.result_summary,
+        )
+        cancelled_event_payload = {
+            "job_id": job.id,
+            "job_type": job.job_type,
+            "requested_by": requested_by,
+            "reason": reason,
+            "summary": reason or "已由桌面控制端终止。",
+        }
+        self._enrich_agent_job_event_payload(cancelled_event_payload, job)
         self.add_event(
             event_type="openclaw.job.cancelled",
             source="desktop",
             severity=EventSeverity.WARNING,
-            payload={
-                "job_id": job.id,
-                "job_type": job.job_type,
-                "requested_by": requested_by,
-                "reason": reason,
-            },
+            payload=cancelled_event_payload,
             strategy_id=str(job.context.get("strategy_id") or "") or None,
         )
 
@@ -1838,9 +2829,28 @@ class AppRepository:
             )
             self._persist()
 
-    def create_backtest(self, strategy_id: str, data_range: str, timeframe: str) -> BacktestRun:
+    def create_backtest(
+        self,
+        strategy_id: str,
+        data_range: str,
+        timeframe: str,
+        source_change_request_id: Optional[str] = None,
+        source_backtest_id: Optional[str] = None,
+        source_review_id: Optional[str] = None,
+        source_proposal_id: Optional[str] = None,
+        trigger_reason: Optional[str] = None,
+    ) -> BacktestRun:
         with self._lock:
-            record = self._create_backtest_locked(strategy_id, data_range, timeframe)
+            record = self._create_backtest_locked(
+                strategy_id,
+                data_range,
+                timeframe,
+                source_change_request_id=source_change_request_id,
+                source_backtest_id=source_backtest_id,
+                source_review_id=source_review_id,
+                source_proposal_id=source_proposal_id,
+                trigger_reason=trigger_reason or "manual_create",
+            )
             self._queue_backtest_review_locked(record, requested_by="desktop_operator")
             self._refresh_derived_state()
             self._persist()
@@ -1851,6 +2861,7 @@ class AppRepository:
     ) -> StrategyProposalActionResult:
         with self._lock:
             proposal = self._find_proposal(proposal_id)
+            parent_review = self._find_review_for_proposal(proposal_id)
             if proposal.status not in {"pending", "testing"}:
                 raise ValueError(f"提案当前状态为 {proposal.status}，不能重复处理。")
             created_change_request = None
@@ -1863,17 +2874,62 @@ class AppRepository:
                         raise ValueError("当前处于人工接管状态，不能接受发布建议。")
                     if scheduler.freeze_publish:
                         raise ValueError("当前已冻结自动发布，不能接受发布建议。")
-                proposal.status = "accepted"
                 proposal_payload = dict(proposal.payload)
                 strategy_id = proposal.strategy_id
+                if proposal.proposal_type == "publish_recommendation":
+                    recommendation = str(proposal_payload.get("recommendation") or "").strip()
+                    if not recommendation:
+                        raise ValueError("发布建议缺少 recommendation，当前不能直接接受。")
+                    target_mode = self._require_proposal_target_mode(
+                        proposal_payload,
+                        "发布建议缺少有效 target_mode，当前不能直接接受。",
+                    )
+                else:
+                    target_mode = self._require_proposal_target_mode(
+                        proposal_payload,
+                        "提案缺少有效 target_mode，当前不能直接接受。",
+                        default_mode=AccountMode.PAPER,
+                    ) if proposal.proposal_type in {"param_update", "pause_resume", "risk_update", "script_patch_proposal"} else None
 
-                if proposal.proposal_type in {"param_update", "pause_resume", "risk_update", "publish_recommendation", "script_patch_proposal"}:
+                if proposal.proposal_type == "script_patch_proposal":
+                    created_change_request = self._create_change_request_locked(
+                        ChangeRequestCreate(
+                            type="proposal.script_patch_proposal",
+                            payload={"strategy_id": strategy_id, **proposal_payload, "proposal_id": proposal.id},
+                            requested_by=payload.requested_by,
+                            source_backtest_id=parent_review.backtest_id,
+                            source_review_id=parent_review.id,
+                            source_proposal_id=proposal.id,
+                            trigger_reason="proposal_accept",
+                            target_mode=target_mode or AccountMode.PAPER,
+                            priority="high",
+                            summary=self._build_script_patch_change_summary(proposal, proposal_payload),
+                        )
+                    )
+                    self.add_event(
+                        event_type="change_request.manual_followup_required",
+                        source="desktop",
+                        severity=EventSeverity.INFO,
+                        payload={
+                            "change_request_id": created_change_request.id,
+                            "proposal_id": proposal.id,
+                            "proposal_type": proposal.proposal_type,
+                            "requested_by": payload.requested_by,
+                            "detail": "脚本补丁提案已转成待处理 ChangeRequest，需后续人工或编排链落实。",
+                        },
+                        strategy_id=strategy_id,
+                    )
+                elif proposal.proposal_type in {"param_update", "pause_resume", "risk_update", "publish_recommendation"}:
                     created_change_request = self._create_change_request_locked(
                         ChangeRequestCreate(
                             type=f"proposal.{proposal.proposal_type}",
                             payload={"strategy_id": strategy_id, **proposal_payload, "proposal_id": proposal.id},
                             requested_by=payload.requested_by,
-                            target_mode=AccountMode(proposal_payload.get("target_mode", "paper")),
+                            source_backtest_id=parent_review.backtest_id,
+                            source_review_id=parent_review.id,
+                            source_proposal_id=proposal.id,
+                            trigger_reason="proposal_accept",
+                            target_mode=target_mode or AccountMode.PAPER,
                             priority="high" if proposal.proposal_type != "publish_recommendation" else "normal",
                             summary=f"接受提案：{proposal.title}",
                         )
@@ -1884,8 +2940,13 @@ class AppRepository:
                         strategy_id=strategy_id,
                         data_range=str(proposal_payload.get("data_range", "2025-12-01 ~ 2026-03-29")),
                         timeframe=str(proposal_payload.get("timeframe", "1h")),
+                        source_backtest_id=parent_review.backtest_id,
+                        source_review_id=parent_review.id,
+                        source_proposal_id=proposal.id,
+                        trigger_reason="proposal_accept",
                     )
                     self._queue_backtest_review_locked(created_backtest, requested_by=payload.requested_by)
+                proposal.status = "accepted"
             else:
                 proposal.status = "rejected"
 
@@ -1914,6 +2975,8 @@ class AppRepository:
         with self._lock:
             scheduler = self.state.control_snapshot.scheduler
             result = {"status": "accepted", "command": command.command}
+            target_job: Optional[AgentJob] = None
+            cancelled_jobs: list[AgentJob] = []
             if command.command == SchedulerCommandType.PAUSE:
                 scheduler.status = "paused"
             elif command.command == SchedulerCommandType.RESUME:
@@ -1921,11 +2984,18 @@ class AppRepository:
             elif command.command == SchedulerCommandType.CANCEL_JOB and command.job_id:
                 for job in self.state.agent_jobs:
                     if job.id == command.job_id:
+                        target_job = job
                         self._cancel_agent_job_locked(job, requested_by=command.requested_by, reason=command.reason)
+                        cancelled_jobs.append(job)
                         break
             elif command.command == SchedulerCommandType.CANCEL_ALL:
                 for job in self.state.agent_jobs:
+                    if job.status not in {JobStatus.QUEUED, JobStatus.RUNNING, JobStatus.WAITING}:
+                        continue
+                    if target_job is None:
+                        target_job = job
                     self._cancel_agent_job_locked(job, requested_by=command.requested_by, reason=command.reason)
+                    cancelled_jobs.append(job)
                 scheduler.current_job_id = None
             elif command.command == SchedulerCommandType.FREEZE_PUBLISH:
                 scheduler.freeze_publish = not scheduler.freeze_publish
@@ -1936,16 +3006,75 @@ class AppRepository:
                 if scheduler.current_job_id:
                     current = next((job for job in self.state.agent_jobs if job.id == scheduler.current_job_id), None)
                     if current is not None:
+                        target_job = current
                         self._cancel_agent_job_locked(current, requested_by=command.requested_by, reason=command.reason)
+                        cancelled_jobs.append(current)
             scheduler.last_heartbeat_at = now_iso()
             self._recompute_scheduler_queue_depth()
+            command_event_payload = command.model_dump(mode="json")
+            command_event_payload["scheduler_status"] = scheduler.status
+            command_event_payload["freeze_publish"] = scheduler.freeze_publish
+            if cancelled_jobs:
+                command_event_payload["cancelled_job_ids"] = [job.id for job in cancelled_jobs]
+                command_event_payload["cancelled_job_count"] = len(cancelled_jobs)
+                self._enrich_agent_job_collection_payload(command_event_payload, cancelled_jobs, prefix="cancelled")
+            if target_job is not None:
+                self._enrich_agent_job_event_payload(command_event_payload, target_job)
+            command_event_payload["summary"] = self._build_scheduler_command_summary(
+                command=command,
+                target_job=target_job,
+                cancelled_jobs=cancelled_jobs,
+                scheduler_status=scheduler.status,
+                freeze_publish=scheduler.freeze_publish,
+            )
+            for key in (
+                "summary",
+                "scheduler_status",
+                "freeze_publish",
+                "job_id",
+                "strategy_id",
+                "review_id",
+                "review_title",
+                "review_period",
+                "linked_review_id",
+                "linked_review_title",
+                "linked_review_period",
+                "backtest_id",
+                "source_change_request_id",
+                "source_backtest_id",
+                "source_review_id",
+                "source_proposal_id",
+                "trigger_reason",
+                "decision_readiness",
+                "decision_readiness_detail",
+                "decision_recommended_data_range",
+                "decision_recommended_timeframe",
+                "decision_readiness_action",
+                "cancelled_job_ids",
+                "cancelled_job_count",
+                "cancelled_job_types",
+                "cancelled_strategy_ids",
+                "cancelled_backtest_ids",
+                "cancelled_source_change_request_ids",
+                "cancelled_source_backtest_ids",
+                "cancelled_source_review_ids",
+                "cancelled_source_proposal_ids",
+                "cancelled_trigger_reasons",
+                "cancelled_decision_readiness_values",
+            ):
+                value = command_event_payload.get(key)
+                if value is None:
+                    continue
+                if isinstance(value, list) and not value:
+                    continue
+                result[key] = value
             self.add_event(
                 event_type="scheduler.command",
                 source="desktop",
                 severity=EventSeverity.WARNING
                 if command.command in {SchedulerCommandType.CANCEL_ALL, SchedulerCommandType.ENTER_MANUAL_OVERRIDE}
                 else EventSeverity.INFO,
-                payload=command.model_dump(mode="json"),
+                payload=command_event_payload,
             )
             self._persist()
             return result
@@ -1978,6 +3107,19 @@ class AppRepository:
                 selected_symbol=payload.selected_symbol,
                 selected_market_timeframe=payload.selected_market_timeframe,
                 selected_strategy_id=payload.selected_strategy_id,
+                selected_backtest_id=self._normalize_optional_string(payload.selected_backtest_id),
+                backtest_filter=payload.backtest_filter,
+                replay_tracking_scope=payload.replay_tracking_scope,
+                alert_severity_filter=payload.alert_severity_filter,
+                alert_status_filter=payload.alert_status_filter,
+                alert_scope_filter=payload.alert_scope_filter,
+                trade_mode_filter=payload.trade_mode_filter,
+                trade_origin_filter=payload.trade_origin_filter,
+                trade_scope_filter=payload.trade_scope_filter,
+                audit_severity_filter=payload.audit_severity_filter,
+                audit_source_filter=self._normalize_workspace_filter_value(payload.audit_source_filter),
+                audit_scope_filter=payload.audit_scope_filter,
+                audit_search=self._normalize_optional_string(payload.audit_search) or "",
                 overview_card_order=card_order,
                 overview_visible_cards=visible_cards,
                 overview_collapsed_cards=collapsed_cards,

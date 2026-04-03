@@ -23,7 +23,7 @@ if str(CONTROL_API_DIR) not in sys.path:
 import main as control_main  # type: ignore  # noqa: E402
 from bybit_private_client import BybitPrivateClient  # type: ignore  # noqa: E402
 from bybit_public_client import BybitPublicMarketClient  # type: ignore  # noqa: E402
-from models import AlertRecord, AccountMode, BybitPrivateStatus, CandlePoint, Direction, OpenClawStatus, OrderBookLevel, StrategyParameter, StrategyRuntimeSnapshot, WatchlistInstrument  # type: ignore  # noqa: E402
+from models import AlertRecord, AccountMode, BacktestMetrics, BacktestRun, BybitPrivateStatus, CandlePoint, ChangeRequestCreate, Direction, OpenClawStatus, OrderBookLevel, StrategyParameter, StrategyRuntimeSnapshot, WatchlistInstrument  # type: ignore  # noqa: E402
 from seed import build_market_detail_for_watchlist, build_state  # type: ignore  # noqa: E402
 
 
@@ -78,6 +78,9 @@ class StubOpenClawClient:
     def get_status(self, worker_state: Optional[Dict[str, Any]] = None) -> OpenClawStatus:
         return OpenClawStatus(
             configured=False,
+            config_path=str(Path.home() / ".openclaw" / "openclaw.json"),
+            config_exists=False,
+            command_available=False,
             gateway_url="ws://127.0.0.1:18789",
             auth_mode=None,
             default_agent=None,
@@ -101,6 +104,9 @@ class StubBybitPrivateClient:
             configured=False,
             can_query_private=False,
             source="none",
+            config_path=str(Path.home() / ".bybit-control" / "private-api.json"),
+            config_exists=False,
+            example_config_path=str(Path(control_main.__file__).resolve().parent / "private-api.example.json"),
             api_base_url="https://api.bybit.com",
             account_type="UNIFIED",
             mode=AccountMode.PAPER,
@@ -126,6 +132,9 @@ class StubConfiguredEmptyBybitPrivateClient:
             configured=True,
             can_query_private=True,
             source="file",
+            config_path=str(Path.home() / ".bybit-control" / "private-api.json"),
+            config_exists=True,
+            example_config_path=str(Path(control_main.__file__).resolve().parent / "private-api.example.json"),
             api_base_url="https://api.bybit.com",
             account_type="UNIFIED",
             mode=AccountMode.LIVE,
@@ -240,6 +249,9 @@ class StubConfiguredTradingBybitPrivateClient(StubConfiguredEmptyBybitPrivateCli
             configured=True,
             can_query_private=True,
             source="file",
+            config_path=str(Path.home() / ".bybit-control" / "private-api.json"),
+            config_exists=True,
+            example_config_path=str(Path(control_main.__file__).resolve().parent / "private-api.example.json"),
             api_base_url="https://api.bybit.com",
             account_type="UNIFIED",
             mode=AccountMode.LIVE,
@@ -328,6 +340,9 @@ class StubConfiguredDemoBybitPrivateClient(StubConfiguredTradingBybitPrivateClie
             configured=True,
             can_query_private=True,
             source="file",
+            config_path=str(Path.home() / ".bybit-control" / "private-api.json"),
+            config_exists=True,
+            example_config_path=str(Path(control_main.__file__).resolve().parent / "private-api.example.json"),
             api_base_url="https://api-demo.bybit.com",
             account_type="UNIFIED",
             mode=AccountMode.DEMO,
@@ -696,10 +711,166 @@ class RecordingBacktestMarketClient(StubBybitPublicMarketClient):
     def __init__(self) -> None:
         super().__init__()
         self.requested_markets: list[str] = []
+        self.candle_requests: list[dict[str, Any]] = []
 
     def get_candles(self, symbol: str, market: str, interval: str = "60", limit: int = 48) -> list[Any]:
         self.requested_markets.append(market)
+        self.candle_requests.append(
+            {
+                "symbol": symbol.upper(),
+                "market": market,
+                "interval": interval,
+                "limit": limit,
+            }
+        )
         return super().get_candles(symbol, market, interval=interval, limit=limit)
+
+
+class LongHistoryBacktestMarketClient(RecordingBacktestMarketClient):
+    def get_candles(self, symbol: str, market: str, interval: str = "60", limit: int = 48) -> list[Any]:
+        self.requested_markets.append(market)
+        self.candle_requests.append(
+            {
+                "symbol": symbol.upper(),
+                "market": market,
+                "interval": interval,
+                "limit": limit,
+            }
+        )
+        base_time = datetime(2025, 1, 1, tzinfo=timezone.utc)
+        candles = [
+            CandlePoint(
+                time=(base_time + timedelta(hours=index)).astimezone().isoformat(),
+                open=100.0 + index * 0.05,
+                high=100.2 + index * 0.05,
+                low=99.8 + index * 0.05,
+                close=100.0 + index * 0.05,
+                volume=1000 + index,
+            )
+            for index in range(limit)
+        ]
+        return candles
+
+
+class PaginatedHistoryBacktestMarketClient(BybitPublicMarketClient):
+    def __init__(self) -> None:
+        super().__init__(base_url="https://api.bybit.com")
+        self.requested_markets: list[str] = []
+        self.candle_requests: list[dict[str, Any]] = []
+
+    @staticmethod
+    def _interval_delta(interval: str) -> timedelta:
+        return {
+            "15": timedelta(minutes=15),
+            "60": timedelta(hours=1),
+            "240": timedelta(hours=4),
+            "D": timedelta(days=1),
+        }.get(interval, timedelta(hours=1))
+
+    def get_candles_page(
+        self,
+        symbol: str,
+        market: str,
+        interval: str = "60",
+        limit: int = 48,
+        end: Optional[int] = None,
+    ) -> list[CandlePoint]:
+        self.requested_markets.append(market)
+        self.candle_requests.append(
+            {
+                "symbol": symbol.upper(),
+                "market": market,
+                "interval": interval,
+                "limit": limit,
+                "end": end,
+            }
+        )
+        delta = self._interval_delta(interval)
+        if end is None:
+            newest_time = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        else:
+            newest_time = datetime.fromtimestamp((int(end) + 1) / 1000, tz=timezone.utc) - delta
+        return [
+            CandlePoint(
+                time=(newest_time - delta * (limit - index - 1)).astimezone().isoformat(),
+                open=100.0 + index * 0.05,
+                high=100.2 + index * 0.05,
+                low=99.8 + index * 0.05,
+                close=100.0 + index * 0.05,
+                volume=1000 + index,
+            )
+            for index in range(limit)
+        ]
+
+
+class ShortHistoryBacktestMarketClient(PaginatedHistoryBacktestMarketClient):
+    def __init__(self, total_available: int = 60) -> None:
+        super().__init__()
+        self.total_available = total_available
+
+    def get_candles_page(
+        self,
+        symbol: str,
+        market: str,
+        interval: str = "60",
+        limit: int = 48,
+        end: Optional[int] = None,
+    ) -> list[CandlePoint]:
+        fetched = sum(int(item["returned"]) for item in self.candle_requests if item.get("interval") == interval)
+        remaining = max(self.total_available - fetched, 0)
+        page_limit = min(limit, remaining)
+        self.requested_markets.append(market)
+        self.candle_requests.append(
+            {
+                "symbol": symbol.upper(),
+                "market": market,
+                "interval": interval,
+                "limit": limit,
+                "end": end,
+                "returned": page_limit,
+            }
+        )
+        if page_limit <= 0:
+            return []
+        delta = self._interval_delta(interval)
+        if end is None:
+            newest_time = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        else:
+            newest_time = datetime.fromtimestamp((int(end) + 1) / 1000, tz=timezone.utc) - delta
+        return [
+            CandlePoint(
+                time=(newest_time - delta * (page_limit - index - 1)).astimezone().isoformat(),
+                open=100.0 + index * 0.05,
+                high=100.2 + index * 0.05,
+                low=99.8 + index * 0.05,
+                close=100.0 + index * 0.05,
+                volume=1000 + index,
+            )
+            for index in range(page_limit)
+        ]
+
+
+class FailingBacktestHistoryMarketClient(StubBybitPublicMarketClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.history_requests: list[dict[str, Any]] = []
+
+    def get_candles_history(
+        self,
+        symbol: str,
+        market: str,
+        timeframe: str = "1h",
+        limit: int = 48,
+    ) -> list[CandlePoint]:
+        self.history_requests.append(
+            {
+                "symbol": symbol.upper(),
+                "market": market,
+                "timeframe": timeframe,
+                "limit": limit,
+            }
+        )
+        raise RuntimeError("Bybit history api unavailable")
 
 
 class StubPublicExecutionRealtimeFeed:
@@ -1376,6 +1547,25 @@ class ReviewParsingUnitTests(unittest.TestCase):
             )
 
     def test_enrich_review_job_context_includes_strategy_activity(self) -> None:
+        original_market = control_main.market_data
+        candles = [
+            CandlePoint(
+                time=f"2026-03-30T{hour:02d}:00:00+08:00",
+                open=3520.0 + hour * 2,
+                high=3530.0 + hour * 2,
+                low=3510.0 + hour * 2,
+                close=3525.0 + hour * 2,
+                volume=1200.0 + hour * 10,
+            )
+            for hour in range(24)
+        ]
+        control_main.market_data = StubStrategyRuntimeMarketClient(
+            symbol="ETHUSDT",
+            price=3568.0,
+            change_24h=1.8,
+            candles=candles,
+        )
+        self.addCleanup(setattr, control_main, "market_data", original_market)
         context = control_main.enrich_review_job_context(
             {
                 "strategy_id": "eth-revert-02",
@@ -1515,17 +1705,240 @@ class ReviewParsingUnitTests(unittest.TestCase):
             {
                 "strategy_id": "eth-revert-02",
                 "strategy_name": "ETH 均值回归",
+                "source_change_request_id": "cr-parent-001",
+                "source_backtest_id": "bt-parent-001",
+                "source_review_id": "review-parent-001",
+                "source_proposal_id": "prop-parent-001",
+                "trigger_reason": "decision_rerun",
                 "mode": "paper",
                 "focus_symbols": ["ETHUSDT"],
                 "timeframe": "1h",
                 "data_range": "最近 90 天",
+                "reference_only": True,
+                "requested_candle_estimate": 2165,
+                "requested_candle_limit": 600,
+                "requested_range_start": "2026-01-02T00:00:00+08:00",
+                "requested_range_end": "2026-04-02T00:00:00+08:00",
+                "retrieved_window_completion_pct": 27.71,
+                "used_window_completion_pct": 27.71,
+                "retrieved_candle_count": 600,
+                "used_candle_count": 600,
+                "history_truncated": True,
                 "metrics": {"annual_return": "+8.2%", "max_drawdown": "-2.4%"},
                 "parameter_snapshot": {"entry_z": 2.1},
+                "review_strategy_activity": {
+                    "strategy_id": "eth-revert-02",
+                    "strategy_name": "ETH 均值回归",
+                    "symbol": "ETHUSDT",
+                    "mode": "paper",
+                    "generated_at": "2026-04-02T00:00:00+08:00",
+                    "runtime": {
+                        "signal": "watch",
+                        "guard_state": "none",
+                        "guard_detail": None,
+                        "note": "继续观察。",
+                        "next_action": "等待下一次信号。",
+                        "position_alignment": "unknown",
+                        "position_alignment_detail": None,
+                        "last_execution_event_type": None,
+                        "execution_preview": None,
+                    },
+                    "active_order_count": 0,
+                    "active_orders": [],
+                    "recent_orders": [],
+                    "recent_trades": [],
+                    "recent_alerts": [],
+                    "recent_audit_events": ["strategy.runtime.refreshed · quant-core"],
+                },
             },
         )
         self.assertIn("策略最近活动：", prompt)
         self.assertIn('"strategy_id": "eth-revert-02"', prompt)
         self.assertIn('"recent_audit_events"', prompt)
+        self.assertIn("来源链路：触发原因=decision_rerun；来源变更=cr-parent-001；来源回测=bt-parent-001；来源复盘=review-parent-001；来源提案=prop-parent-001", prompt)
+        self.assertIn("样本性质：仅参考路径（未命中真实入场信号）", prompt)
+        self.assertIn("当前没有真实成交样本", prompt)
+        self.assertIn("优先只给 backtest_request", prompt)
+        self.assertIn("1d->4h、4h->1h、1h->15m", prompt)
+        self.assertIn("理论需要 2165 根", prompt)
+        self.assertIn("当前上限 600 根", prompt)
+        self.assertIn("请求窗口：2026-01-02T00:00:00+08:00 -> 2026-04-02T00:00:00+08:00", prompt)
+        self.assertIn("窗口覆盖：取样 27.71% · 回测 27.71%", prompt)
+        self.assertIn("样本覆盖：", prompt)
+        self.assertIn("截断状态 是", prompt)
+        self.assertIn("切换到能覆盖完整区间的更粗周期", prompt)
+
+    def test_build_backtest_review_prompt_marks_uncoverable_truncated_window(self) -> None:
+        prompt = control_main.build_agent_job_prompt(
+            "generate_backtest_review",
+            {
+                "strategy_id": "eth-revert-02",
+                "strategy_name": "ETH 均值回归",
+                "mode": "paper",
+                "focus_symbols": ["ETHUSDT"],
+                "timeframe": "1d",
+                "data_range": "最近 30000 天",
+                "requested_candle_estimate": 30005,
+                "requested_candle_limit": 20000,
+                "retrieved_candle_count": 20000,
+                "used_candle_count": 20000,
+                "history_truncated": True,
+                "metrics": {"annual_return": "+8.2%", "max_drawdown": "-2.4%", "trades": 12},
+                "parameter_snapshot": {"entry_z": 2.1},
+            },
+        )
+        self.assertIn("当前请求区间即使切到最粗周期也无法完整覆盖", prompt)
+        self.assertIn("优先缩短 data_range 到可完整覆盖的窗口", prompt)
+        self.assertIn("最近 19995 天 @ 1d", prompt)
+
+    def test_build_backtest_review_prompt_marks_insufficient_history_window(self) -> None:
+        prompt = control_main.build_agent_job_prompt(
+            "generate_backtest_review",
+            {
+                "strategy_id": "eth-revert-02",
+                "strategy_name": "ETH 均值回归",
+                "mode": "paper",
+                "focus_symbols": ["ETHUSDT"],
+                "timeframe": "1d",
+                "data_range": "最近 90 天",
+                "requested_candle_estimate": 95,
+                "requested_candle_limit": 95,
+                "requested_range_start": "2025-10-03T00:00:00+00:00",
+                "requested_range_end": "2026-01-01T00:00:00+00:00",
+                "retrieved_window_completion_pct": 63.16,
+                "used_window_completion_pct": 63.16,
+                "retrieved_candle_count": 60,
+                "used_candle_count": 60,
+                "retrieved_range_start": "2025-11-03T00:00:00+00:00",
+                "retrieved_range_end": "2026-01-01T00:00:00+00:00",
+                "used_range_start": "2025-11-03T00:00:00+00:00",
+                "used_range_end": "2026-01-01T00:00:00+00:00",
+                "history_truncated": True,
+                "history_gap_reason": "insufficient_history",
+                "full_window_recommended_data_range": "2025-11-03 ~ 2026-01-01",
+                "full_window_recommended_timeframe": "1d",
+                "full_window_recommended_action": "当前交易所可用历史仅覆盖 2025-11-03 ~ 2026-01-01，建议先缩短到该可用区间并保持 1d 重新回测。",
+                "metrics": {"annual_return": "+8.2%", "max_drawdown": "-2.4%", "trades": 12},
+                "parameter_snapshot": {"entry_z": 2.1},
+            },
+        )
+        self.assertIn("请求窗口：2025-10-03T00:00:00+00:00 -> 2026-01-01T00:00:00+00:00", prompt)
+        self.assertIn("窗口覆盖：取样 63.16% · 回测 63.16%", prompt)
+        self.assertIn("样本覆盖：取到 2025-11-03T00:00:00+00:00 -> 2026-01-01T00:00:00+00:00", prompt)
+        self.assertIn("交易所当前可用历史不够", prompt)
+        self.assertIn("优先缩短 data_range 到当前已取到的历史范围", prompt)
+
+    def test_build_backtest_review_prompt_marks_market_detail_fallback_source(self) -> None:
+        prompt = control_main.build_agent_job_prompt(
+            "generate_backtest_review",
+            {
+                "strategy_id": "eth-revert-02",
+                "strategy_name": "ETH 均值回归",
+                "mode": "paper",
+                "focus_symbols": ["ETHUSDT"],
+                "timeframe": "1h",
+                "data_range": "最近 90 天",
+                "history_source": "market_detail_fallback",
+                "history_source_reason": "exchange_fetch_failed",
+                "history_source_detail": "Bybit history api unavailable",
+                "requested_range_start": "2026-01-02T00:00:00+08:00",
+                "requested_range_end": "2026-04-02T00:00:00+08:00",
+                "retrieved_window_completion_pct": 100.0,
+                "used_window_completion_pct": 100.0,
+                "requested_candle_estimate": 2165,
+                "requested_candle_limit": 2165,
+                "retrieved_candle_count": 2165,
+                "used_candle_count": 2165,
+                "metrics": {"annual_return": "+8.2%", "max_drawdown": "-2.4%", "trades": 12},
+                "parameter_snapshot": {"entry_z": 2.1},
+            },
+        )
+        self.assertIn("样本来源：行情快照回退（历史拉取报错）", prompt)
+        self.assertIn("来源细节：Bybit history api unavailable", prompt)
+        self.assertIn("来源建议：请先恢复交易所历史 K 线拉取，再按当前区间 最近 90 天 和周期 1h 重跑。", prompt)
+        self.assertIn("结论门禁：仅供研究参考", prompt)
+        self.assertIn("门禁详情：当前交易所历史拉取仍未恢复", prompt)
+        self.assertIn("门禁重跑：最近 90 天 @ 1h", prompt)
+        self.assertIn("门禁建议：请先恢复交易所历史 K 线拉取", prompt)
+        self.assertIn("仅适合研究排障", prompt)
+        self.assertIn("优先建议恢复交易所历史后重跑", prompt)
+
+    def test_build_backtest_review_prompt_uses_structured_full_window_recommendation(self) -> None:
+        prompt = control_main.build_agent_job_prompt(
+            "generate_backtest_review",
+            {
+                "strategy_id": "eth-revert-02",
+                "strategy_name": "ETH 均值回归",
+                "mode": "paper",
+                "focus_symbols": ["ETHUSDT"],
+                "timeframe": "1h",
+                "data_range": "最近 180 天",
+                "requested_candle_estimate": 4325,
+                "requested_candle_limit": 600,
+                "retrieved_candle_count": 600,
+                "used_candle_count": 600,
+                "history_truncated": True,
+                "full_window_recommended_data_range": "最近 180 天",
+                "full_window_recommended_timeframe": "1d",
+                "full_window_recommended_action": "保持当前区间，切换到 1d 补足完整样本窗口。",
+                "metrics": {"annual_return": "+8.2%", "max_drawdown": "-2.4%", "trades": 12},
+                "parameter_snapshot": {"entry_z": 2.1},
+            },
+        )
+        self.assertIn("建议动作：保持当前区间，切换到 1d 补足完整样本窗口。", prompt)
+        self.assertIn("门禁重跑：最近 180 天 @ 1d", prompt)
+        self.assertIn("门禁建议：保持当前区间，切换到 1d 补足完整样本窗口。", prompt)
+
+    def test_build_backtest_review_prompt_marks_low_sample_real_trades(self) -> None:
+        prompt = control_main.build_agent_job_prompt(
+            "generate_backtest_review",
+            {
+                "strategy_id": "eth-revert-02",
+                "strategy_name": "ETH 均值回归",
+                "mode": "paper",
+                "focus_symbols": ["ETHUSDT"],
+                "timeframe": "1h",
+                "data_range": "最近 90 天",
+                "metrics": {
+                    "annual_return": "+8.2%",
+                    "max_drawdown": "-2.4%",
+                    "win_rate": "66.7%",
+                    "trades": 2,
+                },
+                "parameter_snapshot": {"entry_z": 2.1},
+            },
+        )
+        self.assertIn("样本性质：低样本真实成交（仅 2 笔）", prompt)
+        self.assertIn("样本量偏小", prompt)
+        self.assertIn("优先只给 backtest_request", prompt)
+        self.assertIn("1d->4h、4h->1h、1h->15m", prompt)
+
+    def test_build_backtest_review_prompt_does_not_pull_live_health_when_context_is_sparse(self) -> None:
+        original_health = control_main.build_review_health_context
+        original_activity = control_main._build_strategy_activity_review_context
+
+        def _raise_if_called() -> Dict[str, Any]:
+            raise AssertionError("should not fetch live review context")
+
+        control_main.build_review_health_context = _raise_if_called
+        control_main._build_strategy_activity_review_context = _raise_if_called
+        self.addCleanup(setattr, control_main, "build_review_health_context", original_health)
+        self.addCleanup(setattr, control_main, "_build_strategy_activity_review_context", original_activity)
+
+        prompt = control_main.build_agent_job_prompt(
+            "generate_backtest_review",
+            {
+                "strategy_id": "eth-revert-02",
+                "strategy_name": "ETH 均值回归",
+                "mode": "paper",
+                "focus_symbols": ["ETHUSDT"],
+                "timeframe": "1h",
+                "data_range": "最近 90 天",
+                "metrics": {"annual_return": "+8.2%", "max_drawdown": "-2.4%", "trades": 2},
+                "parameter_snapshot": {"entry_z": 2.1},
+            },
+        )
+        self.assertIn("策略最近活动：", prompt)
 
     def test_build_strategy_change_review_prompt_includes_strategy_activity_context(self) -> None:
         prompt = control_main.build_agent_job_prompt(
@@ -1536,6 +1949,12 @@ class ReviewParsingUnitTests(unittest.TestCase):
                 "strategy_id": "eth-revert-02",
                 "strategy_name": "ETH 均值回归",
                 "target_mode": "paper",
+                "review_strategy_activity": {
+                    "strategy_id": "eth-revert-02",
+                    "strategy_name": "ETH 均值回归",
+                    "active_order_count": 1,
+                    "recent_alerts": ["P2 ETH 风险提示"],
+                },
             },
         )
         self.assertIn("策略最近活动：", prompt)
@@ -1552,6 +1971,12 @@ class ReviewParsingUnitTests(unittest.TestCase):
                 "strategy_id": "eth-revert-02",
                 "strategy_name": "ETH 均值回归",
                 "mode": "live",
+                "review_strategy_activity": {
+                    "strategy_id": "eth-revert-02",
+                    "strategy_name": "ETH 均值回归",
+                    "recent_alerts": ["P1 执行受阻"],
+                    "recent_audit_events": ["strategy.execution.blocked · desktop-control"],
+                },
             },
         )
         self.assertIn("策略最近活动：", prompt)
@@ -1611,6 +2036,7 @@ class ReviewParsingUnitTests(unittest.TestCase):
                 "annual_return": "+24.8%",
                 "max_drawdown": "-6.3%",
                 "win_rate": "61.2%",
+                "trades": 6,
             },
         }
 
@@ -1629,6 +2055,807 @@ class ReviewParsingUnitTests(unittest.TestCase):
         assert parsed_param is not None
         self.assertEqual(parsed_param.payload["target_mode"], "paper")
         self.assertEqual(parsed_param.strategy_id, "sol-breakout-01")
+
+    def test_build_review_document_skips_backtest_heuristics_when_no_real_trades(self) -> None:
+        review = control_main.build_review_document_from_text(
+            text=json.dumps(
+                {
+                    "summary": "本次区间未命中真实入场信号。",
+                    "highlights": ["参考路径收益较强"],
+                    "risks": ["参考路径回撤偏高"],
+                    "proposals": [],
+                },
+                ensure_ascii=False,
+            ),
+            context={
+                "strategy_id": "trend-btc-01",
+                "backtest_id": "bt-reference-001",
+                "strategy_name": "BTC 趋势跟随",
+                "mode": "paper",
+                "reference_only": True,
+                "data_range": "最近 90 天",
+                "timeframe": "1h",
+                "metrics": {
+                    "annual_return": "+24.8%",
+                    "max_drawdown": "-6.3%",
+                    "win_rate": "100.0%",
+                    "trades": 0,
+                },
+            },
+            source="openclaw",
+            job_type="generate_backtest_review",
+        )
+
+        self.assertEqual(len(review.proposals), 1)
+        self.assertEqual(review.backtest_id, "bt-reference-001")
+        self.assertEqual(review.decision_readiness, "research_only")
+        self.assertEqual(review.decision_recommended_data_range, "最近 180 天")
+        self.assertEqual(review.decision_recommended_timeframe, "1h")
+        self.assertEqual(review.proposals[0].proposal_type, "backtest_request")
+        self.assertEqual(review.proposals[0].title, "BTC 趋势跟随 扩大样本验证")
+        self.assertEqual(review.proposals[0].payload["data_range"], "最近 180 天")
+        self.assertTrue(any("未命中真实入场信号" in item for item in review.risks))
+
+    def test_build_review_document_preserves_backtest_lineage_fields(self) -> None:
+        review = control_main.build_review_document_from_text(
+            text=json.dumps(
+                {
+                    "summary": "本轮回测需要继续补样本。",
+                    "highlights": ["收益暂时稳定"],
+                    "risks": ["样本窗口仍需补齐"],
+                    "proposals": [],
+                },
+                ensure_ascii=False,
+            ),
+            context={
+                "strategy_id": "trend-btc-01",
+                "backtest_id": "bt-child-001",
+                "source_change_request_id": "cr-parent-001",
+                "source_backtest_id": "bt-parent-001",
+                "source_review_id": "review-parent-001",
+                "source_proposal_id": "prop-parent-001",
+                "trigger_reason": "proposal_accept",
+                "strategy_name": "BTC 趋势跟随",
+                "mode": "paper",
+                "timeframe": "1h",
+                "metrics": {
+                    "annual_return": "+24.8%",
+                    "max_drawdown": "-6.3%",
+                    "win_rate": "61.2%",
+                    "trades": 6,
+                },
+            },
+            source="openclaw",
+            job_type="generate_backtest_review",
+        )
+
+        self.assertEqual(review.backtest_id, "bt-child-001")
+        self.assertEqual(review.source_change_request_id, "cr-parent-001")
+        self.assertEqual(review.source_backtest_id, "bt-parent-001")
+        self.assertEqual(review.source_review_id, "review-parent-001")
+        self.assertEqual(review.source_proposal_id, "prop-parent-001")
+        self.assertEqual(review.trigger_reason, "proposal_accept")
+
+    def test_build_review_document_skips_backtest_heuristics_when_trade_count_is_low(self) -> None:
+        review = control_main.build_review_document_from_text(
+            text=json.dumps(
+                {
+                    "summary": "样本量偏少，但收益表现暂时不错。",
+                    "highlights": ["已有少量真实成交"],
+                    "risks": ["样本量偏少"],
+                    "proposals": [],
+                },
+                ensure_ascii=False,
+            ),
+            context={
+                "strategy_id": "trend-btc-01",
+                "strategy_name": "BTC 趋势跟随",
+                "mode": "paper",
+                "timeframe": "1h",
+                "metrics": {
+                    "annual_return": "+24.8%",
+                    "max_drawdown": "-6.3%",
+                    "win_rate": "100.0%",
+                    "trades": 2,
+                },
+            },
+            source="openclaw",
+            job_type="generate_backtest_review",
+        )
+
+        self.assertEqual(len(review.proposals), 1)
+        self.assertEqual(review.proposals[0].proposal_type, "backtest_request")
+        self.assertEqual(review.proposals[0].title, "BTC 趋势跟随 扩大样本验证")
+        self.assertEqual(review.proposals[0].payload["data_range"], "最近 180 天")
+        self.assertTrue(any("样本量偏小" in item for item in review.risks))
+
+    def test_build_review_document_uses_full_window_backtest_request_when_history_is_truncated(self) -> None:
+        review = control_main.build_review_document_from_text(
+            text=json.dumps(
+                {
+                    "summary": "当前样本窗口被截断，但收益表现暂时不错。",
+                    "highlights": ["回撤可控"],
+                    "risks": ["样本窗口未完整覆盖"],
+                    "proposals": [],
+                },
+                ensure_ascii=False,
+            ),
+            context={
+                "strategy_id": "trend-btc-01",
+                "strategy_name": "BTC 趋势跟随",
+                "mode": "paper",
+                "timeframe": "1h",
+                "data_range": "最近 180 天",
+                "history_truncated": True,
+                "requested_candle_estimate": 4325,
+                "requested_candle_limit": 600,
+                "retrieved_candle_count": 600,
+                "used_candle_count": 600,
+                "metrics": {
+                    "annual_return": "+24.8%",
+                    "max_drawdown": "-3.2%",
+                    "win_rate": "61.0%",
+                    "trades": 12,
+                },
+            },
+            source="openclaw",
+            job_type="generate_backtest_review",
+        )
+
+        self.assertEqual(len(review.proposals), 1)
+        self.assertEqual(review.proposals[0].proposal_type, "backtest_request")
+        self.assertEqual(review.proposals[0].title, "BTC 趋势跟随 补足完整样本窗口")
+        self.assertEqual(review.proposals[0].payload["data_range"], "最近 180 天")
+        self.assertEqual(review.proposals[0].payload["timeframe"], "4h")
+        self.assertTrue(any("样本窗口提示" in item for item in review.risks))
+
+    def test_build_review_document_preserves_safe_backtest_request_when_history_is_truncated(self) -> None:
+        review = control_main.build_review_document_from_text(
+            text=json.dumps(
+                {
+                    "summary": "当前样本窗口被截断。",
+                    "highlights": ["收益表现暂时不错"],
+                    "risks": ["样本窗口未完整覆盖"],
+                    "proposals": [
+                        {
+                            "proposal_type": "backtest_request",
+                            "title": "改跑 1d 覆盖完整区间",
+                            "description": "保持最近 180 天，切到 1d 补足完整样本窗口。",
+                            "expected_impact": "先获得完整时间覆盖，再判断收益质量。",
+                            "payload": {"data_range": "最近 180 天", "timeframe": "1d"},
+                        },
+                        {
+                            "proposal_type": "risk_update",
+                            "title": "提高风险预算",
+                            "description": "继续放大仓位。",
+                            "expected_impact": "追求更高收益。",
+                            "payload": {"risk_budget": "24%"},
+                        },
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+            context={
+                "strategy_id": "trend-btc-01",
+                "strategy_name": "BTC 趋势跟随",
+                "mode": "paper",
+                "timeframe": "1h",
+                "data_range": "最近 180 天",
+                "history_truncated": True,
+                "requested_candle_estimate": 4325,
+                "requested_candle_limit": 600,
+                "retrieved_candle_count": 600,
+                "used_candle_count": 600,
+                "metrics": {
+                    "annual_return": "+24.8%",
+                    "max_drawdown": "-3.2%",
+                    "win_rate": "61.0%",
+                    "trades": 12,
+                },
+            },
+            source="openclaw",
+            job_type="generate_backtest_review",
+        )
+
+        self.assertEqual(len(review.proposals), 1)
+        self.assertEqual(review.proposals[0].proposal_type, "backtest_request")
+        self.assertEqual(review.proposals[0].title, "改跑 1d 覆盖完整区间")
+        self.assertEqual(review.proposals[0].payload["timeframe"], "1d")
+
+    def test_build_review_document_rejects_shorter_range_backtest_request_when_history_is_truncated(self) -> None:
+        review = control_main.build_review_document_from_text(
+            text=json.dumps(
+                {
+                    "summary": "当前样本窗口被截断。",
+                    "highlights": ["收益表现暂时不错"],
+                    "risks": ["样本窗口未完整覆盖"],
+                    "proposals": [
+                        {
+                            "proposal_type": "backtest_request",
+                            "title": "缩短区间后重跑",
+                            "description": "改成最近 45 天的 1d 回测。",
+                            "expected_impact": "尽快获得完整样本。",
+                            "payload": {"data_range": "最近 45 天", "timeframe": "1d"},
+                        }
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+            context={
+                "strategy_id": "trend-btc-01",
+                "strategy_name": "BTC 趋势跟随",
+                "mode": "paper",
+                "timeframe": "1h",
+                "data_range": "最近 180 天",
+                "history_truncated": True,
+                "requested_candle_estimate": 4325,
+                "requested_candle_limit": 600,
+                "retrieved_candle_count": 600,
+                "used_candle_count": 600,
+                "metrics": {
+                    "annual_return": "+24.8%",
+                    "max_drawdown": "-3.2%",
+                    "win_rate": "61.0%",
+                    "trades": 12,
+                },
+            },
+            source="openclaw",
+            job_type="generate_backtest_review",
+        )
+
+        self.assertEqual(len(review.proposals), 1)
+        self.assertEqual(review.proposals[0].proposal_type, "backtest_request")
+        self.assertEqual(review.proposals[0].title, "BTC 趋势跟随 补足完整样本窗口")
+        self.assertEqual(review.proposals[0].payload["data_range"], "最近 180 天")
+        self.assertEqual(review.proposals[0].payload["timeframe"], "4h")
+
+    def test_build_review_document_uses_shorter_range_request_when_truncated_window_is_still_uncoverable(self) -> None:
+        review = control_main.build_review_document_from_text(
+            text=json.dumps(
+                {
+                    "summary": "当前样本窗口被截断。",
+                    "highlights": ["收益表现暂时不错"],
+                    "risks": ["样本窗口未完整覆盖"],
+                    "proposals": [],
+                },
+                ensure_ascii=False,
+            ),
+            context={
+                "strategy_id": "trend-btc-01",
+                "strategy_name": "BTC 趋势跟随",
+                "mode": "paper",
+                "timeframe": "1d",
+                "data_range": "最近 30000 天",
+                "history_truncated": True,
+                "requested_candle_estimate": 30005,
+                "requested_candle_limit": 20000,
+                "retrieved_candle_count": 20000,
+                "used_candle_count": 20000,
+                "metrics": {
+                    "annual_return": "+24.8%",
+                    "max_drawdown": "-3.2%",
+                    "win_rate": "61.0%",
+                    "trades": 12,
+                },
+            },
+            source="openclaw",
+            job_type="generate_backtest_review",
+        )
+
+        self.assertEqual(len(review.proposals), 1)
+        self.assertEqual(review.proposals[0].proposal_type, "backtest_request")
+        self.assertEqual(review.proposals[0].title, "BTC 趋势跟随 缩短区间以补足样本窗口")
+        self.assertEqual(review.proposals[0].payload["data_range"], "最近 19995 天")
+        self.assertEqual(review.proposals[0].payload["timeframe"], "1d")
+        self.assertTrue(any("即使切到最粗周期" in item for item in review.risks))
+
+    def test_build_review_document_preserves_safe_shorter_range_request_when_truncated_window_is_still_uncoverable(self) -> None:
+        review = control_main.build_review_document_from_text(
+            text=json.dumps(
+                {
+                    "summary": "当前样本窗口被截断。",
+                    "highlights": ["收益表现暂时不错"],
+                    "risks": ["样本窗口未完整覆盖"],
+                    "proposals": [
+                        {
+                            "proposal_type": "backtest_request",
+                            "title": "缩短到最近 19995 天",
+                            "description": "保持 1d，把区间缩短到最近 19995 天。",
+                            "expected_impact": "先拿到完整样本窗口。",
+                            "payload": {"data_range": "最近 19995 天", "timeframe": "1d"},
+                        },
+                        {
+                            "proposal_type": "risk_update",
+                            "title": "提高风险预算",
+                            "description": "继续放大仓位。",
+                            "expected_impact": "追求更高收益。",
+                            "payload": {"risk_budget": "24%"},
+                        },
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+            context={
+                "strategy_id": "trend-btc-01",
+                "strategy_name": "BTC 趋势跟随",
+                "mode": "paper",
+                "timeframe": "1d",
+                "data_range": "最近 30000 天",
+                "history_truncated": True,
+                "requested_candle_estimate": 30005,
+                "requested_candle_limit": 20000,
+                "retrieved_candle_count": 20000,
+                "used_candle_count": 20000,
+                "metrics": {
+                    "annual_return": "+24.8%",
+                    "max_drawdown": "-3.2%",
+                    "win_rate": "61.0%",
+                    "trades": 12,
+                },
+            },
+            source="openclaw",
+            job_type="generate_backtest_review",
+        )
+
+        self.assertEqual(len(review.proposals), 1)
+        self.assertEqual(review.proposals[0].proposal_type, "backtest_request")
+        self.assertEqual(review.proposals[0].title, "缩短到最近 19995 天")
+        self.assertEqual(review.proposals[0].payload["data_range"], "最近 19995 天")
+        self.assertEqual(review.proposals[0].payload["timeframe"], "1d")
+
+    def test_build_review_document_preserves_safe_backtest_request_when_reference_only(self) -> None:
+        review = control_main.build_review_document_from_text(
+            text=json.dumps(
+                {
+                    "summary": "本次区间未命中真实入场信号。",
+                    "highlights": ["参考路径收益较强"],
+                    "risks": ["参考路径回撤偏高"],
+                    "proposals": [
+                        {
+                            "proposal_type": "backtest_request",
+                            "title": "补跑更细粒度样本",
+                            "description": "改跑 15m 验证更多真实触发。",
+                            "expected_impact": "更快补足真实样本。",
+                            "payload": {"data_range": "最近 180 天", "timeframe": "15m"},
+                        },
+                        {
+                            "proposal_type": "risk_update",
+                            "title": "压缩风险预算",
+                            "description": "将风险预算降到 8%。",
+                            "expected_impact": "快速压缩回撤。",
+                            "payload": {"risk_budget": "8%"},
+                        },
+                        {
+                            "proposal_type": "publish_recommendation",
+                            "title": "建议灰度发布",
+                            "description": "可尝试小流量发布。",
+                            "expected_impact": "验证线上效果。",
+                            "payload": {"publish_scope": "canary"},
+                        },
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+            context={
+                "strategy_id": "trend-btc-01",
+                "strategy_name": "BTC 趋势跟随",
+                "mode": "paper",
+                "reference_only": True,
+                "timeframe": "1h",
+                "metrics": {
+                    "annual_return": "+24.8%",
+                    "max_drawdown": "-6.3%",
+                    "win_rate": "0.0%",
+                    "trades": 0,
+                },
+            },
+            source="openclaw",
+            job_type="generate_backtest_review",
+        )
+
+        self.assertEqual(len(review.proposals), 1)
+        self.assertEqual(review.proposals[0].proposal_type, "backtest_request")
+        self.assertEqual(review.proposals[0].title, "补跑更细粒度样本")
+        self.assertEqual(review.proposals[0].payload["data_range"], "最近 180 天")
+        self.assertEqual(review.proposals[0].payload["timeframe"], "15m")
+
+    def test_build_review_document_filters_aggressive_parsed_proposals_when_low_sample(self) -> None:
+        review = control_main.build_review_document_from_text(
+            text=json.dumps(
+                {
+                    "summary": "当前样本量偏少。",
+                    "highlights": ["收益表现暂时不错"],
+                    "risks": ["样本量偏少"],
+                    "proposals": [
+                        {
+                            "proposal_type": "backtest_request",
+                            "title": "补跑同区间样本",
+                            "description": "继续补样本。",
+                            "expected_impact": "验证稳定性。",
+                            "payload": {"data_range": "最近 180 天", "timeframe": "4h"},
+                        },
+                        {
+                            "proposal_type": "param_update",
+                            "title": "收紧止损",
+                            "description": "把止损阈值调到 0.8%。",
+                            "expected_impact": "降低最大回撤。",
+                            "payload": {"stop_loss_pct": 0.8},
+                        },
+                        {
+                            "proposal_type": "script_patch_proposal",
+                            "title": "优化下单脚本",
+                            "description": "增加更激进的追单逻辑。",
+                            "expected_impact": "提升成交效率。",
+                            "payload": {"summary": "raise aggressiveness"},
+                        },
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+            context={
+                "strategy_id": "trend-btc-01",
+                "strategy_name": "BTC 趋势跟随",
+                "mode": "paper",
+                "timeframe": "4h",
+                "data_range": "最近 180 天",
+                "metrics": {
+                    "annual_return": "+24.8%",
+                    "max_drawdown": "-6.3%",
+                    "win_rate": "50.0%",
+                    "trades": 2,
+                },
+            },
+            source="openclaw",
+            job_type="generate_backtest_review",
+        )
+
+        self.assertEqual(len(review.proposals), 1)
+        self.assertEqual(review.proposals[0].proposal_type, "backtest_request")
+        self.assertEqual(review.proposals[0].title, "BTC 趋势跟随 扩大样本验证")
+        self.assertEqual(review.proposals[0].payload["data_range"], "最近 180 天")
+        self.assertEqual(review.proposals[0].payload["timeframe"], "1h")
+
+    def test_build_review_document_filters_aggressive_parsed_proposals_when_history_source_is_fallback(self) -> None:
+        review = control_main.build_review_document_from_text(
+            text=json.dumps(
+                {
+                    "summary": "当前结果不错。",
+                    "highlights": ["收益表现暂时不错"],
+                    "risks": ["等待更多确认"],
+                    "proposals": [
+                        {
+                            "proposal_type": "backtest_request",
+                            "title": "恢复后重跑",
+                            "description": "恢复交易所历史后重跑。",
+                            "expected_impact": "拿到正式样本。",
+                            "payload": {"data_range": "最近 90 天", "timeframe": "1h"},
+                        },
+                        {
+                            "proposal_type": "risk_update",
+                            "title": "提高风险预算",
+                            "description": "把风险预算提高到 25%。",
+                            "expected_impact": "提升收益。",
+                            "payload": {"risk_budget": "25%"},
+                        },
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+            context={
+                "strategy_id": "trend-btc-01",
+                "strategy_name": "BTC 趋势跟随",
+                "mode": "paper",
+                "timeframe": "1h",
+                "data_range": "最近 90 天",
+                "history_source": "market_detail_fallback",
+                "history_source_reason": "exchange_fetch_failed",
+                "history_source_detail": "Bybit history api unavailable",
+                "metrics": {
+                    "annual_return": "+24.8%",
+                    "max_drawdown": "-6.3%",
+                    "win_rate": "58.0%",
+                    "trades": 12,
+                },
+            },
+            source="openclaw",
+            job_type="generate_backtest_review",
+        )
+
+        self.assertEqual(len(review.proposals), 1)
+        self.assertEqual(review.proposals[0].proposal_type, "backtest_request")
+        self.assertEqual(review.proposals[0].payload["data_range"], "最近 90 天")
+        self.assertEqual(review.proposals[0].payload["timeframe"], "1h")
+        self.assertTrue(any("行情快照回退" in item for item in review.risks))
+        self.assertTrue(any("Bybit history api unavailable" in item for item in review.risks))
+
+    def test_build_review_document_uses_conservative_backtest_request_when_history_source_is_fallback(self) -> None:
+        review = control_main.build_review_document_from_text(
+            text=json.dumps(
+                {
+                    "summary": "当前结果不错。",
+                    "highlights": ["收益表现暂时不错"],
+                    "risks": ["等待更多确认"],
+                    "proposals": [],
+                },
+                ensure_ascii=False,
+            ),
+            context={
+                "strategy_id": "trend-btc-01",
+                "strategy_name": "BTC 趋势跟随",
+                "mode": "paper",
+                "timeframe": "4h",
+                "data_range": "最近 180 天",
+                "history_source": "market_detail_fallback",
+                "metrics": {
+                    "annual_return": "+24.8%",
+                    "max_drawdown": "-4.0%",
+                    "win_rate": "60.0%",
+                    "trades": 18,
+                },
+            },
+            source="openclaw",
+            job_type="generate_backtest_review",
+        )
+
+        self.assertEqual(len(review.proposals), 1)
+        self.assertEqual(review.proposals[0].proposal_type, "backtest_request")
+        self.assertIn("恢复交易所历史后重跑", review.proposals[0].title)
+        self.assertEqual(review.proposals[0].payload["data_range"], "最近 180 天")
+        self.assertEqual(review.proposals[0].payload["timeframe"], "4h")
+
+    def test_build_review_document_uses_sample_recovery_backtest_request_when_history_source_samples_are_insufficient(self) -> None:
+        review = control_main.build_review_document_from_text(
+            text=json.dumps(
+                {
+                    "summary": "当前结果不错。",
+                    "highlights": ["收益表现暂时不错"],
+                    "risks": ["等待更多确认"],
+                    "proposals": [],
+                },
+                ensure_ascii=False,
+            ),
+            context={
+                "strategy_id": "trend-btc-01",
+                "strategy_name": "BTC 趋势跟随",
+                "mode": "paper",
+                "timeframe": "4h",
+                "data_range": "最近 180 天",
+                "history_source": "market_detail_fallback",
+                "history_source_reason": "insufficient_exchange_samples",
+                "history_source_detail": "交易所历史仅返回 20 根样本，低于最小回测门槛 30 根。",
+                "metrics": {
+                    "annual_return": "+24.8%",
+                    "max_drawdown": "-4.0%",
+                    "win_rate": "60.0%",
+                    "trades": 18,
+                },
+            },
+            source="openclaw",
+            job_type="generate_backtest_review",
+        )
+
+        self.assertEqual(len(review.proposals), 1)
+        self.assertEqual(review.proposals[0].proposal_type, "backtest_request")
+        self.assertIn("补足交易所历史样本", review.proposals[0].title)
+        self.assertEqual(review.proposals[0].payload["data_range"], "最近 180 天")
+        self.assertEqual(review.proposals[0].payload["timeframe"], "1h")
+
+    def test_build_review_document_does_not_pull_live_health_when_context_is_sparse(self) -> None:
+        original_health = control_main.build_review_health_context
+        original_activity = control_main._build_strategy_activity_review_context
+
+        def _raise_if_called() -> Dict[str, Any]:
+            raise AssertionError("should not fetch live review context")
+
+        control_main.build_review_health_context = _raise_if_called
+        control_main._build_strategy_activity_review_context = _raise_if_called
+        self.addCleanup(setattr, control_main, "build_review_health_context", original_health)
+        self.addCleanup(setattr, control_main, "_build_strategy_activity_review_context", original_activity)
+
+        review = control_main.build_review_document_from_text(
+            text=json.dumps(
+                {
+                    "summary": "当前样本量偏少。",
+                    "highlights": ["收益表现暂时不错"],
+                    "risks": ["样本量偏少"],
+                    "proposals": [],
+                },
+                ensure_ascii=False,
+            ),
+            context={
+                "strategy_id": "trend-btc-01",
+                "strategy_name": "BTC 趋势跟随",
+                "mode": "paper",
+                "timeframe": "4h",
+                "data_range": "最近 180 天",
+                "metrics": {
+                    "annual_return": "+24.8%",
+                    "max_drawdown": "-6.3%",
+                    "win_rate": "50.0%",
+                    "trades": 2,
+                },
+            },
+            source="openclaw",
+            job_type="generate_backtest_review",
+        )
+
+        self.assertEqual(review.proposals[0].proposal_type, "backtest_request")
+
+    def test_build_review_document_uses_finer_timeframe_when_sample_validation_range_is_already_180d(self) -> None:
+        review = control_main.build_review_document_from_text(
+            text=json.dumps(
+                {
+                    "summary": "当前样本量偏少。",
+                    "highlights": ["收益表现暂时不错"],
+                    "risks": ["样本量偏少"],
+                    "proposals": [],
+                },
+                ensure_ascii=False,
+            ),
+            context={
+                "strategy_id": "trend-btc-01",
+                "strategy_name": "BTC 趋势跟随",
+                "mode": "paper",
+                "timeframe": "4h",
+                "data_range": "最近 180 天",
+                "metrics": {
+                    "annual_return": "+24.8%",
+                    "max_drawdown": "-6.3%",
+                    "win_rate": "50.0%",
+                    "trades": 2,
+                },
+            },
+            source="openclaw",
+            job_type="generate_backtest_review",
+        )
+
+        self.assertEqual(review.proposals[0].proposal_type, "backtest_request")
+        self.assertEqual(review.proposals[0].payload["data_range"], "最近 180 天")
+        self.assertEqual(review.proposals[0].payload["timeframe"], "1h")
+
+    def test_build_review_document_keeps_timeframe_when_range_is_not_explicitly_provided(self) -> None:
+        review = control_main.build_review_document_from_text(
+            text=json.dumps(
+                {
+                    "summary": "当前样本量偏少。",
+                    "highlights": ["收益表现暂时不错"],
+                    "risks": ["样本量偏少"],
+                    "proposals": [],
+                },
+                ensure_ascii=False,
+            ),
+            context={
+                "strategy_id": "trend-btc-01",
+                "strategy_name": "BTC 趋势跟随",
+                "mode": "paper",
+                "timeframe": "1h",
+                "metrics": {
+                    "annual_return": "+24.8%",
+                    "max_drawdown": "-6.3%",
+                    "win_rate": "50.0%",
+                    "trades": 2,
+                },
+            },
+            source="openclaw",
+            job_type="generate_backtest_review",
+        )
+
+        self.assertEqual(review.proposals[0].proposal_type, "backtest_request")
+        self.assertEqual(review.proposals[0].payload["data_range"], "最近 180 天")
+        self.assertEqual(review.proposals[0].payload["timeframe"], "1h")
+
+    def test_build_fallback_backtest_review_marks_reference_only_sample_risk(self) -> None:
+        review = control_main.build_fallback_review_document(
+            {
+                "strategy_id": "trend-btc-01",
+                "strategy_name": "BTC 趋势跟随",
+                "mode": "paper",
+                "timeframe": "1h",
+                "data_range": "最近 90 天",
+                "reference_only": True,
+                "metrics": {
+                    "annual_return": "+24.8%",
+                    "max_drawdown": "-6.3%",
+                    "win_rate": "0.0%",
+                    "trades": 0,
+                },
+            },
+            job_type="generate_backtest_review",
+        )
+
+        self.assertTrue(any("未命中真实入场信号" in item for item in review.risks))
+        self.assertTrue(any("参考路径年化" in item for item in review.highlights))
+
+    def test_build_fallback_backtest_review_includes_requested_window_and_coverage(self) -> None:
+        review = control_main.build_fallback_review_document(
+            {
+                "strategy_id": "trend-btc-01",
+                "backtest_id": "bt-fallback-001",
+                "strategy_name": "BTC 趋势跟随",
+                "mode": "paper",
+                "timeframe": "1d",
+                "data_range": "最近 90 天",
+                "history_source": "market_detail_fallback",
+                "history_source_reason": "insufficient_exchange_samples",
+                "history_source_detail": "交易所历史仅返回 20 根样本，低于最小回测门槛 30 根。",
+                "requested_range_start": "2025-10-03T00:00:00+00:00",
+                "requested_range_end": "2026-01-01T00:00:00+00:00",
+                "retrieved_window_completion_pct": 63.16,
+                "used_window_completion_pct": 63.16,
+                "metrics": {
+                    "annual_return": "+24.8%",
+                    "max_drawdown": "-6.3%",
+                    "win_rate": "50.0%",
+                    "trades": 12,
+                },
+            },
+            job_type="generate_backtest_review",
+        )
+
+        self.assertEqual(review.backtest_id, "bt-fallback-001")
+        self.assertEqual(review.decision_readiness, "research_only")
+        self.assertEqual(review.decision_recommended_data_range, "最近 180 天")
+        self.assertEqual(review.decision_recommended_timeframe, "1d")
+        self.assertTrue(any("请求窗口 2025-10-03T00:00:00+00:00 -> 2026-01-01T00:00:00+00:00" in item for item in review.highlights))
+        self.assertTrue(any("工作台行情快照样本" in item for item in review.highlights))
+        self.assertTrue(any("交易所历史仅返回 20 根样本" in item for item in review.highlights))
+        self.assertTrue(any("结论门禁：" in item for item in review.highlights))
+        self.assertTrue(any("门禁重跑：" in item for item in review.highlights))
+        self.assertTrue(any("来源建议：" in item for item in review.highlights))
+        self.assertTrue(any("窗口覆盖率：取样 63.16% ，实际回测 63.16%。" in item for item in review.highlights))
+
+    def test_build_fallback_backtest_review_preserves_backtest_lineage_fields(self) -> None:
+        review = control_main.build_fallback_review_document(
+            {
+                "strategy_id": "trend-btc-01",
+                "backtest_id": "bt-fallback-001",
+                "source_change_request_id": "cr-parent-001",
+                "source_backtest_id": "bt-parent-001",
+                "source_review_id": "review-parent-001",
+                "source_proposal_id": "prop-parent-001",
+                "trigger_reason": "review_decision_rerun",
+                "strategy_name": "BTC 趋势跟随",
+                "mode": "paper",
+                "timeframe": "1d",
+                "data_range": "最近 90 天",
+                "metrics": {
+                    "annual_return": "+24.8%",
+                    "max_drawdown": "-6.3%",
+                    "win_rate": "50.0%",
+                    "trades": 12,
+                },
+            },
+            job_type="generate_backtest_review",
+        )
+
+        self.assertEqual(review.backtest_id, "bt-fallback-001")
+        self.assertEqual(review.source_change_request_id, "cr-parent-001")
+        self.assertEqual(review.source_backtest_id, "bt-parent-001")
+        self.assertEqual(review.source_review_id, "review-parent-001")
+        self.assertEqual(review.source_proposal_id, "prop-parent-001")
+        self.assertEqual(review.trigger_reason, "review_decision_rerun")
+        self.assertTrue(any("来源链路：触发原因 review_decision_rerun；来源变更 cr-parent-001；来源回测 bt-parent-001" in item for item in review.highlights))
+
+    def test_build_fallback_backtest_review_marks_low_sample_trade_risk(self) -> None:
+        review = control_main.build_fallback_review_document(
+            {
+                "strategy_id": "trend-btc-01",
+                "strategy_name": "BTC 趋势跟随",
+                "mode": "paper",
+                "timeframe": "1h",
+                "data_range": "最近 90 天",
+                "metrics": {
+                    "annual_return": "+24.8%",
+                    "max_drawdown": "-6.3%",
+                    "win_rate": "50.0%",
+                    "trades": 2,
+                },
+            },
+            job_type="generate_backtest_review",
+        )
+
+        self.assertTrue(any("样本量偏小" in item for item in review.risks))
+        self.assertTrue(any("仅产生 2 笔真实成交" in item for item in review.highlights))
 
     def test_build_review_document_appends_execution_health_issue_to_risks(self) -> None:
         original_running = control_main.strategy_runtime_state.get("running")
@@ -1766,6 +2993,7 @@ class ControlApiIntegrationTests(unittest.TestCase):
         control_main.private_order_metadata.clear()
         control_main.private_trade_cache.update({"status_key": None, "updated_at": 0.0, "items": []})
         control_main.private_order_history_cache.update({"status_key": None, "updated_at": 0.0, "items": []})
+        control_main.market_data.base_url = control_main.repo.state.settings.api_base_url
         control_main.strategy_runtime_state.update({"running": False, "last_refresh_at": None, "last_error": None, "started_once": False})
         self.addCleanup(self._restore_state)
 
@@ -1780,6 +3008,7 @@ class ControlApiIntegrationTests(unittest.TestCase):
         control_main.private_order_metadata.clear()
         control_main.private_trade_cache.update({"status_key": None, "updated_at": 0.0, "items": []})
         control_main.private_order_history_cache.update({"status_key": None, "updated_at": 0.0, "items": []})
+        control_main.market_data.base_url = self._state_backup.settings.api_base_url
         control_main.strategy_runtime_state.clear()
         control_main.strategy_runtime_state.update(self._strategy_runtime_state_backup)
 
@@ -1830,9 +3059,9 @@ class ControlApiIntegrationTests(unittest.TestCase):
             "/api/runtime/strategy-worker/status": ("running", "issue"),
             "/api/workspace/preferences": ("active_section", "updated_at"),
             "/api/ai/live": ("scheduler", "activity_feed"),
-            "/api/integrations/openclaw": ("configured", "gateway_url"),
+            "/api/integrations/openclaw": ("configured", "gateway_url", "config_path", "config_exists", "command_available"),
             "/api/integrations/bybit-public": ("enabled", "updated_at"),
-            "/api/integrations/bybit-private": ("configured", "can_query_private"),
+            "/api/integrations/bybit-private": ("configured", "can_query_private", "config_path", "config_exists", "example_config_path"),
             "/api/integrations/grafana": ("configured", "metrics_path"),
             "/api/integrations/bybit-private/probe-trade": ("configured", "outcome"),
         }
@@ -1863,6 +3092,19 @@ class ControlApiIntegrationTests(unittest.TestCase):
             "selected_symbol": "ETHUSDT",
             "selected_market_timeframe": "4h",
             "selected_strategy_id": "eth-revert-02",
+            "selected_backtest_id": "bt-002",
+            "backtest_filter": "all",
+            "replay_tracking_scope": "selected",
+            "alert_severity_filter": "P1",
+            "alert_status_filter": "acknowledged",
+            "alert_scope_filter": "selected",
+            "trade_mode_filter": "live",
+            "trade_origin_filter": "strategy",
+            "trade_scope_filter": "selected",
+            "audit_severity_filter": "warning",
+            "audit_source_filter": "openclaw",
+            "audit_scope_filter": "selected",
+            "audit_search": "runtime boom",
             "overview_card_order": ["ai_center", "account_center", "strategy_watch", "account_center"],
             "overview_visible_cards": ["strategy_watch", "account_center", "unknown", "account_center"],
             "overview_collapsed_cards": ["account_center", "unknown", "account_center"],
@@ -1876,6 +3118,19 @@ class ControlApiIntegrationTests(unittest.TestCase):
         self.assertEqual(updated["selected_symbol"], "ETHUSDT")
         self.assertEqual(updated["selected_market_timeframe"], "4h")
         self.assertEqual(updated["selected_strategy_id"], "eth-revert-02")
+        self.assertEqual(updated["selected_backtest_id"], "bt-002")
+        self.assertEqual(updated["backtest_filter"], "all")
+        self.assertEqual(updated["replay_tracking_scope"], "selected")
+        self.assertEqual(updated["alert_severity_filter"], "P1")
+        self.assertEqual(updated["alert_status_filter"], "acknowledged")
+        self.assertEqual(updated["alert_scope_filter"], "selected")
+        self.assertEqual(updated["trade_mode_filter"], "live")
+        self.assertEqual(updated["trade_origin_filter"], "strategy")
+        self.assertEqual(updated["trade_scope_filter"], "selected")
+        self.assertEqual(updated["audit_severity_filter"], "warning")
+        self.assertEqual(updated["audit_source_filter"], "openclaw")
+        self.assertEqual(updated["audit_scope_filter"], "selected")
+        self.assertEqual(updated["audit_search"], "runtime boom")
         self.assertEqual(updated["overview_card_order"][:3], ["ai_center", "account_center", "strategy_watch"])
         self.assertEqual(updated["overview_visible_cards"], ["account_center", "strategy_watch"])
         self.assertEqual(updated["overview_collapsed_cards"], ["account_center"])
@@ -1935,6 +3190,9 @@ class ControlApiIntegrationTests(unittest.TestCase):
         self.assertFalse(status_payload["configured"])
         self.assertFalse(status_payload["can_query_private"])
         self.assertEqual(status_payload["source"], "none")
+        self.assertTrue(status_payload["config_path"].endswith(".bybit-control/private-api.json"))
+        self.assertFalse(status_payload["config_exists"])
+        self.assertTrue(status_payload["example_config_path"].endswith("services/control-api/private-api.example.json"))
         self.assertEqual(status_payload["usdt_balance_diagnostics"], [])
 
         overview_status, overview = self._get("/api/account/overview")
@@ -7616,12 +8874,119 @@ class ControlApiIntegrationTests(unittest.TestCase):
         self.assertEqual(metrics_body.count("# HELP bybit_control_strategy_issue_total "), 1)
         self.assertEqual(metrics_body.count("# TYPE bybit_control_strategy_issue_total "), 1)
 
+    def test_settings_endpoint_updates_local_settings_and_grafana_status(self) -> None:
+        status, payload = self._post(
+            "/api/settings",
+            {
+                "bybit_web_entry": "https://www.bybit-global.com/",
+                "api_base_url": "https://api-demo.bybit.com/",
+                "default_mode": "live",
+                "notification_channels": ["desktop", "email"],
+                "notification_quiet_hours_enabled": True,
+                "notification_quiet_hours_start": "22:30",
+                "notification_quiet_hours_end": "07:15",
+                "product_language": "en-US",
+                "grafana_base_url": "https://grafana.local/",
+                "grafana_dashboard_uid": "control-tower",
+                "grafana_org_id": 2,
+                "grafana_theme": "light",
+            },
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["bybit_web_entry"], "https://www.bybit-global.com")
+        self.assertEqual(payload["api_base_url"], "https://api-demo.bybit.com")
+        self.assertEqual(payload["default_mode"], "live")
+        self.assertEqual(payload["notification_channels"], ["desktop", "email"])
+        self.assertTrue(payload["notification_quiet_hours_enabled"])
+        self.assertEqual(payload["notification_quiet_hours_start"], "22:30")
+        self.assertEqual(payload["notification_quiet_hours_end"], "07:15")
+        self.assertEqual(payload["product_language"], "en-US")
+        self.assertEqual(payload["grafana_base_url"], "https://grafana.local")
+        self.assertEqual(payload["grafana_dashboard_uid"], "control-tower")
+        self.assertEqual(payload["grafana_org_id"], 2)
+        self.assertEqual(payload["grafana_theme"], "light")
+        self.assertEqual(control_main.market_data.base_url, "https://api-demo.bybit.com")
+
+        settings_status, settings = self._get("/api/settings")
+        self.assertEqual(settings_status, 200)
+        self.assertEqual(settings["api_base_url"], "https://api-demo.bybit.com")
+        self.assertEqual(settings["notification_channels"], ["desktop", "email"])
+        self.assertTrue(settings["notification_quiet_hours_enabled"])
+
+        grafana_status, grafana = self._get("/api/integrations/grafana")
+        self.assertEqual(grafana_status, 200)
+        self.assertTrue(grafana["configured"])
+        self.assertEqual(grafana["base_url"], "https://grafana.local")
+        self.assertEqual(grafana["dashboard_uid"], "control-tower")
+        self.assertEqual(grafana["org_id"], 2)
+        self.assertEqual(grafana["theme"], "light")
+        self.assertIn("https://grafana.local/d/control-tower", grafana["dashboard_url"])
+
+        audit_status, audit = self._get("/api/audit/events")
+        self.assertEqual(audit_status, 200)
+        event = next(item for item in audit if item["event_type"] == "settings.updated")
+        self.assertEqual(event["source"], "desktop")
+        self.assertEqual(event["payload"]["summary"], "本地设置已更新。")
+        self.assertEqual(event["payload"]["default_mode"], "live")
+        self.assertEqual(event["payload"]["notification_channels"], ["desktop", "email"])
+        self.assertTrue(event["payload"]["notification_quiet_hours_enabled"])
+        self.assertEqual(event["payload"]["notification_quiet_hours_start"], "22:30")
+        self.assertEqual(event["payload"]["notification_quiet_hours_end"], "07:15")
+
+    def test_settings_endpoint_validates_notification_channels_and_supports_clearing_grafana(self) -> None:
+        seeded_status, seeded = self._post(
+            "/api/settings",
+            {
+                "grafana_base_url": "https://grafana.local/",
+                "grafana_dashboard_uid": "control-tower",
+                "grafana_org_id": 3,
+                "grafana_theme": "dark",
+                "notification_quiet_hours_enabled": True,
+                "notification_quiet_hours_start": "23:00",
+                "notification_quiet_hours_end": "08:00",
+            },
+        )
+        self.assertEqual(seeded_status, 200)
+        self.assertEqual(seeded["grafana_base_url"], "https://grafana.local")
+
+        cleared_status, cleared = self._post(
+            "/api/settings",
+            {
+                "grafana_base_url": "",
+                "grafana_dashboard_uid": "",
+            },
+        )
+        self.assertEqual(cleared_status, 200)
+        self.assertIsNone(cleared["grafana_base_url"])
+        self.assertIsNone(cleared["grafana_dashboard_uid"])
+
+        grafana_status, grafana = self._get("/api/integrations/grafana")
+        self.assertEqual(grafana_status, 200)
+        self.assertFalse(grafana["configured"])
+        self.assertIsNone(grafana["dashboard_url"])
+
+        invalid_status, error = self._post("/api/settings", {"notification_channels": []})
+        self.assertEqual(invalid_status, 400)
+        self.assertIn("至少保留一个通知渠道", error["detail"])
+
+        invalid_quiet_status, quiet_error = self._post(
+            "/api/settings",
+            {
+                "notification_quiet_hours_enabled": True,
+                "notification_quiet_hours_start": "09:00",
+                "notification_quiet_hours_end": "09:00",
+            },
+        )
+        self.assertEqual(invalid_quiet_status, 400)
+        self.assertIn("通知静默开始和结束时间不能相同", quiet_error["detail"])
+
     def test_ai_live_snapshot_returns_scheduler_jobs_and_activity(self) -> None:
         status, payload = self._get("/api/ai/live")
         self.assertEqual(status, 200)
         self.assertIn("scheduler", payload)
         self.assertIn("jobs", payload)
         self.assertIn("change_requests", payload)
+        self.assertIn("latest_scheduler_command", payload)
         self.assertIn("activity_feed", payload)
         self.assertGreaterEqual(len(payload["activity_feed"]), 1)
         self.assertIn("generated_at", payload)
@@ -7647,6 +9012,7 @@ class ControlApiIntegrationTests(unittest.TestCase):
         self.assertIn("alerts", payload)
         self.assertIn("trades", payload)
         self.assertIn("audit_events", payload)
+        self.assertIn("latest_scheduler_command", payload)
         self.assertIn("generated_at", payload)
         self.assertGreaterEqual(payload["summary"]["pending_alerts"], 0)
         self.assertGreaterEqual(payload["summary"]["recent_trades"], 0)
@@ -7654,6 +9020,49 @@ class ControlApiIntegrationTests(unittest.TestCase):
         self.assertIn("execution_top_issue", payload["summary"])
         self.assertIn("execution_top_issue_symbol", payload["summary"])
         self.assertIn("execution_top_issue_detail", payload["summary"])
+
+    def test_scheduler_snapshots_surface_latest_scheduler_command(self) -> None:
+        control_main.repo.add_event(
+            event_type="scheduler.command",
+            source="desktop",
+            severity=control_main.EventSeverity.WARNING,
+            payload={
+                "command": "cancel_all",
+                "summary": "已终止 1 个回测复盘任务。",
+                "review_id": "review-unit-latest-command",
+                "retry_job_id": "job-retry-latest-command",
+                "cancelled_job_types": ["generate_backtest_review"],
+                "cancelled_strategy_ids": ["trend-btc-01"],
+                "cancelled_backtest_ids": ["bt-unit-latest-command"],
+                "cancelled_source_change_request_ids": ["cr-unit-source-command"],
+                "cancelled_source_backtest_ids": ["bt-unit-source-command"],
+                "cancelled_source_review_ids": ["review-unit-source-command"],
+                "cancelled_source_proposal_ids": ["proposal-unit-source-command"],
+                "cancelled_trigger_reasons": ["manual_review"],
+                "cancelled_decision_readiness_values": ["sample_incomplete"],
+            },
+        )
+
+        for path in ("/api/control/snapshot", "/api/ai/scheduler", "/api/ai/live", "/api/ops/live"):
+            status, payload = self._get(path)
+            self.assertEqual(status, 200, path)
+            latest = payload.get("latest_scheduler_command")
+            self.assertIsNotNone(latest, path)
+            assert latest is not None
+            self.assertEqual(latest["command"], "cancel_all", path)
+            self.assertEqual(latest["summary"], "已终止 1 个回测复盘任务。", path)
+            self.assertEqual(latest["job_id"], "job-retry-latest-command", path)
+            self.assertEqual(latest["linked_review_id"], "review-unit-latest-command", path)
+            self.assertEqual(latest["strategy_id"], "trend-btc-01", path)
+            self.assertEqual(latest["backtest_id"], "bt-unit-latest-command", path)
+            self.assertEqual(latest["source_change_request_id"], "cr-unit-source-command", path)
+            self.assertEqual(latest["source_backtest_id"], "bt-unit-source-command", path)
+            self.assertEqual(latest["source_review_id"], "review-unit-source-command", path)
+            self.assertEqual(latest["source_proposal_id"], "proposal-unit-source-command", path)
+            self.assertEqual(latest["severity"], "warning", path)
+            self.assertIn("任务 generate_backtest_review", latest["impact_detail"], path)
+            self.assertIn("策略 trend-btc-01", latest["impact_detail"], path)
+            self.assertIn("来源变更 cr-unit-source-command", latest["impact_detail"], path)
 
     def test_ops_stream_once_returns_sse_snapshot(self) -> None:
         status, body = self._get_text("/api/ops/stream?once=true")
@@ -7726,6 +9135,238 @@ class ControlApiIntegrationTests(unittest.TestCase):
         self.assertEqual(audit_events[0]["payload"]["review_title"], review.title)
         self.assertEqual(audit_events[0]["payload"]["review_period"], review.period)
 
+    def test_backtest_review_job_completion_writes_lineage_and_decision_into_audit_event(self) -> None:
+        control_main.repo.state.control_snapshot.scheduler.current_job_id = None
+
+        create_status, created = self._post(
+            "/api/ai/jobs",
+            {
+                "job_type": "generate_backtest_review",
+                "context": {
+                    "strategy_id": "trend-btc-01",
+                    "backtest_id": "bt-unit-001",
+                    "source_change_request_id": "cr-parent-001",
+                    "source_backtest_id": "bt-parent-001",
+                    "source_review_id": "review-parent-001",
+                    "source_proposal_id": "prop-parent-001",
+                    "trigger_reason": "proposal_accept",
+                    "decision_readiness": "sample_incomplete",
+                    "decision_readiness_detail": "当前样本窗口仍未完整覆盖。",
+                    "decision_recommended_data_range": "最近 180 天",
+                    "decision_recommended_timeframe": "4h",
+                    "decision_readiness_action": "保持最近 180 天，改成 4h 后重跑。",
+                },
+                "allowed_actions": ["review_backtest", "propose_next_step"],
+                "timeout": 60,
+                "idempotency_key": "unit-test-backtest-review-audit",
+                "writeback_target": "ai_review",
+            },
+        )
+        self.assertEqual(create_status, 200)
+        self.assertEqual(created["status"], "queued")
+
+        claimed = control_main.repo.claim_next_agent_job()
+        self.assertIsNotNone(claimed)
+        assert claimed is not None
+        self.assertEqual(claimed.status.value, "running")
+
+        review = control_main.ReviewDocument(
+            id="review-backtest-audit-001",
+            period="backtest",
+            strategy_id="trend-btc-01",
+            backtest_id="bt-unit-001",
+            source_change_request_id="cr-parent-001",
+            source_backtest_id="bt-parent-001",
+            source_review_id="review-parent-001",
+            source_proposal_id="prop-parent-001",
+            trigger_reason="proposal_accept",
+            decision_readiness="sample_incomplete",
+            decision_readiness_detail="当前样本窗口仍未完整覆盖。",
+            decision_recommended_data_range="最近 180 天",
+            decision_recommended_timeframe="4h",
+            decision_readiness_action="保持最近 180 天，改成 4h 后重跑。",
+            title="BTC 回测复盘",
+            summary="当前样本窗口仍未完整覆盖，建议补样本后重跑。",
+            highlights=["来源链路已保留。"],
+            risks=["当前样本仍待补。"],
+            proposals=[],
+            created_at="2026-04-03T12:00:00Z",
+        )
+        completed = control_main.repo.complete_agent_job(
+            claimed.id,
+            result_summary="回测复盘已完成。",
+            review=review,
+            source="openclaw",
+        )
+        self.assertEqual(completed.status.value, "completed")
+
+        audit_status, audit_events = self._get("/api/audit/events")
+        self.assertEqual(audit_status, 200)
+        self.assertEqual(audit_events[0]["event_type"], "openclaw.job.completed")
+        payload = audit_events[0]["payload"]
+        self.assertEqual(payload["review_id"], review.id)
+        self.assertEqual(payload["backtest_id"], "bt-unit-001")
+        self.assertEqual(payload["source_change_request_id"], "cr-parent-001")
+        self.assertEqual(payload["source_backtest_id"], "bt-parent-001")
+        self.assertEqual(payload["source_review_id"], "review-parent-001")
+        self.assertEqual(payload["source_proposal_id"], "prop-parent-001")
+        self.assertEqual(payload["trigger_reason"], "proposal_accept")
+        self.assertEqual(payload["decision_readiness"], "sample_incomplete")
+        self.assertEqual(payload["decision_readiness_detail"], "当前样本窗口仍未完整覆盖。")
+        self.assertEqual(payload["decision_recommended_data_range"], "最近 180 天")
+        self.assertEqual(payload["decision_recommended_timeframe"], "4h")
+        self.assertEqual(payload["decision_readiness_action"], "保持最近 180 天，改成 4h 后重跑。")
+
+    def test_backtest_review_job_queued_event_writes_lineage_and_decision_into_audit_event(self) -> None:
+        control_main.repo.state.control_snapshot.scheduler.current_job_id = None
+
+        create_status, created = self._post(
+            "/api/ai/jobs",
+            {
+                "job_type": "generate_backtest_review",
+                "context": {
+                    "strategy_id": "trend-btc-01",
+                    "backtest_id": "bt-unit-000",
+                    "source_change_request_id": "cr-parent-000",
+                    "source_backtest_id": "bt-parent-000",
+                    "source_review_id": "review-parent-000",
+                    "source_proposal_id": "prop-parent-000",
+                    "trigger_reason": "manual_create",
+                    "decision_readiness": "sample_incomplete",
+                    "decision_readiness_detail": "当前样本窗口仍未完整覆盖。",
+                    "decision_recommended_data_range": "最近 180 天",
+                    "decision_recommended_timeframe": "4h",
+                    "decision_readiness_action": "保持最近 180 天，改成 4h 后重跑。",
+                },
+                "allowed_actions": ["review_backtest", "propose_next_step"],
+                "timeout": 60,
+                "idempotency_key": "unit-test-backtest-review-queued-audit",
+                "writeback_target": "ai_review",
+            },
+        )
+        self.assertEqual(create_status, 200)
+        self.assertEqual(created["status"], "queued")
+
+        audit_status, audit_events = self._get("/api/audit/events")
+        self.assertEqual(audit_status, 200)
+        self.assertEqual(audit_events[0]["event_type"], "openclaw.job.queued")
+        payload = audit_events[0]["payload"]
+        self.assertEqual(payload["summary"], "任务已入队：generate_backtest_review")
+        self.assertEqual(payload["job_id"], created["id"])
+        self.assertEqual(payload["backtest_id"], "bt-unit-000")
+        self.assertEqual(payload["source_change_request_id"], "cr-parent-000")
+        self.assertEqual(payload["source_backtest_id"], "bt-parent-000")
+        self.assertEqual(payload["source_review_id"], "review-parent-000")
+        self.assertEqual(payload["source_proposal_id"], "prop-parent-000")
+        self.assertEqual(payload["trigger_reason"], "manual_create")
+        self.assertEqual(payload["decision_readiness"], "sample_incomplete")
+        self.assertEqual(payload["decision_readiness_detail"], "当前样本窗口仍未完整覆盖。")
+        self.assertEqual(payload["decision_recommended_data_range"], "最近 180 天")
+        self.assertEqual(payload["decision_recommended_timeframe"], "4h")
+        self.assertEqual(payload["decision_readiness_action"], "保持最近 180 天，改成 4h 后重跑。")
+
+    def test_backtest_review_job_started_event_writes_lineage_and_decision_into_audit_event(self) -> None:
+        control_main.repo.state.control_snapshot.scheduler.current_job_id = None
+
+        create_status, created = self._post(
+            "/api/ai/jobs",
+            {
+                "job_type": "generate_backtest_review",
+                "context": {
+                    "strategy_id": "trend-btc-01",
+                    "backtest_id": "bt-unit-002",
+                    "source_backtest_id": "bt-parent-002",
+                    "source_review_id": "review-parent-002",
+                    "source_proposal_id": "prop-parent-002",
+                    "trigger_reason": "review_decision_rerun",
+                    "decision_readiness": "sample_incomplete",
+                    "decision_readiness_detail": "当前样本窗口仍未完整覆盖。",
+                    "decision_recommended_data_range": "最近 180 天",
+                    "decision_recommended_timeframe": "4h",
+                    "decision_readiness_action": "保持最近 180 天，改成 4h 后重跑。",
+                },
+                "allowed_actions": ["review_backtest", "propose_next_step"],
+                "timeout": 60,
+                "idempotency_key": "unit-test-backtest-review-start-audit",
+                "writeback_target": "ai_review",
+            },
+        )
+        self.assertEqual(create_status, 200)
+        self.assertEqual(created["status"], "queued")
+
+        claimed = control_main.repo.claim_next_agent_job()
+        self.assertIsNotNone(claimed)
+        assert claimed is not None
+        self.assertEqual(claimed.status.value, "running")
+
+        audit_status, audit_events = self._get("/api/audit/events")
+        self.assertEqual(audit_status, 200)
+        self.assertEqual(audit_events[0]["event_type"], "openclaw.job.started")
+        payload = audit_events[0]["payload"]
+        self.assertEqual(payload["summary"], "任务开始执行：generate_backtest_review")
+        self.assertEqual(payload["backtest_id"], "bt-unit-002")
+        self.assertEqual(payload["source_backtest_id"], "bt-parent-002")
+        self.assertEqual(payload["source_review_id"], "review-parent-002")
+        self.assertEqual(payload["source_proposal_id"], "prop-parent-002")
+        self.assertEqual(payload["trigger_reason"], "review_decision_rerun")
+        self.assertEqual(payload["decision_readiness"], "sample_incomplete")
+        self.assertEqual(payload["decision_readiness_detail"], "当前样本窗口仍未完整覆盖。")
+        self.assertEqual(payload["decision_recommended_data_range"], "最近 180 天")
+        self.assertEqual(payload["decision_recommended_timeframe"], "4h")
+        self.assertEqual(payload["decision_readiness_action"], "保持最近 180 天，改成 4h 后重跑。")
+
+    def test_backtest_review_job_failure_writes_lineage_and_decision_into_audit_event(self) -> None:
+        control_main.repo.state.control_snapshot.scheduler.current_job_id = None
+
+        create_status, created = self._post(
+            "/api/ai/jobs",
+            {
+                "job_type": "generate_backtest_review",
+                "context": {
+                    "strategy_id": "trend-btc-01",
+                    "backtest_id": "bt-unit-003",
+                    "source_backtest_id": "bt-parent-003",
+                    "source_review_id": "review-parent-003",
+                    "source_proposal_id": "prop-parent-003",
+                    "trigger_reason": "proposal_accept",
+                    "decision_readiness": "sample_incomplete",
+                    "decision_readiness_detail": "当前样本窗口仍未完整覆盖。",
+                    "decision_recommended_data_range": "最近 90 天",
+                    "decision_recommended_timeframe": "1d",
+                    "decision_readiness_action": "保持最近 90 天，改成 1d 后重跑。",
+                },
+                "allowed_actions": ["review_backtest", "propose_next_step"],
+                "timeout": 60,
+                "idempotency_key": "unit-test-backtest-review-failed-audit",
+                "writeback_target": "ai_review",
+            },
+        )
+        self.assertEqual(create_status, 200)
+        self.assertEqual(created["status"], "queued")
+
+        claimed = control_main.repo.claim_next_agent_job()
+        self.assertIsNotNone(claimed)
+        assert claimed is not None
+        failed = control_main.repo.fail_agent_job(claimed.id, "OpenClaw 连接中断。", source="openclaw")
+        self.assertEqual(failed.status.value, "failed")
+
+        audit_status, audit_events = self._get("/api/audit/events")
+        self.assertEqual(audit_status, 200)
+        self.assertEqual(audit_events[0]["event_type"], "openclaw.job.failed")
+        payload = audit_events[0]["payload"]
+        self.assertEqual(payload["summary"], "OpenClaw 连接中断。")
+        self.assertEqual(payload["error"], "OpenClaw 连接中断。")
+        self.assertEqual(payload["backtest_id"], "bt-unit-003")
+        self.assertEqual(payload["source_backtest_id"], "bt-parent-003")
+        self.assertEqual(payload["source_review_id"], "review-parent-003")
+        self.assertEqual(payload["source_proposal_id"], "prop-parent-003")
+        self.assertEqual(payload["trigger_reason"], "proposal_accept")
+        self.assertEqual(payload["decision_readiness"], "sample_incomplete")
+        self.assertEqual(payload["decision_readiness_detail"], "当前样本窗口仍未完整覆盖。")
+        self.assertEqual(payload["decision_recommended_data_range"], "最近 90 天")
+        self.assertEqual(payload["decision_recommended_timeframe"], "1d")
+        self.assertEqual(payload["decision_readiness_action"], "保持最近 90 天，改成 1d 后重跑。")
+
     def test_strategy_change_review_job_completion_writes_strategy_audit_event(self) -> None:
         control_main.repo.state.control_snapshot.scheduler.current_job_id = None
         job = control_main.repo.create_agent_job(
@@ -7764,6 +9405,9 @@ class ControlApiIntegrationTests(unittest.TestCase):
         assert review_event is not None
         self.assertEqual(review_event["payload"]["change_request_id"], "cr-unit-001")
         self.assertEqual(review_event["payload"]["strategy_id"], "trend-btc-01")
+        self.assertIsNone(review_event["payload"]["source_review_id"])
+        self.assertIsNone(review_event["payload"]["source_proposal_id"])
+        self.assertIsNone(review_event["payload"]["trigger_reason"])
         self.assertEqual(review_event["payload"]["linked_review_id"], review.id)
         self.assertEqual(review_event["payload"]["linked_review_title"], review.title)
         self.assertEqual(review_event["payload"]["linked_review_period"], review.period)
@@ -7800,6 +9444,140 @@ class ControlApiIntegrationTests(unittest.TestCase):
         assert review_event is not None
         self.assertEqual(review_event["payload"]["change_request_id"], "cr-unit-002")
         self.assertEqual(review_event["payload"]["strategy_id"], "trend-btc-01")
+        self.assertIsNone(review_event["payload"]["source_review_id"])
+        self.assertIsNone(review_event["payload"]["source_proposal_id"])
+        self.assertIsNone(review_event["payload"]["trigger_reason"])
+
+    def test_change_request_follow_up_fields_update_after_strategy_change_review_completion(self) -> None:
+        status, change_request = self._post(
+            "/api/change-requests",
+            {
+                "type": "strategy.parameter.update",
+                "payload": {"strategy_id": "trend-btc-01", "fast_ma": 15},
+                "requested_by": "unit_test",
+                "target_mode": "paper",
+                "priority": "high",
+                "summary": "补齐变更跟踪结果写回",
+            },
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(change_request["follow_up_job_type"], "review_strategy_change")
+        self.assertEqual(change_request["follow_up_job_status"], "queued")
+        follow_up_job_id = change_request["follow_up_job_id"]
+        self.assertIsNotNone(follow_up_job_id)
+
+        job = next(item for item in control_main.repo.state.agent_jobs if item.id == follow_up_job_id)
+        review = control_main.build_strategy_tracking_review_document(
+            "这次参数调整已经落地，执行状态稳定。",
+            job.context,
+            "review_strategy_change",
+        )
+        completed = control_main.repo.complete_agent_job(
+            job.id,
+            result_summary="这次参数调整已经落地，执行状态稳定。",
+            review=review,
+            source="local_fallback",
+        )
+        self.assertEqual(completed.status.value, "completed")
+
+        change_requests_status, change_requests = self._get("/api/change-requests")
+        self.assertEqual(change_requests_status, 200)
+        updated = next(item for item in change_requests if item["id"] == change_request["id"])
+        self.assertEqual(updated["follow_up_job_id"], job.id)
+        self.assertEqual(updated["follow_up_job_type"], "review_strategy_change")
+        self.assertEqual(updated["follow_up_job_status"], "completed")
+        self.assertEqual(updated["follow_up_result_summary"], "这次参数调整已经落地，执行状态稳定。")
+        self.assertEqual(updated["linked_review_id"], review.id)
+        self.assertEqual(updated["linked_review_title"], review.title)
+        self.assertEqual(updated["linked_review_period"], review.period)
+
+    def test_change_request_follow_up_fields_update_after_strategy_change_review_failure(self) -> None:
+        status, change_request = self._post(
+            "/api/change-requests",
+            {
+                "type": "strategy.risk_update",
+                "payload": {"strategy_id": "trend-btc-01", "risk_budget": "10%"},
+                "requested_by": "unit_test",
+                "target_mode": "paper",
+                "priority": "high",
+                "summary": "补齐变更跟踪失败写回",
+            },
+        )
+        self.assertEqual(status, 200)
+        follow_up_job_id = change_request["follow_up_job_id"]
+        self.assertIsNotNone(follow_up_job_id)
+
+        failed = control_main.repo.fail_agent_job(
+            follow_up_job_id,
+            "OpenClaw 任务执行失败。",
+            source="local_fallback",
+        )
+        self.assertEqual(failed.status.value, "failed")
+
+        change_requests_status, change_requests = self._get("/api/change-requests")
+        self.assertEqual(change_requests_status, 200)
+        updated = next(item for item in change_requests if item["id"] == change_request["id"])
+        self.assertEqual(updated["follow_up_job_id"], follow_up_job_id)
+        self.assertEqual(updated["follow_up_job_type"], "review_strategy_change")
+        self.assertEqual(updated["follow_up_job_status"], "failed")
+        self.assertEqual(updated["follow_up_result_summary"], "OpenClaw 任务执行失败。")
+        self.assertIsNone(updated["linked_review_id"])
+
+    def test_change_request_follow_up_fields_reset_when_retrying_cancelled_tracking_job(self) -> None:
+        status, change_request = self._post(
+            "/api/change-requests",
+            {
+                "type": "strategy.parameter.update",
+                "payload": {"strategy_id": "trend-btc-01", "slow_ma": 30},
+                "requested_by": "unit_test",
+                "target_mode": "paper",
+                "priority": "high",
+                "summary": "验证变更跟踪取消后重试回写",
+            },
+        )
+        self.assertEqual(status, 200)
+        follow_up_job_id = change_request["follow_up_job_id"]
+        self.assertIsNotNone(follow_up_job_id)
+
+        cancel_status, cancel_payload = self._post(
+            "/api/ai/scheduler/commands",
+            {
+                "command": "cancel_job",
+                "job_id": follow_up_job_id,
+                "requested_by": "unit_test",
+                "reason": "人工取消变更跟踪",
+            },
+        )
+        self.assertEqual(cancel_status, 200)
+        self.assertEqual(cancel_payload["job_id"], follow_up_job_id)
+
+        change_requests_status, change_requests = self._get("/api/change-requests")
+        self.assertEqual(change_requests_status, 200)
+        cancelled = next(item for item in change_requests if item["id"] == change_request["id"])
+        self.assertEqual(cancelled["follow_up_job_id"], follow_up_job_id)
+        self.assertEqual(cancelled["follow_up_job_status"], "cancelled")
+        self.assertEqual(cancelled["follow_up_result_summary"], "人工取消变更跟踪")
+        self.assertIsNone(cancelled["linked_review_id"])
+
+        retry_status, retried = self._post(
+            f"/api/ai/jobs/{follow_up_job_id}/retry",
+            {"requested_by": "unit_test"},
+        )
+        self.assertEqual(retry_status, 200)
+        self.assertNotEqual(retried["id"], follow_up_job_id)
+        self.assertEqual(retried["status"], "queued")
+        self.assertEqual(retried["context"]["change_request_id"], change_request["id"])
+
+        change_requests_status, change_requests = self._get("/api/change-requests")
+        self.assertEqual(change_requests_status, 200)
+        updated = next(item for item in change_requests if item["id"] == change_request["id"])
+        self.assertEqual(updated["follow_up_job_id"], retried["id"])
+        self.assertEqual(updated["follow_up_job_type"], "review_strategy_change")
+        self.assertEqual(updated["follow_up_job_status"], "queued")
+        self.assertIsNone(updated["follow_up_result_summary"])
+        self.assertIsNone(updated["linked_review_id"])
+        self.assertIsNone(updated["linked_review_title"])
+        self.assertIsNone(updated["linked_review_period"])
 
     def test_strategy_issue_review_job_completion_writes_strategy_audit_event(self) -> None:
         control_main.repo.state.control_snapshot.scheduler.current_job_id = None
@@ -7931,6 +9709,39 @@ class ControlApiIntegrationTests(unittest.TestCase):
         review_ids = {item["id"] for item in reviews}
         self.assertIn("review-unit-strategy-issue", review_ids)
         self.assertIn("review-unit-strategy-change", review_ids)
+
+    def test_get_reviews_supports_backtest_filter(self) -> None:
+        matching_review = control_main.ReviewDocument(
+            id="review-unit-backtest-match",
+            period="backtest",
+            strategy_id="trend-btc-01",
+            backtest_id="bt-review-001",
+            title="BTC 回测复盘",
+            summary="这轮回测需要继续补样本。",
+            highlights=["当前样本窗口仍未完整覆盖。"],
+            risks=["暂不建议直接用于上线判断。"],
+            proposals=[],
+            created_at=datetime.now(timezone.utc).astimezone().isoformat(),
+        )
+        other_review = control_main.ReviewDocument(
+            id="review-unit-backtest-other",
+            period="backtest",
+            strategy_id="trend-btc-01",
+            backtest_id="bt-review-002",
+            title="BTC 另一轮回测复盘",
+            summary="另一轮回测。",
+            highlights=["这是另一条记录。"],
+            risks=["仍需继续观察。"],
+            proposals=[],
+            created_at=datetime.now(timezone.utc).astimezone().isoformat(),
+        )
+        control_main.repo.state.reviews.insert(0, other_review)
+        control_main.repo.state.reviews.insert(0, matching_review)
+
+        status, reviews = self._get("/api/ai/reviews?backtest_id=bt-review-001&period=backtest")
+        self.assertEqual(status, 200)
+        review_ids = {item["id"] for item in reviews}
+        self.assertEqual(review_ids, {"review-unit-backtest-match"})
         self.assertNotIn("review-20260330-daily", review_ids)
 
     def test_manual_strategy_issue_review_endpoint_queues_tracking_job(self) -> None:
@@ -8052,6 +9863,7 @@ class ControlApiIntegrationTests(unittest.TestCase):
         self.assertEqual(change_status, 200)
         self.assertEqual(change_request["status"], "applied")
         self.assertEqual(change_request["requested_by"], "unit_test")
+        self.assertEqual(change_request["trigger_reason"], "manual_create")
 
         scheduler_after_change_status, scheduler_after_change = self._get("/api/ai/scheduler")
         self.assertEqual(scheduler_after_change_status, 200)
@@ -8063,6 +9875,9 @@ class ControlApiIntegrationTests(unittest.TestCase):
         self.assertEqual(review_job["job_type"], "review_strategy_change")
         self.assertEqual(review_job["writeback_target"], "strategy_activity")
         self.assertEqual(review_job["context"]["strategy_id"], "trend-btc-01")
+        self.assertIsNone(review_job["context"]["source_review_id"])
+        self.assertIsNone(review_job["context"]["source_proposal_id"])
+        self.assertEqual(review_job["context"]["trigger_reason"], "manual_create")
 
         strategies_status, strategies = self._get("/api/strategies")
         self.assertEqual(strategies_status, 200)
@@ -8083,8 +9898,22 @@ class ControlApiIntegrationTests(unittest.TestCase):
         self.assertEqual(backtest_status, 200)
         self.assertEqual(backtest["strategy_id"], "trend-btc-01")
         self.assertEqual(backtest["status"], "completed")
+        self.assertIsNone(backtest["source_backtest_id"])
+        self.assertIsNone(backtest["source_review_id"])
+        self.assertIsNone(backtest["source_proposal_id"])
+        self.assertEqual(backtest["trigger_reason"], "manual_create")
         self.assertIn("本地回测引擎", backtest["notes"])
-        self.assertGreater(backtest["metrics"]["trades"], 0)
+        self.assertGreaterEqual(backtest["metrics"]["trades"], 0)
+        if backtest["metrics"]["trades"] == 0:
+            self.assertTrue(backtest["reference_only"])
+            self.assertEqual(backtest["sample_quality"], "reference_only")
+            self.assertIn("未命中真实入场信号", backtest["notes"])
+        elif backtest["metrics"]["trades"] < 5:
+            self.assertFalse(backtest["reference_only"])
+            self.assertEqual(backtest["sample_quality"], "low_sample")
+        else:
+            self.assertFalse(backtest["reference_only"])
+            self.assertEqual(backtest["sample_quality"], "sufficient")
 
         scheduler_after_backtest_status, scheduler_after_backtest = self._get("/api/ai/scheduler")
         self.assertEqual(scheduler_after_backtest_status, 200)
@@ -8094,6 +9923,12 @@ class ControlApiIntegrationTests(unittest.TestCase):
         )
         self.assertIsNotNone(review_job)
         self.assertEqual(review_job["job_type"], "generate_backtest_review")
+        self.assertEqual(review_job["context"]["reference_only"], backtest["reference_only"])
+        self.assertEqual(review_job["context"]["sample_quality"], backtest["sample_quality"])
+        self.assertIsNone(review_job["context"]["source_backtest_id"])
+        self.assertIsNone(review_job["context"]["source_review_id"])
+        self.assertIsNone(review_job["context"]["source_proposal_id"])
+        self.assertEqual(review_job["context"]["trigger_reason"], "manual_create")
         self.assertIn("execution_health", review_job["context"])
         self.assertIn("execution_top_issue", review_job["context"])
 
@@ -8165,6 +10000,11 @@ class ControlApiIntegrationTests(unittest.TestCase):
         self.assertGreaterEqual(scheduler_after["scheduler"]["queue_depth"], initial_queue_depth)
         self.assertTrue(any(item["id"] == job["id"] for item in scheduler_after["jobs"]))
 
+        audit_status, audit_events = self._get("/api/audit/events")
+        self.assertEqual(audit_status, 200)
+        queued_events = [item for item in audit_events if item["event_type"] == "openclaw.job.queued" and item["payload"].get("job_id") == job["id"]]
+        self.assertEqual(len(queued_events), 1)
+
     def test_scheduler_cancel_job_marks_job_cancelled_and_clears_current_slot(self) -> None:
         control_main.repo.state.control_snapshot.scheduler.current_job_id = None
         created = control_main.repo.create_agent_job(
@@ -8192,6 +10032,10 @@ class ControlApiIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(status, 200)
         self.assertEqual(payload["command"], "cancel_job")
+        self.assertEqual(payload["summary"], "已终止任务：generate_daily_review")
+        self.assertEqual(payload["job_id"], created.id)
+        self.assertEqual(payload["cancelled_job_ids"], [created.id])
+        self.assertEqual(payload["cancelled_job_count"], 1)
 
         scheduler_status, scheduler = self._get("/api/ai/scheduler")
         self.assertEqual(scheduler_status, 200)
@@ -8204,7 +10048,331 @@ class ControlApiIntegrationTests(unittest.TestCase):
         audit_status, audit_events = self._get("/api/audit/events")
         self.assertEqual(audit_status, 200)
         self.assertEqual(audit_events[0]["event_type"], "scheduler.command")
+        self.assertEqual(audit_events[0]["payload"]["summary"], "已终止任务：generate_daily_review")
         self.assertTrue(any(item["event_type"] == "openclaw.job.cancelled" for item in audit_events))
+        cancelled_event = next((item for item in audit_events if item["event_type"] == "openclaw.job.cancelled"), None)
+        self.assertIsNotNone(cancelled_event)
+        cancelled_payload = cancelled_event["payload"]
+        self.assertEqual(cancelled_payload["summary"], "人工终止当前任务")
+        self.assertEqual(cancelled_payload["reason"], "人工终止当前任务")
+
+    def test_scheduler_cancel_job_command_event_carries_backtest_review_lineage(self) -> None:
+        control_main.repo.state.control_snapshot.scheduler.current_job_id = None
+        create_status, created = self._post(
+            "/api/ai/jobs",
+            {
+                "job_type": "generate_backtest_review",
+                "context": {
+                    "strategy_id": "trend-btc-01",
+                    "backtest_id": "bt-unit-006",
+                    "source_change_request_id": "cr-parent-006",
+                    "source_backtest_id": "bt-parent-006",
+                    "source_review_id": "review-parent-006",
+                    "source_proposal_id": "prop-parent-006",
+                    "trigger_reason": "proposal_accept",
+                    "decision_readiness": "sample_incomplete",
+                    "decision_readiness_detail": "当前样本窗口仍未完整覆盖。",
+                    "decision_recommended_data_range": "最近 180 天",
+                    "decision_recommended_timeframe": "4h",
+                    "decision_readiness_action": "保持最近 180 天，改成 4h 后重跑。",
+                },
+                "allowed_actions": ["review_backtest", "propose_next_step"],
+                "timeout": 60,
+                "idempotency_key": "unit-test-scheduler-command-cancel-audit",
+                "writeback_target": "ai_review",
+            },
+        )
+        self.assertEqual(create_status, 200)
+        claimed = control_main.repo.claim_next_agent_job()
+        self.assertIsNotNone(claimed)
+
+        status, payload = self._post(
+            "/api/ai/scheduler/commands",
+            {
+                "command": "cancel_job",
+                "job_id": created["id"],
+                "requested_by": "unit_test",
+                "reason": "人工终止回测复盘任务",
+            },
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["command"], "cancel_job")
+        self.assertEqual(payload["summary"], "已终止任务：generate_backtest_review")
+        self.assertEqual(payload["job_id"], created["id"])
+        self.assertEqual(payload["backtest_id"], "bt-unit-006")
+        self.assertEqual(payload["source_change_request_id"], "cr-parent-006")
+        self.assertEqual(payload["source_backtest_id"], "bt-parent-006")
+        self.assertEqual(payload["source_review_id"], "review-parent-006")
+        self.assertEqual(payload["source_proposal_id"], "prop-parent-006")
+        self.assertEqual(payload["trigger_reason"], "proposal_accept")
+        self.assertEqual(payload["decision_readiness"], "sample_incomplete")
+        self.assertEqual(payload["decision_readiness_detail"], "当前样本窗口仍未完整覆盖。")
+        self.assertEqual(payload["decision_recommended_data_range"], "最近 180 天")
+        self.assertEqual(payload["decision_recommended_timeframe"], "4h")
+        self.assertEqual(payload["decision_readiness_action"], "保持最近 180 天，改成 4h 后重跑。")
+        self.assertEqual(payload["cancelled_job_ids"], [created["id"]])
+        self.assertEqual(payload["cancelled_job_count"], 1)
+
+        audit_status, audit_events = self._get("/api/audit/events")
+        self.assertEqual(audit_status, 200)
+        command_event = next((item for item in audit_events if item["event_type"] == "scheduler.command"), None)
+        self.assertIsNotNone(command_event)
+        command_payload = command_event["payload"]
+        self.assertEqual(command_payload["summary"], "已终止任务：generate_backtest_review")
+        self.assertEqual(command_payload["job_id"], created["id"])
+        self.assertEqual(command_payload["backtest_id"], "bt-unit-006")
+        self.assertEqual(command_payload["source_change_request_id"], "cr-parent-006")
+        self.assertEqual(command_payload["source_backtest_id"], "bt-parent-006")
+        self.assertEqual(command_payload["source_review_id"], "review-parent-006")
+        self.assertEqual(command_payload["source_proposal_id"], "prop-parent-006")
+        self.assertEqual(command_payload["trigger_reason"], "proposal_accept")
+        self.assertEqual(command_payload["decision_readiness"], "sample_incomplete")
+        self.assertEqual(command_payload["decision_readiness_detail"], "当前样本窗口仍未完整覆盖。")
+        self.assertEqual(command_payload["decision_recommended_data_range"], "最近 180 天")
+        self.assertEqual(command_payload["decision_recommended_timeframe"], "4h")
+        self.assertEqual(command_payload["decision_readiness_action"], "保持最近 180 天，改成 4h 后重跑。")
+        self.assertEqual(command_payload["cancelled_job_ids"], [created["id"]])
+        self.assertEqual(command_payload["cancelled_job_count"], 1)
+
+    def test_enter_manual_override_command_event_carries_current_job_lineage(self) -> None:
+        control_main.repo.state.control_snapshot.scheduler.current_job_id = None
+        create_status, created = self._post(
+            "/api/ai/jobs",
+            {
+                "job_type": "generate_backtest_review",
+                "context": {
+                    "strategy_id": "trend-btc-01",
+                    "backtest_id": "bt-unit-007",
+                    "source_change_request_id": "cr-parent-007",
+                    "source_backtest_id": "bt-parent-007",
+                    "source_review_id": "review-parent-007",
+                    "source_proposal_id": "prop-parent-007",
+                    "trigger_reason": "decision_rerun",
+                    "decision_readiness": "sample_incomplete",
+                    "decision_readiness_detail": "当前样本窗口仍未完整覆盖。",
+                    "decision_recommended_data_range": "最近 90 天",
+                    "decision_recommended_timeframe": "1d",
+                    "decision_readiness_action": "保持最近 90 天，改成 1d 后重跑。",
+                },
+                "allowed_actions": ["review_backtest", "propose_next_step"],
+                "timeout": 60,
+                "idempotency_key": "unit-test-scheduler-command-manual-override-audit",
+                "writeback_target": "ai_review",
+            },
+        )
+        self.assertEqual(create_status, 200)
+        claimed = control_main.repo.claim_next_agent_job()
+        self.assertIsNotNone(claimed)
+
+        status, payload = self._post(
+            "/api/ai/scheduler/commands",
+            {
+                "command": "enter_manual_override",
+                "requested_by": "unit_test",
+                "reason": "切人工接管排障",
+            },
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["command"], "enter_manual_override")
+        self.assertEqual(payload["summary"], "已进入人工接管，并终止当前任务：generate_backtest_review")
+        self.assertEqual(payload["job_id"], created["id"])
+        self.assertEqual(payload["backtest_id"], "bt-unit-007")
+        self.assertEqual(payload["source_change_request_id"], "cr-parent-007")
+        self.assertEqual(payload["source_backtest_id"], "bt-parent-007")
+        self.assertEqual(payload["source_review_id"], "review-parent-007")
+        self.assertEqual(payload["source_proposal_id"], "prop-parent-007")
+        self.assertEqual(payload["trigger_reason"], "decision_rerun")
+        self.assertEqual(payload["decision_readiness"], "sample_incomplete")
+        self.assertEqual(payload["decision_readiness_detail"], "当前样本窗口仍未完整覆盖。")
+        self.assertEqual(payload["decision_recommended_data_range"], "最近 90 天")
+        self.assertEqual(payload["decision_recommended_timeframe"], "1d")
+        self.assertEqual(payload["decision_readiness_action"], "保持最近 90 天，改成 1d 后重跑。")
+        self.assertEqual(payload["cancelled_job_ids"], [created["id"]])
+        self.assertEqual(payload["cancelled_job_count"], 1)
+        self.assertEqual(payload["scheduler_status"], "manual_override")
+        self.assertTrue(payload["freeze_publish"])
+
+        audit_status, audit_events = self._get("/api/audit/events")
+        self.assertEqual(audit_status, 200)
+        command_event = next((item for item in audit_events if item["event_type"] == "scheduler.command"), None)
+        self.assertIsNotNone(command_event)
+        command_payload = command_event["payload"]
+        self.assertEqual(command_payload["summary"], "已进入人工接管，并终止当前任务：generate_backtest_review")
+        self.assertEqual(command_payload["job_id"], created["id"])
+        self.assertEqual(command_payload["backtest_id"], "bt-unit-007")
+        self.assertEqual(command_payload["source_change_request_id"], "cr-parent-007")
+        self.assertEqual(command_payload["source_backtest_id"], "bt-parent-007")
+        self.assertEqual(command_payload["source_review_id"], "review-parent-007")
+        self.assertEqual(command_payload["source_proposal_id"], "prop-parent-007")
+        self.assertEqual(command_payload["trigger_reason"], "decision_rerun")
+        self.assertEqual(command_payload["decision_readiness"], "sample_incomplete")
+        self.assertEqual(command_payload["decision_readiness_detail"], "当前样本窗口仍未完整覆盖。")
+        self.assertEqual(command_payload["decision_recommended_data_range"], "最近 90 天")
+        self.assertEqual(command_payload["decision_recommended_timeframe"], "1d")
+        self.assertEqual(command_payload["decision_readiness_action"], "保持最近 90 天，改成 1d 后重跑。")
+        self.assertEqual(command_payload["cancelled_job_ids"], [created["id"]])
+        self.assertEqual(command_payload["cancelled_job_count"], 1)
+        self.assertEqual(command_payload["scheduler_status"], "manual_override")
+        self.assertTrue(command_payload["freeze_publish"])
+
+    def test_scheduler_cancel_all_command_event_summarizes_affected_jobs_and_lineage(self) -> None:
+        control_main.repo.state.control_snapshot.scheduler.current_job_id = None
+        control_main.repo.state.agent_jobs = []
+        control_main.repo._recompute_scheduler_queue_depth()
+
+        review_job_status, review_job = self._post(
+            "/api/ai/jobs",
+            {
+                "job_type": "generate_backtest_review",
+                "context": {
+                    "strategy_id": "trend-btc-01",
+                    "backtest_id": "bt-unit-008",
+                    "source_change_request_id": "cr-parent-008",
+                    "source_backtest_id": "bt-parent-008",
+                    "source_review_id": "review-parent-008",
+                    "source_proposal_id": "prop-parent-008",
+                    "trigger_reason": "proposal_accept",
+                    "decision_readiness": "sample_incomplete",
+                    "decision_readiness_detail": "当前样本窗口仍未完整覆盖。",
+                    "decision_recommended_data_range": "最近 180 天",
+                    "decision_recommended_timeframe": "4h",
+                    "decision_readiness_action": "保持最近 180 天，改成 4h 后重跑。",
+                },
+                "allowed_actions": ["review_backtest", "propose_next_step"],
+                "timeout": 60,
+                "idempotency_key": "unit-test-scheduler-command-cancel-all-review",
+                "writeback_target": "ai_review",
+            },
+        )
+        self.assertEqual(review_job_status, 200)
+        daily_job_status, daily_job = self._post(
+            "/api/ai/jobs",
+            {
+                "job_type": "generate_daily_review",
+                "context": {"focus_symbols": ["BTCUSDT"], "mode": "paper"},
+                "allowed_actions": ["review"],
+                "timeout": 60,
+                "idempotency_key": "unit-test-scheduler-command-cancel-all-daily",
+                "writeback_target": "ai_review",
+            },
+        )
+        self.assertEqual(daily_job_status, 200)
+        claimed = control_main.repo.claim_next_agent_job()
+        self.assertIsNotNone(claimed)
+
+        status, payload = self._post(
+            "/api/ai/scheduler/commands",
+            {
+                "command": "cancel_all",
+                "requested_by": "unit_test",
+                "reason": "批量终止排障",
+            },
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["command"], "cancel_all")
+        self.assertEqual(
+            payload["summary"],
+            "已终止 2 个任务，其中 generate_daily_review 1 个、generate_backtest_review 1 个。",
+        )
+        self.assertEqual(payload["cancelled_job_count"], 2)
+        self.assertEqual(set(payload["cancelled_job_ids"]), {review_job["id"], daily_job["id"]})
+        self.assertEqual(
+            set(payload["cancelled_job_types"]),
+            {"generate_backtest_review", "generate_daily_review"},
+        )
+        self.assertEqual(payload["cancelled_backtest_ids"], ["bt-unit-008"])
+        self.assertEqual(payload["cancelled_source_change_request_ids"], ["cr-parent-008"])
+        self.assertEqual(payload["cancelled_source_backtest_ids"], ["bt-parent-008"])
+        self.assertEqual(payload["cancelled_source_review_ids"], ["review-parent-008"])
+        self.assertEqual(payload["cancelled_source_proposal_ids"], ["prop-parent-008"])
+        self.assertEqual(payload["cancelled_trigger_reasons"], ["proposal_accept"])
+        self.assertEqual(payload["cancelled_decision_readiness_values"], ["sample_incomplete"])
+
+        audit_status, audit_events = self._get("/api/audit/events")
+        self.assertEqual(audit_status, 200)
+        command_event = next((item for item in audit_events if item["event_type"] == "scheduler.command"), None)
+        self.assertIsNotNone(command_event)
+        command_payload = command_event["payload"]
+        self.assertEqual(
+            command_payload["summary"],
+            "已终止 2 个任务，其中 generate_daily_review 1 个、generate_backtest_review 1 个。",
+        )
+        self.assertEqual(command_payload["cancelled_job_count"], 2)
+        self.assertEqual(set(command_payload["cancelled_job_ids"]), {review_job["id"], daily_job["id"]})
+        self.assertEqual(
+            set(command_payload["cancelled_job_types"]),
+            {"generate_backtest_review", "generate_daily_review"},
+        )
+        self.assertEqual(command_payload["cancelled_backtest_ids"], ["bt-unit-008"])
+        self.assertEqual(command_payload["cancelled_source_change_request_ids"], ["cr-parent-008"])
+        self.assertEqual(command_payload["cancelled_source_backtest_ids"], ["bt-parent-008"])
+        self.assertEqual(command_payload["cancelled_source_review_ids"], ["review-parent-008"])
+        self.assertEqual(command_payload["cancelled_source_proposal_ids"], ["prop-parent-008"])
+        self.assertEqual(command_payload["cancelled_trigger_reasons"], ["proposal_accept"])
+        self.assertEqual(command_payload["cancelled_decision_readiness_values"], ["sample_incomplete"])
+
+    def test_backtest_review_job_cancelled_event_writes_lineage_and_decision_into_audit_event(self) -> None:
+        control_main.repo.state.control_snapshot.scheduler.current_job_id = None
+
+        create_status, created = self._post(
+            "/api/ai/jobs",
+            {
+                "job_type": "generate_backtest_review",
+                "context": {
+                    "strategy_id": "trend-btc-01",
+                    "backtest_id": "bt-unit-004",
+                    "source_backtest_id": "bt-parent-004",
+                    "source_review_id": "review-parent-004",
+                    "source_proposal_id": "prop-parent-004",
+                    "trigger_reason": "decision_rerun",
+                    "decision_readiness": "sample_incomplete",
+                    "decision_readiness_detail": "当前样本窗口仍未完整覆盖。",
+                    "decision_recommended_data_range": "最近 180 天",
+                    "decision_recommended_timeframe": "4h",
+                    "decision_readiness_action": "保持最近 180 天，改成 4h 后重跑。",
+                },
+                "allowed_actions": ["review_backtest", "propose_next_step"],
+                "timeout": 60,
+                "idempotency_key": "unit-test-backtest-review-cancelled-audit",
+                "writeback_target": "ai_review",
+            },
+        )
+        self.assertEqual(create_status, 200)
+        self.assertEqual(created["status"], "queued")
+
+        claimed = control_main.repo.claim_next_agent_job()
+        self.assertIsNotNone(claimed)
+        assert claimed is not None
+
+        status, payload = self._post(
+            "/api/ai/scheduler/commands",
+            {
+                "command": "cancel_job",
+                "job_id": created["id"],
+                "requested_by": "unit_test",
+                "reason": "人工终止回测复盘任务",
+            },
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["command"], "cancel_job")
+
+        audit_status, audit_events = self._get("/api/audit/events")
+        self.assertEqual(audit_status, 200)
+        cancelled_event = next((item for item in audit_events if item["event_type"] == "openclaw.job.cancelled"), None)
+        self.assertIsNotNone(cancelled_event)
+        cancelled_payload = cancelled_event["payload"]
+        self.assertEqual(cancelled_payload["summary"], "人工终止回测复盘任务")
+        self.assertEqual(cancelled_payload["reason"], "人工终止回测复盘任务")
+        self.assertEqual(cancelled_payload["backtest_id"], "bt-unit-004")
+        self.assertEqual(cancelled_payload["source_backtest_id"], "bt-parent-004")
+        self.assertEqual(cancelled_payload["source_review_id"], "review-parent-004")
+        self.assertEqual(cancelled_payload["source_proposal_id"], "prop-parent-004")
+        self.assertEqual(cancelled_payload["trigger_reason"], "decision_rerun")
+        self.assertEqual(cancelled_payload["decision_readiness"], "sample_incomplete")
+        self.assertEqual(cancelled_payload["decision_readiness_detail"], "当前样本窗口仍未完整覆盖。")
+        self.assertEqual(cancelled_payload["decision_recommended_data_range"], "最近 180 天")
+        self.assertEqual(cancelled_payload["decision_recommended_timeframe"], "4h")
+        self.assertEqual(cancelled_payload["decision_readiness_action"], "保持最近 180 天，改成 4h 后重跑。")
 
     def test_retry_cancelled_job_creates_new_retry_job(self) -> None:
         control_main.repo.state.control_snapshot.scheduler.current_job_id = None
@@ -8289,6 +10457,75 @@ class ControlApiIntegrationTests(unittest.TestCase):
         self.assertEqual(retried_job["retry_count"], 1)
         self.assertEqual(retried_job["retried_from_job_id"], created["id"])
 
+    def test_backtest_review_job_retry_requested_event_writes_lineage_and_decision_into_audit_event(self) -> None:
+        control_main.repo.state.control_snapshot.scheduler.current_job_id = None
+
+        create_status, created = self._post(
+            "/api/ai/jobs",
+            {
+                "job_type": "generate_backtest_review",
+                "context": {
+                    "strategy_id": "trend-btc-01",
+                    "backtest_id": "bt-unit-005",
+                    "source_backtest_id": "bt-parent-005",
+                    "source_review_id": "review-parent-005",
+                    "source_proposal_id": "prop-parent-005",
+                    "trigger_reason": "proposal_accept",
+                    "decision_readiness": "sample_incomplete",
+                    "decision_readiness_detail": "当前样本窗口仍未完整覆盖。",
+                    "decision_recommended_data_range": "最近 180 天",
+                    "decision_recommended_timeframe": "4h",
+                    "decision_readiness_action": "保持最近 180 天，改成 4h 后重跑。",
+                },
+                "allowed_actions": ["review_backtest", "propose_next_step"],
+                "timeout": 60,
+                "idempotency_key": "unit-test-backtest-review-retry-audit",
+                "writeback_target": "ai_review",
+            },
+        )
+        self.assertEqual(create_status, 200)
+        self.assertEqual(created["status"], "queued")
+
+        claimed = control_main.repo.claim_next_agent_job()
+        self.assertIsNotNone(claimed)
+        assert claimed is not None
+        control_main.repo.apply_scheduler_command(
+            control_main.SchedulerCommand(
+                command="cancel_job",
+                job_id=claimed.id,
+                requested_by="unit_test",
+                reason="准备验证重试事件",
+            )
+        )
+
+        retry_status, retried = self._post(
+            f"/api/ai/jobs/{created['id']}/retry",
+            {"requested_by": "unit_test"},
+        )
+        self.assertEqual(retry_status, 200)
+
+        audit_status, audit_events = self._get("/api/audit/events")
+        self.assertEqual(audit_status, 200)
+        retry_event = next((item for item in audit_events if item["event_type"] == "openclaw.job.retry_requested"), None)
+        self.assertIsNotNone(retry_event)
+        retry_payload = retry_event["payload"]
+        self.assertEqual(retry_payload["summary"], "已请求重试任务：generate_backtest_review")
+        self.assertEqual(retry_payload["previous_job_id"], created["id"])
+        self.assertEqual(retry_payload["retry_job_id"], retried["id"])
+        self.assertEqual(retry_payload["retried_from_job_id"], created["id"])
+        self.assertEqual(retry_payload["retry_count"], 1)
+        self.assertEqual(retry_payload["job_id"], retried["id"])
+        self.assertEqual(retry_payload["backtest_id"], "bt-unit-005")
+        self.assertEqual(retry_payload["source_backtest_id"], "bt-parent-005")
+        self.assertEqual(retry_payload["source_review_id"], "review-parent-005")
+        self.assertEqual(retry_payload["source_proposal_id"], "prop-parent-005")
+        self.assertEqual(retry_payload["trigger_reason"], "proposal_accept")
+        self.assertEqual(retry_payload["decision_readiness"], "sample_incomplete")
+        self.assertEqual(retry_payload["decision_readiness_detail"], "当前样本窗口仍未完整覆盖。")
+        self.assertEqual(retry_payload["decision_recommended_data_range"], "最近 180 天")
+        self.assertEqual(retry_payload["decision_recommended_timeframe"], "4h")
+        self.assertEqual(retry_payload["decision_readiness_action"], "保持最近 180 天，改成 4h 后重跑。")
+
     def test_strategy_activity_job_carries_linked_review_metadata_after_completion(self) -> None:
         created = control_main.repo.create_agent_job(
             control_main.AgentJobCreate(
@@ -8336,6 +10573,47 @@ class ControlApiIntegrationTests(unittest.TestCase):
         self.assertEqual(linked_review["source_job_id"], created.id)
         self.assertEqual(linked_review["source_job_type"], "review_strategy_issue")
         self.assertEqual(linked_review["source_job_status"], "completed")
+
+    def test_strategy_activity_review_summary_carries_backtest_lineage_metadata(self) -> None:
+        review = control_main.ReviewDocument(
+            id="review-unit-backtest-lineage",
+            period="backtest",
+            strategy_id="trend-btc-01",
+            backtest_id="bt-child-001",
+            source_job_id="job-backtest-review-001",
+            source_job_type="generate_backtest_review",
+            source_job_status="completed",
+            source_change_request_id="cr-parent-001",
+            source_backtest_id="bt-parent-001",
+            source_review_id="review-parent-001",
+            source_proposal_id="prop-parent-001",
+            trigger_reason="proposal_accept",
+            title="BTC 回测复盘",
+            summary="本轮回测来自接受提案后的补样本重跑。",
+            highlights=["已完成补样本。"],
+            risks=["仍需继续观察。"],
+            proposals=[],
+            created_at=datetime.now(timezone.utc).astimezone().isoformat(),
+        )
+        control_main.repo.state.reviews.insert(0, review)
+
+        activity_status, activity = self._get("/api/strategies/trend-btc-01/activity")
+        self.assertEqual(activity_status, 200)
+        linked_review = next((item for item in activity["recent_reviews"] if item["id"] == review.id), None)
+        self.assertIsNotNone(linked_review)
+        assert linked_review is not None
+        self.assertEqual(linked_review["backtest_id"], "bt-child-001")
+        self.assertEqual(linked_review["source_job_id"], "job-backtest-review-001")
+        self.assertEqual(linked_review["source_job_type"], "generate_backtest_review")
+        self.assertEqual(linked_review["source_job_status"], "completed")
+        self.assertEqual(linked_review["source_change_request_id"], "cr-parent-001")
+        self.assertEqual(linked_review["source_backtest_id"], "bt-parent-001")
+        self.assertEqual(linked_review["source_review_id"], "review-parent-001")
+        self.assertEqual(linked_review["source_proposal_id"], "prop-parent-001")
+        self.assertEqual(linked_review["trigger_reason"], "proposal_accept")
+        self.assertEqual(activity["latest_primary_review"]["id"], review.id)
+        self.assertEqual(activity["latest_primary_review"]["source_change_request_id"], "cr-parent-001")
+        self.assertEqual(activity["latest_primary_review"]["source_backtest_id"], "bt-parent-001")
 
     def test_strategy_pause_and_risk_update_requests_apply_immediately(self) -> None:
         pause_status, pause_request = self._post(
@@ -8401,6 +10679,24 @@ class ControlApiIntegrationTests(unittest.TestCase):
         self.assertEqual(change_requests_status, 200)
         self.assertEqual(change_requests[0]["type"], "proposal.param_update")
         self.assertEqual(change_requests[0]["payload"]["proposal_id"], "prop-001")
+        self.assertEqual(change_requests[0]["source_review_id"], "review-20260330-daily")
+        self.assertEqual(change_requests[0]["source_proposal_id"], "prop-001")
+        self.assertEqual(change_requests[0]["trigger_reason"], "proposal_accept")
+        self.assertEqual(change_requests[0]["follow_up_job_type"], "review_strategy_change")
+        self.assertEqual(change_requests[0]["follow_up_job_status"], "queued")
+
+        scheduler_status, scheduler = self._get("/api/ai/scheduler")
+        self.assertEqual(scheduler_status, 200)
+        review_job = next(
+            (item for item in scheduler["jobs"] if item["idempotency_key"] == f"strategy-change-review-{change_requests[0]['id']}"),
+            None,
+        )
+        self.assertIsNotNone(review_job)
+        assert review_job is not None
+        self.assertEqual(review_job["context"]["source_review_id"], "review-20260330-daily")
+        self.assertEqual(review_job["context"]["source_proposal_id"], "prop-001")
+        self.assertEqual(review_job["context"]["trigger_reason"], "proposal_accept")
+        self.assertEqual(change_requests[0]["follow_up_job_id"], review_job["id"])
 
         snapshot_status, snapshot = self._get("/api/control/snapshot")
         self.assertEqual(snapshot_status, 200)
@@ -8440,20 +10736,848 @@ class ControlApiIntegrationTests(unittest.TestCase):
         self.assertIsNone(result["created_change_request"])
         self.assertIsNotNone(result["created_backtest"])
         self.assertEqual(result["created_backtest"]["strategy_id"], "sol-breakout-03")
+        self.assertIsNone(result["created_backtest"]["source_backtest_id"])
+        self.assertEqual(result["created_backtest"]["source_review_id"], "review-20260330-daily")
+        self.assertEqual(result["created_backtest"]["source_proposal_id"], "prop-003")
+        self.assertEqual(result["created_backtest"]["trigger_reason"], "proposal_accept")
 
         backtests_status, backtests = self._get("/api/backtests")
         self.assertEqual(backtests_status, 200)
         self.assertEqual(backtests[0]["id"], result["created_backtest"]["id"])
         self.assertEqual(backtests[0]["timeframe"], "15m")
+        self.assertEqual(backtests[0]["source_review_id"], "review-20260330-daily")
+        self.assertEqual(backtests[0]["source_proposal_id"], "prop-003")
+        self.assertEqual(backtests[0]["trigger_reason"], "proposal_accept")
 
         scheduler_status, scheduler = self._get("/api/ai/scheduler")
         self.assertEqual(scheduler_status, 200)
-        self.assertTrue(
-            any(
-                item["idempotency_key"] == f"backtest-review-{result['created_backtest']['id']}"
-                for item in scheduler["jobs"]
+        review_job = next(
+            item for item in scheduler["jobs"] if item["idempotency_key"] == f"backtest-review-{result['created_backtest']['id']}"
+        )
+        self.assertEqual(review_job["context"]["source_review_id"], "review-20260330-daily")
+        self.assertEqual(review_job["context"]["source_proposal_id"], "prop-003")
+        self.assertEqual(review_job["context"]["trigger_reason"], "proposal_accept")
+
+    def test_backtest_launch_change_request_preserves_source_change_request_lineage(self) -> None:
+        status, change_request = self._post(
+            "/api/change-requests",
+            {
+                "type": "backtest.launch",
+                "payload": {
+                    "strategy_id": "trend-btc-01",
+                    "data_range": "最近 90 天",
+                    "timeframe": "1h",
+                },
+                "requested_by": "unit_test",
+                "source_review_id": "review-parent-010",
+                "source_proposal_id": "prop-parent-010",
+                "trigger_reason": "proposal_accept",
+                "target_mode": "paper",
+                "priority": "high",
+                "summary": "按提案补跑回测",
+            },
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(change_request["status"], "applied")
+        self.assertEqual(change_request["source_review_id"], "review-parent-010")
+        self.assertEqual(change_request["source_proposal_id"], "prop-parent-010")
+        self.assertEqual(change_request["trigger_reason"], "proposal_accept")
+        self.assertEqual(change_request["follow_up_job_type"], "generate_backtest_review")
+        self.assertEqual(change_request["follow_up_job_status"], "queued")
+        self.assertIsNotNone(change_request["linked_backtest_id"])
+        self.assertEqual(change_request["linked_backtest_timeframe"], "1h")
+        self.assertEqual(change_request["linked_backtest_data_range"], "最近 90 天")
+
+        backtests_status, backtests = self._get("/api/backtests")
+        self.assertEqual(backtests_status, 200)
+        self.assertEqual(change_request["linked_backtest_id"], backtests[0]["id"])
+        self.assertEqual(backtests[0]["source_change_request_id"], change_request["id"])
+        self.assertEqual(backtests[0]["source_review_id"], "review-parent-010")
+        self.assertEqual(backtests[0]["source_proposal_id"], "prop-parent-010")
+        self.assertEqual(backtests[0]["trigger_reason"], "proposal_accept")
+
+        change_requests_status, change_requests = self._get("/api/change-requests")
+        self.assertEqual(change_requests_status, 200)
+        self.assertEqual(change_requests[0]["linked_backtest_id"], backtests[0]["id"])
+        self.assertEqual(change_requests[0]["linked_backtest_timeframe"], "1h")
+        self.assertEqual(change_requests[0]["linked_backtest_data_range"], "最近 90 天")
+        self.assertEqual(change_requests[0]["linked_backtest_sample_quality"], backtests[0]["sample_quality"])
+        self.assertEqual(change_requests[0]["linked_backtest_history_source"], backtests[0]["history_source"])
+        self.assertEqual(change_requests[0]["linked_backtest_history_source_reason"], backtests[0]["history_source_reason"])
+        self.assertEqual(change_requests[0]["linked_backtest_history_source_detail"], backtests[0]["history_source_detail"])
+        self.assertEqual(
+            change_requests[0]["linked_backtest_history_source_recommended_data_range"],
+            backtests[0]["history_source_recommended_data_range"],
+        )
+        self.assertEqual(
+            change_requests[0]["linked_backtest_history_source_recommended_timeframe"],
+            backtests[0]["history_source_recommended_timeframe"],
+        )
+        self.assertEqual(
+            change_requests[0]["linked_backtest_history_source_recommended_action"],
+            backtests[0]["history_source_recommended_action"],
+        )
+        self.assertEqual(
+            change_requests[0]["linked_backtest_requested_candle_estimate"],
+            backtests[0]["requested_candle_estimate"],
+        )
+        self.assertEqual(
+            change_requests[0]["linked_backtest_requested_candle_limit"],
+            backtests[0]["requested_candle_limit"],
+        )
+        self.assertEqual(
+            change_requests[0]["linked_backtest_requested_range_start"],
+            backtests[0]["requested_range_start"],
+        )
+        self.assertEqual(
+            change_requests[0]["linked_backtest_requested_range_end"],
+            backtests[0]["requested_range_end"],
+        )
+        self.assertEqual(
+            change_requests[0]["linked_backtest_retrieved_window_completion_pct"],
+            backtests[0]["retrieved_window_completion_pct"],
+        )
+        self.assertEqual(
+            change_requests[0]["linked_backtest_used_window_completion_pct"],
+            backtests[0]["used_window_completion_pct"],
+        )
+        self.assertEqual(
+            change_requests[0]["linked_backtest_retrieved_candle_count"],
+            backtests[0]["retrieved_candle_count"],
+        )
+        self.assertEqual(
+            change_requests[0]["linked_backtest_used_candle_count"],
+            backtests[0]["used_candle_count"],
+        )
+        self.assertEqual(
+            change_requests[0]["linked_backtest_retrieved_range_start"],
+            backtests[0]["retrieved_range_start"],
+        )
+        self.assertEqual(
+            change_requests[0]["linked_backtest_retrieved_range_end"],
+            backtests[0]["retrieved_range_end"],
+        )
+        self.assertEqual(
+            change_requests[0]["linked_backtest_used_range_start"],
+            backtests[0]["used_range_start"],
+        )
+        self.assertEqual(
+            change_requests[0]["linked_backtest_used_range_end"],
+            backtests[0]["used_range_end"],
+        )
+        self.assertEqual(change_requests[0]["linked_backtest_history_truncated"], backtests[0]["history_truncated"])
+        self.assertEqual(change_requests[0]["linked_backtest_history_gap_reason"], backtests[0]["history_gap_reason"])
+        self.assertEqual(
+            change_requests[0]["linked_backtest_full_window_recommended_data_range"],
+            backtests[0]["full_window_recommended_data_range"],
+        )
+        self.assertEqual(
+            change_requests[0]["linked_backtest_full_window_recommended_timeframe"],
+            backtests[0]["full_window_recommended_timeframe"],
+        )
+        self.assertEqual(
+            change_requests[0]["linked_backtest_full_window_recommended_action"],
+            backtests[0]["full_window_recommended_action"],
+        )
+        self.assertEqual(change_requests[0]["linked_backtest_decision_readiness"], backtests[0]["decision_readiness"])
+        self.assertEqual(
+            change_requests[0]["linked_backtest_decision_readiness_detail"],
+            backtests[0]["decision_readiness_detail"],
+        )
+        self.assertEqual(
+            change_requests[0]["linked_backtest_decision_recommended_data_range"],
+            backtests[0]["decision_recommended_data_range"],
+        )
+        self.assertEqual(
+            change_requests[0]["linked_backtest_decision_recommended_timeframe"],
+            backtests[0]["decision_recommended_timeframe"],
+        )
+        self.assertEqual(
+            change_requests[0]["linked_backtest_decision_readiness_action"],
+            backtests[0]["decision_readiness_action"],
+        )
+
+        scheduler_status, scheduler = self._get("/api/ai/scheduler")
+        self.assertEqual(scheduler_status, 200)
+        review_job = next(
+            item for item in scheduler["jobs"] if item["idempotency_key"] == f"backtest-review-{backtests[0]['id']}"
+        )
+        self.assertEqual(change_request["follow_up_job_id"], review_job["id"])
+        self.assertEqual(review_job["context"]["source_change_request_id"], change_request["id"])
+        self.assertEqual(review_job["context"]["source_review_id"], "review-parent-010")
+        self.assertEqual(review_job["context"]["source_proposal_id"], "prop-parent-010")
+        self.assertEqual(review_job["context"]["trigger_reason"], "proposal_accept")
+
+    def test_backtest_review_completion_links_review_back_to_source_change_request(self) -> None:
+        status, change_request = self._post(
+            "/api/change-requests",
+            {
+                "type": "backtest.launch",
+                "payload": {
+                    "strategy_id": "trend-btc-01",
+                    "data_range": "最近 180 天",
+                    "timeframe": "4h",
+                },
+                "requested_by": "unit_test",
+                "source_review_id": "review-parent-011",
+                "source_proposal_id": "prop-parent-011",
+                "trigger_reason": "proposal_accept",
+                "target_mode": "paper",
+                "priority": "high",
+                "summary": "按提案继续补样本回测",
+            },
+        )
+
+        self.assertEqual(status, 200)
+
+        backtests_status, backtests = self._get("/api/backtests")
+        self.assertEqual(backtests_status, 200)
+        linked_backtest = backtests[0]
+
+        scheduler_status, scheduler = self._get("/api/ai/scheduler")
+        self.assertEqual(scheduler_status, 200)
+        review_job = next(
+            item for item in scheduler["jobs"] if item["idempotency_key"] == f"backtest-review-{linked_backtest['id']}"
+        )
+        reconcile_job = next(
+            item for item in scheduler["jobs"] if item["idempotency_key"] == f"change-request-reconcile-{change_request['id']}"
+        )
+        self.assertEqual(change_request["follow_up_job_id"], review_job["id"])
+        self.assertEqual(change_request["follow_up_job_type"], "generate_backtest_review")
+
+        control_main.repo.complete_agent_job(
+            reconcile_job["id"],
+            result_summary="AI 执行记录已补齐。",
+            review=None,
+            source="unit_test",
+        )
+
+        change_requests_status, change_requests = self._get("/api/change-requests")
+        self.assertEqual(change_requests_status, 200)
+        unchanged = next(item for item in change_requests if item["id"] == change_request["id"])
+        self.assertEqual(unchanged["follow_up_job_id"], review_job["id"])
+        self.assertEqual(unchanged["follow_up_job_type"], "generate_backtest_review")
+        self.assertEqual(unchanged["follow_up_job_status"], "queued")
+        self.assertIsNone(unchanged["follow_up_result_summary"])
+
+        review = control_main.ReviewDocument(
+            id="review-backtest-change-request-001",
+            period="backtest",
+            strategy_id="trend-btc-01",
+            backtest_id=linked_backtest["id"],
+            source_change_request_id=change_request["id"],
+            source_review_id="review-parent-011",
+            source_proposal_id="prop-parent-011",
+            trigger_reason="proposal_accept",
+            title="BTC 补样本回测复盘",
+            summary="本轮回测已补齐更长窗口，可继续评估。",
+            highlights=["回测结果已经挂回来源变更。"],
+            risks=["仍需继续观察资金门槛。"],
+            proposals=[],
+            created_at=datetime.now(timezone.utc).astimezone().isoformat(),
+        )
+        control_main.repo.complete_agent_job(
+            review_job["id"],
+            result_summary="回测复盘已完成。",
+            review=review,
+            source="unit_test",
+        )
+
+        change_requests_status, change_requests = self._get("/api/change-requests")
+        self.assertEqual(change_requests_status, 200)
+        updated = next(item for item in change_requests if item["id"] == change_request["id"])
+        self.assertEqual(updated["follow_up_job_id"], review_job["id"])
+        self.assertEqual(updated["follow_up_job_type"], "generate_backtest_review")
+        self.assertEqual(updated["follow_up_job_status"], "completed")
+        self.assertEqual(updated["follow_up_result_summary"], "回测复盘已完成。")
+        self.assertEqual(updated["linked_backtest_id"], linked_backtest["id"])
+        self.assertEqual(updated["linked_backtest_timeframe"], "4h")
+        self.assertEqual(updated["linked_backtest_data_range"], "最近 180 天")
+        self.assertEqual(updated["linked_backtest_sample_quality"], linked_backtest["sample_quality"])
+        self.assertEqual(updated["linked_backtest_history_source"], linked_backtest["history_source"])
+        self.assertEqual(updated["linked_backtest_history_source_reason"], linked_backtest["history_source_reason"])
+        self.assertEqual(updated["linked_backtest_history_source_detail"], linked_backtest["history_source_detail"])
+        self.assertEqual(
+            updated["linked_backtest_history_source_recommended_data_range"],
+            linked_backtest["history_source_recommended_data_range"],
+        )
+        self.assertEqual(
+            updated["linked_backtest_history_source_recommended_timeframe"],
+            linked_backtest["history_source_recommended_timeframe"],
+        )
+        self.assertEqual(
+            updated["linked_backtest_history_source_recommended_action"],
+            linked_backtest["history_source_recommended_action"],
+        )
+        self.assertEqual(
+            updated["linked_backtest_requested_candle_estimate"],
+            linked_backtest["requested_candle_estimate"],
+        )
+        self.assertEqual(
+            updated["linked_backtest_requested_candle_limit"],
+            linked_backtest["requested_candle_limit"],
+        )
+        self.assertEqual(
+            updated["linked_backtest_requested_range_start"],
+            linked_backtest["requested_range_start"],
+        )
+        self.assertEqual(
+            updated["linked_backtest_requested_range_end"],
+            linked_backtest["requested_range_end"],
+        )
+        self.assertEqual(
+            updated["linked_backtest_retrieved_window_completion_pct"],
+            linked_backtest["retrieved_window_completion_pct"],
+        )
+        self.assertEqual(
+            updated["linked_backtest_used_window_completion_pct"],
+            linked_backtest["used_window_completion_pct"],
+        )
+        self.assertEqual(
+            updated["linked_backtest_retrieved_candle_count"],
+            linked_backtest["retrieved_candle_count"],
+        )
+        self.assertEqual(
+            updated["linked_backtest_used_candle_count"],
+            linked_backtest["used_candle_count"],
+        )
+        self.assertEqual(
+            updated["linked_backtest_retrieved_range_start"],
+            linked_backtest["retrieved_range_start"],
+        )
+        self.assertEqual(
+            updated["linked_backtest_retrieved_range_end"],
+            linked_backtest["retrieved_range_end"],
+        )
+        self.assertEqual(
+            updated["linked_backtest_used_range_start"],
+            linked_backtest["used_range_start"],
+        )
+        self.assertEqual(
+            updated["linked_backtest_used_range_end"],
+            linked_backtest["used_range_end"],
+        )
+        self.assertEqual(updated["linked_backtest_history_truncated"], linked_backtest["history_truncated"])
+        self.assertEqual(updated["linked_backtest_history_gap_reason"], linked_backtest["history_gap_reason"])
+        self.assertEqual(
+            updated["linked_backtest_full_window_recommended_data_range"],
+            linked_backtest["full_window_recommended_data_range"],
+        )
+        self.assertEqual(
+            updated["linked_backtest_full_window_recommended_timeframe"],
+            linked_backtest["full_window_recommended_timeframe"],
+        )
+        self.assertEqual(
+            updated["linked_backtest_full_window_recommended_action"],
+            linked_backtest["full_window_recommended_action"],
+        )
+        self.assertEqual(updated["linked_backtest_decision_readiness"], linked_backtest["decision_readiness"])
+        self.assertEqual(
+            updated["linked_backtest_decision_readiness_detail"],
+            linked_backtest["decision_readiness_detail"],
+        )
+        self.assertEqual(
+            updated["linked_backtest_decision_recommended_data_range"],
+            linked_backtest["decision_recommended_data_range"],
+        )
+        self.assertEqual(
+            updated["linked_backtest_decision_recommended_timeframe"],
+            linked_backtest["decision_recommended_timeframe"],
+        )
+        self.assertEqual(
+            updated["linked_backtest_decision_readiness_action"],
+            linked_backtest["decision_readiness_action"],
+        )
+        self.assertEqual(updated["linked_review_id"], review.id)
+        self.assertEqual(updated["linked_review_title"], review.title)
+        self.assertEqual(updated["linked_review_period"], "backtest")
+
+    def test_change_request_endpoint_mirrors_linked_backtest_window_hints_without_backtest_lookup(self) -> None:
+        record = control_main.repo.create_change_request(
+            ChangeRequestCreate(
+                type="backtest.launch",
+                payload={
+                    "strategy_id": "trend-btc-01",
+                    "data_range": "最近 180 天",
+                    "timeframe": "4h",
+                },
+                requested_by="unit_test",
+                source_review_id="review-parent-window-001",
+                source_proposal_id="prop-parent-window-001",
+                trigger_reason="proposal_accept",
+                target_mode=AccountMode.PAPER,
+                priority="high",
+                summary="验证 ChangeRequest 镜像回测窗口提示",
             )
         )
+        now = datetime.now(timezone.utc).astimezone().isoformat()
+        mirrored_backtest = BacktestRun(
+            id="backtest-window-hints-001",
+            strategy_id="trend-btc-01",
+            strategy_name="BTC 趋势跟随",
+            source_change_request_id=record.id,
+            source_review_id="review-parent-window-001",
+            source_proposal_id="prop-parent-window-001",
+            trigger_reason="proposal_accept",
+            status="completed",
+            started_at=now,
+            finished_at=now,
+            symbol_scope=["BTCUSDT"],
+            timeframe="4h",
+            data_range="最近 180 天",
+            data_granularity="4h",
+            fee_model="taker",
+            slippage_model="fixed_bp_5",
+            parameter_snapshot={},
+            metrics=BacktestMetrics(
+                annual_return="+2.00%",
+                max_drawdown="-3.00%",
+                sharpe="0.80",
+                win_rate="40.00%",
+                pnl="+120.00 USDT",
+                trades=2,
+            ),
+            reference_only=False,
+            sample_quality="low_sample",
+            history_source="market_detail_fallback",
+            history_source_reason="exchange_fetch_failed",
+            history_source_detail="upstream TLS EOF while reading",
+            history_source_recommended_data_range="最近 90 天",
+            history_source_recommended_timeframe="1h",
+            history_source_recommended_action="恢复交易所历史 K 线拉取后，再按 最近 90 天 / 1h 重跑。",
+            decision_readiness="sample_incomplete",
+            decision_readiness_detail="样本窗口未完整覆盖。",
+            decision_recommended_data_range=None,
+            decision_recommended_timeframe=None,
+            decision_readiness_action="先补样本后再继续判断。",
+            requested_candle_estimate=1200,
+            requested_candle_limit=600,
+            requested_range_start="2025-01-01T00:00:00+08:00",
+            requested_range_end="2025-06-30T00:00:00+08:00",
+            retrieved_window_completion_pct=50.0,
+            used_window_completion_pct=50.0,
+            retrieved_candle_count=600,
+            used_candle_count=600,
+            retrieved_range_start="2025-01-01T00:00:00+08:00",
+            retrieved_range_end="2025-03-31T00:00:00+08:00",
+            used_range_start="2025-01-01T00:00:00+08:00",
+            used_range_end="2025-03-31T00:00:00+08:00",
+            history_truncated=True,
+            history_gap_reason="sample_cap",
+            full_window_recommended_data_range="最近 45 天",
+            full_window_recommended_timeframe="1d",
+            full_window_recommended_action="保持研究目标不变，建议先缩短到 最近 45 天 并保持 1d 重跑。",
+            notes="synthetic backtest for change request mirror",
+        )
+        control_main.repo._sync_change_request_follow_up_locked(record.id, backtest=mirrored_backtest)
+
+        change_requests_status, change_requests = self._get("/api/change-requests")
+        self.assertEqual(change_requests_status, 200)
+        updated = next(item for item in change_requests if item["id"] == record.id)
+        self.assertEqual(updated["linked_backtest_id"], mirrored_backtest.id)
+        self.assertEqual(updated["linked_backtest_history_source"], "market_detail_fallback")
+        self.assertEqual(updated["linked_backtest_history_source_reason"], "exchange_fetch_failed")
+        self.assertEqual(updated["linked_backtest_history_source_detail"], "upstream TLS EOF while reading")
+        self.assertEqual(updated["linked_backtest_history_source_recommended_data_range"], "最近 90 天")
+        self.assertEqual(updated["linked_backtest_history_source_recommended_timeframe"], "1h")
+        self.assertIn("恢复交易所历史 K 线拉取", updated["linked_backtest_history_source_recommended_action"])
+        self.assertEqual(updated["linked_backtest_requested_candle_estimate"], 1200)
+        self.assertEqual(updated["linked_backtest_requested_candle_limit"], 600)
+        self.assertEqual(updated["linked_backtest_requested_range_start"], "2025-01-01T00:00:00+08:00")
+        self.assertEqual(updated["linked_backtest_requested_range_end"], "2025-06-30T00:00:00+08:00")
+        self.assertEqual(updated["linked_backtest_retrieved_window_completion_pct"], 50.0)
+        self.assertEqual(updated["linked_backtest_used_window_completion_pct"], 50.0)
+        self.assertEqual(updated["linked_backtest_retrieved_candle_count"], 600)
+        self.assertEqual(updated["linked_backtest_used_candle_count"], 600)
+        self.assertEqual(updated["linked_backtest_retrieved_range_start"], "2025-01-01T00:00:00+08:00")
+        self.assertEqual(updated["linked_backtest_retrieved_range_end"], "2025-03-31T00:00:00+08:00")
+        self.assertEqual(updated["linked_backtest_used_range_start"], "2025-01-01T00:00:00+08:00")
+        self.assertEqual(updated["linked_backtest_used_range_end"], "2025-03-31T00:00:00+08:00")
+        self.assertTrue(updated["linked_backtest_history_truncated"])
+        self.assertEqual(updated["linked_backtest_history_gap_reason"], "sample_cap")
+        self.assertEqual(updated["linked_backtest_full_window_recommended_data_range"], "最近 45 天")
+        self.assertEqual(updated["linked_backtest_full_window_recommended_timeframe"], "1d")
+        self.assertIn("建议先缩短到 最近 45 天", updated["linked_backtest_full_window_recommended_action"])
+
+    def test_backtest_endpoint_rejects_invalid_timeframe(self) -> None:
+        status, payload = self._post(
+            "/api/backtests",
+            {
+                "strategy_id": "trend-btc-01",
+                "data_range": "最近 90 天",
+                "timeframe": "2h",
+            },
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("回测周期仅支持 15m / 1h / 4h / 1d", payload["detail"])
+
+    def test_backtest_endpoint_preserves_source_lineage_fields(self) -> None:
+        status, backtest = self._post(
+            "/api/backtests",
+            {
+                "strategy_id": "trend-btc-01",
+                "data_range": "最近 90 天",
+                "timeframe": "1h",
+                "source_change_request_id": "cr-parent-001",
+                "source_backtest_id": "bt-parent-001",
+                "source_review_id": "review-parent-001",
+                "source_proposal_id": "prop-parent-001",
+                "trigger_reason": "decision_rerun",
+            },
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(backtest["source_change_request_id"], "cr-parent-001")
+        self.assertEqual(backtest["source_backtest_id"], "bt-parent-001")
+        self.assertEqual(backtest["source_review_id"], "review-parent-001")
+        self.assertEqual(backtest["source_proposal_id"], "prop-parent-001")
+        self.assertEqual(backtest["trigger_reason"], "decision_rerun")
+
+        scheduler_status, scheduler = self._get("/api/ai/scheduler")
+        self.assertEqual(scheduler_status, 200)
+        review_job = next(
+            item for item in scheduler["jobs"] if item["idempotency_key"] == f"backtest-review-{backtest['id']}"
+        )
+        self.assertEqual(review_job["context"]["source_change_request_id"], "cr-parent-001")
+        self.assertEqual(review_job["context"]["source_backtest_id"], "bt-parent-001")
+        self.assertEqual(review_job["context"]["source_review_id"], "review-parent-001")
+        self.assertEqual(review_job["context"]["source_proposal_id"], "prop-parent-001")
+        self.assertEqual(review_job["context"]["trigger_reason"], "decision_rerun")
+
+    def test_backtest_endpoint_expands_candle_window_for_relative_data_range(self) -> None:
+        original_market_data = control_main.market_data
+        backtest_market_data = RecordingBacktestMarketClient()
+        control_main.market_data = backtest_market_data
+        self.addCleanup(setattr, control_main, "market_data", original_market_data)
+
+        status_90, _ = self._post(
+            "/api/backtests",
+            {
+                "strategy_id": "trend-btc-01",
+                "data_range": "最近 90 天",
+                "timeframe": "1d",
+            },
+        )
+        status_180, _ = self._post(
+            "/api/backtests",
+            {
+                "strategy_id": "trend-btc-01",
+                "data_range": "最近 180 天",
+                "timeframe": "1d",
+            },
+        )
+
+        self.assertEqual(status_90, 200)
+        self.assertEqual(status_180, 200)
+        self.assertGreaterEqual(len(backtest_market_data.candle_requests), 2)
+        self.assertEqual(backtest_market_data.candle_requests[-2]["interval"], "D")
+        self.assertEqual(backtest_market_data.candle_requests[-2]["limit"], 95)
+        self.assertEqual(backtest_market_data.candle_requests[-1]["interval"], "D")
+        self.assertEqual(backtest_market_data.candle_requests[-1]["limit"], 185)
+
+    def test_backtest_endpoint_fetches_full_sample_window_with_paginated_history(self) -> None:
+        original_market_data = control_main.market_data
+        backtest_market_data = PaginatedHistoryBacktestMarketClient()
+        control_main.market_data = backtest_market_data
+        self.addCleanup(setattr, control_main, "market_data", original_market_data)
+
+        status, backtest = self._post(
+            "/api/backtests",
+            {
+                "strategy_id": "trend-btc-01",
+                "data_range": "最近 180 天",
+                "timeframe": "1h",
+            },
+        )
+
+        self.assertEqual(status, 200)
+        self.assertGreater(len(backtest_market_data.candle_requests), 1)
+        self.assertEqual(backtest_market_data.candle_requests[0]["limit"], 600)
+        self.assertEqual(backtest["requested_candle_estimate"], 4325)
+        self.assertEqual(backtest["requested_candle_limit"], 4325)
+        self.assertTrue(backtest["requested_range_start"])
+        self.assertTrue(backtest["requested_range_end"])
+        self.assertEqual(backtest["retrieved_window_completion_pct"], 100.0)
+        self.assertEqual(backtest["used_window_completion_pct"], 100.0)
+        self.assertEqual(backtest["retrieved_candle_count"], 4325)
+        self.assertEqual(backtest["used_candle_count"], 4325)
+        self.assertTrue(backtest["retrieved_range_start"])
+        self.assertTrue(backtest["retrieved_range_end"])
+        self.assertEqual(backtest["retrieved_range_start"], backtest["used_range_start"])
+        self.assertEqual(backtest["retrieved_range_end"], backtest["used_range_end"])
+        self.assertFalse(backtest["history_truncated"])
+        self.assertIsNone(backtest["full_window_recommended_data_range"])
+        self.assertIsNone(backtest["full_window_recommended_timeframe"])
+        self.assertIsNone(backtest["full_window_recommended_action"])
+        self.assertEqual(backtest["decision_readiness"], "ready")
+        self.assertIn("已达到最小门槛", backtest["decision_readiness_detail"])
+        self.assertIsNone(backtest["decision_recommended_data_range"])
+        self.assertIsNone(backtest["decision_recommended_timeframe"])
+        self.assertIsNone(backtest["decision_readiness_action"])
+        self.assertNotIn("理论需要约 4325 根 K 线", backtest["notes"])
+
+        scheduler_status, scheduler = self._get("/api/ai/scheduler")
+        self.assertEqual(scheduler_status, 200)
+        review_job = next(
+            item for item in scheduler["jobs"] if item["idempotency_key"] == f"backtest-review-{backtest['id']}"
+        )
+        self.assertEqual(review_job["context"]["requested_candle_estimate"], 4325)
+        self.assertEqual(review_job["context"]["requested_candle_limit"], 4325)
+        self.assertEqual(review_job["context"]["requested_range_start"], backtest["requested_range_start"])
+        self.assertEqual(review_job["context"]["requested_range_end"], backtest["requested_range_end"])
+        self.assertEqual(review_job["context"]["retrieved_window_completion_pct"], 100.0)
+        self.assertEqual(review_job["context"]["used_window_completion_pct"], 100.0)
+        self.assertEqual(review_job["context"]["retrieved_candle_count"], 4325)
+        self.assertEqual(review_job["context"]["used_candle_count"], 4325)
+        self.assertEqual(review_job["context"]["retrieved_range_start"], backtest["retrieved_range_start"])
+        self.assertEqual(review_job["context"]["retrieved_range_end"], backtest["retrieved_range_end"])
+        self.assertEqual(review_job["context"]["used_range_start"], backtest["used_range_start"])
+        self.assertEqual(review_job["context"]["used_range_end"], backtest["used_range_end"])
+        self.assertFalse(review_job["context"]["history_truncated"])
+        self.assertIsNone(review_job["context"]["full_window_recommended_data_range"])
+        self.assertIsNone(review_job["context"]["full_window_recommended_timeframe"])
+        self.assertIsNone(review_job["context"]["full_window_recommended_action"])
+        self.assertEqual(review_job["context"]["decision_readiness"], "ready")
+        self.assertIn("已达到最小门槛", review_job["context"]["decision_readiness_detail"])
+        self.assertIsNone(review_job["context"]["decision_recommended_data_range"])
+        self.assertIsNone(review_job["context"]["decision_recommended_timeframe"])
+        self.assertIsNone(review_job["context"]["decision_readiness_action"])
+        self.assertEqual(review_job["context"]["review_strategy_activity"]["strategy_id"], "trend-btc-01")
+        self.assertIn("recent_audit_events", review_job["context"]["review_strategy_activity"])
+
+    def test_backtest_endpoint_surfaces_shorter_range_recommendation_when_even_1d_cannot_cover(self) -> None:
+        original_market_data = control_main.market_data
+        backtest_market_data = PaginatedHistoryBacktestMarketClient()
+        control_main.market_data = backtest_market_data
+        self.addCleanup(setattr, control_main, "market_data", original_market_data)
+
+        status, backtest = self._post(
+            "/api/backtests",
+            {
+                "strategy_id": "trend-btc-01",
+                "data_range": "最近 30000 天",
+                "timeframe": "1d",
+            },
+        )
+
+        self.assertEqual(status, 200)
+        self.assertGreater(len(backtest_market_data.candle_requests), 1)
+        self.assertEqual(backtest_market_data.candle_requests[0]["interval"], "D")
+        self.assertEqual(backtest_market_data.candle_requests[0]["limit"], 600)
+        self.assertEqual(backtest["requested_candle_estimate"], 30005)
+        self.assertEqual(backtest["requested_candle_limit"], 20000)
+        self.assertTrue(backtest["requested_range_start"])
+        self.assertTrue(backtest["requested_range_end"])
+        self.assertEqual(backtest["retrieved_window_completion_pct"], 66.66)
+        self.assertEqual(backtest["used_window_completion_pct"], 66.66)
+        self.assertEqual(backtest["retrieved_candle_count"], 20000)
+        self.assertEqual(backtest["used_candle_count"], 20000)
+        self.assertTrue(backtest["retrieved_range_start"])
+        self.assertTrue(backtest["retrieved_range_end"])
+        self.assertEqual(backtest["retrieved_range_start"], backtest["used_range_start"])
+        self.assertEqual(backtest["retrieved_range_end"], backtest["used_range_end"])
+        self.assertTrue(backtest["history_truncated"])
+        self.assertEqual(backtest["full_window_recommended_data_range"], "最近 19995 天")
+        self.assertEqual(backtest["full_window_recommended_timeframe"], "1d")
+        self.assertIn("缩短到 最近 19995 天", backtest["full_window_recommended_action"])
+        self.assertEqual(backtest["decision_readiness"], "sample_incomplete")
+        self.assertEqual(backtest["decision_recommended_data_range"], "最近 19995 天")
+        self.assertEqual(backtest["decision_recommended_timeframe"], "1d")
+        self.assertIn("补足完整样本", backtest["decision_readiness_detail"])
+        self.assertIn("缩短到 最近 19995 天", backtest["decision_readiness_action"])
+
+        scheduler_status, scheduler = self._get("/api/ai/scheduler")
+        self.assertEqual(scheduler_status, 200)
+        review_job = next(
+            item for item in scheduler["jobs"] if item["idempotency_key"] == f"backtest-review-{backtest['id']}"
+        )
+        self.assertEqual(review_job["context"]["retrieved_range_start"], backtest["retrieved_range_start"])
+        self.assertEqual(review_job["context"]["retrieved_range_end"], backtest["retrieved_range_end"])
+        self.assertEqual(review_job["context"]["requested_range_start"], backtest["requested_range_start"])
+        self.assertEqual(review_job["context"]["requested_range_end"], backtest["requested_range_end"])
+        self.assertEqual(review_job["context"]["retrieved_window_completion_pct"], 66.66)
+        self.assertEqual(review_job["context"]["used_window_completion_pct"], 66.66)
+        self.assertEqual(review_job["context"]["used_range_start"], backtest["used_range_start"])
+        self.assertEqual(review_job["context"]["used_range_end"], backtest["used_range_end"])
+        self.assertEqual(review_job["context"]["full_window_recommended_data_range"], "最近 19995 天")
+        self.assertEqual(review_job["context"]["full_window_recommended_timeframe"], "1d")
+        self.assertIn("缩短到 最近 19995 天", review_job["context"]["full_window_recommended_action"])
+        self.assertEqual(review_job["context"]["decision_readiness"], "sample_incomplete")
+        self.assertEqual(review_job["context"]["decision_recommended_data_range"], "最近 19995 天")
+        self.assertEqual(review_job["context"]["decision_recommended_timeframe"], "1d")
+        self.assertIn("补足完整样本", review_job["context"]["decision_readiness_detail"])
+        self.assertIn("缩短到 最近 19995 天", review_job["context"]["decision_readiness_action"])
+        self.assertEqual(review_job["context"]["review_strategy_activity"]["strategy_id"], "trend-btc-01")
+
+    def test_backtest_endpoint_surfaces_available_history_range_when_exchange_history_is_short(self) -> None:
+        original_market_data = control_main.market_data
+        backtest_market_data = ShortHistoryBacktestMarketClient(total_available=60)
+        control_main.market_data = backtest_market_data
+        self.addCleanup(setattr, control_main, "market_data", original_market_data)
+
+        status, backtest = self._post(
+            "/api/backtests",
+            {
+                "strategy_id": "trend-btc-01",
+                "data_range": "最近 90 天",
+                "timeframe": "1d",
+            },
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(backtest["requested_candle_estimate"], 95)
+        self.assertEqual(backtest["requested_candle_limit"], 95)
+        self.assertTrue(backtest["requested_range_start"])
+        self.assertTrue(backtest["requested_range_end"])
+        self.assertEqual(backtest["retrieved_window_completion_pct"], 63.16)
+        self.assertEqual(backtest["used_window_completion_pct"], 63.16)
+        self.assertEqual(backtest["retrieved_candle_count"], 60)
+        self.assertEqual(backtest["used_candle_count"], 60)
+        self.assertEqual(backtest["history_gap_reason"], "insufficient_history")
+        self.assertTrue(backtest["history_truncated"])
+        self.assertTrue(backtest["retrieved_range_start"])
+        self.assertTrue(backtest["retrieved_range_end"])
+        self.assertEqual(backtest["full_window_recommended_timeframe"], "1d")
+        self.assertIn("建议先缩短到该可用区间", backtest["full_window_recommended_action"])
+
+        scheduler_status, scheduler = self._get("/api/ai/scheduler")
+        self.assertEqual(scheduler_status, 200)
+        review_job = next(
+            item for item in scheduler["jobs"] if item["idempotency_key"] == f"backtest-review-{backtest['id']}"
+        )
+        self.assertEqual(review_job["context"]["history_gap_reason"], "insufficient_history")
+        self.assertEqual(review_job["context"]["requested_range_start"], backtest["requested_range_start"])
+        self.assertEqual(review_job["context"]["requested_range_end"], backtest["requested_range_end"])
+        self.assertEqual(review_job["context"]["retrieved_window_completion_pct"], 63.16)
+        self.assertEqual(review_job["context"]["used_window_completion_pct"], 63.16)
+        self.assertEqual(review_job["context"]["retrieved_range_start"], backtest["retrieved_range_start"])
+        self.assertEqual(review_job["context"]["retrieved_range_end"], backtest["retrieved_range_end"])
+        self.assertIn("建议先缩短到该可用区间", review_job["context"]["full_window_recommended_action"])
+
+    def test_backtest_endpoint_marks_market_detail_fallback_history_source_when_history_fetch_fails(self) -> None:
+        original_market_data = control_main.market_data
+        backtest_market_data = FailingBacktestHistoryMarketClient()
+        control_main.market_data = backtest_market_data
+        self.addCleanup(setattr, control_main, "market_data", original_market_data)
+
+        status, backtest = self._post(
+            "/api/backtests",
+            {
+                "strategy_id": "trend-btc-01",
+                "data_range": "最近 90 天",
+                "timeframe": "1h",
+            },
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(len(backtest_market_data.history_requests), 1)
+        self.assertEqual(backtest["history_source"], "market_detail_fallback")
+        self.assertEqual(backtest["history_source_reason"], "exchange_fetch_failed")
+        self.assertEqual(backtest["history_source_detail"], "Bybit history api unavailable")
+        self.assertEqual(backtest["history_source_recommended_data_range"], "最近 90 天")
+        self.assertEqual(backtest["history_source_recommended_timeframe"], "1h")
+        self.assertIn("恢复交易所历史 K 线拉取", backtest["history_source_recommended_action"])
+        self.assertEqual(backtest["decision_readiness"], "research_only")
+        self.assertIn("仅适合研究排障", backtest["decision_readiness_detail"])
+        self.assertEqual(backtest["decision_recommended_data_range"], "最近 90 天")
+        self.assertEqual(backtest["decision_recommended_timeframe"], "1h")
+        self.assertIn("恢复交易所历史 K 线拉取", backtest["decision_readiness_action"])
+        self.assertIn("工作台行情快照样本", backtest["notes"])
+        self.assertIn("回退原因：Bybit history api unavailable", backtest["notes"])
+        self.assertIn("建议动作：请先恢复交易所历史 K 线拉取", backtest["notes"])
+
+        scheduler_status, scheduler = self._get("/api/ai/scheduler")
+        self.assertEqual(scheduler_status, 200)
+        review_job = next(
+            item for item in scheduler["jobs"] if item["idempotency_key"] == f"backtest-review-{backtest['id']}"
+        )
+        self.assertEqual(review_job["context"]["history_source"], "market_detail_fallback")
+        self.assertEqual(review_job["context"]["history_source_reason"], "exchange_fetch_failed")
+        self.assertEqual(review_job["context"]["history_source_detail"], "Bybit history api unavailable")
+        self.assertEqual(review_job["context"]["history_source_recommended_data_range"], "最近 90 天")
+        self.assertEqual(review_job["context"]["history_source_recommended_timeframe"], "1h")
+        self.assertIn("恢复交易所历史 K 线拉取", review_job["context"]["history_source_recommended_action"])
+        self.assertEqual(review_job["context"]["decision_readiness"], "research_only")
+        self.assertIn("仅适合研究排障", review_job["context"]["decision_readiness_detail"])
+        self.assertEqual(review_job["context"]["decision_recommended_data_range"], "最近 90 天")
+        self.assertEqual(review_job["context"]["decision_recommended_timeframe"], "1h")
+        self.assertIn("恢复交易所历史 K 线拉取", review_job["context"]["decision_readiness_action"])
+
+    def test_backtest_endpoint_marks_market_detail_fallback_when_exchange_history_samples_are_insufficient(self) -> None:
+        original_market_data = control_main.market_data
+        backtest_market_data = ShortHistoryBacktestMarketClient(total_available=20)
+        control_main.market_data = backtest_market_data
+        self.addCleanup(setattr, control_main, "market_data", original_market_data)
+
+        status, backtest = self._post(
+            "/api/backtests",
+            {
+                "strategy_id": "trend-btc-01",
+                "data_range": "最近 90 天",
+                "timeframe": "1d",
+            },
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(backtest["history_source"], "market_detail_fallback")
+        self.assertEqual(backtest["history_source_reason"], "insufficient_exchange_samples")
+        self.assertEqual(
+            backtest["history_source_detail"],
+            "交易所历史仅返回 20 根样本，低于最小回测门槛 30 根。",
+        )
+        self.assertEqual(backtest["history_source_recommended_data_range"], "最近 180 天")
+        self.assertEqual(backtest["history_source_recommended_timeframe"], "1d")
+        self.assertIn("改用 最近 180 天，并保持 1d 补样本后再重跑", backtest["history_source_recommended_action"])
+        self.assertEqual(backtest["decision_readiness"], "research_only")
+        self.assertIn("暂不建议直接用于调参或上线判断", backtest["decision_readiness_detail"])
+        self.assertEqual(backtest["decision_recommended_data_range"], "最近 180 天")
+        self.assertEqual(backtest["decision_recommended_timeframe"], "1d")
+        self.assertIn("改用 最近 180 天，并保持 1d 补样本后再重跑", backtest["decision_readiness_action"])
+        self.assertIn("回退原因：交易所历史仅返回 20 根样本", backtest["notes"])
+        self.assertIn("建议动作：当前交易所历史样本不足", backtest["notes"])
+
+        scheduler_status, scheduler = self._get("/api/ai/scheduler")
+        self.assertEqual(scheduler_status, 200)
+        review_job = next(
+            item for item in scheduler["jobs"] if item["idempotency_key"] == f"backtest-review-{backtest['id']}"
+        )
+        self.assertEqual(review_job["context"]["history_source"], "market_detail_fallback")
+        self.assertEqual(review_job["context"]["history_source_reason"], "insufficient_exchange_samples")
+        self.assertEqual(
+            review_job["context"]["history_source_detail"],
+            "交易所历史仅返回 20 根样本，低于最小回测门槛 30 根。",
+        )
+        self.assertEqual(review_job["context"]["history_source_recommended_data_range"], "最近 180 天")
+        self.assertEqual(review_job["context"]["history_source_recommended_timeframe"], "1d")
+        self.assertIn("改用 最近 180 天，并保持 1d 补样本后再重跑", review_job["context"]["history_source_recommended_action"])
+        self.assertEqual(review_job["context"]["decision_readiness"], "research_only")
+        self.assertIn("暂不建议直接用于调参或上线判断", review_job["context"]["decision_readiness_detail"])
+        self.assertEqual(review_job["context"]["decision_recommended_data_range"], "最近 180 天")
+        self.assertEqual(review_job["context"]["decision_recommended_timeframe"], "1d")
+        self.assertIn("改用 最近 180 天，并保持 1d 补样本后再重跑", review_job["context"]["decision_readiness_action"])
+
+    def test_accepting_backtest_request_proposal_rejects_invalid_timeframe_without_mutating_status(self) -> None:
+        proposal = next(
+            item
+            for review in control_main.repo.snapshot().reviews
+            for item in review.proposals
+            if item.id == "prop-003"
+        )
+        original_payload = dict(proposal.payload)
+        original_backtest_count = len(control_main.repo.snapshot().backtests)
+        proposal.payload = {**proposal.payload, "timeframe": "2h"}
+        try:
+            action_status, result = self._post(
+                "/api/ai/proposals/prop-003/action",
+                {"action": "accept", "requested_by": "unit_test"},
+            )
+            self.assertEqual(action_status, 409)
+            self.assertIn("回测周期仅支持 15m / 1h / 4h / 1d", result["detail"])
+            self.assertEqual(proposal.status, "pending")
+            self.assertEqual(len(control_main.repo.snapshot().backtests), original_backtest_count)
+        finally:
+            proposal.payload = original_payload
 
     def test_publish_recommendation_is_blocked_when_freeze_publish_enabled(self) -> None:
         toggle_status, toggle_result = self._post(
@@ -8469,6 +11593,168 @@ class ControlApiIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(action_status, 409)
         self.assertIn("冻结自动发布", result["detail"])
+
+    def test_publish_recommendation_requires_recommendation_without_mutating_status(self) -> None:
+        proposal = next(
+            item
+            for review in control_main.repo.snapshot().reviews
+            for item in review.proposals
+            if item.id == "prop-002"
+        )
+        original_payload = dict(proposal.payload)
+        original_change_request_count = len(control_main.repo.snapshot().change_requests)
+        proposal.payload = {key: value for key, value in proposal.payload.items() if key != "recommendation"}
+        try:
+            action_status, result = self._post(
+                "/api/ai/proposals/prop-002/action",
+                {"action": "accept", "requested_by": "unit_test"},
+            )
+            self.assertEqual(action_status, 409)
+            self.assertIn("缺少 recommendation", result["detail"])
+            self.assertEqual(proposal.status, "pending")
+            self.assertEqual(len(control_main.repo.snapshot().change_requests), original_change_request_count)
+        finally:
+            proposal.payload = original_payload
+
+    def test_accepting_script_patch_proposal_creates_queued_change_request_and_manual_followup_event(self) -> None:
+        review = control_main.repo.snapshot().reviews[0]
+        proposal = control_main.StrategyProposal(
+            id="prop-script-001",
+            proposal_type="script_patch_proposal",
+            strategy_id="trend-btc-01",
+            title="补执行摘要脚本补丁",
+            description="为回测复盘脚本补上更细的执行摘要。",
+            created_at=datetime.now(timezone.utc).astimezone().isoformat(),
+            status="pending",
+            expected_impact="让后续编排链能按补丁提案继续推进。",
+            payload={
+                "target_mode": "paper",
+                "summary": "补回测复盘执行摘要",
+                "files": ["services/control-api/main.py"],
+            },
+        )
+        review.proposals.insert(0, proposal)
+        self.addCleanup(lambda: review.proposals.remove(proposal) if proposal in review.proposals else None)
+
+        action_status, result = self._post(
+            "/api/ai/proposals/prop-script-001/action",
+            {"action": "accept", "requested_by": "unit_test"},
+        )
+        self.assertEqual(action_status, 200)
+        self.assertEqual(result["proposal"]["status"], "accepted")
+        self.assertIsNotNone(result["created_change_request"])
+        self.assertIsNone(result["created_backtest"])
+        assert result["created_change_request"] is not None
+        self.assertEqual(result["created_change_request"]["type"], "proposal.script_patch_proposal")
+        self.assertEqual(result["created_change_request"]["status"], "queued")
+        self.assertEqual(result["created_change_request"]["source_review_id"], "review-20260330-daily")
+        self.assertEqual(result["created_change_request"]["source_proposal_id"], "prop-script-001")
+        self.assertEqual(result["created_change_request"]["trigger_reason"], "proposal_accept")
+
+        change_requests_status, change_requests = self._get("/api/change-requests")
+        self.assertEqual(change_requests_status, 200)
+        patch_request = next(
+            (item for item in change_requests if item["payload"].get("proposal_id") == "prop-script-001"),
+            None,
+        )
+        self.assertIsNotNone(patch_request)
+        self.assertEqual(patch_request["status"], "queued")
+        self.assertEqual(patch_request["source_review_id"], "review-20260330-daily")
+        self.assertEqual(patch_request["source_proposal_id"], "prop-script-001")
+        self.assertEqual(patch_request["trigger_reason"], "proposal_accept")
+
+        audit_status, audit_events = self._get("/api/audit/events")
+        self.assertEqual(audit_status, 200)
+        followup_event = next(
+            (
+                item
+                for item in audit_events
+                if item["event_type"] == "change_request.manual_followup_required"
+                and item["payload"].get("proposal_id") == "prop-script-001"
+            ),
+            None,
+        )
+        self.assertIsNotNone(followup_event)
+
+    def test_manual_change_request_defaults_to_manual_create_trigger_reason(self) -> None:
+        status, created = self._post(
+            "/api/change-requests",
+            {
+                "type": "strategy.parameter.update",
+                "payload": {"strategy_id": "trend-btc-01", "ema_fast": 11},
+                "requested_by": "unit_test",
+                "source_backtest_id": "bt-manual-001",
+                "target_mode": "paper",
+                "priority": "high",
+                "summary": "手动调整 BTC 趋势快线参数",
+            },
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(created["trigger_reason"], "manual_create")
+        self.assertEqual(created["source_backtest_id"], "bt-manual-001")
+        self.assertIsNone(created["source_review_id"])
+        self.assertIsNone(created["source_proposal_id"])
+
+    def test_accepting_strategy_proposal_from_backtest_review_preserves_source_backtest_lineage(self) -> None:
+        review = control_main.ReviewDocument(
+            id="review-backtest-proposal-001",
+            title="BTC 趋势回测复盘",
+            period="backtest",
+            summary="基于回测结果给出一条调参建议。",
+            highlights=["快线参数仍有轻微优化空间。"],
+            symbols=["BTCUSDT"],
+            overall_risk="medium",
+            market_bias="bullish",
+            confidence=0.68,
+            actions=["观察 4h 周期趋势一致性"],
+            suggestions=["保留 4h 主趋势，但略微放宽快线参数。"],
+            risks=["近期样本仍需持续观察。"],
+            proposal_status="pending",
+            proposals=[
+                control_main.StrategyProposal(
+                    id="prop-backtest-param-001",
+                    proposal_type="param_update",
+                    strategy_id="trend-btc-01",
+                    title="放宽快线参数",
+                    description="基于回测结果建议把快线参数调到 13。",
+                    created_at=datetime.now(timezone.utc).astimezone().isoformat(),
+                    status="pending",
+                    expected_impact="减少短噪音触发频率。",
+                    payload={"target_mode": "paper", "ema_fast": 13},
+                )
+            ],
+            backtest_id="bt-parent-from-review-001",
+            created_at=datetime.now(timezone.utc).astimezone().isoformat(),
+        )
+        control_main.repo.state.reviews.insert(0, review)
+        self.addCleanup(lambda: control_main.repo.state.reviews.remove(review) if review in control_main.repo.state.reviews else None)
+
+        action_status, result = self._post(
+            "/api/ai/proposals/prop-backtest-param-001/action",
+            {"action": "accept", "requested_by": "unit_test"},
+        )
+        self.assertEqual(action_status, 200)
+        assert result["created_change_request"] is not None
+        self.assertEqual(result["created_change_request"]["source_backtest_id"], "bt-parent-from-review-001")
+        self.assertEqual(result["created_change_request"]["source_review_id"], "review-backtest-proposal-001")
+        self.assertEqual(result["created_change_request"]["source_proposal_id"], "prop-backtest-param-001")
+        self.assertEqual(result["created_change_request"]["trigger_reason"], "proposal_accept")
+
+        change_requests_status, change_requests = self._get("/api/change-requests")
+        self.assertEqual(change_requests_status, 200)
+        created_request = next(item for item in change_requests if item["id"] == result["created_change_request"]["id"])
+        self.assertEqual(created_request["source_backtest_id"], "bt-parent-from-review-001")
+        self.assertEqual(created_request["source_review_id"], "review-backtest-proposal-001")
+
+        scheduler_status, scheduler = self._get("/api/ai/scheduler")
+        self.assertEqual(scheduler_status, 200)
+        review_job = next(
+            item for item in scheduler["jobs"] if item["idempotency_key"] == f"strategy-change-review-{created_request['id']}"
+        )
+        self.assertEqual(review_job["context"]["source_backtest_id"], "bt-parent-from-review-001")
+        self.assertEqual(review_job["context"]["source_review_id"], "review-backtest-proposal-001")
+        self.assertEqual(review_job["context"]["source_proposal_id"], "prop-backtest-param-001")
+        self.assertEqual(review_job["context"]["trigger_reason"], "proposal_accept")
 
     def test_manual_trade_only_accepts_paper_mode(self) -> None:
         before_status, before_overview = self._get("/api/account/overview")

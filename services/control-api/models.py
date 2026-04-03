@@ -6,6 +6,40 @@ from typing import Any, Dict, List, Literal, Optional, Union
 from pydantic import BaseModel, Field
 
 
+BacktestSampleQuality = Literal["reference_only", "low_sample", "sufficient"]
+BacktestTimeframe = Literal["15m", "1h", "4h", "1d"]
+BacktestHistoryGapReason = Literal["none", "sample_cap", "insufficient_history"]
+BacktestHistorySource = Literal["exchange_history", "market_detail_fallback"]
+BacktestHistorySourceReason = Literal["none", "exchange_fetch_failed", "insufficient_exchange_samples"]
+BacktestDecisionReadiness = Literal["ready", "sample_incomplete", "research_only"]
+
+
+def derive_backtest_sample_quality(reference_only: bool, trade_count: int) -> BacktestSampleQuality:
+    if reference_only:
+        return "reference_only"
+    if trade_count < 5:
+        return "low_sample"
+    return "sufficient"
+
+
+def normalize_backtest_timeframe(timeframe: Any) -> BacktestTimeframe:
+    normalized = str(timeframe or "1h").strip().lower()
+    mapping = {
+        "15": "15m",
+        "15m": "15m",
+        "60": "1h",
+        "1h": "1h",
+        "240": "4h",
+        "4h": "4h",
+        "d": "1d",
+        "1d": "1d",
+    }
+    resolved = mapping.get(normalized)
+    if resolved is None:
+        raise ValueError("回测周期仅支持 15m / 1h / 4h / 1d。")
+    return resolved
+
+
 class PriorityLevel(str, Enum):
     LOW = "low"
     NORMAL = "normal"
@@ -112,6 +146,22 @@ class ExecutionHealthSummary(BaseModel):
     top_issue_recommended_action: Optional[str] = None
 
 
+class LatestSchedulerCommand(BaseModel):
+    command: Optional[SchedulerCommandType] = None
+    summary: str
+    impact_detail: Optional[str] = None
+    job_id: Optional[str] = None
+    strategy_id: Optional[str] = None
+    linked_review_id: Optional[str] = None
+    backtest_id: Optional[str] = None
+    source_change_request_id: Optional[str] = None
+    source_backtest_id: Optional[str] = None
+    source_review_id: Optional[str] = None
+    source_proposal_id: Optional[str] = None
+    occurred_at: str
+    severity: EventSeverity = EventSeverity.INFO
+
+
 class ControlSnapshot(BaseModel):
     account_metrics: List[MetricCard]
     risk_metrics: List[MetricCard]
@@ -121,6 +171,7 @@ class ControlSnapshot(BaseModel):
     pending_tasks: List[TaskSummary]
     today_performance: Dict[str, str]
     execution_health: ExecutionHealthSummary = Field(default_factory=ExecutionHealthSummary)
+    latest_scheduler_command: Optional[LatestSchedulerCommand] = None
 
 
 class WatchlistInstrument(BaseModel):
@@ -216,6 +267,7 @@ class OpsLiveSnapshot(BaseModel):
     alerts: List["AlertRecord"]
     trades: List["TradeRecord"]
     audit_events: List["ExecutionEvent"]
+    latest_scheduler_command: Optional[LatestSchedulerCommand] = None
     generated_at: str
 
 
@@ -304,6 +356,15 @@ class StrategyActivitySnapshot(BaseModel):
 class StrategyActivityReviewSummary(BaseModel):
     id: str
     period: str
+    backtest_id: Optional[str] = None
+    source_job_id: Optional[str] = None
+    source_job_type: Optional[str] = None
+    source_job_status: Optional[str] = None
+    source_change_request_id: Optional[str] = None
+    source_backtest_id: Optional[str] = None
+    source_review_id: Optional[str] = None
+    source_proposal_id: Optional[str] = None
+    trigger_reason: Optional[str] = None
     title: str
     summary: str
     proposal_count: int = 0
@@ -346,17 +407,52 @@ class BacktestRun(BaseModel):
     id: str
     strategy_id: str
     strategy_name: str
+    source_change_request_id: Optional[str] = None
+    source_backtest_id: Optional[str] = None
+    source_review_id: Optional[str] = None
+    source_proposal_id: Optional[str] = None
+    trigger_reason: Optional[str] = None
     status: Literal["queued", "running", "completed", "failed"]
     started_at: str
     finished_at: Optional[str] = None
     symbol_scope: List[str]
-    timeframe: str
+    timeframe: BacktestTimeframe
     data_range: str
     data_granularity: str
     fee_model: str
     slippage_model: str
     parameter_snapshot: Dict[str, Any]
     metrics: BacktestMetrics
+    reference_only: bool = False
+    sample_quality: BacktestSampleQuality = "sufficient"
+    history_source: BacktestHistorySource = "exchange_history"
+    history_source_reason: BacktestHistorySourceReason = "none"
+    history_source_detail: Optional[str] = None
+    history_source_recommended_data_range: Optional[str] = None
+    history_source_recommended_timeframe: Optional[BacktestTimeframe] = None
+    history_source_recommended_action: Optional[str] = None
+    decision_readiness: BacktestDecisionReadiness = "ready"
+    decision_readiness_detail: str = ""
+    decision_recommended_data_range: Optional[str] = None
+    decision_recommended_timeframe: Optional[BacktestTimeframe] = None
+    decision_readiness_action: Optional[str] = None
+    requested_candle_estimate: int = 0
+    requested_candle_limit: int = 0
+    requested_range_start: Optional[str] = None
+    requested_range_end: Optional[str] = None
+    retrieved_window_completion_pct: float = 0.0
+    used_window_completion_pct: float = 0.0
+    retrieved_candle_count: int = 0
+    used_candle_count: int = 0
+    retrieved_range_start: Optional[str] = None
+    retrieved_range_end: Optional[str] = None
+    used_range_start: Optional[str] = None
+    used_range_end: Optional[str] = None
+    history_truncated: bool = False
+    history_gap_reason: BacktestHistoryGapReason = "none"
+    full_window_recommended_data_range: Optional[str] = None
+    full_window_recommended_timeframe: Optional[BacktestTimeframe] = None
+    full_window_recommended_action: Optional[str] = None
     notes: str
 
 
@@ -365,10 +461,53 @@ class ChangeRequest(BaseModel):
     type: str
     payload: Dict[str, Any]
     requested_by: str
+    source_backtest_id: Optional[str] = None
+    source_review_id: Optional[str] = None
+    source_proposal_id: Optional[str] = None
+    trigger_reason: Optional[str] = None
     target_mode: AccountMode
     priority: PriorityLevel
     status: ChangeRequestStatus
     correlation_id: str
+    linked_backtest_id: Optional[str] = None
+    linked_backtest_timeframe: Optional[BacktestTimeframe] = None
+    linked_backtest_data_range: Optional[str] = None
+    linked_backtest_sample_quality: Optional[BacktestSampleQuality] = None
+    linked_backtest_decision_readiness: Optional[BacktestDecisionReadiness] = None
+    linked_backtest_decision_readiness_detail: Optional[str] = None
+    linked_backtest_decision_recommended_data_range: Optional[str] = None
+    linked_backtest_decision_recommended_timeframe: Optional[BacktestTimeframe] = None
+    linked_backtest_decision_readiness_action: Optional[str] = None
+    linked_backtest_history_source: Optional[BacktestHistorySource] = None
+    linked_backtest_history_source_reason: Optional[BacktestHistorySourceReason] = None
+    linked_backtest_history_source_detail: Optional[str] = None
+    linked_backtest_history_source_recommended_data_range: Optional[str] = None
+    linked_backtest_history_source_recommended_timeframe: Optional[BacktestTimeframe] = None
+    linked_backtest_history_source_recommended_action: Optional[str] = None
+    linked_backtest_requested_candle_estimate: int = 0
+    linked_backtest_requested_candle_limit: int = 0
+    linked_backtest_requested_range_start: Optional[str] = None
+    linked_backtest_requested_range_end: Optional[str] = None
+    linked_backtest_retrieved_window_completion_pct: float = 0.0
+    linked_backtest_used_window_completion_pct: float = 0.0
+    linked_backtest_retrieved_candle_count: int = 0
+    linked_backtest_used_candle_count: int = 0
+    linked_backtest_retrieved_range_start: Optional[str] = None
+    linked_backtest_retrieved_range_end: Optional[str] = None
+    linked_backtest_used_range_start: Optional[str] = None
+    linked_backtest_used_range_end: Optional[str] = None
+    linked_backtest_history_truncated: Optional[bool] = None
+    linked_backtest_history_gap_reason: Optional[BacktestHistoryGapReason] = None
+    linked_backtest_full_window_recommended_data_range: Optional[str] = None
+    linked_backtest_full_window_recommended_timeframe: Optional[BacktestTimeframe] = None
+    linked_backtest_full_window_recommended_action: Optional[str] = None
+    follow_up_job_id: Optional[str] = None
+    follow_up_job_type: Optional[str] = None
+    follow_up_job_status: Optional[JobStatus] = None
+    follow_up_result_summary: Optional[str] = None
+    linked_review_id: Optional[str] = None
+    linked_review_title: Optional[str] = None
+    linked_review_period: Optional[str] = None
     created_at: str
     updated_at: str
     summary: str
@@ -378,6 +517,10 @@ class ChangeRequestCreate(BaseModel):
     type: str
     payload: Dict[str, Any]
     requested_by: str = "desktop_operator"
+    source_backtest_id: Optional[str] = None
+    source_review_id: Optional[str] = None
+    source_proposal_id: Optional[str] = None
+    trigger_reason: Optional[str] = "manual_create"
     target_mode: AccountMode = AccountMode.PAPER
     priority: PriorityLevel = PriorityLevel.NORMAL
     summary: str
@@ -454,10 +597,14 @@ class RuntimeWorkerStatus(BaseModel):
     generated_at: str
 
 
-class AiLiveSnapshot(BaseModel):
+class SchedulerSnapshot(BaseModel):
     scheduler: SchedulerState
     jobs: List[AgentJob]
     change_requests: List[ChangeRequest]
+    latest_scheduler_command: Optional[LatestSchedulerCommand] = None
+
+
+class AiLiveSnapshot(SchedulerSnapshot):
     activity_feed: List["ExecutionEvent"]
     generated_at: str
 
@@ -496,9 +643,20 @@ class ReviewDocument(BaseModel):
     id: str
     period: str
     strategy_id: Optional[str] = None
+    backtest_id: Optional[str] = None
+    source_change_request_id: Optional[str] = None
+    source_backtest_id: Optional[str] = None
+    source_review_id: Optional[str] = None
+    source_proposal_id: Optional[str] = None
+    trigger_reason: Optional[str] = None
     source_job_id: Optional[str] = None
     source_job_type: Optional[str] = None
     source_job_status: Optional[str] = None
+    decision_readiness: Optional[BacktestDecisionReadiness] = None
+    decision_readiness_detail: Optional[str] = None
+    decision_recommended_data_range: Optional[str] = None
+    decision_recommended_timeframe: Optional[BacktestTimeframe] = None
+    decision_readiness_action: Optional[str] = None
     title: str
     summary: str
     highlights: List[str]
@@ -750,11 +908,29 @@ class SettingsPayload(BaseModel):
     openclaw_agent: str
     default_mode: AccountMode
     notification_channels: List[str]
+    notification_quiet_hours_enabled: bool = False
+    notification_quiet_hours_start: str = "23:00"
+    notification_quiet_hours_end: str = "08:00"
     product_language: str = "zh-CN"
     grafana_base_url: Optional[str] = None
     grafana_dashboard_uid: Optional[str] = None
     grafana_org_id: int = 1
     grafana_theme: Literal["dark", "light"] = "dark"
+
+
+class SettingsUpdatePayload(BaseModel):
+    bybit_web_entry: Optional[str] = None
+    api_base_url: Optional[str] = None
+    default_mode: Optional[AccountMode] = None
+    notification_channels: Optional[List[str]] = None
+    notification_quiet_hours_enabled: Optional[bool] = None
+    notification_quiet_hours_start: Optional[str] = None
+    notification_quiet_hours_end: Optional[str] = None
+    product_language: Optional[str] = None
+    grafana_base_url: Optional[str] = None
+    grafana_dashboard_uid: Optional[str] = None
+    grafana_org_id: Optional[int] = None
+    grafana_theme: Optional[Literal["dark", "light"]] = None
 
 
 class GrafanaIntegrationStatus(BaseModel):
@@ -788,6 +964,19 @@ class WorkspacePreferences(BaseModel):
     selected_symbol: str
     selected_market_timeframe: Literal["15m", "1h", "4h", "1d"] = "1h"
     selected_strategy_id: Optional[str] = None
+    selected_backtest_id: Optional[str] = None
+    backtest_filter: Literal["selected", "all"] = "selected"
+    replay_tracking_scope: Literal["all", "selected"] = "all"
+    alert_severity_filter: Literal["all", "P0", "P1", "P2"] = "all"
+    alert_status_filter: Literal["all", "pending", "acknowledged"] = "pending"
+    alert_scope_filter: Literal["all", "selected"] = "all"
+    trade_mode_filter: Literal["all", "paper", "demo", "live"] = "all"
+    trade_origin_filter: Literal["all", "manual", "strategy", "exchange"] = "all"
+    trade_scope_filter: Literal["all", "selected"] = "all"
+    audit_severity_filter: Literal["all", "info", "warning", "error", "critical"] = "all"
+    audit_source_filter: str = "all"
+    audit_scope_filter: Literal["all", "selected"] = "all"
+    audit_search: str = ""
     overview_card_order: List[str]
     overview_visible_cards: List[str]
     overview_collapsed_cards: List[str] = Field(default_factory=list)
@@ -813,6 +1002,19 @@ class WorkspacePreferencesUpdate(BaseModel):
     selected_symbol: str
     selected_market_timeframe: Literal["15m", "1h", "4h", "1d"] = "1h"
     selected_strategy_id: Optional[str] = None
+    selected_backtest_id: Optional[str] = None
+    backtest_filter: Literal["selected", "all"] = "selected"
+    replay_tracking_scope: Literal["all", "selected"] = "all"
+    alert_severity_filter: Literal["all", "P0", "P1", "P2"] = "all"
+    alert_status_filter: Literal["all", "pending", "acknowledged"] = "pending"
+    alert_scope_filter: Literal["all", "selected"] = "all"
+    trade_mode_filter: Literal["all", "paper", "demo", "live"] = "all"
+    trade_origin_filter: Literal["all", "manual", "strategy", "exchange"] = "all"
+    trade_scope_filter: Literal["all", "selected"] = "all"
+    audit_severity_filter: Literal["all", "info", "warning", "error", "critical"] = "all"
+    audit_source_filter: str = "all"
+    audit_scope_filter: Literal["all", "selected"] = "all"
+    audit_search: str = ""
     overview_card_order: List[str]
     overview_visible_cards: List[str]
     overview_collapsed_cards: List[str] = Field(default_factory=list)
@@ -820,6 +1022,9 @@ class WorkspacePreferencesUpdate(BaseModel):
 
 class OpenClawStatus(BaseModel):
     configured: bool
+    config_path: Optional[str] = None
+    config_exists: bool = False
+    command_available: bool = False
     gateway_url: Optional[str] = None
     auth_mode: Optional[str] = None
     default_agent: Optional[str] = None
@@ -850,6 +1055,9 @@ class BybitPrivateStatus(BaseModel):
     configured: bool
     can_query_private: bool
     source: Literal["env", "file", "none"]
+    config_path: Optional[str] = None
+    config_exists: bool = False
+    example_config_path: Optional[str] = None
     api_base_url: str
     account_type: str
     mode: AccountMode

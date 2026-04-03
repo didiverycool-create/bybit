@@ -81,11 +81,14 @@ class BybitPublicMarketClient:
         self._announcement_cache: Dict[Tuple[str, int], Tuple[float, List[Dict]]] = {}
         self._instrument_cache: Dict[Tuple[str, str], Tuple[float, Dict[str, str]]] = {}
         self._connectivity_probe_cache: Optional[Tuple[float, Dict[str, object]]] = None
+        self._candle_history_cache: Dict[Tuple[str, str, str, int], Tuple[float, List[CandlePoint]]] = {}
         self._candle_cache_ttl = 20.0
         self._recent_trade_cache_ttl = 3.0
         self._announcement_cache_ttl = 300.0
         self._instrument_cache_ttl = 600.0
         self._connectivity_probe_cache_ttl = 20.0
+        self._candle_history_cache_ttl = 20.0
+        self._candle_page_limit = 600
 
     @staticmethod
     def normalize_timeframe(timeframe: str) -> str:
@@ -220,17 +223,7 @@ class BybitPublicMarketClient:
             raise RuntimeError(f"Ticker not found for {symbol}")
         return items[0]
 
-    def get_candles(self, symbol: str, market: str, interval: str = "60", limit: int = 48) -> List[CandlePoint]:
-        result = self._request(
-            "/v5/market/kline",
-            {
-                "category": self._category_for_market(market),
-                "symbol": symbol,
-                "interval": interval,
-                "limit": limit,
-            },
-        )
-        rows = result.get("list", [])
+    def _build_candle_points(self, rows: List[List[str]]) -> List[CandlePoint]:
         candles: List[CandlePoint] = []
         for row in reversed(rows):
             if len(row) < 6:
@@ -247,6 +240,32 @@ class BybitPublicMarketClient:
             )
         return candles
 
+    def get_candles_page(
+        self,
+        symbol: str,
+        market: str,
+        interval: str = "60",
+        limit: int = 48,
+        end: Optional[int] = None,
+    ) -> List[CandlePoint]:
+        params: Dict[str, object] = {
+            "category": self._category_for_market(market),
+            "symbol": symbol,
+            "interval": interval,
+            "limit": max(1, min(int(limit), self._candle_page_limit)),
+        }
+        if end is not None:
+            params["end"] = int(end)
+        result = self._request(
+            "/v5/market/kline",
+            params,
+        )
+        rows = result.get("list", [])
+        return self._build_candle_points(rows)
+
+    def get_candles(self, symbol: str, market: str, interval: str = "60", limit: int = 48) -> List[CandlePoint]:
+        return self.get_candles_page(symbol, market, interval=interval, limit=limit)
+
     def get_candles_cached(self, symbol: str, market: str, timeframe: str = "1h", limit: int = 48) -> List[CandlePoint]:
         normalized_timeframe = self.normalize_timeframe(timeframe)
         interval = self.interval_for_timeframe(normalized_timeframe)
@@ -258,6 +277,43 @@ class BybitPublicMarketClient:
 
         candles = self.get_candles(symbol, market, interval=interval, limit=limit)
         self._candle_cache[cache_key] = (now, list(candles))
+        return candles
+
+    def get_candles_history(self, symbol: str, market: str, timeframe: str = "1h", limit: int = 48) -> List[CandlePoint]:
+        normalized_timeframe = self.normalize_timeframe(timeframe)
+        target_limit = max(int(limit), 1)
+        cache_key = (symbol.upper(), market, normalized_timeframe, target_limit)
+        cached = self._candle_history_cache.get(cache_key)
+        now = time.monotonic()
+        if cached and now - cached[0] < self._candle_history_cache_ttl:
+            return list(cached[1])
+
+        interval = self.interval_for_timeframe(normalized_timeframe)
+        remaining = target_limit
+        page_end: Optional[int] = None
+        candles_by_time: Dict[str, CandlePoint] = {}
+        previous_oldest_time: Optional[str] = None
+        while remaining > 0:
+            page_limit = min(remaining, self._candle_page_limit)
+            page = self.get_candles_page(symbol, market, interval=interval, limit=page_limit, end=page_end)
+            if not page:
+                break
+            for candle in page:
+                candles_by_time[candle.time] = candle
+            oldest_time = page[0].time
+            if previous_oldest_time == oldest_time:
+                break
+            previous_oldest_time = oldest_time
+            if len(page) < page_limit:
+                break
+            oldest_dt = datetime.fromisoformat(oldest_time)
+            page_end = int(oldest_dt.timestamp() * 1000) - 1
+            remaining = target_limit - len(candles_by_time)
+
+        candles = sorted(candles_by_time.values(), key=lambda item: item.time)
+        if len(candles) > target_limit:
+            candles = candles[-target_limit:]
+        self._candle_history_cache[cache_key] = (now, list(candles))
         return candles
 
     def get_orderbook(self, symbol: str, market: str, limit: int = 8) -> Dict[str, List[OrderBookLevel]]:

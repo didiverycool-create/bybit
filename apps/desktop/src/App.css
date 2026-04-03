@@ -1587,6 +1587,13 @@
   font-size: 13px;
 }
 
+.console-strip small {
+  display: block;
+  margin-top: 3px;
+  color: var(--text-muted);
+  font-size: 10px;
+}
+
 .console-list,
 .request-list,
 .job-list,

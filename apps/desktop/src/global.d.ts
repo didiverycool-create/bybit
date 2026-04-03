@@ -11,6 +11,14 @@ declare global {
         urgency?: 'normal' | 'critical'
         silent?: boolean
       }) => Promise<boolean>
+      openPath?: (payload: {
+        path?: string
+        revealInFolder?: boolean
+      }) => Promise<{
+        ok: boolean
+        path?: string
+        message?: string
+      }>
     }
   }
 }

@@ -1,4 +1,4 @@
-import { Suspense, lazy, startTransition, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react'
+import { Suspense, lazy, startTransition, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   Activity,
@@ -23,20 +23,26 @@ import './App.css'
 import type {
   AccountOverview,
   AccountLiveSnapshot,
+  AgentJob,
   AiLiveSnapshot,
   AlertRecord,
+  BacktestRun,
   ControlSnapshot,
   ExecutionEvent,
   ExecutionPreview,
   LayoutPreset,
+  LatestSchedulerCommand,
   MarketDetail,
   MarketLiveSnapshot,
   MarketRecentTrade,
   Mode,
   OpsLiveSnapshot,
   OrderRecord,
+  ReviewDocument,
+  SchedulerCommandResult,
   RuntimeWorkerStatus,
   SectionKey,
+  SettingsPayload,
   StrategyActivitySnapshot,
   StrategyActivityJobSummary,
   StrategyRuntimeSnapshot,
@@ -81,14 +87,15 @@ const defaultCardOrder = ['ai_center', 'strategy_watch', 'account_center']
 const defaultVisibleCards = [...defaultCardOrder]
 const WORKSPACE_STORAGE_KEY = 'bybit-control-workspace-v1'
 const backtestRangePresets = [
-  { value: '2026-03-01 ~ 2026-03-29', label: '近 30 天' },
-  { value: '2025-12-01 ~ 2026-03-29', label: '近 90 天' },
-  { value: '2025-10-01 ~ 2026-03-29', label: '近 180 天' },
+  { value: '最近 30 天', label: '近 30 天' },
+  { value: '最近 90 天', label: '近 90 天' },
+  { value: '最近 180 天', label: '近 180 天' },
 ] as const
 const backtestTimeframePresets = [
   { value: '15m', label: '15m' },
   { value: '1h', label: '1h' },
   { value: '4h', label: '4h' },
+  { value: '1d', label: '1d' },
 ] as const
 const marketTimeframePresets = [
   { value: '15m', label: '15m' },
@@ -104,6 +111,19 @@ type WorkspaceBootstrap = {
   selected_symbol: string
   selected_market_timeframe: '15m' | '1h' | '4h' | '1d'
   selected_strategy_id: string | null
+  selected_backtest_id: string | null
+  backtest_filter: 'selected' | 'all'
+  replay_tracking_scope: 'all' | 'selected'
+  alert_severity_filter: 'all' | 'P0' | 'P1' | 'P2'
+  alert_status_filter: 'all' | 'pending' | 'acknowledged'
+  alert_scope_filter: 'all' | 'selected'
+  trade_mode_filter: 'all' | Mode
+  trade_origin_filter: 'all' | 'manual' | 'strategy' | 'exchange'
+  trade_scope_filter: 'all' | 'selected'
+  audit_severity_filter: 'all' | 'info' | 'warning' | 'error' | 'critical'
+  audit_source_filter: string
+  audit_scope_filter: 'all' | 'selected'
+  audit_search: string
   overview_card_order: string[]
   overview_visible_cards: string[]
   overview_collapsed_cards: string[]
@@ -123,6 +143,99 @@ type DesktopNotificationPayload = {
   title: string
   body: string
   urgency?: DesktopNotificationTone
+}
+
+type DesktopNotificationDelivery = 'delivered' | 'suppressed' | 'unavailable'
+const duplicateDesktopNotificationCooldownMs = 2 * 60 * 1000
+
+const settingsNotificationChannelOptions = [
+  { value: 'desktop', label: '桌面通知' },
+  { value: 'telegram', label: 'Telegram' },
+  { value: 'email', label: '邮件' },
+] as const
+
+type SettingsNotificationChannel = (typeof settingsNotificationChannelOptions)[number]['value']
+
+type SettingsDraft = {
+  bybitWebEntry: string
+  apiBaseUrl: string
+  defaultMode: Mode
+  notificationChannels: SettingsNotificationChannel[]
+  notificationQuietHoursEnabled: boolean
+  notificationQuietHoursStart: string
+  notificationQuietHoursEnd: string
+  productLanguage: string
+  grafanaBaseUrl: string
+  grafanaDashboardUid: string
+  grafanaOrgId: string
+  grafanaTheme: 'dark' | 'light'
+}
+
+function normalizeSettingsUrl(value: string | null | undefined) {
+  const trimmed = String(value ?? '').trim()
+  return trimmed ? trimmed.replace(/\/+$/, '') : ''
+}
+
+function normalizeSettingsText(value: string | null | undefined) {
+  return String(value ?? '').trim()
+}
+
+function normalizeSettingsQuietTime(value: string | null | undefined, fallback: string) {
+  const trimmed = String(value ?? '').trim()
+  return /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(trimmed) ? trimmed : fallback
+}
+
+function normalizeSettingsNotificationChannels(
+  channels: readonly string[] | null | undefined,
+): SettingsNotificationChannel[] {
+  const allowed = new Set<SettingsNotificationChannel>(settingsNotificationChannelOptions.map((item) => item.value))
+  const unique: SettingsNotificationChannel[] = []
+  for (const item of channels ?? []) {
+    const candidate = String(item ?? '').trim().toLowerCase() as SettingsNotificationChannel
+    if (!allowed.has(candidate) || unique.includes(candidate)) {
+      continue
+    }
+    unique.push(candidate)
+  }
+  return unique
+}
+
+function buildSettingsDraft(settings?: SettingsPayload | null): SettingsDraft {
+  return {
+    bybitWebEntry: normalizeSettingsUrl(settings?.bybit_web_entry ?? 'https://www.bybit-global.com/'),
+    apiBaseUrl: normalizeSettingsUrl(settings?.api_base_url ?? 'https://api.bybit.com'),
+    defaultMode: settings?.default_mode ?? 'paper',
+    notificationChannels: normalizeSettingsNotificationChannels(settings?.notification_channels ?? ['desktop', 'telegram', 'email']),
+    notificationQuietHoursEnabled: settings?.notification_quiet_hours_enabled ?? false,
+    notificationQuietHoursStart: normalizeSettingsQuietTime(settings?.notification_quiet_hours_start ?? '23:00', '23:00'),
+    notificationQuietHoursEnd: normalizeSettingsQuietTime(settings?.notification_quiet_hours_end ?? '08:00', '08:00'),
+    productLanguage: normalizeSettingsText(settings?.product_language ?? 'zh-CN'),
+    grafanaBaseUrl: normalizeSettingsUrl(settings?.grafana_base_url ?? ''),
+    grafanaDashboardUid: normalizeSettingsText(settings?.grafana_dashboard_uid ?? ''),
+    grafanaOrgId: String(settings?.grafana_org_id ?? 1),
+    grafanaTheme: settings?.grafana_theme ?? 'dark',
+  }
+}
+
+function settingsDraftEqualsSettings(draft: SettingsDraft, settings?: SettingsPayload | null) {
+  if (!settings) {
+    return false
+  }
+  return (
+    normalizeSettingsUrl(draft.bybitWebEntry) === normalizeSettingsUrl(settings.bybit_web_entry) &&
+    normalizeSettingsUrl(draft.apiBaseUrl) === normalizeSettingsUrl(settings.api_base_url) &&
+    draft.defaultMode === settings.default_mode &&
+    draft.notificationQuietHoursEnabled === (settings.notification_quiet_hours_enabled ?? false) &&
+    draft.notificationQuietHoursStart === normalizeSettingsQuietTime(settings.notification_quiet_hours_start ?? '23:00', '23:00') &&
+    draft.notificationQuietHoursEnd === normalizeSettingsQuietTime(settings.notification_quiet_hours_end ?? '08:00', '08:00') &&
+    draft.productLanguage.trim() === normalizeSettingsText(settings.product_language) &&
+    draft.grafanaBaseUrl.trim() === normalizeSettingsUrl(settings.grafana_base_url ?? '') &&
+    draft.grafanaDashboardUid.trim() === normalizeSettingsText(settings.grafana_dashboard_uid ?? '') &&
+    draft.grafanaOrgId.trim() === String(settings.grafana_org_id ?? 1) &&
+    draft.grafanaTheme === (settings.grafana_theme ?? 'dark') &&
+    JSON.stringify(normalizeSettingsNotificationChannels(draft.notificationChannels)) ===
+      JSON.stringify(normalizeSettingsNotificationChannels(settings.notification_channels))
+  )
 }
 
 async function sendDesktopNotification(
@@ -162,6 +275,58 @@ async function sendDesktopNotification(
   return true
 }
 
+function quietHoursMinuteOfDay(value: string | null | undefined) {
+  const normalized = normalizeSettingsQuietTime(value, '')
+  if (!normalized) {
+    return null
+  }
+  const [hoursText, minutesText] = normalized.split(':')
+  const hours = Number.parseInt(hoursText, 10)
+  const minutes = Number.parseInt(minutesText, 10)
+  if (!Number.isFinite(hours) || !Number.isFinite(minutes)) {
+    return null
+  }
+  return hours * 60 + minutes
+}
+
+function isNotificationQuietHoursActive(settings?: SettingsPayload | null, now = new Date()) {
+  if (!settings?.notification_quiet_hours_enabled) {
+    return false
+  }
+  const startMinutes = quietHoursMinuteOfDay(settings.notification_quiet_hours_start)
+  const endMinutes = quietHoursMinuteOfDay(settings.notification_quiet_hours_end)
+  if (startMinutes == null || endMinutes == null || startMinutes === endMinutes) {
+    return false
+  }
+  const currentMinutes = now.getHours() * 60 + now.getMinutes()
+  if (startMinutes < endMinutes) {
+    return currentMinutes >= startMinutes && currentMinutes < endMinutes
+  }
+  return currentMinutes >= startMinutes || currentMinutes < endMinutes
+}
+
+function notificationQuietHoursLabel(settings?: SettingsPayload | null) {
+  if (!settings?.notification_quiet_hours_enabled) {
+    return '静默时段未开启'
+  }
+  return `${settings.notification_quiet_hours_start} - ${settings.notification_quiet_hours_end}`
+}
+
+async function sendDesktopNotificationWithSettings(
+  payload: DesktopNotificationPayload,
+  settings: SettingsPayload | null | undefined,
+  permissionRequestedRef?: { current: boolean },
+): Promise<DesktopNotificationDelivery> {
+  if (payload.urgency !== 'critical' && isNotificationQuietHoursActive(settings)) {
+    return 'suppressed'
+  }
+  return (await sendDesktopNotification(payload, permissionRequestedRef)) ? 'delivered' : 'unavailable'
+}
+
+function desktopNotificationSignature(payload: DesktopNotificationPayload) {
+  return [payload.urgency ?? 'normal', payload.title ?? '', payload.body ?? ''].join('::')
+}
+
 function eventCategoryMeta(eventType: string) {
   if (eventType.includes('change_request')) {
     return { icon: ClipboardList, label: '请求' }
@@ -189,6 +354,10 @@ function summarizeAuditEvent(payload: Record<string, unknown>) {
   if (typeof summary === 'string' && summary.trim()) {
     return summary
   }
+  const resultSummary = payload.result_summary
+  if (typeof resultSummary === 'string' && resultSummary.trim()) {
+    return resultSummary
+  }
   const command = payload.command
   if (typeof command === 'string' && command.trim()) {
     return `命令 ${command}`
@@ -204,6 +373,20 @@ function summarizeAuditEvent(payload: Record<string, unknown>) {
   return '事件已记录'
 }
 
+function getAuditStringList(payload: Record<string, unknown>, key: string) {
+  const value = payload[key]
+  if (!Array.isArray(value)) return []
+  const next: string[] = []
+  value.forEach((item) => {
+    if (typeof item !== 'string') return
+    const normalized = item.trim()
+    if (normalized && !next.includes(normalized)) {
+      next.push(normalized)
+    }
+  })
+  return next
+}
+
 function getAuditLinkedReviewId(payload: Record<string, unknown>) {
   const linkedReviewId = payload.linked_review_id
   if (typeof linkedReviewId === 'string' && linkedReviewId.trim()) {
@@ -213,9 +396,217 @@ function getAuditLinkedReviewId(payload: Record<string, unknown>) {
   return typeof reviewId === 'string' && reviewId.trim() ? reviewId : null
 }
 
+function getAuditJobId(payload: Record<string, unknown>) {
+  const retryJobId = payload.retry_job_id
+  if (typeof retryJobId === 'string' && retryJobId.trim()) {
+    return retryJobId
+  }
+  const jobId = payload.job_id
+  return typeof jobId === 'string' && jobId.trim() ? jobId : null
+}
+
+function getAuditChangeRequestId(payload: Record<string, unknown>) {
+  const changeRequestId = payload.change_request_id
+  if (typeof changeRequestId === 'string' && changeRequestId.trim()) {
+    return changeRequestId
+  }
+  const createdChangeRequestId = payload.created_change_request_id
+  if (typeof createdChangeRequestId === 'string' && createdChangeRequestId.trim()) {
+    return createdChangeRequestId
+  }
+  const sourceChangeRequestId = payload.source_change_request_id
+  return typeof sourceChangeRequestId === 'string' && sourceChangeRequestId.trim() ? sourceChangeRequestId : null
+}
+
 function getAuditStrategyId(payload: Record<string, unknown>) {
   const strategyId = payload.strategy_id
-  return typeof strategyId === 'string' && strategyId.trim() ? strategyId : null
+  if (typeof strategyId === 'string' && strategyId.trim()) {
+    return strategyId
+  }
+  const cancelledStrategyIds = getAuditStringList(payload, 'cancelled_strategy_ids')
+  return cancelledStrategyIds.length === 1 ? cancelledStrategyIds[0] : null
+}
+
+function getAuditBacktestId(payload: Record<string, unknown>) {
+  const backtestId = payload.backtest_id
+  if (typeof backtestId === 'string' && backtestId.trim()) {
+    return backtestId
+  }
+  const cancelledBacktestIds = getAuditStringList(payload, 'cancelled_backtest_ids')
+  return cancelledBacktestIds.length === 1 ? cancelledBacktestIds[0] : null
+}
+
+function getAuditSourceBacktestId(payload: Record<string, unknown>) {
+  const backtestId = payload.source_backtest_id
+  if (typeof backtestId === 'string' && backtestId.trim()) {
+    return backtestId
+  }
+  const cancelledBacktestIds = getAuditStringList(payload, 'cancelled_source_backtest_ids')
+  return cancelledBacktestIds.length === 1 ? cancelledBacktestIds[0] : null
+}
+
+function getAuditSourceReviewId(payload: Record<string, unknown>) {
+  const reviewId = payload.source_review_id
+  if (typeof reviewId === 'string' && reviewId.trim()) {
+    return reviewId
+  }
+  const cancelledReviewIds = getAuditStringList(payload, 'cancelled_source_review_ids')
+  return cancelledReviewIds.length === 1 ? cancelledReviewIds[0] : null
+}
+
+function getAuditSourceProposalId(payload: Record<string, unknown>) {
+  const proposalId = payload.source_proposal_id
+  if (typeof proposalId === 'string' && proposalId.trim()) {
+    return proposalId
+  }
+  const cancelledProposalIds = getAuditStringList(payload, 'cancelled_source_proposal_ids')
+  return cancelledProposalIds.length === 1 ? cancelledProposalIds[0] : null
+}
+
+function auditImpactMeta(payload: Record<string, unknown>) {
+  const jobTypes = getAuditStringList(payload, 'cancelled_job_types')
+  const strategyIds = getAuditStringList(payload, 'cancelled_strategy_ids')
+  const backtestIds = getAuditStringList(payload, 'cancelled_backtest_ids')
+  const sourceChangeRequestIds = getAuditStringList(payload, 'cancelled_source_change_request_ids')
+  const sourceBacktestIds = getAuditStringList(payload, 'cancelled_source_backtest_ids')
+  const sourceReviewIds = getAuditStringList(payload, 'cancelled_source_review_ids')
+  const sourceProposalIds = getAuditStringList(payload, 'cancelled_source_proposal_ids')
+  const triggerReasons = getAuditStringList(payload, 'cancelled_trigger_reasons')
+  const decisionReadinessValues = getAuditStringList(payload, 'cancelled_decision_readiness_values')
+  const parts: string[] = []
+  if (jobTypes.length) {
+    parts.push(`任务 ${jobTypes.join(' / ')}`)
+  }
+  if (strategyIds.length) {
+    parts.push(strategyIds.length === 1 ? `策略 ${strategyIds[0]}` : `策略 ${strategyIds.length} 条`)
+  }
+  if (backtestIds.length) {
+    parts.push(backtestIds.length === 1 ? `回测 ${backtestIds[0]}` : `回测 ${backtestIds.length} 轮`)
+  }
+  if (sourceChangeRequestIds.length) {
+    parts.push(
+      sourceChangeRequestIds.length === 1
+        ? `来源变更 ${sourceChangeRequestIds[0]}`
+        : `来源变更 ${sourceChangeRequestIds.length} 条`,
+    )
+  }
+  if (sourceBacktestIds.length) {
+    parts.push(sourceBacktestIds.length === 1 ? `来源回测 ${sourceBacktestIds[0]}` : `来源回测 ${sourceBacktestIds.length} 轮`)
+  }
+  if (sourceReviewIds.length) {
+    parts.push(sourceReviewIds.length === 1 ? `来源复盘 ${sourceReviewIds[0]}` : `来源复盘 ${sourceReviewIds.length} 条`)
+  }
+  if (sourceProposalIds.length) {
+    parts.push(sourceProposalIds.length === 1 ? `来源提案 ${sourceProposalIds[0]}` : `来源提案 ${sourceProposalIds.length} 条`)
+  }
+  if (triggerReasons.length) {
+    parts.push(`触发 ${triggerReasons.join(' / ')}`)
+  }
+  if (decisionReadinessValues.length) {
+    parts.push(`门禁 ${decisionReadinessValues.join(' / ')}`)
+  }
+  if (!parts.length) {
+    return null
+  }
+  return {
+    detail: parts.join(' · '),
+  }
+}
+
+function auditNotificationBody(payload: Record<string, unknown>) {
+  const summary = summarizeAuditEvent(payload)
+  const impactMeta = auditImpactMeta(payload)
+  if (!impactMeta) {
+    return summary
+  }
+  if (impactMeta.detail === summary) {
+    return summary
+  }
+  return `${summary} · ${impactMeta.detail}`
+}
+
+function schedulerCommandSnapshotMeta(command?: LatestSchedulerCommand | null) {
+  if (!command) {
+    return null
+  }
+  return {
+    command: command.command ?? null,
+    commandLabel: schedulerCommandLabel(command.command ?? null),
+    summary: command.summary,
+    impactDetail: command.impact_detail ?? null,
+    jobId: command.job_id ?? null,
+    linkedReviewId: command.linked_review_id ?? null,
+    strategyId: command.strategy_id ?? null,
+    backtestId: command.backtest_id ?? null,
+    sourceChangeRequestId: command.source_change_request_id ?? null,
+    sourceBacktestId: command.source_backtest_id ?? null,
+    sourceReviewId: command.source_review_id ?? null,
+    sourceProposalId: command.source_proposal_id ?? null,
+    occurredAt: command.occurred_at,
+    tone:
+      command.severity === 'warning' || command.severity === 'error' || command.severity === 'critical'
+        ? 'warning'
+        : 'success',
+  } as const
+}
+
+function schedulerCommandEventMeta(event?: ExecutionEvent | null) {
+  if (!event || event.event_type !== 'scheduler.command') {
+    return null
+  }
+  const payload = event.payload ?? {}
+  const impactMeta = auditImpactMeta(payload)
+  const command = typeof payload.command === 'string' && payload.command.trim() ? payload.command.trim() : null
+  return {
+    command,
+    commandLabel: schedulerCommandLabel(command),
+    summary: summarizeAuditEvent(payload),
+    impactDetail: impactMeta?.detail ?? null,
+    jobId: getAuditJobId(payload),
+    linkedReviewId: getAuditLinkedReviewId(payload),
+    strategyId: getAuditStrategyId(payload),
+    backtestId: getAuditBacktestId(payload),
+    sourceChangeRequestId: getAuditChangeRequestId(payload),
+    sourceBacktestId: getAuditSourceBacktestId(payload),
+    sourceReviewId: getAuditSourceReviewId(payload),
+    sourceProposalId: getAuditSourceProposalId(payload),
+    occurredAt: event.occurred_at,
+    tone: event.severity === 'warning' || event.severity === 'error' || event.severity === 'critical' ? 'warning' : 'success',
+  } as const
+}
+
+function schedulerCommandFeedbackDetail(result: SchedulerCommandResult, fallbackReason: string) {
+  const summary =
+    typeof result.summary === 'string' && result.summary.trim()
+      ? result.summary.trim()
+      : fallbackReason
+  const detailParts: string[] = []
+  const impactMeta = auditImpactMeta(result as unknown as Record<string, unknown>)
+  if (impactMeta?.detail && impactMeta.detail !== summary) {
+    detailParts.push(impactMeta.detail)
+  }
+  if (typeof result.backtest_id === 'string' && result.backtest_id.trim()) {
+    detailParts.push(`回测 ${result.backtest_id}`)
+  }
+  if (typeof result.source_change_request_id === 'string' && result.source_change_request_id.trim()) {
+    detailParts.push(`来源变更 ${result.source_change_request_id}`)
+  }
+  if (typeof result.source_backtest_id === 'string' && result.source_backtest_id.trim()) {
+    detailParts.push(`来源回测 ${result.source_backtest_id}`)
+  }
+  if (typeof result.source_review_id === 'string' && result.source_review_id.trim()) {
+    detailParts.push(`来源复盘 ${result.source_review_id}`)
+  }
+  if (typeof result.source_proposal_id === 'string' && result.source_proposal_id.trim()) {
+    detailParts.push(`来源提案 ${result.source_proposal_id}`)
+  }
+  if (typeof result.decision_readiness === 'string' && result.decision_readiness.trim()) {
+    detailParts.push(`门禁 ${result.decision_readiness}`)
+  }
+  if (!detailParts.length) {
+    return summary
+  }
+  return `${summary} · ${detailParts.join(' · ')}`
 }
 
 function normalizeCardIds(ids: string[]) {
@@ -274,6 +665,19 @@ function buildDefaultWorkspaceBootstrap(): WorkspaceBootstrap {
     selected_symbol: 'BTCUSDT',
     selected_market_timeframe: '1h',
     selected_strategy_id: null,
+    selected_backtest_id: null,
+    backtest_filter: 'selected',
+    replay_tracking_scope: 'all',
+    alert_severity_filter: 'all',
+    alert_status_filter: 'pending',
+    alert_scope_filter: 'all',
+    trade_mode_filter: 'all',
+    trade_origin_filter: 'all',
+    trade_scope_filter: 'all',
+    audit_severity_filter: 'all',
+    audit_source_filter: 'all',
+    audit_scope_filter: 'all',
+    audit_search: '',
     overview_card_order: [...defaultCardOrder],
     overview_visible_cards: [...defaultVisibleCards],
     overview_collapsed_cards: [],
@@ -304,6 +708,22 @@ function readWorkspaceBootstrap(): WorkspaceBootstrap {
         parsed.selected_market_timeframe ?? baseline.selected_market_timeframe,
       ),
       selected_strategy_id: parsed.selected_strategy_id ?? baseline.selected_strategy_id,
+      selected_backtest_id: parsed.selected_backtest_id ?? baseline.selected_backtest_id,
+      backtest_filter: parsed.backtest_filter ?? baseline.backtest_filter,
+      replay_tracking_scope: parsed.replay_tracking_scope ?? baseline.replay_tracking_scope,
+      alert_severity_filter: parsed.alert_severity_filter ?? baseline.alert_severity_filter,
+      alert_status_filter: parsed.alert_status_filter ?? baseline.alert_status_filter,
+      alert_scope_filter: parsed.alert_scope_filter ?? baseline.alert_scope_filter,
+      trade_mode_filter: parsed.trade_mode_filter ?? baseline.trade_mode_filter,
+      trade_origin_filter: parsed.trade_origin_filter ?? baseline.trade_origin_filter,
+      trade_scope_filter: parsed.trade_scope_filter ?? baseline.trade_scope_filter,
+      audit_severity_filter: parsed.audit_severity_filter ?? baseline.audit_severity_filter,
+      audit_source_filter:
+        typeof parsed.audit_source_filter === 'string' && parsed.audit_source_filter.trim()
+          ? parsed.audit_source_filter
+          : baseline.audit_source_filter,
+      audit_scope_filter: parsed.audit_scope_filter ?? baseline.audit_scope_filter,
+      audit_search: typeof parsed.audit_search === 'string' ? parsed.audit_search : baseline.audit_search,
       overview_card_order: cardOrder,
       overview_visible_cards: normalizeVisibleCardIds(
         parsed.overview_visible_cards ?? baseline.overview_visible_cards,
@@ -349,17 +769,47 @@ function buildWorkspaceSignature(workspace: {
   selected_symbol: string
   selected_market_timeframe: '15m' | '1h' | '4h' | '1d'
   selected_strategy_id?: string | null
+  selected_backtest_id?: string | null
+  backtest_filter: 'selected' | 'all'
+  replay_tracking_scope: 'all' | 'selected'
+  alert_severity_filter: 'all' | 'P0' | 'P1' | 'P2'
+  alert_status_filter: 'all' | 'pending' | 'acknowledged'
+  alert_scope_filter: 'all' | 'selected'
+  trade_mode_filter: 'all' | Mode
+  trade_origin_filter: 'all' | 'manual' | 'strategy' | 'exchange'
+  trade_scope_filter: 'all' | 'selected'
+  audit_severity_filter: 'all' | 'info' | 'warning' | 'error' | 'critical'
+  audit_source_filter: string
+  audit_scope_filter: 'all' | 'selected'
+  audit_search: string
   overview_card_order: string[]
   overview_visible_cards: string[]
   overview_collapsed_cards: string[]
 }) {
+  const defaults = buildDefaultWorkspaceBootstrap()
   return JSON.stringify({
-    active_section: workspace.active_section,
-    layout_preset: workspace.layout_preset,
-    selected_mode: workspace.selected_mode,
-    selected_symbol: workspace.selected_symbol,
+    active_section: workspace.active_section ?? defaults.active_section,
+    layout_preset: workspace.layout_preset ?? defaults.layout_preset,
+    selected_mode: workspace.selected_mode ?? defaults.selected_mode,
+    selected_symbol: workspace.selected_symbol ?? defaults.selected_symbol,
     selected_market_timeframe: normalizeWorkspaceMarketTimeframe(workspace.selected_market_timeframe),
     selected_strategy_id: workspace.selected_strategy_id ?? '',
+    selected_backtest_id: workspace.selected_backtest_id ?? '',
+    backtest_filter: workspace.backtest_filter ?? defaults.backtest_filter,
+    replay_tracking_scope: workspace.replay_tracking_scope ?? defaults.replay_tracking_scope,
+    alert_severity_filter: workspace.alert_severity_filter ?? defaults.alert_severity_filter,
+    alert_status_filter: workspace.alert_status_filter ?? defaults.alert_status_filter,
+    alert_scope_filter: workspace.alert_scope_filter ?? defaults.alert_scope_filter,
+    trade_mode_filter: workspace.trade_mode_filter ?? defaults.trade_mode_filter,
+    trade_origin_filter: workspace.trade_origin_filter ?? defaults.trade_origin_filter,
+    trade_scope_filter: workspace.trade_scope_filter ?? defaults.trade_scope_filter,
+    audit_severity_filter: workspace.audit_severity_filter ?? defaults.audit_severity_filter,
+    audit_source_filter:
+      typeof workspace.audit_source_filter === 'string' && workspace.audit_source_filter.trim()
+        ? workspace.audit_source_filter.trim()
+        : defaults.audit_source_filter,
+    audit_scope_filter: workspace.audit_scope_filter ?? defaults.audit_scope_filter,
+    audit_search: String(workspace.audit_search ?? defaults.audit_search).trim(),
     overview_card_order: normalizeCardIds(workspace.overview_card_order),
     overview_visible_cards: normalizeVisibleCardIds(
       workspace.overview_visible_cards,
@@ -376,8 +826,27 @@ function formatPercent(value: number) {
   return `${value >= 0 ? '+' : ''}${value.toFixed(2)}%`
 }
 
+function formatUnsignedPercent(value: number) {
+  return `${Math.max(value, 0).toFixed(2)}%`
+}
+
 function formatNumber(value: number) {
   return new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 2 }).format(value)
+}
+
+function withDraftPresetOption(
+  presets: readonly { value: string; label: string }[],
+  draft: string,
+  customLabelPrefix: string,
+) {
+  const normalizedDraft = draft.trim()
+  if (!normalizedDraft) {
+    return [...presets]
+  }
+  if (presets.some((preset) => preset.value === normalizedDraft)) {
+    return [...presets]
+  }
+  return [{ value: normalizedDraft, label: `${customLabelPrefix} · ${normalizedDraft}` }, ...presets]
 }
 
 function formatCompactNumber(value: number) {
@@ -445,6 +914,19 @@ function schedulerLabel(status: string) {
   )
 }
 
+function schedulerCommandLabel(command?: SchedulerCommandType | string | null) {
+  return (
+    {
+      pause: '暂停调度',
+      resume: '恢复调度',
+      cancel_job: '终止任务',
+      cancel_all: '终止全部任务',
+      freeze_publish: '切换发布门禁',
+      enter_manual_override: '进入人工接管',
+    }[command ?? ''] ?? (command || '调度命令')
+  )
+}
+
 function strategyStatusLabel(status: StrategySummary['status']) {
   return (
     {
@@ -467,6 +949,185 @@ function changeRequestStatusLabel(status: string) {
       rolled_back: '已回滚',
     }[status] ?? status
   )
+}
+
+function changeRequestTriggerReasonLabel(reason?: string | null) {
+  return (
+    {
+      manual_create: '手动创建',
+      proposal_accept: '接受提案',
+    }[reason ?? ''] ?? (reason || '来源未标记')
+  )
+}
+
+function getChangeRequestStrategyId(request: ChangeRequest, fallbackStrategyId?: string | null) {
+  const payloadStrategyId = request.payload?.strategy_id
+  if (typeof payloadStrategyId === 'string' && payloadStrategyId.trim()) {
+    return payloadStrategyId.trim()
+  }
+  return fallbackStrategyId ?? null
+}
+
+function getChangeRequestSourceProposalId(request: ChangeRequest) {
+  if (typeof request.source_proposal_id === 'string' && request.source_proposal_id.trim()) {
+    return request.source_proposal_id.trim()
+  }
+  const payloadProposalId = request.payload?.proposal_id
+  return typeof payloadProposalId === 'string' && payloadProposalId.trim() ? payloadProposalId.trim() : null
+}
+
+function getChangeRequestSourceBacktestId(request: ChangeRequest) {
+  return typeof request.source_backtest_id === 'string' && request.source_backtest_id.trim()
+    ? request.source_backtest_id.trim()
+    : null
+}
+
+function getChangeRequestLinkedBacktestId(request: ChangeRequest) {
+  return typeof request.linked_backtest_id === 'string' && request.linked_backtest_id.trim()
+    ? request.linked_backtest_id.trim()
+    : null
+}
+
+function getChangeRequestLinkedBacktestDecisionMeta(request: ChangeRequest) {
+  return backtestDecisionReadinessMeta({
+    decision_readiness: request.linked_backtest_decision_readiness ?? null,
+    decision_readiness_detail: request.linked_backtest_decision_readiness_detail ?? null,
+    decision_recommended_data_range: request.linked_backtest_decision_recommended_data_range ?? null,
+    decision_recommended_timeframe: request.linked_backtest_decision_recommended_timeframe ?? null,
+    decision_readiness_action: request.linked_backtest_decision_readiness_action ?? null,
+  })
+}
+
+function getChangeRequestLinkedBacktestWindowMeta(
+  request: ChangeRequest,
+  linkedBacktest?: BacktestRun | null,
+) {
+  const linkedMeta = backtestWindowMeta(linkedBacktest)
+  if (linkedMeta) {
+    return linkedMeta
+  }
+  return backtestWindowMeta({
+    history_source:
+      request.linked_backtest_history_source === 'market_detail_fallback'
+        ? 'market_detail_fallback'
+        : 'exchange_history',
+    history_source_reason:
+      request.linked_backtest_history_source_reason === 'exchange_fetch_failed'
+        ? 'exchange_fetch_failed'
+        : request.linked_backtest_history_source_reason === 'insufficient_exchange_samples'
+          ? 'insufficient_exchange_samples'
+          : 'none',
+    history_source_detail: request.linked_backtest_history_source_detail ?? null,
+    history_source_recommended_action: request.linked_backtest_history_source_recommended_action ?? null,
+    requested_candle_estimate: Number(request.linked_backtest_requested_candle_estimate ?? 0),
+    requested_candle_limit: Number(request.linked_backtest_requested_candle_limit ?? 0),
+    requested_range_start: request.linked_backtest_requested_range_start ?? null,
+    requested_range_end: request.linked_backtest_requested_range_end ?? null,
+    retrieved_window_completion_pct: Number(request.linked_backtest_retrieved_window_completion_pct ?? 0),
+    used_window_completion_pct: Number(request.linked_backtest_used_window_completion_pct ?? 0),
+    retrieved_candle_count: Number(request.linked_backtest_retrieved_candle_count ?? 0),
+    used_candle_count: Number(request.linked_backtest_used_candle_count ?? 0),
+    retrieved_range_start: request.linked_backtest_retrieved_range_start ?? null,
+    retrieved_range_end: request.linked_backtest_retrieved_range_end ?? null,
+    used_range_start: request.linked_backtest_used_range_start ?? null,
+    used_range_end: request.linked_backtest_used_range_end ?? null,
+    history_truncated: Boolean(request.linked_backtest_history_truncated),
+    history_gap_reason:
+      request.linked_backtest_history_gap_reason === 'insufficient_history'
+        ? 'insufficient_history'
+        : request.linked_backtest_history_gap_reason === 'sample_cap'
+          ? 'sample_cap'
+          : 'none',
+    full_window_recommended_data_range: request.linked_backtest_full_window_recommended_data_range ?? null,
+    full_window_recommended_timeframe: request.linked_backtest_full_window_recommended_timeframe ?? null,
+    full_window_recommended_action: request.linked_backtest_full_window_recommended_action ?? null,
+  })
+}
+
+function getChangeRequestLinkedBacktestRecommendation(
+  request: ChangeRequest,
+  linkedBacktest?: BacktestRun | null,
+) {
+  const decisionMeta = linkedBacktest
+    ? backtestDecisionReadinessMeta(linkedBacktest)
+    : getChangeRequestLinkedBacktestDecisionMeta(request)
+  if (decisionMeta?.recommendedRange && decisionMeta?.recommendedTimeframe) {
+    return {
+      recommendedRange: decisionMeta.recommendedRange,
+      recommendedTimeframe: decisionMeta.recommendedTimeframe,
+      nextAction: decisionMeta.nextAction,
+    }
+  }
+
+  const fullWindowRange =
+    typeof linkedBacktest?.full_window_recommended_data_range === 'string' &&
+    linkedBacktest.full_window_recommended_data_range.trim()
+      ? linkedBacktest.full_window_recommended_data_range.trim()
+      : typeof request.linked_backtest_full_window_recommended_data_range === 'string' &&
+          request.linked_backtest_full_window_recommended_data_range.trim()
+        ? request.linked_backtest_full_window_recommended_data_range.trim()
+      : null
+  const fullWindowTimeframe =
+    typeof linkedBacktest?.full_window_recommended_timeframe === 'string' &&
+    linkedBacktest.full_window_recommended_timeframe.trim()
+      ? linkedBacktest.full_window_recommended_timeframe.trim()
+      : typeof request.linked_backtest_full_window_recommended_timeframe === 'string' &&
+          request.linked_backtest_full_window_recommended_timeframe.trim()
+        ? request.linked_backtest_full_window_recommended_timeframe.trim()
+      : null
+  if (fullWindowRange && fullWindowTimeframe) {
+    return {
+      recommendedRange: fullWindowRange,
+      recommendedTimeframe: fullWindowTimeframe,
+      nextAction:
+        typeof linkedBacktest?.full_window_recommended_action === 'string' &&
+        linkedBacktest.full_window_recommended_action.trim()
+          ? linkedBacktest.full_window_recommended_action.trim()
+          : typeof request.linked_backtest_full_window_recommended_action === 'string' &&
+              request.linked_backtest_full_window_recommended_action.trim()
+            ? request.linked_backtest_full_window_recommended_action.trim()
+          : null,
+    }
+  }
+
+  const historyRange =
+    typeof linkedBacktest?.history_source_recommended_data_range === 'string' &&
+    linkedBacktest.history_source_recommended_data_range.trim()
+      ? linkedBacktest.history_source_recommended_data_range.trim()
+      : typeof request.linked_backtest_history_source_recommended_data_range === 'string' &&
+          request.linked_backtest_history_source_recommended_data_range.trim()
+        ? request.linked_backtest_history_source_recommended_data_range.trim()
+      : null
+  const historyTimeframe =
+    typeof linkedBacktest?.history_source_recommended_timeframe === 'string' &&
+    linkedBacktest.history_source_recommended_timeframe.trim()
+      ? linkedBacktest.history_source_recommended_timeframe.trim()
+      : typeof request.linked_backtest_history_source_recommended_timeframe === 'string' &&
+          request.linked_backtest_history_source_recommended_timeframe.trim()
+        ? request.linked_backtest_history_source_recommended_timeframe.trim()
+      : null
+  if (historyRange && historyTimeframe) {
+    return {
+      recommendedRange: historyRange,
+      recommendedTimeframe: historyTimeframe,
+      nextAction:
+        typeof linkedBacktest?.history_source_recommended_action === 'string' &&
+        linkedBacktest.history_source_recommended_action.trim()
+          ? linkedBacktest.history_source_recommended_action.trim()
+          : typeof request.linked_backtest_history_source_recommended_action === 'string' &&
+              request.linked_backtest_history_source_recommended_action.trim()
+            ? request.linked_backtest_history_source_recommended_action.trim()
+          : null,
+    }
+  }
+
+  return null
+}
+
+function getChangeRequestSourceReviewId(request: ChangeRequest) {
+  return typeof request.source_review_id === 'string' && request.source_review_id.trim()
+    ? request.source_review_id.trim()
+    : null
 }
 
 function proposalTypeLabel(type: string) {
@@ -514,6 +1175,321 @@ function reviewPeriodChipClass(period?: string | null) {
   return 'chip chip--success'
 }
 
+function backtestSampleQualityMeta(backtest?: Pick<BacktestRun, 'sample_quality' | 'reference_only'> | null) {
+  if (!backtest) return null
+  if (backtest.sample_quality === 'reference_only' || backtest.reference_only) {
+    return {
+      label: '参考路径',
+      description: '未命中真实入场信号',
+      chipClass: 'chip chip--warning',
+    }
+  }
+  if (backtest.sample_quality === 'low_sample') {
+    return {
+      label: '低样本',
+      description: '真实成交少于 5 笔',
+      chipClass: 'chip chip--muted',
+    }
+  }
+  return {
+    label: '样本达标',
+    description: '真实成交已达最小门槛',
+    chipClass: 'chip chip--success',
+  }
+}
+
+function backtestDecisionReadinessMeta(
+  backtest?: {
+    decision_readiness?: 'ready' | 'sample_incomplete' | 'research_only' | null
+    decision_readiness_detail?: string | null
+    decision_recommended_data_range?: string | null
+    decision_recommended_timeframe?: string | null
+    decision_readiness_action?: string | null
+  } | null,
+) {
+  if (!backtest) return null
+  const readiness =
+    backtest.decision_readiness === 'research_only'
+      ? 'research_only'
+      : backtest.decision_readiness === 'sample_incomplete'
+        ? 'sample_incomplete'
+        : 'ready'
+  const detail =
+    typeof backtest.decision_readiness_detail === 'string' && backtest.decision_readiness_detail.trim()
+      ? backtest.decision_readiness_detail.trim()
+      : readiness === 'research_only'
+        ? '当前结果仅供研究参考'
+        : readiness === 'sample_incomplete'
+          ? '当前样本仍需补充'
+          : '当前结果可继续结合策略上下文判断'
+  const nextAction =
+    typeof backtest.decision_readiness_action === 'string' && backtest.decision_readiness_action.trim()
+      ? backtest.decision_readiness_action.trim()
+      : null
+  const recommendedRange =
+    typeof backtest.decision_recommended_data_range === 'string' && backtest.decision_recommended_data_range.trim()
+      ? backtest.decision_recommended_data_range.trim()
+      : null
+  const recommendedTimeframe =
+    typeof backtest.decision_recommended_timeframe === 'string' && backtest.decision_recommended_timeframe.trim()
+      ? backtest.decision_recommended_timeframe.trim()
+      : null
+  if (readiness === 'research_only') {
+    return {
+      label: '研究参考',
+      description: detail,
+      recommendedRange,
+      recommendedTimeframe,
+      nextAction,
+      chipClass: 'chip chip--warning',
+    }
+  }
+  if (readiness === 'sample_incomplete') {
+    return {
+      label: '待补样本',
+      description: detail,
+      recommendedRange,
+      recommendedTimeframe,
+      nextAction,
+      chipClass: 'chip chip--muted',
+    }
+  }
+  return {
+    label: '可继续判断',
+    description: detail,
+    recommendedRange,
+    recommendedTimeframe,
+    nextAction,
+    chipClass: 'chip chip--success',
+  }
+}
+
+function backtestTriggerReasonLabel(reason?: string | null) {
+  return (
+    {
+      manual_create: '手动创建',
+      decision_rerun: '门禁重跑',
+      review_decision_rerun: '复盘建议重跑',
+      proposal_accept: '接受提案',
+    }[reason ?? ''] ?? (reason || '未标注')
+  )
+}
+
+function backtestLineageMeta(
+  backtest?: Pick<
+    BacktestRun,
+    'source_change_request_id' | 'source_backtest_id' | 'source_review_id' | 'source_proposal_id' | 'trigger_reason'
+  > | null,
+) {
+  if (!backtest) return null
+  const sourceChangeRequestId =
+    typeof backtest.source_change_request_id === 'string' && backtest.source_change_request_id.trim()
+      ? backtest.source_change_request_id.trim()
+      : null
+  const sourceBacktestId =
+    typeof backtest.source_backtest_id === 'string' && backtest.source_backtest_id.trim()
+      ? backtest.source_backtest_id.trim()
+      : null
+  const sourceReviewId =
+    typeof backtest.source_review_id === 'string' && backtest.source_review_id.trim()
+      ? backtest.source_review_id.trim()
+      : null
+  const sourceProposalId =
+    typeof backtest.source_proposal_id === 'string' && backtest.source_proposal_id.trim()
+      ? backtest.source_proposal_id.trim()
+      : null
+  const triggerReason =
+    typeof backtest.trigger_reason === 'string' && backtest.trigger_reason.trim()
+      ? backtest.trigger_reason.trim()
+      : null
+  if (!triggerReason && !sourceChangeRequestId && !sourceBacktestId && !sourceReviewId && !sourceProposalId) {
+    return null
+  }
+  const detailParts = [backtestTriggerReasonLabel(triggerReason)]
+  if (sourceChangeRequestId) {
+    detailParts.push(`来源变更 ${sourceChangeRequestId}`)
+  }
+  if (sourceBacktestId) {
+    detailParts.push(`来源回测 ${sourceBacktestId}`)
+  }
+  if (sourceReviewId) {
+    detailParts.push(`来源复盘 ${sourceReviewId}`)
+  }
+  if (sourceProposalId) {
+    detailParts.push(`来源提案 ${sourceProposalId}`)
+  }
+  return {
+    label: backtestTriggerReasonLabel(triggerReason),
+    detail: detailParts.join(' · '),
+  }
+}
+
+function backtestWindowMeta(
+  backtest?: Pick<
+    BacktestRun,
+    | 'history_source'
+    | 'history_source_reason'
+    | 'history_source_detail'
+    | 'history_source_recommended_action'
+    | 'requested_candle_estimate'
+    | 'requested_candle_limit'
+    | 'requested_range_start'
+    | 'requested_range_end'
+    | 'retrieved_window_completion_pct'
+    | 'used_window_completion_pct'
+    | 'retrieved_candle_count'
+    | 'used_candle_count'
+    | 'retrieved_range_start'
+    | 'retrieved_range_end'
+    | 'used_range_start'
+    | 'used_range_end'
+    | 'history_truncated'
+    | 'history_gap_reason'
+    | 'full_window_recommended_data_range'
+    | 'full_window_recommended_timeframe'
+    | 'full_window_recommended_action'
+  > | null,
+) {
+  if (!backtest) return null
+  const historySource =
+    backtest.history_source === 'market_detail_fallback' ? 'market_detail_fallback' : 'exchange_history'
+  const historySourceReason =
+    backtest.history_source_reason === 'exchange_fetch_failed'
+      ? 'exchange_fetch_failed'
+      : backtest.history_source_reason === 'insufficient_exchange_samples'
+        ? 'insufficient_exchange_samples'
+        : 'none'
+  const historySourceDetail =
+    typeof backtest.history_source_detail === 'string' && backtest.history_source_detail.trim()
+      ? backtest.history_source_detail.trim()
+      : null
+  const historySourceRecommendedAction =
+    typeof backtest.history_source_recommended_action === 'string' && backtest.history_source_recommended_action.trim()
+      ? backtest.history_source_recommended_action.trim()
+      : null
+  const requestedEstimate = Number(backtest.requested_candle_estimate ?? 0)
+  const requestedLimit = Number(backtest.requested_candle_limit ?? 0)
+  const requestedRangeStart =
+    typeof backtest.requested_range_start === 'string' && backtest.requested_range_start.trim()
+      ? backtest.requested_range_start.trim()
+      : null
+  const requestedRangeEnd =
+    typeof backtest.requested_range_end === 'string' && backtest.requested_range_end.trim()
+      ? backtest.requested_range_end.trim()
+      : null
+  const retrievedWindowCompletionPct = Number(backtest.retrieved_window_completion_pct ?? 0)
+  const usedWindowCompletionPct = Number(backtest.used_window_completion_pct ?? 0)
+  const retrievedCount = Number(backtest.retrieved_candle_count ?? 0)
+  const usedCount = Number(backtest.used_candle_count ?? 0)
+  const retrievedRangeStart =
+    typeof backtest.retrieved_range_start === 'string' && backtest.retrieved_range_start.trim()
+      ? backtest.retrieved_range_start.trim()
+      : null
+  const retrievedRangeEnd =
+    typeof backtest.retrieved_range_end === 'string' && backtest.retrieved_range_end.trim()
+      ? backtest.retrieved_range_end.trim()
+      : null
+  const usedRangeStart =
+    typeof backtest.used_range_start === 'string' && backtest.used_range_start.trim()
+      ? backtest.used_range_start.trim()
+      : null
+  const usedRangeEnd =
+    typeof backtest.used_range_end === 'string' && backtest.used_range_end.trim()
+      ? backtest.used_range_end.trim()
+      : null
+  const recommendedAction =
+    typeof backtest.full_window_recommended_action === 'string' && backtest.full_window_recommended_action.trim()
+      ? backtest.full_window_recommended_action.trim()
+      : null
+  if (requestedEstimate <= 0 && requestedLimit <= 0 && retrievedCount <= 0 && usedCount <= 0) {
+    return null
+  }
+  const truncated = Boolean(backtest.history_truncated)
+  const gapReason =
+    backtest.history_gap_reason === 'insufficient_history'
+      ? 'insufficient_history'
+      : backtest.history_gap_reason === 'sample_cap'
+        ? 'sample_cap'
+        : 'none'
+  const requestedRangeText =
+    requestedRangeStart && requestedRangeEnd ? `${formatTime(requestedRangeStart)} -> ${formatTime(requestedRangeEnd)}` : null
+  const retrievedRangeText =
+    retrievedRangeStart && retrievedRangeEnd ? `${formatTime(retrievedRangeStart)} -> ${formatTime(retrievedRangeEnd)}` : null
+  const usedRangeText =
+    usedRangeStart && usedRangeEnd ? `${formatTime(usedRangeStart)} -> ${formatTime(usedRangeEnd)}` : null
+  const detail = `理论 ${formatNumber(requestedEstimate || requestedLimit || retrievedCount || usedCount)} 根 · 当前上限 ${formatNumber(
+    requestedLimit || retrievedCount || usedCount || requestedEstimate,
+  )} 根 · 取到 ${formatNumber(retrievedCount || usedCount || requestedLimit || requestedEstimate)} 根 (${formatUnsignedPercent(
+    retrievedWindowCompletionPct,
+  )}) · 使用 ${formatNumber(usedCount || retrievedCount || requestedLimit || requestedEstimate)} 根 (${formatUnsignedPercent(
+    usedWindowCompletionPct,
+  )})`
+  const rangeParts: string[] = []
+  if (
+    requestedRangeText &&
+    requestedRangeText !== retrievedRangeText &&
+    requestedRangeText !== usedRangeText
+  ) {
+    rangeParts.push(`请求 ${requestedRangeText}`)
+  }
+  if (retrievedRangeText && usedRangeText) {
+    if (retrievedRangeText === usedRangeText) {
+      rangeParts.push(`覆盖 ${retrievedRangeText}`)
+    } else {
+      rangeParts.push(`取样 ${retrievedRangeText}`)
+      rangeParts.push(`回测 ${usedRangeText}`)
+    }
+  } else if (retrievedRangeText) {
+    rangeParts.push(`覆盖 ${retrievedRangeText}`)
+  } else if (usedRangeText) {
+    rangeParts.push(`回测 ${usedRangeText}`)
+  }
+  if (historySource === 'market_detail_fallback') {
+    const historySourceReasonLabel =
+      historySourceReason === 'exchange_fetch_failed'
+        ? '历史拉取报错'
+        : historySourceReason === 'insufficient_exchange_samples'
+          ? '交易所样本不足'
+          : null
+    rangeParts.push(
+      `数据源 ${historySourceReasonLabel ? `行情快照回退（${historySourceReasonLabel}）` : '行情快照回退'}`,
+    )
+    if (historySourceDetail) {
+      rangeParts.push(`原因 ${historySourceDetail}`)
+    }
+  }
+  const detailWithRange = rangeParts.length ? `${detail} · ${rangeParts.join(' · ')}` : detail
+  if (truncated) {
+    return {
+      attention: true,
+      truncated,
+      label: gapReason === 'insufficient_history' ? '历史不足' : '样本截断',
+      description:
+        recommendedAction ??
+        `理论 ${formatNumber(requestedEstimate || requestedLimit)} 根，上限 ${formatNumber(requestedLimit || retrievedCount || usedCount)} 根`,
+      detail: recommendedAction ? `${recommendedAction} · ${detailWithRange}` : detailWithRange,
+      nextAction: recommendedAction,
+      chipClass: 'chip chip--warning',
+    }
+  }
+  return {
+    attention: historySource === 'market_detail_fallback',
+    truncated,
+    label: historySource === 'market_detail_fallback' ? '快照回退' : '样本窗口',
+    description:
+      historySource === 'market_detail_fallback'
+        ? historySourceReason === 'exchange_fetch_failed'
+          ? '交易所历史拉取报错，当前改用工作台行情快照样本'
+          : historySourceReason === 'insufficient_exchange_samples'
+            ? '交易所历史样本不足，当前改用工作台行情快照样本'
+            : '当前使用工作台行情快照样本'
+        : `本次使用 ${formatNumber(usedCount || retrievedCount || requestedLimit || requestedEstimate)} 根样本`,
+    detail: detailWithRange,
+    nextAction: historySourceRecommendedAction,
+    chipClass: historySource === 'market_detail_fallback' ? 'chip chip--warning' : 'chip chip--success',
+  }
+}
+
 function alertSourceMeta(sourceType?: 'rule' | 'news' | 'backtest' | 'system') {
   return (
     {
@@ -554,6 +1530,24 @@ function bybitPrivateRealtimeStatusLabel(status?: {
     return `私有 WS 已失活${status.realtime_stale_seconds ? ` / ${status.realtime_stale_seconds}s` : ''}`
   }
   return `私有 WS 已连通${status.realtime_authenticated ? ' / 已鉴权' : ''}`
+}
+
+function bybitPrivateConfigSourceLabel(source?: 'env' | 'file' | 'none') {
+  if (source === 'env') return '环境变量优先'
+  if (source === 'file') return '读取本地配置文件'
+  return '未检测到私有配置'
+}
+
+function configPresenceLabel(exists?: boolean | null) {
+  return exists ? '配置文件已存在' : '配置文件不存在'
+}
+
+function openClawCommandLabel(commandAvailable?: boolean | null) {
+  return commandAvailable ? 'openclaw 命令可用' : '未检测到 openclaw 命令'
+}
+
+function isAbsoluteLocalPath(value?: string | null) {
+  return typeof value === 'string' && value.startsWith('/')
 }
 
 function bybitPublicChannelStatusLabel(
@@ -763,7 +1757,7 @@ function buildOpsEventNotification(event: ExecutionEvent) {
 
   return {
     title: '量化控制端事件',
-    body: summarizeAuditEvent(event.payload),
+    body: auditNotificationBody(event.payload),
     urgency: 'normal',
   } satisfies DesktopNotificationPayload
 }
@@ -823,6 +1817,117 @@ function getAgentJobLinkedReviewPeriod(job: { linked_review_period?: string | nu
   }
   const period = job.context?.linked_review_period
   return typeof period === 'string' && period.trim() ? period : null
+}
+
+function getAgentJobBacktestId(job: { context?: Record<string, unknown> }) {
+  const backtestId = job.context?.backtest_id
+  return typeof backtestId === 'string' && backtestId.trim() ? backtestId : null
+}
+
+function getAgentJobChangeRequestId(job: { context?: Record<string, unknown> }) {
+  const changeRequestId = job.context?.change_request_id
+  if (typeof changeRequestId === 'string' && changeRequestId.trim()) {
+    return changeRequestId
+  }
+  const sourceChangeRequestId = job.context?.source_change_request_id
+  return typeof sourceChangeRequestId === 'string' && sourceChangeRequestId.trim() ? sourceChangeRequestId : null
+}
+
+function getAgentJobSourceChangeRequestId(job: { context?: Record<string, unknown> }) {
+  const changeRequestId = job.context?.source_change_request_id
+  return typeof changeRequestId === 'string' && changeRequestId.trim() ? changeRequestId : null
+}
+
+function getAgentJobSourceBacktestId(job: { context?: Record<string, unknown> }) {
+  const backtestId = job.context?.source_backtest_id
+  return typeof backtestId === 'string' && backtestId.trim() ? backtestId : null
+}
+
+function getAgentJobSourceReviewId(job: { context?: Record<string, unknown> }) {
+  const reviewId = job.context?.source_review_id
+  return typeof reviewId === 'string' && reviewId.trim() ? reviewId : null
+}
+
+function getAgentJobSourceProposalId(job: { context?: Record<string, unknown> }) {
+  const proposalId = job.context?.source_proposal_id
+  return typeof proposalId === 'string' && proposalId.trim() ? proposalId : null
+}
+
+function agentJobContextMeta(job?: AgentJob | null) {
+  if (!job) return null
+  const parts: string[] = []
+  const strategyId = getAgentJobStrategyId(job)
+  const backtestId = getAgentJobBacktestId(job)
+  const changeRequestId = getAgentJobChangeRequestId(job)
+  const sourceChangeRequestId = getAgentJobSourceChangeRequestId(job)
+  const sourceBacktestId = getAgentJobSourceBacktestId(job)
+  const sourceReviewId = getAgentJobSourceReviewId(job)
+  const sourceProposalId = getAgentJobSourceProposalId(job)
+  const retryCount = getAgentJobRetryCount(job)
+  const retriedFrom = getAgentJobRetriedFrom(job)
+  const linkedReviewId = getAgentJobLinkedReviewId(job)
+
+  if (strategyId) {
+    parts.push(`策略 ${strategyId}`)
+  }
+  if (backtestId) {
+    parts.push(`回测 ${backtestId}`)
+  }
+  if (changeRequestId) {
+    parts.push(`变更 ${changeRequestId}`)
+  }
+  if (sourceChangeRequestId && sourceChangeRequestId !== changeRequestId) {
+    parts.push(`来源变更 ${sourceChangeRequestId}`)
+  }
+  if (sourceBacktestId && sourceBacktestId !== backtestId) {
+    parts.push(`来源回测 ${sourceBacktestId}`)
+  }
+  if (sourceReviewId && sourceReviewId !== linkedReviewId) {
+    parts.push(`来源复盘 ${sourceReviewId}`)
+  }
+  if (sourceProposalId) {
+    parts.push(`来源提案 ${sourceProposalId}`)
+  }
+  if (retryCount > 0) {
+    parts.push(`第 ${retryCount} 次重试`)
+  }
+  if (retriedFrom) {
+    parts.push(`源任务 ${retriedFrom}`)
+  }
+  return parts.length ? parts.join(' · ') : null
+}
+
+function backtestReviewJobMeta(job?: AgentJob | null, hasReview = false) {
+  if (!job) return null
+  const retryCount = getAgentJobRetryCount(job)
+  let detail =
+    typeof job.result_summary === 'string' && job.result_summary.trim()
+      ? job.result_summary.trim()
+      : null
+
+  if (!detail) {
+    if (job.status === 'queued') {
+      detail = '回测复盘任务已进入 AI 调度队列，等待 OpenClaw 处理。'
+    } else if (job.status === 'running') {
+      detail = 'OpenClaw 正在生成这轮回测的复盘结果。'
+    } else if (job.status === 'waiting') {
+      detail = '当前任务正在等待外部依赖或上游资源返回。'
+    } else if (job.status === 'completed' && !hasReview) {
+      detail = '任务已完成，复盘结果正在写回列表。'
+    } else if (job.status === 'failed') {
+      detail = '复盘任务失败，可进入 AI 调度查看错误详情或直接重试。'
+    } else if (job.status === 'cancelled') {
+      detail = '复盘任务已取消，可进入 AI 调度查看原因或重新发起。'
+    } else {
+      detail = '当前这轮回测已有对应的 AI 复盘任务记录。'
+    }
+  }
+
+  return {
+    label: jobStatusLabel(job.status),
+    detail: retryCount > 0 ? `${detail} · 第 ${retryCount} 次重试` : detail,
+    canRetry: canRetryAgentJob(job.status),
+  }
 }
 
 function signalLabel(signal: 'neutral' | 'watch' | 'active') {
@@ -1093,16 +2198,6 @@ function executionHealthTooltip(health?: ControlSnapshot['execution_health']) {
     .join(' · ')
 }
 
-function executionEventSummary(event: ExecutionEvent) {
-  return String(
-    event.payload?.detail ??
-      event.payload?.message ??
-      event.payload?.status ??
-      event.source ??
-      event.event_type,
-  )
-}
-
 function activityAlertToneClass(alert: AlertRecord) {
   if (alert.severity === 'P0') return 'negative'
   if (alert.severity === 'P1') return 'tone-risk-medium'
@@ -1340,26 +2435,29 @@ function App() {
     () => `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
   )
   const [replayFocusedReviewId, setReplayFocusedReviewId] = useState<string | null>(null)
-  const [alertSeverityFilter, setAlertSeverityFilter] = useState<'all' | 'P0' | 'P1' | 'P2'>('all')
-  const [alertStatusFilter, setAlertStatusFilter] = useState<'all' | 'pending' | 'acknowledged'>('pending')
-  const [alertScopeFilter, setAlertScopeFilter] = useState<'all' | 'selected'>('all')
-  const [tradeModeFilter, setTradeModeFilter] = useState<'all' | Mode>('all')
-  const [tradeOriginFilter, setTradeOriginFilter] = useState<'all' | 'manual' | 'strategy' | 'exchange'>('all')
-  const [tradeScopeFilter, setTradeScopeFilter] = useState<'all' | 'selected'>('all')
-  const [auditSeverityFilter, setAuditSeverityFilter] = useState<'all' | 'info' | 'warning' | 'error' | 'critical'>('all')
-  const [auditSourceFilter, setAuditSourceFilter] = useState('all')
-  const [auditScopeFilter, setAuditScopeFilter] = useState<'all' | 'selected'>('all')
-  const [auditSearch, setAuditSearch] = useState('')
+  const [selectedProposalId, setSelectedProposalId] = useState<string | null>(null)
+  const [selectedChangeRequestId, setSelectedChangeRequestId] = useState<string | null>(null)
+  const [alertSeverityFilter, setAlertSeverityFilter] = useState<'all' | 'P0' | 'P1' | 'P2'>(workspaceBootstrap.alert_severity_filter)
+  const [alertStatusFilter, setAlertStatusFilter] = useState<'all' | 'pending' | 'acknowledged'>(workspaceBootstrap.alert_status_filter)
+  const [alertScopeFilter, setAlertScopeFilter] = useState<'all' | 'selected'>(workspaceBootstrap.alert_scope_filter)
+  const [tradeModeFilter, setTradeModeFilter] = useState<'all' | Mode>(workspaceBootstrap.trade_mode_filter)
+  const [tradeOriginFilter, setTradeOriginFilter] = useState<'all' | 'manual' | 'strategy' | 'exchange'>(workspaceBootstrap.trade_origin_filter)
+  const [tradeScopeFilter, setTradeScopeFilter] = useState<'all' | 'selected'>(workspaceBootstrap.trade_scope_filter)
+  const [auditSeverityFilter, setAuditSeverityFilter] = useState<'all' | 'info' | 'warning' | 'error' | 'critical'>(workspaceBootstrap.audit_severity_filter)
+  const [auditSourceFilter, setAuditSourceFilter] = useState(workspaceBootstrap.audit_source_filter)
+  const [auditScopeFilter, setAuditScopeFilter] = useState<'all' | 'selected'>(workspaceBootstrap.audit_scope_filter)
+  const [auditSearch, setAuditSearch] = useState(workspaceBootstrap.audit_search)
   const [watchlistDraftSymbol, setWatchlistDraftSymbol] = useState('')
   const [watchlistDraftMarket, setWatchlistDraftMarket] = useState<'spot' | 'perp'>('perp')
   const [watchlistAlertDrafts, setWatchlistAlertDrafts] = useState<Record<string, string>>({})
   const [parameterDrafts, setParameterDrafts] = useState<Record<string, string>>({})
   const [riskBudgetDraft, setRiskBudgetDraft] = useState('')
-  const [backtestFilter, setBacktestFilter] = useState<'selected' | 'all'>('selected')
-  const [replayTrackingScope, setReplayTrackingScope] = useState<'all' | 'selected'>('all')
-  const [selectedBacktestId, setSelectedBacktestId] = useState<string | null>(null)
+  const [backtestFilter, setBacktestFilter] = useState<'selected' | 'all'>(workspaceBootstrap.backtest_filter)
+  const [replayTrackingScope, setReplayTrackingScope] = useState<'all' | 'selected'>(workspaceBootstrap.replay_tracking_scope)
+  const [selectedBacktestId, setSelectedBacktestId] = useState<string | null>(workspaceBootstrap.selected_backtest_id)
   const [backtestRangeDraft, setBacktestRangeDraft] = useState<string>(backtestRangePresets[1].value)
   const [backtestTimeframeDraft, setBacktestTimeframeDraft] = useState<string>('1h')
+  const [settingsDraft, setSettingsDraft] = useState<SettingsDraft>(() => buildSettingsDraft())
   const [manualOrder, setManualOrder] = useState({
     side: 'buy' as 'buy' | 'sell',
     quantity: '1',
@@ -1367,7 +2465,9 @@ function App() {
     note: '',
   })
   const manualOrderSymbolRef = useRef<string | null>(null)
+  const lastLoadedSettingsSignatureRef = useRef<string | null>(null)
   const desktopNotificationPermissionRequestedRef = useRef(false)
+  const recentDesktopNotificationRef = useRef<Map<string, number>>(new Map())
   const seenAlertNotificationIdsRef = useRef<Set<string>>(new Set())
   const seenAgentJobStatusRef = useRef<Map<string, string>>(new Map())
   const seenOpsNotificationIdsRef = useRef<Set<string>>(new Set())
@@ -1544,6 +2644,15 @@ function App() {
     queryFn: api.getReviews,
     refetchInterval: 30000,
   })
+  const selectedBacktestQueryId =
+    selectedBacktestId ??
+    (
+      (
+        backtestFilter === 'selected' && activeStrategyId
+          ? (backtestsQuery.data ?? []).find((item) => item.strategy_id === activeStrategyId)
+          : (backtestsQuery.data ?? [])[0]
+      )?.id ?? null
+    )
   const selectedStrategyReviewsQuery = useQuery({
     queryKey: ['strategy-reviews', activeStrategyId],
     queryFn: () => api.getReviews({ strategyId: activeStrategyId }),
@@ -1552,6 +2661,12 @@ function App() {
       (activeSection === 'strategy' || activeSection === 'backtest' || activeSection === 'replay'),
     refetchInterval:
       activeSection === 'strategy' || activeSection === 'backtest' || activeSection === 'replay' ? 30000 : false,
+  })
+  const selectedBacktestReviewsQuery = useQuery({
+    queryKey: ['backtest-reviews', selectedBacktestQueryId],
+    queryFn: () => api.getReviews({ backtestId: selectedBacktestQueryId, periods: ['backtest'] }),
+    enabled: Boolean(selectedBacktestQueryId) && (activeSection === 'backtest' || activeSection === 'replay'),
+    refetchInterval: activeSection === 'backtest' || activeSection === 'replay' ? 30000 : false,
   })
   const replayTrackingReviewsQuery = useQuery({
     queryKey: ['replay-tracking-reviews', replayTrackingScope, selectedStrategy?.id ?? 'none'],
@@ -1612,12 +2727,30 @@ function App() {
   })
 
   const applyWorkspaceState = (nextWorkspace: WorkspaceBootstrap | WorkspacePreferences) => {
+    const defaults = buildDefaultWorkspaceBootstrap()
     setActiveSection(nextWorkspace.active_section)
     setLayoutPreset(nextWorkspace.layout_preset)
     setSelectedMode(nextWorkspace.selected_mode)
     setSelectedSymbol(nextWorkspace.selected_symbol)
     setSelectedMarketTimeframe(normalizeWorkspaceMarketTimeframe(nextWorkspace.selected_market_timeframe))
     setSelectedStrategyId(nextWorkspace.selected_strategy_id ?? null)
+    setSelectedBacktestId(nextWorkspace.selected_backtest_id ?? null)
+    setBacktestFilter(nextWorkspace.backtest_filter ?? defaults.backtest_filter)
+    setReplayTrackingScope(nextWorkspace.replay_tracking_scope ?? defaults.replay_tracking_scope)
+    setAlertSeverityFilter(nextWorkspace.alert_severity_filter ?? defaults.alert_severity_filter)
+    setAlertStatusFilter(nextWorkspace.alert_status_filter ?? defaults.alert_status_filter)
+    setAlertScopeFilter(nextWorkspace.alert_scope_filter ?? defaults.alert_scope_filter)
+    setTradeModeFilter(nextWorkspace.trade_mode_filter ?? defaults.trade_mode_filter)
+    setTradeOriginFilter(nextWorkspace.trade_origin_filter ?? defaults.trade_origin_filter)
+    setTradeScopeFilter(nextWorkspace.trade_scope_filter ?? defaults.trade_scope_filter)
+    setAuditSeverityFilter(nextWorkspace.audit_severity_filter ?? defaults.audit_severity_filter)
+    setAuditSourceFilter(
+      typeof nextWorkspace.audit_source_filter === 'string' && nextWorkspace.audit_source_filter.trim()
+        ? nextWorkspace.audit_source_filter.trim()
+        : defaults.audit_source_filter,
+    )
+    setAuditScopeFilter(nextWorkspace.audit_scope_filter ?? defaults.audit_scope_filter)
+    setAuditSearch(String(nextWorkspace.audit_search ?? defaults.audit_search))
     setCardOrder(normalizeCardIds(nextWorkspace.overview_card_order))
     setVisibleOverviewCards(
       normalizeVisibleCardIds(nextWorkspace.overview_visible_cards, nextWorkspace.overview_card_order),
@@ -1634,6 +2767,75 @@ function App() {
 
   const showFeedback = (tone: ActionFeedback['tone'], title: string, detail: string) => {
     setActionFeedback({ tone, title, detail })
+  }
+
+  const dispatchDesktopNotification = useCallback(
+    async (
+      payload: DesktopNotificationPayload,
+      options?: {
+        bypassCooldown?: boolean
+        dedupeKey?: string | null
+      },
+    ): Promise<DesktopNotificationDelivery> => {
+      const shouldApplyCooldown = payload.urgency !== 'critical' && !options?.bypassCooldown
+      const signature = options?.dedupeKey?.trim() || desktopNotificationSignature(payload)
+      const now = Date.now()
+      if (shouldApplyCooldown) {
+        recentDesktopNotificationRef.current.forEach((timestamp, key) => {
+          if (now - timestamp > duplicateDesktopNotificationCooldownMs * 3) {
+            recentDesktopNotificationRef.current.delete(key)
+          }
+        })
+        const lastDeliveredAt = recentDesktopNotificationRef.current.get(signature)
+        if (lastDeliveredAt && now - lastDeliveredAt < duplicateDesktopNotificationCooldownMs) {
+          return 'suppressed'
+        }
+      }
+      const delivery = await sendDesktopNotificationWithSettings(
+        payload,
+        settingsQuery.data,
+        desktopNotificationPermissionRequestedRef,
+      )
+      if (delivery === 'delivered' && shouldApplyCooldown) {
+        recentDesktopNotificationRef.current.set(signature, now)
+      }
+      return delivery
+    },
+    [settingsQuery.data],
+  )
+
+  const openLocalPath = async (
+    targetPath: string | null | undefined,
+    options: {
+      label: string
+      revealInFolder?: boolean
+    },
+  ) => {
+    if (!isAbsoluteLocalPath(targetPath)) {
+      showFeedback('warning', `无法打开${options.label}`, '当前路径不是本机绝对路径，请先确认控制服务已刷新到最新配置状态。')
+      return
+    }
+    if (typeof window.bybitApp?.openPath !== 'function') {
+      showFeedback('warning', `无法打开${options.label}`, '当前运行环境不支持本地路径操作，请在 Electron 桌面端中使用。')
+      return
+    }
+    try {
+      const result = await window.bybitApp.openPath({
+        path: targetPath,
+        revealInFolder: options.revealInFolder ?? false,
+      })
+      if (!result?.ok) {
+        showFeedback('error', `打开${options.label}失败`, result?.message ?? '本机未返回更详细的错误信息。')
+        return
+      }
+      showFeedback('success', `已打开${options.label}`, result.path ?? targetPath)
+    } catch (error) {
+      showFeedback(
+        'error',
+        `打开${options.label}失败`,
+        error instanceof Error ? error.message : '本机未返回更详细的错误信息。',
+      )
+    }
   }
 
   useEffect(() => {
@@ -1698,6 +2900,19 @@ function App() {
       selected_symbol: selectedSymbol,
       selected_market_timeframe: selectedMarketTimeframe,
       selected_strategy_id: selectedStrategyId,
+      selected_backtest_id: selectedBacktestId,
+      backtest_filter: backtestFilter,
+      replay_tracking_scope: replayTrackingScope,
+      alert_severity_filter: alertSeverityFilter,
+      alert_status_filter: alertStatusFilter,
+      alert_scope_filter: alertScopeFilter,
+      trade_mode_filter: tradeModeFilter,
+      trade_origin_filter: tradeOriginFilter,
+      trade_scope_filter: tradeScopeFilter,
+      audit_severity_filter: auditSeverityFilter,
+      audit_source_filter: auditSourceFilter,
+      audit_scope_filter: auditScopeFilter,
+      audit_search: auditSearch,
       overview_card_order: cardOrder,
       overview_visible_cards: visibleOverviewCards,
       overview_collapsed_cards: collapsedOverviewCards,
@@ -1723,6 +2938,19 @@ function App() {
     selectedMode,
     selectedMarketTimeframe,
     selectedStrategyId,
+    selectedBacktestId,
+    backtestFilter,
+    replayTrackingScope,
+    alertSeverityFilter,
+    alertStatusFilter,
+    alertScopeFilter,
+    tradeModeFilter,
+    tradeOriginFilter,
+    tradeScopeFilter,
+    auditSeverityFilter,
+    auditSourceFilter,
+    auditScopeFilter,
+    auditSearch,
     selectedSymbol,
     collapsedOverviewCards,
     visibleOverviewCards,
@@ -1901,7 +3129,7 @@ function App() {
         warnings: selectedStrategyRuntime.note ? [selectedStrategyRuntime.note] : [],
       }
     : null
-  const backtests = backtestsQuery.data ?? []
+  const backtests = useMemo(() => backtestsQuery.data ?? [], [backtestsQuery.data])
   const scheduler = aiLiveQuery.data ?? schedulerQuery.data
   const opsLive = opsLiveQuery.data
   const alerts = useMemo(() => opsLive?.alerts ?? alertsQuery.data ?? [], [opsLive?.alerts, alertsQuery.data])
@@ -1923,9 +3151,21 @@ function App() {
     () => opsLive?.audit_events ?? auditQuery.data ?? [],
     [auditQuery.data, opsLive?.audit_events],
   )
-  const changeRequests = aiLiveQuery.data?.change_requests ?? changeRequestsQuery.data ?? scheduler?.change_requests ?? []
+  const latestSchedulerCommand = useMemo(
+    () =>
+      schedulerCommandSnapshotMeta(
+        scheduler?.latest_scheduler_command ?? opsLive?.latest_scheduler_command ?? snapshot?.latest_scheduler_command ?? null,
+      ) ?? schedulerCommandEventMeta(auditEvents.find((event) => event.event_type === 'scheduler.command') ?? null),
+    [auditEvents, opsLive?.latest_scheduler_command, scheduler?.latest_scheduler_command, snapshot?.latest_scheduler_command],
+  )
+  const changeRequests = useMemo(
+    () => aiLiveQuery.data?.change_requests ?? changeRequestsQuery.data ?? scheduler?.change_requests ?? [],
+    [aiLiveQuery.data?.change_requests, changeRequestsQuery.data, scheduler?.change_requests],
+  )
   const settings = settingsQuery.data
   const grafanaStatus = grafanaQuery.data
+  const settingsDraftDirty = settings ? !settingsDraftEqualsSettings(settingsDraft, settings) : false
+  const notificationQuietHoursActive = isNotificationQuietHoursActive(settings)
   const metricsPreviewLines = (metricsPreviewQuery.data ?? '')
     .split('\n')
     .map((line) => line.trim())
@@ -1947,6 +3187,20 @@ function App() {
       ).slice(0, 4),
     [bybitPublicIssueDiagnostics, bybitPublicStatus?.watched_symbol_diagnostics],
   )
+
+  useEffect(() => {
+    if (!settings) {
+      return
+    }
+    const nextDraft = buildSettingsDraft(settings)
+    const nextSignature = JSON.stringify(nextDraft)
+    if (lastLoadedSettingsSignatureRef.current === nextSignature) {
+      return
+    }
+    setSettingsDraft(nextDraft)
+    lastLoadedSettingsSignatureRef.current = nextSignature
+  }, [settings])
+
   const snapshotExecutionHealth = snapshot?.execution_health
   const desktopNotificationsEnabled = settings?.notification_channels.includes('desktop') ?? true
   const runtimeWorkerNeedsRecovery = runtimeWorkerStatus
@@ -1961,16 +3215,30 @@ function App() {
     runtimeWorkerStatus?.recommended_action ??
     '当前策略运行线程异常、停滞或未运行，恢复后后台自动执行链会重新接管。'
   const aiActivityFeed = aiLiveQuery.data?.activity_feed ?? auditEvents.filter((event) => event.source === 'openclaw' || event.source === 'desktop').slice(0, 5)
+  const backtestReviewJobs = useMemo(
+    () =>
+      [...(scheduler?.jobs ?? [])]
+        .filter((job) => job.job_type === 'generate_backtest_review')
+        .sort((left, right) => new Date(right.updated_at).getTime() - new Date(left.updated_at).getTime()),
+    [scheduler?.jobs],
+  )
   const strategyBacktests = selectedStrategy
     ? backtests.filter((item) => item.strategy_id === selectedStrategy.id)
     : []
   const latestStrategyBacktest = strategyBacktests[0]
-  const strategyProposals = selectedStrategy
-    ? reviews
-        .flatMap((review) => review.proposals)
-        .filter((proposal) => proposal.strategy_id === selectedStrategy.id)
-        .sort((left, right) => new Date(right.created_at).getTime() - new Date(left.created_at).getTime())
-    : []
+  const latestStrategyBacktestDecisionMeta = backtestDecisionReadinessMeta(latestStrategyBacktest)
+  const latestStrategyBacktestSampleMeta = backtestSampleQualityMeta(latestStrategyBacktest)
+  const latestStrategyBacktestWindowMeta = backtestWindowMeta(latestStrategyBacktest)
+  const strategyProposals = useMemo(
+    () =>
+      selectedStrategy
+        ? reviews
+            .flatMap((review) => review.proposals)
+            .filter((proposal) => proposal.strategy_id === selectedStrategy.id)
+            .sort((left, right) => new Date(right.created_at).getTime() - new Date(left.created_at).getTime())
+        : [],
+    [reviews, selectedStrategy],
+  )
   const selectedStrategyReviews = selectedStrategy
     ? (selectedStrategyReviewsQuery.data ?? reviews)
         .filter(
@@ -1984,6 +3252,7 @@ function App() {
     const combined = [
       ...reviews,
       ...(selectedStrategyReviewsQuery.data ?? []),
+      ...(selectedBacktestReviewsQuery.data ?? []),
       ...(replayTrackingReviewsQuery.data ?? []),
     ]
     const seen = new Set<string>()
@@ -1994,7 +3263,55 @@ function App() {
       seen.add(review.id)
       return true
     })
-  }, [reviews, selectedStrategyReviewsQuery.data, replayTrackingReviewsQuery.data])
+  }, [reviews, selectedStrategyReviewsQuery.data, selectedBacktestReviewsQuery.data, replayTrackingReviewsQuery.data])
+  const proposalBacktestMap = useMemo(() => {
+    const mapping = new Map<string, BacktestRun>()
+    for (const backtest of backtests) {
+      const proposalId =
+        typeof backtest.source_proposal_id === 'string' && backtest.source_proposal_id.trim()
+          ? backtest.source_proposal_id.trim()
+          : null
+      if (!proposalId) {
+        continue
+      }
+      const existing = mapping.get(proposalId)
+      if (!existing || new Date(backtest.started_at).getTime() > new Date(existing.started_at).getTime()) {
+        mapping.set(proposalId, backtest)
+      }
+    }
+    return mapping
+  }, [backtests])
+  const proposalReviewMap = useMemo(() => {
+    const mapping = new Map<string, ReviewDocument>()
+    for (const review of reviewCatalog) {
+      const proposalId =
+        typeof review.source_proposal_id === 'string' && review.source_proposal_id.trim()
+          ? review.source_proposal_id.trim()
+          : null
+      if (!proposalId) {
+        continue
+      }
+      const existing = mapping.get(proposalId)
+      if (!existing || new Date(review.created_at).getTime() > new Date(existing.created_at).getTime()) {
+        mapping.set(proposalId, review)
+      }
+    }
+    return mapping
+  }, [reviewCatalog])
+  const latestStrategyBacktestReview =
+    latestStrategyBacktest
+      ? reviewCatalog
+          .filter((review) => review.backtest_id === latestStrategyBacktest.id)
+          .sort((left, right) => new Date(right.created_at).getTime() - new Date(left.created_at).getTime())[0] ?? null
+      : null
+  const latestStrategyBacktestReviewJob =
+    latestStrategyBacktest
+      ? backtestReviewJobs.find((job) => getAgentJobBacktestId(job) === latestStrategyBacktest.id) ?? null
+      : null
+  const latestStrategyBacktestReviewJobMeta = backtestReviewJobMeta(
+    latestStrategyBacktestReviewJob,
+    Boolean(latestStrategyBacktestReview),
+  )
   const selectedStrategyPrimaryReviews = selectedStrategyReviews.filter(
     (review) => !isStrategyTrackingReview(review.period),
   )
@@ -2017,7 +3334,45 @@ function App() {
       : backtests
   const selectedBacktest =
     backtestsForWorkspace.find((item) => item.id === selectedBacktestId) ?? backtestsForWorkspace[0]
+  const selectedBacktestReviews = selectedBacktest
+    ? (selectedBacktestReviewsQuery.data ?? reviewCatalog)
+        .filter((review) => review.backtest_id === selectedBacktest.id)
+        .sort((left, right) => new Date(right.created_at).getTime() - new Date(left.created_at).getTime())
+    : []
+  const selectedBacktestReview = selectedBacktestReviews[0] ?? null
+  const selectedBacktestReviewJob =
+    selectedBacktest
+      ? backtestReviewJobs.find((job) => getAgentJobBacktestId(job) === selectedBacktest.id) ?? null
+      : null
+  const selectedBacktestProposals = selectedBacktestReview?.proposals ?? []
+  const selectedBacktestDecisionMeta = backtestDecisionReadinessMeta(selectedBacktest)
+  const selectedBacktestSampleMeta = backtestSampleQualityMeta(selectedBacktest)
+  const selectedBacktestLineageMeta = backtestLineageMeta(selectedBacktest)
+  const selectedBacktestWindowMeta = backtestWindowMeta(selectedBacktest)
+  const selectedBacktestReviewJobMeta = backtestReviewJobMeta(
+    selectedBacktestReviewJob,
+    Boolean(selectedBacktestReview),
+  )
   const latestWorkspaceBacktest = backtestsForWorkspace[0]
+  const latestWorkspaceBacktestDecisionMeta = backtestDecisionReadinessMeta(latestWorkspaceBacktest)
+  const latestWorkspaceBacktestSampleMeta = backtestSampleQualityMeta(latestWorkspaceBacktest)
+  const latestWorkspaceBacktestWindowMeta = backtestWindowMeta(latestWorkspaceBacktest)
+  const latestStrategyBacktestLineageMeta = backtestLineageMeta(latestStrategyBacktest)
+  const selectedStrategyReviewLineageMeta =
+    selectedStrategyReview?.period === 'backtest' ? backtestLineageMeta(selectedStrategyReview) : null
+  const selectedStrategyReviewDecisionMeta =
+    selectedStrategyReview?.period === 'backtest' &&
+    (
+      selectedStrategyReview.decision_readiness ||
+      selectedStrategyReview.decision_readiness_detail ||
+      selectedStrategyReview.decision_readiness_action ||
+      selectedStrategyReview.decision_recommended_data_range ||
+      selectedStrategyReview.decision_recommended_timeframe
+    )
+      ? backtestDecisionReadinessMeta(selectedStrategyReview)
+      : null
+  const backtestRangeOptions = withDraftPresetOption(backtestRangePresets, backtestRangeDraft, '当前区间')
+  const backtestTimeframeOptions = withDraftPresetOption(backtestTimeframePresets, backtestTimeframeDraft, '当前周期')
   const backtestParameterComparison = selectedBacktest
     ? Array.from(
         new Set([
@@ -2063,12 +3418,9 @@ function App() {
         return
       }
       seenAlertNotificationIdsRef.current.add(alert.id)
-      void sendDesktopNotification(
-        buildAlertNotification(alert),
-        desktopNotificationPermissionRequestedRef,
-      )
+      void dispatchDesktopNotification(buildAlertNotification(alert))
     })
-  }, [alerts, alertsNotificationBootstrapReady, desktopNotificationsEnabled])
+  }, [alerts, alertsNotificationBootstrapReady, desktopNotificationsEnabled, dispatchDesktopNotification])
 
   useEffect(() => {
     if (!desktopNotificationsEnabled || !jobsNotificationBootstrapReady) {
@@ -2096,17 +3448,16 @@ function App() {
       }
 
       if (job.status === 'failed' || job.status === 'cancelled') {
-        void sendDesktopNotification(
+        void dispatchDesktopNotification(
           buildAgentJobNotification({
             job_type: job.job_type,
             status: job.status,
             result_summary: job.result_summary,
           }),
-          desktopNotificationPermissionRequestedRef,
         )
       }
     })
-  }, [desktopNotificationsEnabled, jobsNotificationBootstrapReady, scheduler?.jobs])
+  }, [desktopNotificationsEnabled, dispatchDesktopNotification, jobsNotificationBootstrapReady, scheduler?.jobs])
 
   useEffect(() => {
     if (!desktopNotificationsEnabled) {
@@ -2133,16 +3484,15 @@ function App() {
     }
 
     if (nextStatus === 'degraded' || nextStatus === 'manual_override') {
-      void sendDesktopNotification(
+      void dispatchDesktopNotification(
         {
           title: `AI 调度${nextStatus === 'degraded' ? '降级' : '进入人工接管'}`,
           body: `当前状态：${schedulerLabel(nextStatus)} · 队列 ${schedulerState.queue_depth} 个，请进入 AI 调度页查看。`,
           urgency: nextStatus === 'degraded' ? 'critical' : 'normal',
         },
-        desktopNotificationPermissionRequestedRef,
       )
     }
-  }, [desktopNotificationsEnabled, scheduler?.scheduler])
+  }, [desktopNotificationsEnabled, dispatchDesktopNotification, scheduler?.scheduler])
 
   useEffect(() => {
     if (!desktopNotificationsEnabled || !opsNotificationBootstrapReady) {
@@ -2178,12 +3528,9 @@ function App() {
         return
       }
       seenOpsNotificationIdsRef.current.add(event.id)
-      void sendDesktopNotification(
-        buildOpsEventNotification(event),
-        desktopNotificationPermissionRequestedRef,
-      )
+      void dispatchDesktopNotification(buildOpsEventNotification(event))
     })
-  }, [auditEvents, desktopNotificationsEnabled, opsNotificationBootstrapReady])
+  }, [auditEvents, desktopNotificationsEnabled, dispatchDesktopNotification, opsNotificationBootstrapReady])
 
   useEffect(() => {
     const currentParameters = selectedStrategy?.parameters ?? []
@@ -2218,6 +3565,26 @@ function App() {
       setSelectedBacktestId(backtestsForWorkspace[0].id)
     }
   }, [backtestsForWorkspace, selectedBacktestId])
+
+  useEffect(() => {
+    if (!selectedProposalId) {
+      return
+    }
+    if (strategyProposals.some((proposal) => proposal.id === selectedProposalId)) {
+      return
+    }
+    setSelectedProposalId(null)
+  }, [strategyProposals, selectedProposalId])
+
+  useEffect(() => {
+    if (!selectedChangeRequestId) {
+      return
+    }
+    if (changeRequests.some((request) => request.id === selectedChangeRequestId)) {
+      return
+    }
+    setSelectedChangeRequestId(null)
+  }, [changeRequests, selectedChangeRequestId])
 
   useEffect(() => {
     if (editingOrderId && !editingOrder) {
@@ -2477,6 +3844,18 @@ function App() {
   })
   const tradeProbeResult = tradeProbeMutation.data
 
+  const settingsMutation = useMutation({
+    mutationFn: api.updateSettings,
+    onSuccess: async (nextSettings) => {
+      queryClient.setQueryData(['settings'], nextSettings)
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['settings'] }),
+        queryClient.invalidateQueries({ queryKey: ['grafana'] }),
+        refreshControlData(),
+      ])
+    },
+  })
+
   const workspaceMutation = useMutation({
     mutationFn: api.updateWorkspacePreferences,
     onSuccess: async (workspace) => {
@@ -2504,7 +3883,7 @@ function App() {
           ? result.freeze_publish
             ? '自动发布已冻结，新的 AI 发布提案会停留在控制端。'
             : '自动发布冻结已解除。'
-          : reason
+          : schedulerCommandFeedbackDetail(result, reason)
       showFeedback('success', 'AI 调度命令已发送', detail)
     } catch (error) {
       showFeedback('error', 'AI 调度命令失败', resolveErrorMessage(error))
@@ -2543,6 +3922,59 @@ function App() {
     })
   }
 
+  const openBacktestDetail = (backtestId?: string | null, strategyId?: string | null) => {
+    if (!backtestId) {
+      return
+    }
+    const linkedBacktest = backtests.find((item) => item.id === backtestId) ?? null
+    const nextStrategyId = strategyId ?? linkedBacktest?.strategy_id ?? null
+    startTransition(() => {
+      setActiveSection('backtest')
+      if (nextStrategyId) {
+        setSelectedStrategyId(nextStrategyId)
+        setBacktestFilter('selected')
+      } else {
+        setBacktestFilter('all')
+      }
+      setSelectedBacktestId(backtestId)
+    })
+    setReviewInspectorOpen(false)
+  }
+
+  const openSourceReview = (reviewId?: string | null, strategyId?: string | null) => {
+    if (!reviewId) {
+      return
+    }
+    openReplayReview(reviewId, strategyId, strategyId ? 'selected' : 'all')
+    setReviewInspectorOpen(false)
+  }
+
+  const openStrategyProposal = (proposalId?: string | null, strategyId?: string | null) => {
+    if (!proposalId || !strategyId) {
+      return
+    }
+    startTransition(() => {
+      setActiveSection('strategy')
+      setSelectedStrategyId(strategyId)
+      setSelectedProposalId(proposalId)
+    })
+    setReviewInspectorOpen(false)
+  }
+
+  const openChangeRequest = (changeRequestId?: string | null, strategyId?: string | null) => {
+    if (!changeRequestId) {
+      return
+    }
+    startTransition(() => {
+      setActiveSection('strategy')
+      if (strategyId) {
+        setSelectedStrategyId(strategyId)
+      }
+      setSelectedChangeRequestId(changeRequestId)
+    })
+    setReviewInspectorOpen(false)
+  }
+
   const openReviewInspector = (reviewId?: string | null, strategyId?: string | null) => {
     if (!reviewId) {
       return
@@ -2557,7 +3989,7 @@ function App() {
       return
     }
     startTransition(() => {
-      setActiveSection('ai-scheduler')
+      setActiveSection('scheduler')
       setAiSchedulerFocusedJobId(jobId)
     })
     setReviewInspectorOpen(false)
@@ -2575,6 +4007,92 @@ function App() {
       setReplayTrackingScope(scope)
       setReplayFocusedReviewId(reviewId ?? null)
     })
+  }
+
+  const renderLatestSchedulerCommandActions = (buttonClass = 'ghost-button ghost-button--inline') => {
+    if (!latestSchedulerCommand) {
+      return null
+    }
+    return (
+      <div className="inline-actions inline-actions--tight">
+        {latestSchedulerCommand.jobId && (
+          <button
+            type="button"
+            className={buttonClass}
+            onClick={() => openAiSchedulerJob(latestSchedulerCommand.jobId)}
+          >
+            打开任务
+          </button>
+        )}
+        {latestSchedulerCommand.linkedReviewId && latestSchedulerCommand.strategyId && (
+          <button
+            type="button"
+            className={buttonClass}
+            onClick={() => openReviewInspector(latestSchedulerCommand.linkedReviewId, latestSchedulerCommand.strategyId)}
+          >
+            查看结果
+          </button>
+        )}
+        {latestSchedulerCommand.backtestId && latestSchedulerCommand.strategyId && (
+          <button
+            type="button"
+            className={buttonClass}
+            onClick={() => openBacktestDetail(latestSchedulerCommand.backtestId, latestSchedulerCommand.strategyId)}
+          >
+            打开回测
+          </button>
+        )}
+        {latestSchedulerCommand.sourceChangeRequestId && latestSchedulerCommand.strategyId && (
+          <button
+            type="button"
+            className={buttonClass}
+            onClick={() => openChangeRequest(latestSchedulerCommand.sourceChangeRequestId, latestSchedulerCommand.strategyId)}
+          >
+            来源变更
+          </button>
+        )}
+        {latestSchedulerCommand.sourceBacktestId &&
+          latestSchedulerCommand.strategyId &&
+          latestSchedulerCommand.sourceBacktestId !== latestSchedulerCommand.backtestId && (
+            <button
+              type="button"
+              className={buttonClass}
+              onClick={() => openBacktestDetail(latestSchedulerCommand.sourceBacktestId, latestSchedulerCommand.strategyId)}
+            >
+              来源回测
+            </button>
+          )}
+        {latestSchedulerCommand.sourceReviewId &&
+          latestSchedulerCommand.strategyId &&
+          latestSchedulerCommand.sourceReviewId !== latestSchedulerCommand.linkedReviewId && (
+            <button
+              type="button"
+              className={buttonClass}
+              onClick={() => openSourceReview(latestSchedulerCommand.sourceReviewId, latestSchedulerCommand.strategyId)}
+            >
+              来源复盘
+            </button>
+          )}
+        {latestSchedulerCommand.sourceProposalId && latestSchedulerCommand.strategyId && (
+          <button
+            type="button"
+            className={buttonClass}
+            onClick={() => openStrategyProposal(latestSchedulerCommand.sourceProposalId, latestSchedulerCommand.strategyId)}
+          >
+            来源提案
+          </button>
+        )}
+        {latestSchedulerCommand.strategyId && (
+          <button
+            type="button"
+            className={buttonClass}
+            onClick={() => openStrategyActivity(latestSchedulerCommand.strategyId)}
+          >
+            打开策略
+          </button>
+        )}
+      </div>
+    )
   }
 
   const resetStrategyTrackingDraft = (kind: 'issue' | 'change' = 'issue', nextSummary = '', nextDetail = '') => {
@@ -2633,23 +4151,129 @@ function App() {
     }
   }
 
+  const toggleSettingsNotificationChannel = (channel: SettingsNotificationChannel) => {
+    const channels = normalizeSettingsNotificationChannels(settingsDraft.notificationChannels)
+    if (channels.includes(channel) && channels.length === 1) {
+      showFeedback('warning', '至少保留一个通知渠道', '桌面端至少需要保留一个可用通知渠道，避免关键提醒被完全关闭。')
+      return
+    }
+    setSettingsDraft((current) => {
+      const currentChannels = normalizeSettingsNotificationChannels(current.notificationChannels)
+      return currentChannels.includes(channel)
+        ? {
+            ...current,
+            notificationChannels: currentChannels.filter((item) => item !== channel),
+          }
+        : {
+            ...current,
+            notificationChannels: normalizeSettingsNotificationChannels([...currentChannels, channel]),
+          }
+    })
+  }
+
+  const restoreSettingsDraft = () => {
+    if (!settings) {
+      return
+    }
+    const nextDraft = buildSettingsDraft(settings)
+    setSettingsDraft(nextDraft)
+    lastLoadedSettingsSignatureRef.current = JSON.stringify(nextDraft)
+  }
+
+  const saveSettings = async () => {
+    if (!settings) {
+      showFeedback('warning', '设置尚未就绪', '本地控制服务还没有返回当前设置，请稍后再试。')
+      return
+    }
+    if (!settingsDraftDirty) {
+      showFeedback('warning', '当前没有可保存的设置', '你还没有修改本地设置。')
+      return
+    }
+
+    const bybitWebEntry = normalizeSettingsUrl(settingsDraft.bybitWebEntry)
+    const apiBaseUrl = normalizeSettingsUrl(settingsDraft.apiBaseUrl)
+    const productLanguage = normalizeSettingsText(settingsDraft.productLanguage)
+    const notificationQuietHoursStart = normalizeSettingsQuietTime(settingsDraft.notificationQuietHoursStart, '')
+    const notificationQuietHoursEnd = normalizeSettingsQuietTime(settingsDraft.notificationQuietHoursEnd, '')
+    const grafanaBaseUrl = normalizeSettingsUrl(settingsDraft.grafanaBaseUrl)
+    const grafanaDashboardUid = normalizeSettingsText(settingsDraft.grafanaDashboardUid)
+    const grafanaOrgId = Number.parseInt(settingsDraft.grafanaOrgId.trim(), 10)
+
+    if (!bybitWebEntry) {
+      showFeedback('warning', '网页入口不能为空', '登录、账户设置和 API Key 创建统一使用 bybit-global.com 网页入口。')
+      return
+    }
+    if (!apiBaseUrl) {
+      showFeedback('warning', 'API Base URL 不能为空', '请输入 Bybit 公共 API 域名，例如 https://api.bybit.com。')
+      return
+    }
+    if (!productLanguage) {
+      showFeedback('warning', '产品语言不能为空', '请输入产品语言代码，例如 zh-CN、zh-TW 或 en-US。')
+      return
+    }
+    if (!notificationQuietHoursStart || !notificationQuietHoursEnd) {
+      showFeedback('warning', '静默时段格式无效', '请使用 HH:MM 的 24 小时格式，例如 23:00 或 08:30。')
+      return
+    }
+    if (settingsDraft.notificationQuietHoursEnabled && notificationQuietHoursStart === notificationQuietHoursEnd) {
+      showFeedback('warning', '静默时段无效', '通知静默开始和结束时间不能相同。')
+      return
+    }
+    if (!Number.isFinite(grafanaOrgId) || grafanaOrgId < 1) {
+      showFeedback('warning', 'Grafana Org ID 无效', 'Grafana Org ID 必须是大于等于 1 的整数。')
+      return
+    }
+
+    try {
+      const nextSettings = await settingsMutation.mutateAsync({
+        bybit_web_entry: bybitWebEntry,
+        api_base_url: apiBaseUrl,
+        default_mode: settingsDraft.defaultMode,
+        notification_channels: normalizeSettingsNotificationChannels(settingsDraft.notificationChannels),
+        notification_quiet_hours_enabled: settingsDraft.notificationQuietHoursEnabled,
+        notification_quiet_hours_start: notificationQuietHoursStart,
+        notification_quiet_hours_end: notificationQuietHoursEnd,
+        product_language: productLanguage,
+        grafana_base_url: grafanaBaseUrl,
+        grafana_dashboard_uid: grafanaDashboardUid,
+        grafana_org_id: grafanaOrgId,
+        grafana_theme: settingsDraft.grafanaTheme,
+      })
+      const nextDraft = buildSettingsDraft(nextSettings)
+      setSettingsDraft(nextDraft)
+      lastLoadedSettingsSignatureRef.current = JSON.stringify(nextDraft)
+      showFeedback('success', '本地设置已保存', '网页入口、公共 API、通知通道与 Grafana 配置已经写回控制端并立即生效。')
+    } catch (error) {
+      showFeedback('error', '本地设置保存失败', resolveErrorMessage(error))
+    }
+  }
+
   const triggerDesktopNotificationTest = async () => {
     if (!desktopNotificationsEnabled) {
       showFeedback('warning', '桌面通知当前已关闭', '请先在通知通道中保留 desktop，再测试系统通知。')
       return
     }
 
-    const delivered = await sendDesktopNotification(
+    const delivered = await dispatchDesktopNotification(
       {
         title: '桌面通知测试',
         body: '这是一条来自量化交易控制端的测试通知，用于确认原生提醒链路可用。',
         urgency: 'normal',
       },
-      desktopNotificationPermissionRequestedRef,
+      { bypassCooldown: true },
     )
 
-    if (delivered) {
+    if (delivered === 'delivered') {
       showFeedback('success', '测试通知已发送', '原生通知链路已触发，可以继续用它接收高优先级提醒和 AI 任务失败通知。')
+      return
+    }
+
+    if (delivered === 'suppressed') {
+      showFeedback(
+        'warning',
+        '测试通知已静默',
+        `当前正处于通知静默时段 ${notificationQuietHoursLabel(settings)}，普通通知不会弹出；critical 级提醒仍会继续放行。`,
+      )
       return
     }
 
@@ -2696,6 +4320,136 @@ function App() {
       )
     } catch (error) {
       showFeedback('error', '回测发起失败', resolveErrorMessage(error))
+    }
+  }
+
+  const rerunBacktestFromRecommendation = async (backtest?: BacktestRun | null) => {
+    if (!backtest) {
+      return
+    }
+    const decisionMeta = backtestDecisionReadinessMeta(backtest)
+    const recommendedRange = decisionMeta?.recommendedRange
+    const recommendedTimeframe = decisionMeta?.recommendedTimeframe
+    if (!recommendedRange || !recommendedTimeframe) {
+      showFeedback('warning', '当前没有可执行建议', '这条回测结果目前没有结构化的建议重跑参数。')
+      return
+    }
+
+    const nextStrategy = strategies.find((item) => item.id === backtest.strategy_id)
+    const strategyName = nextStrategy?.name ?? backtest.strategy_name
+    const linkedReview =
+      reviewCatalog
+        .filter((review) => review.backtest_id === backtest.id)
+        .sort((left, right) => new Date(right.created_at).getTime() - new Date(left.created_at).getTime())[0] ?? null
+    setSelectedStrategyId(backtest.strategy_id)
+    setBacktestRangeDraft(recommendedRange)
+    setBacktestTimeframeDraft(recommendedTimeframe)
+
+    try {
+      const rerunBacktest = await backtestMutation.mutateAsync({
+        strategy_id: backtest.strategy_id,
+        data_range: recommendedRange,
+        timeframe: recommendedTimeframe,
+        source_change_request_id: backtest.source_change_request_id ?? null,
+        source_backtest_id: backtest.id,
+        source_review_id: linkedReview?.id ?? null,
+        trigger_reason: 'decision_rerun',
+      })
+      setSelectedBacktestId(rerunBacktest.id)
+      showFeedback(
+        'success',
+        '已按建议重跑回测',
+        `${strategyName} 已按 ${recommendedTimeframe} / ${recommendedRange} 重新生成回测结果。`,
+      )
+    } catch (error) {
+      showFeedback('error', '按建议重跑失败', resolveErrorMessage(error))
+    }
+  }
+
+  const rerunBacktestFromReview = async (review?: ReviewDocument | null) => {
+    if (!review?.strategy_id) {
+      return
+    }
+    const recommendedRange =
+      typeof review.decision_recommended_data_range === 'string' && review.decision_recommended_data_range.trim()
+        ? review.decision_recommended_data_range.trim()
+        : null
+    const recommendedTimeframe =
+      typeof review.decision_recommended_timeframe === 'string' && review.decision_recommended_timeframe.trim()
+        ? review.decision_recommended_timeframe.trim()
+        : null
+    if (!recommendedRange || !recommendedTimeframe) {
+      showFeedback('warning', '当前没有可执行建议', '这条 AI 复盘结果目前没有结构化的建议重跑参数。')
+      return
+    }
+
+    const nextStrategy = strategies.find((item) => item.id === review.strategy_id)
+    const strategyName = nextStrategy?.name ?? review.strategy_id
+    setSelectedStrategyId(review.strategy_id)
+    setBacktestRangeDraft(recommendedRange)
+    setBacktestTimeframeDraft(recommendedTimeframe)
+
+    try {
+      const rerunBacktest = await backtestMutation.mutateAsync({
+        strategy_id: review.strategy_id,
+        data_range: recommendedRange,
+        timeframe: recommendedTimeframe,
+        source_change_request_id: review.source_change_request_id ?? null,
+        source_backtest_id: review.backtest_id ?? null,
+        source_review_id: review.id,
+        trigger_reason: 'review_decision_rerun',
+      })
+      setSelectedBacktestId(rerunBacktest.id)
+      showFeedback(
+        'success',
+        '已按复盘建议重跑回测',
+        `${strategyName} 已按 ${recommendedTimeframe} / ${recommendedRange} 重新生成回测结果。`,
+      )
+    } catch (error) {
+      showFeedback('error', '按复盘建议重跑失败', resolveErrorMessage(error))
+    }
+  }
+
+  const rerunBacktestFromChangeRequest = async (request?: ChangeRequest | null) => {
+    if (!request) {
+      return
+    }
+    const strategyId = getChangeRequestStrategyId(request, selectedStrategy?.id ?? null)
+    const linkedBacktestId = getChangeRequestLinkedBacktestId(request)
+    const linkedBacktest = linkedBacktestId ? backtests.find((item) => item.id === linkedBacktestId) ?? null : null
+    const rerunRecommendation = getChangeRequestLinkedBacktestRecommendation(request, linkedBacktest)
+    const recommendedRange = rerunRecommendation?.recommendedRange ?? null
+    const recommendedTimeframe = rerunRecommendation?.recommendedTimeframe ?? null
+    if (!strategyId || !linkedBacktestId || !recommendedRange || !recommendedTimeframe) {
+      showFeedback('warning', '当前没有可执行建议', '这条变更当前还没有可直接执行的结构化重跑参数。')
+      return
+    }
+
+    const nextStrategy = strategies.find((item) => item.id === strategyId)
+    const strategyName = nextStrategy?.name ?? strategyId
+    setSelectedStrategyId(strategyId)
+    setBacktestRangeDraft(recommendedRange)
+    setBacktestTimeframeDraft(recommendedTimeframe)
+
+    try {
+      const rerunBacktest = await backtestMutation.mutateAsync({
+        strategy_id: strategyId,
+        data_range: recommendedRange,
+        timeframe: recommendedTimeframe,
+        source_change_request_id: request.id,
+        source_backtest_id: linkedBacktestId,
+        source_review_id: request.linked_review_id ?? request.source_review_id ?? null,
+        source_proposal_id: request.source_proposal_id ?? null,
+        trigger_reason: 'decision_rerun',
+      })
+      setSelectedBacktestId(rerunBacktest.id)
+      showFeedback(
+        'success',
+        '已按变更卡片建议重跑回测',
+        `${strategyName} 已按 ${recommendedTimeframe} / ${recommendedRange} 重新生成回测结果。`,
+      )
+    } catch (error) {
+      showFeedback('error', '按变更卡片建议重跑失败', resolveErrorMessage(error))
     }
   }
 
@@ -2765,17 +4519,22 @@ function App() {
     }
   }
 
-  const retryAgentJob = async (jobId: string) => {
+  const retryAgentJob = async (jobId: string, options?: { focusJob?: boolean }) => {
     try {
       const job = await retryAgentJobMutation.mutateAsync(jobId)
       const retryCount = getAgentJobRetryCount(job)
+      if (options?.focusJob) {
+        openAiSchedulerJob(job.id)
+      }
       showFeedback(
         'success',
         'AI 任务已重新排队',
         retryCount > 0 ? `已创建第 ${retryCount} 次重试任务。` : '失败任务已重新加入调度队列。',
       )
+      return job
     } catch (error) {
       showFeedback('error', 'AI 任务重试失败', resolveErrorMessage(error))
+      return null
     }
   }
 
@@ -3127,14 +4886,26 @@ function App() {
     }
     try {
       const result = await proposalMutation.mutateAsync({ proposalId, action })
+      if (action === 'accept') {
+        setSelectedProposalId(result.proposal.id)
+        if (result.created_backtest) {
+          openBacktestDetail(result.created_backtest.id, result.created_backtest.strategy_id)
+        }
+        if (result.created_change_request && result.created_change_request.status !== 'applied') {
+          openChangeRequest(
+            result.created_change_request.id,
+            getChangeRequestStrategyId(result.created_change_request, result.proposal.strategy_id),
+          )
+        }
+      }
       const detail =
         action === 'accept'
           ? result.created_backtest
-            ? `${result.proposal.title} 已转成回测任务并写回结果。`
+            ? `${result.proposal.title} 已转成回测任务并写回结果，当前已自动定位到新回测。`
             : result.created_change_request
               ? result.created_change_request.status === 'applied'
                 ? `${result.proposal.title} 已转成 ChangeRequest 并完成落实。`
-                : `${result.proposal.title} 已转成 ChangeRequest，等待编排层落实。`
+                : `${result.proposal.title} 已转成 ChangeRequest，当前已定位到待落实变更。`
               : `${result.proposal.title} 已标记为接受。`
           : `${result.proposal.title} 已被拒绝，不会继续进入执行链路。`
       showFeedback('success', action === 'accept' ? 'AI 提案已接受' : 'AI 提案已拒绝', detail)
@@ -3153,6 +4924,19 @@ function App() {
     selected_symbol: selectedSymbol,
     selected_market_timeframe: selectedMarketTimeframe,
     selected_strategy_id: (selectedStrategy?.id ?? selectedStrategyId) || null,
+    selected_backtest_id: selectedBacktestId,
+    backtest_filter: backtestFilter,
+    replay_tracking_scope: replayTrackingScope,
+    alert_severity_filter: alertSeverityFilter,
+    alert_status_filter: alertStatusFilter,
+    alert_scope_filter: alertScopeFilter,
+    trade_mode_filter: tradeModeFilter,
+    trade_origin_filter: tradeOriginFilter,
+    trade_scope_filter: tradeScopeFilter,
+    audit_severity_filter: auditSeverityFilter,
+    audit_source_filter: auditSourceFilter,
+    audit_scope_filter: auditScopeFilter,
+    audit_search: auditSearch,
     overview_card_order: normalizeCardIds(cardOrder),
     overview_visible_cards: orderedVisibleCards,
     overview_collapsed_cards: normalizeCollapsedCardIds(collapsedOverviewCards, cardOrder),
@@ -3284,8 +5068,34 @@ function App() {
     latestReview ??
     latestTrackingReview ??
     null
+  const replayFocusReviewLineageMeta =
+    replayFocusReview?.period === 'backtest' ? backtestLineageMeta(replayFocusReview) : null
+  const replayFocusReviewDecisionMeta =
+    replayFocusReview?.period === 'backtest' &&
+    (
+      replayFocusReview.decision_readiness ||
+      replayFocusReview.decision_readiness_detail ||
+      replayFocusReview.decision_readiness_action ||
+      replayFocusReview.decision_recommended_data_range ||
+      replayFocusReview.decision_recommended_timeframe
+    )
+      ? backtestDecisionReadinessMeta(replayFocusReview)
+      : null
   const reviewInspectorReview =
     reviewCatalog.find((review) => review.id === reviewInspectorReviewId) ?? null
+  const reviewInspectorReviewLineageMeta =
+    reviewInspectorReview?.period === 'backtest' ? backtestLineageMeta(reviewInspectorReview) : null
+  const reviewInspectorReviewDecisionMeta =
+    reviewInspectorReview?.period === 'backtest' &&
+    (
+      reviewInspectorReview.decision_readiness ||
+      reviewInspectorReview.decision_readiness_detail ||
+      reviewInspectorReview.decision_readiness_action ||
+      reviewInspectorReview.decision_recommended_data_range ||
+      reviewInspectorReview.decision_recommended_timeframe
+    )
+      ? backtestDecisionReadinessMeta(reviewInspectorReview)
+      : null
   const selectedWatchAlertLabel = selectedWatchItem
     ? selectedWatchItem.alert_enabled
       ? `提醒 ${selectedWatchItem.alert_threshold_pct.toFixed(1)}%`
@@ -3308,6 +5118,19 @@ function App() {
       selected_symbol: selectedSymbol,
       selected_market_timeframe: selectedMarketTimeframe,
       selected_strategy_id: (selectedStrategy?.id ?? selectedStrategyId) || null,
+      selected_backtest_id: selectedBacktestId,
+      backtest_filter: backtestFilter,
+      replay_tracking_scope: replayTrackingScope,
+      alert_severity_filter: alertSeverityFilter,
+      alert_status_filter: alertStatusFilter,
+      alert_scope_filter: alertScopeFilter,
+      trade_mode_filter: tradeModeFilter,
+      trade_origin_filter: tradeOriginFilter,
+      trade_scope_filter: tradeScopeFilter,
+      audit_severity_filter: auditSeverityFilter,
+      audit_source_filter: auditSourceFilter,
+      audit_scope_filter: auditScopeFilter,
+      audit_search: auditSearch,
       overview_card_order: normalizeCardIds(cardOrder),
       overview_visible_cards: orderedVisibleCards,
       overview_collapsed_cards: normalizeCollapsedCardIds(collapsedOverviewCards, cardOrder),
@@ -3323,6 +5146,19 @@ function App() {
     selectedMarketTimeframe,
     selectedStrategy?.id,
     selectedStrategyId,
+    selectedBacktestId,
+    backtestFilter,
+    replayTrackingScope,
+    alertSeverityFilter,
+    alertStatusFilter,
+    alertScopeFilter,
+    tradeModeFilter,
+    tradeOriginFilter,
+    tradeScopeFilter,
+    auditSeverityFilter,
+    auditSourceFilter,
+    auditScopeFilter,
+    auditSearch,
     selectedSymbol,
     workspaceSavedAt,
   ])
@@ -3358,6 +5194,19 @@ function App() {
       selected_symbol: watchlist[0]?.symbol ?? defaults.selected_symbol,
       selected_market_timeframe: defaults.selected_market_timeframe,
       selected_strategy_id: strategies[0]?.id ?? defaults.selected_strategy_id,
+      selected_backtest_id: null,
+      backtest_filter: defaults.backtest_filter,
+      replay_tracking_scope: defaults.replay_tracking_scope,
+      alert_severity_filter: defaults.alert_severity_filter,
+      alert_status_filter: defaults.alert_status_filter,
+      alert_scope_filter: defaults.alert_scope_filter,
+      trade_mode_filter: defaults.trade_mode_filter,
+      trade_origin_filter: defaults.trade_origin_filter,
+      trade_scope_filter: defaults.trade_scope_filter,
+      audit_severity_filter: defaults.audit_severity_filter,
+      audit_source_filter: defaults.audit_source_filter,
+      audit_scope_filter: defaults.audit_scope_filter,
+      audit_search: defaults.audit_search,
       overview_card_order: [...defaultCardOrder],
       overview_visible_cards: [...defaultVisibleCards],
       overview_collapsed_cards: [],
@@ -3368,6 +5217,19 @@ function App() {
     setSelectedSymbol(nextDraft.selected_symbol)
     setSelectedMarketTimeframe(nextDraft.selected_market_timeframe)
     setSelectedStrategyId(nextDraft.selected_strategy_id)
+    setSelectedBacktestId(nextDraft.selected_backtest_id)
+    setBacktestFilter(nextDraft.backtest_filter)
+    setReplayTrackingScope(nextDraft.replay_tracking_scope)
+    setAlertSeverityFilter(nextDraft.alert_severity_filter)
+    setAlertStatusFilter(nextDraft.alert_status_filter)
+    setAlertScopeFilter(nextDraft.alert_scope_filter)
+    setTradeModeFilter(nextDraft.trade_mode_filter)
+    setTradeOriginFilter(nextDraft.trade_origin_filter)
+    setTradeScopeFilter(nextDraft.trade_scope_filter)
+    setAuditSeverityFilter(nextDraft.audit_severity_filter)
+    setAuditSourceFilter(nextDraft.audit_source_filter)
+    setAuditScopeFilter(nextDraft.audit_scope_filter)
+    setAuditSearch(nextDraft.audit_search)
     setCardOrder(nextDraft.overview_card_order)
     setVisibleOverviewCards(nextDraft.overview_visible_cards)
     setCollapsedOverviewCards(nextDraft.overview_collapsed_cards)
@@ -3573,6 +5435,21 @@ function App() {
                     )
                   })}
                 </div>
+
+                {latestSchedulerCommand && (
+                  <div
+                    className={`service-banner service-banner--${latestSchedulerCommand.tone === 'warning' ? 'warning' : 'success'} service-banner--inline`}
+                  >
+                    <Bot size={16} />
+                    <div>
+                      <strong>最近调度动作 · {latestSchedulerCommand.commandLabel}</strong>
+                      <p>{latestSchedulerCommand.summary}</p>
+                      {latestSchedulerCommand.impactDetail && <p>{latestSchedulerCommand.impactDetail}</p>}
+                      <p>发生于 {formatTime(latestSchedulerCommand.occurredAt)}</p>
+                      {renderLatestSchedulerCommandActions()}
+                    </div>
+                  </div>
+                )}
 
                 <div className="console-panel">
                   <div className="watchlist-module__header">
@@ -4677,6 +6554,63 @@ function App() {
                       打开策略
                     </button>
                   )}
+                  {reviewInspectorReview?.source_change_request_id &&
+                    (reviewInspectorStrategyId || reviewInspectorReview?.strategy_id) && (
+                      <button
+                        type="button"
+                        className="micro-action"
+                        onClick={() =>
+                          openChangeRequest(
+                            reviewInspectorReview.source_change_request_id,
+                            reviewInspectorStrategyId ?? reviewInspectorReview?.strategy_id,
+                          )
+                        }
+                      >
+                        打开来源变更
+                      </button>
+                    )}
+                  {reviewInspectorReview?.source_backtest_id && (
+                    <button
+                      type="button"
+                      className="micro-action"
+                      onClick={() =>
+                        openBacktestDetail(
+                          reviewInspectorReview.source_backtest_id,
+                          reviewInspectorStrategyId ?? reviewInspectorReview?.strategy_id,
+                        )
+                      }
+                    >
+                      打开来源回测
+                    </button>
+                  )}
+                  {reviewInspectorReview?.source_review_id && (
+                    <button
+                      type="button"
+                      className="micro-action"
+                      onClick={() =>
+                        openSourceReview(
+                          reviewInspectorReview.source_review_id,
+                          reviewInspectorStrategyId ?? reviewInspectorReview?.strategy_id,
+                        )
+                      }
+                    >
+                      打开来源复盘
+                    </button>
+                  )}
+                  {reviewInspectorReview?.source_proposal_id && reviewInspectorReview?.strategy_id && (
+                    <button
+                      type="button"
+                      className="micro-action"
+                      onClick={() =>
+                        openStrategyProposal(
+                          reviewInspectorReview.source_proposal_id,
+                          reviewInspectorReview.strategy_id,
+                        )
+                      }
+                    >
+                      打开来源提案
+                    </button>
+                  )}
                   {reviewInspectorReview?.source_job_id && (
                     <button
                       type="button"
@@ -4705,7 +6639,34 @@ function App() {
                 {reviewInspectorReview && (
                   <div className="review-inspector">
                     <div className="review-inspector__summary">
-                      <p>{reviewInspectorReview.summary}</p>
+                    <p>{reviewInspectorReview.summary}</p>
+                      {reviewInspectorReviewDecisionMeta && (
+                        <p className="panel-note">
+                          结论门禁: {reviewInspectorReviewDecisionMeta.description}
+                          {reviewInspectorReviewDecisionMeta.nextAction
+                            ? ` · 建议 ${reviewInspectorReviewDecisionMeta.nextAction}`
+                            : ''}
+                        </p>
+                      )}
+                      {reviewInspectorReviewLineageMeta && (
+                        <p className="panel-note">来源链路: {reviewInspectorReviewLineageMeta.detail}</p>
+                      )}
+                      {reviewInspectorReview?.strategy_id &&
+                        reviewInspectorReviewDecisionMeta?.recommendedRange &&
+                        reviewInspectorReviewDecisionMeta?.recommendedTimeframe && (
+                          <div className="inline-actions inline-actions--tight">
+                            <button
+                              type="button"
+                              className="micro-action"
+                              disabled={!serviceAvailable || backtestMutation.isPending}
+                              onClick={() => {
+                                void rerunBacktestFromReview(reviewInspectorReview)
+                              }}
+                            >
+                              按建议重跑
+                            </button>
+                          </div>
+                        )}
                     </div>
                     <div className="review-inspector__grid">
                       <div className="review-inspector__section">
@@ -4738,21 +6699,70 @@ function App() {
                         <span className="chip chip--muted">{reviewInspectorReview.proposals.length} 条</span>
                       </div>
                       <div className="job-list">
-                        {reviewInspectorReview.proposals.map((proposal, index) => (
-                          <div key={proposal.id} className="job-row job-row--fade" style={{ animationDelay: `${index * 24}ms` }}>
-                            <div className="console-row__main">
-                              <strong>
-                                <Sparkles size={13} />
-                                {proposal.title}
-                              </strong>
-                              <p>{proposalTypeLabel(proposal.proposal_type)} · {proposal.expected_impact}</p>
+                        {reviewInspectorReview.proposals.map((proposal, index) => {
+                          const linkedBacktest = proposalBacktestMap.get(proposal.id) ?? null
+                          const linkedReview = proposalReviewMap.get(proposal.id) ?? null
+                          const blockedReason = proposalAcceptBlockedReason(proposal.proposal_type, snapshot?.scheduler)
+                          return (
+                            <div
+                              key={proposal.id}
+                              className={`job-row job-row--fade ${selectedProposalId === proposal.id ? 'job-row--active' : ''}`}
+                              style={{ animationDelay: `${index * 24}ms` }}
+                            >
+                              <div className="console-row__main">
+                                <strong>
+                                  <Sparkles size={13} />
+                                  {proposal.title}
+                                </strong>
+                                <p>{proposalTypeLabel(proposal.proposal_type)} · {proposal.expected_impact}</p>
+                              </div>
+                              <div className="job-meta">
+                                <span className="console-tag">{proposalStatusLabel(proposal.status)}</span>
+                                {selectedProposalId === proposal.id && (
+                                  <span className="console-tag console-tag--warn">来源提案</span>
+                                )}
+                                {linkedBacktest && (
+                                  <button
+                                    type="button"
+                                    className="micro-action"
+                                    onClick={() => openBacktestDetail(linkedBacktest.id, proposal.strategy_id)}
+                                  >
+                                    生成回测
+                                  </button>
+                                )}
+                                {linkedReview && (
+                                  <button
+                                    type="button"
+                                    className="micro-action"
+                                    onClick={() => openReplayReview(linkedReview.id, proposal.strategy_id, 'selected')}
+                                  >
+                                    生成复盘
+                                  </button>
+                                )}
+                                <small>{formatTime(proposal.created_at)}</small>
+                              </div>
+                              {(proposal.status === 'pending' || proposal.status === 'testing') && (
+                                <div className="toggle-card__actions">
+                                  <button
+                                    type="button"
+                                    title={blockedReason ?? `接受 ${proposalTypeLabel(proposal.proposal_type)}`}
+                                    disabled={!serviceAvailable || proposalMutation.isPending || Boolean(blockedReason)}
+                                    onClick={() => handleProposalAction(proposal.id, 'accept')}
+                                  >
+                                    接受 {proposalTypeLabel(proposal.proposal_type)}
+                                  </button>
+                                  <button
+                                    type="button"
+                                    disabled={!serviceAvailable || proposalMutation.isPending}
+                                    onClick={() => handleProposalAction(proposal.id, 'reject')}
+                                  >
+                                    拒绝
+                                  </button>
+                                </div>
+                              )}
                             </div>
-                            <div className="job-meta">
-                              <span className="console-tag">{proposalStatusLabel(proposal.status)}</span>
-                              <small>{formatTime(proposal.created_at)}</small>
-                            </div>
-                          </div>
-                        ))}
+                          )
+                        })}
                         {!reviewInspectorReview.proposals.length && (
                           <div className="empty-state empty-state--inline">当前结果没有附带额外提案。</div>
                         )}
@@ -4823,6 +6833,10 @@ function App() {
                           {selectedStrategyActivity.latest_primary_review
                             ? `最近复盘: ${selectedStrategyActivity.latest_primary_review.summary}`
                             : '最近复盘: 暂无'}
+                          {selectedStrategyActivity.latest_primary_review &&
+                          backtestLineageMeta(selectedStrategyActivity.latest_primary_review)
+                            ? ` · ${backtestLineageMeta(selectedStrategyActivity.latest_primary_review)?.detail}`
+                            : ''}
                           {selectedStrategyActivity.latest_tracking_review
                             ? ` · 最近跟踪: ${selectedStrategyActivity.latest_tracking_review.summary}`
                             : ''}
@@ -4835,36 +6849,82 @@ function App() {
                       <div className="trade-list trade-list--dense">
                         {selectedStrategyActivity.recent_reviews
                           .filter((review) => isStrategyTrackingReview(review.period))
-                          .map((review) => (
-                            <div key={review.id} className="trade-row trade-row--fade">
-                              <div className="console-row__main">
-                                <strong>{review.title}</strong>
-                                <p>{review.summary}</p>
+                          .map((review) => {
+                            const reviewLineageMeta = backtestLineageMeta(review)
+                            return (
+                              <div key={review.id} className="trade-row trade-row--fade">
+                                <div className="console-row__main">
+                                  <strong>{review.title}</strong>
+                                  <p>{review.summary}</p>
+                                  {reviewLineageMeta && <p className="panel-note">来源链路: {reviewLineageMeta.detail}</p>}
+                                </div>
+                                <div className="trade-meta">
+                                  <span className="console-tag">{reviewPeriodLabel(review.period)}</span>
+                                  {review.source_change_request_id && (
+                                    <button
+                                      type="button"
+                                      className="micro-action"
+                                      onClick={() =>
+                                        openChangeRequest(review.source_change_request_id, selectedStrategyActivity.strategy_id)
+                                      }
+                                    >
+                                      来源变更
+                                    </button>
+                                  )}
+                                  {review.source_backtest_id && (
+                                    <button
+                                      type="button"
+                                      className="micro-action"
+                                      onClick={() =>
+                                        openBacktestDetail(review.source_backtest_id, selectedStrategyActivity.strategy_id)
+                                      }
+                                    >
+                                      来源回测
+                                    </button>
+                                  )}
+                                  {review.source_review_id && (
+                                    <button
+                                      type="button"
+                                      className="micro-action"
+                                      onClick={() => openSourceReview(review.source_review_id, selectedStrategyActivity.strategy_id)}
+                                    >
+                                      来源复盘
+                                    </button>
+                                  )}
+                                  {review.source_proposal_id && (
+                                    <button
+                                      type="button"
+                                      className="micro-action"
+                                      onClick={() =>
+                                        openStrategyProposal(review.source_proposal_id, selectedStrategyActivity.strategy_id)
+                                      }
+                                    >
+                                      来源提案
+                                    </button>
+                                  )}
+                                  {review.source_job_id && (
+                                    <button
+                                      type="button"
+                                      className="micro-action"
+                                      onClick={() => openAiSchedulerJob(review.source_job_id)}
+                                    >
+                                      打开任务
+                                    </button>
+                                  )}
+                                  {selectedStrategy?.id && (
+                                    <button
+                                      type="button"
+                                      className="micro-action"
+                                      onClick={() => openReviewInspector(review.id, selectedStrategy.id)}
+                                    >
+                                      查看结果
+                                    </button>
+                                  )}
+                                  <small>{formatDateTime(review.created_at)}</small>
+                                </div>
                               </div>
-                              <div className="trade-meta">
-                                <span className="console-tag">{reviewPeriodLabel(review.period)}</span>
-                                {review.source_job_id && (
-                                  <button
-                                    type="button"
-                                    className="micro-action"
-                                    onClick={() => openAiSchedulerJob(review.source_job_id)}
-                                  >
-                                    打开任务
-                                  </button>
-                                )}
-                                {selectedStrategy?.id && (
-                                  <button
-                                    type="button"
-                                    className="micro-action"
-                                    onClick={() => openReviewInspector(review.id, selectedStrategy.id)}
-                                  >
-                                    查看结果
-                                  </button>
-                                )}
-                                <small>{formatDateTime(review.created_at)}</small>
-                              </div>
-                            </div>
-                          ))}
+                            )
+                          })}
                         {!selectedStrategyActivity.recent_reviews.filter((review) => isStrategyTrackingReview(review.period)).length && (
                           <div className="empty-state empty-state--inline">当前没有策略问题或变更跟踪。</div>
                         )}
@@ -4873,89 +6933,228 @@ function App() {
                       <div className="trade-list trade-list--dense">
                         {selectedStrategyActivity.recent_reviews
                           .filter((review) => !isStrategyTrackingReview(review.period))
-                          .map((review) => (
-                            <div key={review.id} className="trade-row trade-row--fade">
-                              <div className="console-row__main">
-                                <strong>{review.title}</strong>
-                                <p>{review.summary}</p>
+                          .map((review) => {
+                            const reviewLineageMeta = backtestLineageMeta(review)
+                            const reviewDecisionMeta =
+                              review.period === 'backtest' &&
+                              (
+                                review.decision_readiness ||
+                                review.decision_readiness_detail ||
+                                review.decision_readiness_action ||
+                                review.decision_recommended_data_range ||
+                                review.decision_recommended_timeframe
+                              )
+                                ? backtestDecisionReadinessMeta(review)
+                                : null
+                            return (
+                              <div key={review.id} className="trade-row trade-row--fade">
+                                <div className="console-row__main">
+                                  <strong>{review.title}</strong>
+                                  <p>{review.summary}</p>
+                                  {reviewDecisionMeta && (
+                                    <p className="panel-note">
+                                      结论门禁: {reviewDecisionMeta.description}
+                                      {reviewDecisionMeta.nextAction ? ` · 建议 ${reviewDecisionMeta.nextAction}` : ''}
+                                    </p>
+                                  )}
+                                  {reviewLineageMeta && <p className="panel-note">来源链路: {reviewLineageMeta.detail}</p>}
+                                </div>
+                                <div className="trade-meta">
+                                  <span className="console-tag">{reviewPeriodLabel(review.period)}</span>
+                                  {review.source_change_request_id && (
+                                    <button
+                                      type="button"
+                                      className="micro-action"
+                                      onClick={() =>
+                                        openChangeRequest(review.source_change_request_id, selectedStrategyActivity.strategy_id)
+                                      }
+                                    >
+                                      来源变更
+                                    </button>
+                                  )}
+                                  {review.source_backtest_id && (
+                                    <button
+                                      type="button"
+                                      className="micro-action"
+                                      onClick={() =>
+                                        openBacktestDetail(review.source_backtest_id, selectedStrategyActivity.strategy_id)
+                                      }
+                                    >
+                                      来源回测
+                                    </button>
+                                  )}
+                                  {review.source_review_id && (
+                                    <button
+                                      type="button"
+                                      className="micro-action"
+                                      onClick={() => openSourceReview(review.source_review_id, selectedStrategyActivity.strategy_id)}
+                                    >
+                                      来源复盘
+                                    </button>
+                                  )}
+                                  {review.source_proposal_id && (
+                                    <button
+                                      type="button"
+                                      className="micro-action"
+                                      onClick={() =>
+                                        openStrategyProposal(review.source_proposal_id, selectedStrategyActivity.strategy_id)
+                                      }
+                                    >
+                                      来源提案
+                                    </button>
+                                  )}
+                                  {review.source_job_id && (
+                                    <button
+                                      type="button"
+                                      className="micro-action"
+                                      onClick={() => openAiSchedulerJob(review.source_job_id)}
+                                    >
+                                      打开任务
+                                    </button>
+                                  )}
+                                  {selectedStrategy?.id && (
+                                    <button
+                                      type="button"
+                                      className="micro-action"
+                                      onClick={() => openReplayReview(review.id, selectedStrategy.id, 'selected')}
+                                    >
+                                      打开复盘
+                                    </button>
+                                  )}
+                                  {review.strategy_id &&
+                                    reviewDecisionMeta?.recommendedRange &&
+                                    reviewDecisionMeta?.recommendedTimeframe && (
+                                      <button
+                                        type="button"
+                                        className="micro-action"
+                                        disabled={!serviceAvailable || backtestMutation.isPending}
+                                        onClick={() => {
+                                          void rerunBacktestFromReview(review)
+                                        }}
+                                      >
+                                        按建议重跑
+                                      </button>
+                                    )}
+                                  <small>
+                                    {review.proposal_count > 0
+                                      ? `${review.proposal_count} 条提案 · ${formatDateTime(review.created_at)}`
+                                      : formatDateTime(review.created_at)}
+                                  </small>
+                                </div>
                               </div>
-                              <div className="trade-meta">
-                                <span className="console-tag">{reviewPeriodLabel(review.period)}</span>
-                                {selectedStrategy?.id && (
-                                  <button
-                                    type="button"
-                                    className="micro-action"
-                                    onClick={() => openReplayReview(review.id, selectedStrategy.id, 'selected')}
-                                  >
-                                    打开复盘
-                                  </button>
-                                )}
-                                <small>
-                                  {review.proposal_count > 0
-                                    ? `${review.proposal_count} 条提案 · ${formatDateTime(review.created_at)}`
-                                    : formatDateTime(review.created_at)}
-                                </small>
-                              </div>
-                            </div>
-                          ))}
+                            )
+                          })}
                         {!selectedStrategyActivity.recent_reviews.filter((review) => !isStrategyTrackingReview(review.period)).length && (
                           <div className="empty-state empty-state--inline">当前没有策略关联的 AI 复盘。</div>
                         )}
                       </div>
                       <span className="section-label">跟踪任务</span>
                       <div className="trade-list trade-list--dense">
-                        {selectedStrategyActivity.recent_agent_jobs.map((job) => (
-                          <div key={job.id} className="trade-row trade-row--fade">
-                            <div className="console-row__main">
-                              <strong>{strategyAgentJobSummary(job)}</strong>
-                              <p>
-                                {job.result_summary || `${job.writeback_target} · ${job.requested_by || 'system'}`}
-                                {job.linked_review_title ? ` · 结果 ${job.linked_review_title}` : ''}
-                              </p>
-                            </div>
-                            <div className="trade-meta">
-                              <span className="console-tag">{job.writeback_target}</span>
-                              {job.linked_review_period && (
-                                <span className={reviewPeriodChipClass(job.linked_review_period)}>
-                                  {reviewPeriodLabel(job.linked_review_period)}
-                                </span>
-                              )}
-                              {job.linked_review_id && selectedStrategy?.id && (
-                                <button
-                                  type="button"
-                                  className="micro-action"
-                                  onClick={() => openReviewInspector(job.linked_review_id, selectedStrategy.id)}
-                                >
-                                  查看结果
-                                </button>
-                              )}
-                              {!job.linked_review_id &&
-                                (job.job_type === 'review_strategy_issue' || job.job_type === 'review_strategy_change') &&
-                                selectedStrategy?.id && (
+                        {selectedStrategyActivity.recent_agent_jobs.map((job) => {
+                          const jobStrategyId = getAgentJobStrategyId(job) ?? selectedStrategyActivity.strategy_id
+                          const jobBacktestId = getAgentJobBacktestId(job)
+                          const jobChangeRequestId = getAgentJobChangeRequestId(job)
+                          const sourceBacktestId = getAgentJobSourceBacktestId(job)
+                          const sourceReviewId = getAgentJobSourceReviewId(job)
+                          const sourceProposalId = getAgentJobSourceProposalId(job)
+                          return (
+                            <div key={job.id} className="trade-row trade-row--fade">
+                              <div className="console-row__main">
+                                <strong>{strategyAgentJobSummary(job)}</strong>
+                                <p>
+                                  {job.result_summary || `${job.writeback_target} · ${job.requested_by || 'system'}`}
+                                  {job.linked_review_title ? ` · 结果 ${job.linked_review_title}` : ''}
+                                </p>
+                              </div>
+                              <div className="trade-meta">
+                                <span className="console-tag">{job.writeback_target}</span>
+                                {job.linked_review_period && (
+                                  <span className={reviewPeriodChipClass(job.linked_review_period)}>
+                                    {reviewPeriodLabel(job.linked_review_period)}
+                                  </span>
+                                )}
+                                {job.linked_review_id && selectedStrategy?.id && (
                                   <button
                                     type="button"
                                     className="micro-action"
-                                    onClick={() => openStrategyReplay(selectedStrategy.id)}
+                                    onClick={() => openReviewInspector(job.linked_review_id, selectedStrategy.id)}
                                   >
-                                    打开复盘
+                                    查看结果
                                   </button>
                                 )}
-                              {(job.status === 'failed' || job.status === 'cancelled') && (
-                                <button
-                                  type="button"
-                                  className="micro-action"
-                                  disabled={!serviceAvailable || retryAgentJobMutation.isPending}
-                                  onClick={() => {
-                                    void retryAgentJob(job.id)
-                                  }}
-                                >
-                                  重试
-                                </button>
-                              )}
-                              <small>{formatDateTime(job.updated_at || job.created_at)}</small>
+                                {jobChangeRequestId && jobStrategyId && (
+                                  <button
+                                    type="button"
+                                    className="micro-action"
+                                    onClick={() => openChangeRequest(jobChangeRequestId, jobStrategyId)}
+                                  >
+                                    查看变更
+                                  </button>
+                                )}
+                                {jobBacktestId && jobStrategyId && (
+                                  <button
+                                    type="button"
+                                    className="micro-action"
+                                    onClick={() => openBacktestDetail(jobBacktestId, jobStrategyId)}
+                                  >
+                                    打开回测
+                                  </button>
+                                )}
+                                {sourceBacktestId && jobStrategyId && sourceBacktestId !== jobBacktestId && (
+                                  <button
+                                    type="button"
+                                    className="micro-action"
+                                    onClick={() => openBacktestDetail(sourceBacktestId, jobStrategyId)}
+                                  >
+                                    来源回测
+                                  </button>
+                                )}
+                                {sourceReviewId && jobStrategyId && sourceReviewId !== job.linked_review_id && (
+                                  <button
+                                    type="button"
+                                    className="micro-action"
+                                    onClick={() => openSourceReview(sourceReviewId, jobStrategyId)}
+                                  >
+                                    来源复盘
+                                  </button>
+                                )}
+                                {sourceProposalId && jobStrategyId && (
+                                  <button
+                                    type="button"
+                                    className="micro-action"
+                                    onClick={() => openStrategyProposal(sourceProposalId, jobStrategyId)}
+                                  >
+                                    来源提案
+                                  </button>
+                                )}
+                                {!job.linked_review_id &&
+                                  (job.job_type === 'review_strategy_issue' || job.job_type === 'review_strategy_change') &&
+                                  selectedStrategy?.id && (
+                                    <button
+                                      type="button"
+                                      className="micro-action"
+                                      onClick={() => openStrategyReplay(selectedStrategy.id)}
+                                    >
+                                      打开复盘
+                                    </button>
+                                  )}
+                                {(job.status === 'failed' || job.status === 'cancelled') && (
+                                  <button
+                                    type="button"
+                                    className="micro-action"
+                                    disabled={!serviceAvailable || retryAgentJobMutation.isPending}
+                                    onClick={() => {
+                                      void retryAgentJob(job.id)
+                                    }}
+                                  >
+                                    重试
+                                  </button>
+                                )}
+                                <small>{formatDateTime(job.updated_at || job.created_at)}</small>
+                              </div>
                             </div>
-                          </div>
-                        ))}
+                          )
+                        })}
                         {!selectedStrategyActivity.recent_agent_jobs.length && (
                           <div className="empty-state empty-state--inline">当前没有策略关联的 AI 跟踪任务。</div>
                         )}
@@ -4981,18 +7180,93 @@ function App() {
                         )}
                       </div>
                       <div className="trade-list trade-list--dense">
-                        {selectedStrategyActivity.recent_audit_events.map((event) => (
-                          <div key={event.id} className="trade-row trade-row--fade">
-                            <div className="console-row__main">
-                              <strong>{event.event_type}</strong>
-                              <p>{executionEventSummary(event)}</p>
+                        {selectedStrategyActivity.recent_audit_events.map((event) => {
+                          const auditJobId = getAuditJobId(event.payload)
+                          const auditChangeRequestId = getAuditChangeRequestId(event.payload)
+                          const auditLinkedReviewId = getAuditLinkedReviewId(event.payload)
+                          const auditStrategyId = getAuditStrategyId(event.payload) ?? selectedStrategyActivity.strategy_id
+                          const auditBacktestId = getAuditBacktestId(event.payload)
+                          const auditSourceBacktestId = getAuditSourceBacktestId(event.payload)
+                          const auditSourceReviewId = getAuditSourceReviewId(event.payload)
+                          const auditSourceProposalId = getAuditSourceProposalId(event.payload)
+                          const impactMeta = auditImpactMeta(event.payload)
+                          return (
+                            <div key={event.id} className="trade-row trade-row--fade">
+                              <div className="console-row__main">
+                                <strong>{event.event_type}</strong>
+                                <p>{summarizeAuditEvent(event.payload)}</p>
+                                {impactMeta && <p>{impactMeta.detail}</p>}
+                              </div>
+                              <div className="trade-meta">
+                                <span className="console-tag">{event.severity}</span>
+                                {auditJobId && (
+                                  <button
+                                    type="button"
+                                    className="micro-action"
+                                    onClick={() => openAiSchedulerJob(auditJobId)}
+                                  >
+                                    打开任务
+                                  </button>
+                                )}
+                                {auditLinkedReviewId && (
+                                  <button
+                                    type="button"
+                                    className="micro-action"
+                                    onClick={() => openReviewInspector(auditLinkedReviewId, auditStrategyId)}
+                                  >
+                                    查看结果
+                                  </button>
+                                )}
+                                {auditChangeRequestId && auditStrategyId && (
+                                  <button
+                                    type="button"
+                                    className="micro-action"
+                                    onClick={() => openChangeRequest(auditChangeRequestId, auditStrategyId)}
+                                  >
+                                    查看变更
+                                  </button>
+                                )}
+                                {auditBacktestId && auditStrategyId && (
+                                  <button
+                                    type="button"
+                                    className="micro-action"
+                                    onClick={() => openBacktestDetail(auditBacktestId, auditStrategyId)}
+                                  >
+                                    打开回测
+                                  </button>
+                                )}
+                                {auditSourceBacktestId && auditStrategyId && auditSourceBacktestId !== auditBacktestId && (
+                                  <button
+                                    type="button"
+                                    className="micro-action"
+                                    onClick={() => openBacktestDetail(auditSourceBacktestId, auditStrategyId)}
+                                  >
+                                    来源回测
+                                  </button>
+                                )}
+                                {auditSourceReviewId && auditStrategyId && auditSourceReviewId !== auditLinkedReviewId && (
+                                  <button
+                                    type="button"
+                                    className="micro-action"
+                                    onClick={() => openSourceReview(auditSourceReviewId, auditStrategyId)}
+                                  >
+                                    来源复盘
+                                  </button>
+                                )}
+                                {auditSourceProposalId && auditStrategyId && (
+                                  <button
+                                    type="button"
+                                    className="micro-action"
+                                    onClick={() => openStrategyProposal(auditSourceProposalId, auditStrategyId)}
+                                  >
+                                    来源提案
+                                  </button>
+                                )}
+                                <small>{formatDateTime(event.occurred_at)}</small>
+                              </div>
                             </div>
-                            <div className="trade-meta">
-                              <span className="console-tag">{event.severity}</span>
-                              <small>{formatDateTime(event.occurred_at)}</small>
-                            </div>
-                          </div>
-                        ))}
+                          )
+                        })}
                         {!selectedStrategyActivity.recent_audit_events.length && (
                           <div className="empty-state empty-state--inline">当前没有可展示的策略审计事件。</div>
                         )}
@@ -5169,25 +7443,97 @@ function App() {
                         </span>
                       </div>
                       <div className="console-list">
-                        {scheduler?.jobs.slice(0, 1).map((job) => (
-                          <div key={job.id} className="console-row console-row--highlight">
-                            <div className="console-row__main">
-                              <strong>
-                                <Bot size={13} />
-                                任务 · {job.job_type}
-                              </strong>
-                              <p>{job.status} · 写回 {job.writeback_target}</p>
+                        {scheduler?.jobs.slice(0, 1).map((job) => {
+                          const jobStrategyId = getAgentJobStrategyId(job)
+                          const jobBacktestId = getAgentJobBacktestId(job)
+                          const sourceBacktestId = getAgentJobSourceBacktestId(job)
+                          const sourceReviewId = getAgentJobSourceReviewId(job)
+                          const sourceProposalId = getAgentJobSourceProposalId(job)
+                          const linkedReviewId = getAgentJobLinkedReviewId(job)
+                          const contextMeta = agentJobContextMeta(job)
+                          return (
+                            <div key={job.id} className="console-row console-row--highlight">
+                              <div className="console-row__main">
+                                <strong>
+                                  <Bot size={13} />
+                                  任务 · {job.job_type}
+                                </strong>
+                                <p>{jobStatusLabel(job.status)} · 写回 {job.writeback_target}</p>
+                                {contextMeta && <p>{contextMeta}</p>}
+                              </div>
+                              <div className="console-row__meta">
+                                <span className="console-tag console-tag--warn">当前任务</span>
+                                {linkedReviewId && (
+                                  <button
+                                    type="button"
+                                    className="micro-action"
+                                    onClick={() => openReviewInspector(linkedReviewId, jobStrategyId)}
+                                  >
+                                    查看结果
+                                  </button>
+                                )}
+                                {jobBacktestId && jobStrategyId && (
+                                  <button
+                                    type="button"
+                                    className="micro-action"
+                                    onClick={() => openBacktestDetail(jobBacktestId, jobStrategyId)}
+                                  >
+                                    打开回测
+                                  </button>
+                                )}
+                                {sourceBacktestId && jobStrategyId && sourceBacktestId !== jobBacktestId && (
+                                  <button
+                                    type="button"
+                                    className="micro-action"
+                                    onClick={() => openBacktestDetail(sourceBacktestId, jobStrategyId)}
+                                  >
+                                    来源回测
+                                  </button>
+                                )}
+                                {sourceReviewId && jobStrategyId && sourceReviewId !== linkedReviewId && (
+                                  <button
+                                    type="button"
+                                    className="micro-action"
+                                    onClick={() => openSourceReview(sourceReviewId, jobStrategyId)}
+                                  >
+                                    来源复盘
+                                  </button>
+                                )}
+                                {sourceProposalId && jobStrategyId && (
+                                  <button
+                                    type="button"
+                                    className="micro-action"
+                                    onClick={() => openStrategyProposal(sourceProposalId, jobStrategyId)}
+                                  >
+                                    来源提案
+                                  </button>
+                                )}
+                                {jobStrategyId && (
+                                  <button
+                                    type="button"
+                                    className="micro-action"
+                                    onClick={() => openStrategyActivity(jobStrategyId)}
+                                  >
+                                    打开策略
+                                  </button>
+                                )}
+                                <small>{formatTime(job.updated_at)}</small>
+                              </div>
                             </div>
-                            <div className="console-row__meta">
-                              <span className="console-tag console-tag--warn">当前任务</span>
-                              <small>{formatTime(job.updated_at)}</small>
-                            </div>
-                          </div>
-                        ))}
+                          )
+                        })}
                         {overviewAiEvents.map((event, index) => (
                           (() => {
                             const meta = eventCategoryMeta(event.event_type)
                             const Icon = meta.icon
+                            const linkedReviewId = getAuditLinkedReviewId(event.payload)
+                            const auditJobId = getAuditJobId(event.payload)
+                            const eventStrategyId = event.strategy_id ?? getAuditStrategyId(event.payload)
+                            const backtestId = getAuditBacktestId(event.payload)
+                            const sourceBacktestId = getAuditSourceBacktestId(event.payload)
+                            const sourceReviewId = getAuditSourceReviewId(event.payload)
+                            const sourceProposalId = getAuditSourceProposalId(event.payload)
+                            const impactMeta = auditImpactMeta(event.payload)
                             return (
                               <div key={event.id} className="console-row console-row--fade" style={{ animationDelay: `${index * 32}ms` }}>
                                 <div className="console-row__main">
@@ -5196,28 +7542,69 @@ function App() {
                                     {meta.label} · {event.event_type}
                                   </strong>
                                   <p>{event.source === 'openclaw' ? 'OpenClaw' : '桌面控制端'} · {event.symbol ?? '系统'} · {event.strategy_id ?? '无策略'}</p>
+                                  {impactMeta && <p>{impactMeta.detail}</p>}
                                 </div>
                                 <div className="console-row__meta">
                                   <span className="console-tag">{event.severity}</span>
-                                  {getAuditLinkedReviewId(event.payload) && (
+                                  {auditJobId && (
                                     <button
                                       type="button"
                                       className="micro-action"
-                                      onClick={() =>
-                                        openReviewInspector(
-                                          getAuditLinkedReviewId(event.payload),
-                                          event.strategy_id ?? getAuditStrategyId(event.payload),
-                                        )
-                                      }
+                                      onClick={() => openAiSchedulerJob(auditJobId)}
+                                    >
+                                      打开任务
+                                    </button>
+                                  )}
+                                  {linkedReviewId && (
+                                    <button
+                                      type="button"
+                                      className="micro-action"
+                                      onClick={() => openReviewInspector(linkedReviewId, eventStrategyId)}
                                     >
                                       查看结果
                                     </button>
                                   )}
-                                  {!getAuditLinkedReviewId(event.payload) && (event.strategy_id || getAuditStrategyId(event.payload)) && (
+                                  {backtestId && eventStrategyId && (
                                     <button
                                       type="button"
                                       className="micro-action"
-                                      onClick={() => openStrategyActivity(event.strategy_id ?? getAuditStrategyId(event.payload))}
+                                      onClick={() => openBacktestDetail(backtestId, eventStrategyId)}
+                                    >
+                                      打开回测
+                                    </button>
+                                  )}
+                                  {sourceBacktestId && eventStrategyId && sourceBacktestId !== backtestId && (
+                                    <button
+                                      type="button"
+                                      className="micro-action"
+                                      onClick={() => openBacktestDetail(sourceBacktestId, eventStrategyId)}
+                                    >
+                                      来源回测
+                                    </button>
+                                  )}
+                                  {sourceReviewId && eventStrategyId && sourceReviewId !== linkedReviewId && (
+                                    <button
+                                      type="button"
+                                      className="micro-action"
+                                      onClick={() => openSourceReview(sourceReviewId, eventStrategyId)}
+                                    >
+                                      来源复盘
+                                    </button>
+                                  )}
+                                  {sourceProposalId && eventStrategyId && (
+                                    <button
+                                      type="button"
+                                      className="micro-action"
+                                      onClick={() => openStrategyProposal(sourceProposalId, eventStrategyId)}
+                                    >
+                                      来源提案
+                                    </button>
+                                  )}
+                                  {!linkedReviewId && eventStrategyId && (
+                                    <button
+                                      type="button"
+                                      className="micro-action"
+                                      onClick={() => openStrategyActivity(eventStrategyId)}
                                     >
                                       打开策略
                                     </button>
@@ -5393,15 +7780,311 @@ function App() {
                   <span className="section-label">接入配置</span>
                   <h3>网页入口、API 与 OpenClaw</h3>
                 </div>
+                <span
+                  className={`chip ${
+                    settingsMutation.isPending ? 'chip--warning' : settingsDraftDirty ? 'chip--warning' : 'chip--success'
+                  }`}
+                >
+                  {settingsMutation.isPending ? '设置保存中' : settingsDraftDirty ? '有未保存设置' : '设置已同步'}
+                </span>
               </div>
-              <div className="contract-list">
-                <code>{settings?.bybit_web_entry ?? 'https://www.bybit-global.com/'}</code>
-                <code>{settings?.api_base_url ?? 'https://api.bybit.com'}</code>
-                <code>{openClawStatus?.gateway_url ?? settings?.openclaw_gateway_url ?? 'ws://127.0.0.1:18789'}</code>
+              <div className="field-grid">
+                <label className="field field--wide">
+                  <span>Bybit 网页入口</span>
+                  <input
+                    value={settingsDraft.bybitWebEntry}
+                    disabled={settingsMutation.isPending || settingsQuery.isLoading}
+                    placeholder="https://www.bybit-global.com/"
+                    onChange={(event) =>
+                      setSettingsDraft((current) => ({
+                        ...current,
+                        bybitWebEntry: event.target.value,
+                      }))
+                    }
+                  />
+                </label>
+                <label className="field field--wide">
+                  <span>公共 API Base URL</span>
+                  <input
+                    value={settingsDraft.apiBaseUrl}
+                    disabled={settingsMutation.isPending || settingsQuery.isLoading}
+                    placeholder="https://api.bybit.com"
+                    onChange={(event) =>
+                      setSettingsDraft((current) => ({
+                        ...current,
+                        apiBaseUrl: event.target.value,
+                      }))
+                    }
+                  />
+                </label>
+                <label className="field">
+                  <span>默认模式</span>
+                  <select
+                    value={settingsDraft.defaultMode}
+                    disabled={settingsMutation.isPending || settingsQuery.isLoading}
+                    onChange={(event) =>
+                      setSettingsDraft((current) => ({
+                        ...current,
+                        defaultMode: event.target.value as Mode,
+                      }))
+                    }
+                  >
+                    <option value="paper">paper</option>
+                    <option value="demo">demo</option>
+                    <option value="live">live</option>
+                  </select>
+                </label>
+                <label className="field">
+                  <span>产品语言</span>
+                  <input
+                    value={settingsDraft.productLanguage}
+                    disabled={settingsMutation.isPending || settingsQuery.isLoading}
+                    placeholder="zh-CN"
+                    onChange={(event) =>
+                      setSettingsDraft((current) => ({
+                        ...current,
+                        productLanguage: event.target.value,
+                      }))
+                    }
+                  />
+                </label>
+                <label className="field field--wide">
+                  <span>Grafana Base URL</span>
+                  <input
+                    value={settingsDraft.grafanaBaseUrl}
+                    disabled={settingsMutation.isPending || settingsQuery.isLoading}
+                    placeholder="留空表示未配置"
+                    onChange={(event) =>
+                      setSettingsDraft((current) => ({
+                        ...current,
+                        grafanaBaseUrl: event.target.value,
+                      }))
+                    }
+                  />
+                </label>
+                <label className="field">
+                  <span>Grafana Dashboard UID</span>
+                  <input
+                    value={settingsDraft.grafanaDashboardUid}
+                    disabled={settingsMutation.isPending || settingsQuery.isLoading}
+                    placeholder="留空表示未配置"
+                    onChange={(event) =>
+                      setSettingsDraft((current) => ({
+                        ...current,
+                        grafanaDashboardUid: event.target.value,
+                      }))
+                    }
+                  />
+                </label>
+                <label className="field">
+                  <span>Grafana Org ID</span>
+                  <input
+                    type="number"
+                    min="1"
+                    value={settingsDraft.grafanaOrgId}
+                    disabled={settingsMutation.isPending || settingsQuery.isLoading}
+                    onChange={(event) =>
+                      setSettingsDraft((current) => ({
+                        ...current,
+                        grafanaOrgId: event.target.value,
+                      }))
+                    }
+                  />
+                </label>
+                <label className="field">
+                  <span>Grafana Theme</span>
+                  <select
+                    value={settingsDraft.grafanaTheme}
+                    disabled={settingsMutation.isPending || settingsQuery.isLoading}
+                    onChange={(event) =>
+                      setSettingsDraft((current) => ({
+                        ...current,
+                        grafanaTheme: event.target.value as 'dark' | 'light',
+                      }))
+                    }
+                  >
+                    <option value="dark">dark</option>
+                    <option value="light">light</option>
+                  </select>
+                </label>
+              </div>
+              <div className="settings-grid">
+                <div className="settings-block">
+                  <span className="section-label">通知通道</span>
+                  <div className="compact-switch settings-switch">
+                    {settingsNotificationChannelOptions.map((item) => {
+                      const active = settingsDraft.notificationChannels.includes(item.value)
+                      return (
+                        <button
+                          key={item.value}
+                          type="button"
+                          className={active ? 'pill pill--compact active' : 'pill pill--compact'}
+                          disabled={settingsMutation.isPending || settingsQuery.isLoading}
+                          onClick={() => toggleSettingsNotificationChannel(item.value)}
+                        >
+                          {item.label}
+                        </button>
+                      )
+                    })}
+                  </div>
+                  <p className="panel-note">
+                    保存后会立即更新桌面通知通道；若移除 <code>desktop</code>，设置页里的测试通知也会一并停用。
+                  </p>
+                  <div className="field-grid">
+                    <label className="field">
+                      <span>通知静默</span>
+                      <select
+                        value={settingsDraft.notificationQuietHoursEnabled ? 'enabled' : 'disabled'}
+                        disabled={settingsMutation.isPending || settingsQuery.isLoading}
+                        onChange={(event) =>
+                          setSettingsDraft((current) => ({
+                            ...current,
+                            notificationQuietHoursEnabled: event.target.value === 'enabled',
+                          }))
+                        }
+                      >
+                        <option value="disabled">关闭</option>
+                        <option value="enabled">开启</option>
+                      </select>
+                    </label>
+                    <label className="field">
+                      <span>静默开始</span>
+                      <input
+                        type="time"
+                        value={settingsDraft.notificationQuietHoursStart}
+                        disabled={settingsMutation.isPending || settingsQuery.isLoading}
+                        onChange={(event) =>
+                          setSettingsDraft((current) => ({
+                            ...current,
+                            notificationQuietHoursStart: event.target.value,
+                          }))
+                        }
+                      />
+                    </label>
+                    <label className="field">
+                      <span>静默结束</span>
+                      <input
+                        type="time"
+                        value={settingsDraft.notificationQuietHoursEnd}
+                        disabled={settingsMutation.isPending || settingsQuery.isLoading}
+                        onChange={(event) =>
+                          setSettingsDraft((current) => ({
+                            ...current,
+                            notificationQuietHoursEnd: event.target.value,
+                          }))
+                        }
+                      />
+                    </label>
+                  </div>
+                  <p className="panel-note">
+                    当前配置：{notificationQuietHoursLabel(settings)}。
+                    {notificationQuietHoursActive
+                      ? ' 当前正处于静默时段，普通桌面通知会被静默，critical 级提醒仍会继续放行。'
+                      : ' 普通桌面通知会按这里的静默时段自动抑制，critical 级提醒不会被静默。'}
+                  </p>
+                  <p className="panel-note">
+                    同内容的普通桌面通知当前还会自动做 2 分钟短时去重，避免同类提醒短时间重复刷屏；测试通知和 critical 级提醒不受这条去重影响。
+                  </p>
+                </div>
+                <div className="settings-block">
+                  <span className="section-label">Bybit 私有只读配置</span>
+                  <div className="contract-list">
+                    <code>{bybitPrivateConfigSourceLabel(bybitPrivateStatus?.source)}</code>
+                    <code>{bybitPrivateStatus?.config_path ?? '~/.bybit-control/private-api.json'}</code>
+                    <code>{configPresenceLabel(bybitPrivateStatus?.config_exists)}</code>
+                  </div>
+                  <p className="panel-note">
+                    当前 API 域名：<code>{bybitPrivateStatus?.api_base_url ?? settingsDraft.apiBaseUrl ?? 'https://api.bybit.com'}</code>。
+                    浏览器里的登录、账户设置和 API Key 创建仍使用 {settingsDraft.bybitWebEntry || 'https://www.bybit-global.com/'}，两者用途不同。
+                  </p>
+                  <p className="panel-note">
+                    示例文件：<code>{bybitPrivateStatus?.example_config_path ?? '/Users/leo/Desktop/Work/bybit/services/control-api/private-api.example.json'}</code>。
+                    如果同时设置环境变量，环境变量会覆盖本地配置文件。
+                  </p>
+                  <div className="hero-actions hero-actions--compact">
+                    <button
+                      type="button"
+                      className="ghost-button"
+                      disabled={!isAbsoluteLocalPath(bybitPrivateStatus?.config_path)}
+                      onClick={() =>
+                        void openLocalPath(bybitPrivateStatus?.config_path, {
+                          label: 'Bybit 私有配置目录',
+                          revealInFolder: true,
+                        })
+                      }
+                    >
+                      <ExternalLink size={14} />
+                      打开配置目录
+                    </button>
+                    <button
+                      type="button"
+                      className="ghost-button"
+                      disabled={!isAbsoluteLocalPath(bybitPrivateStatus?.example_config_path)}
+                      onClick={() =>
+                        void openLocalPath(bybitPrivateStatus?.example_config_path, {
+                          label: 'Bybit 私有配置示例',
+                        })
+                      }
+                    >
+                      <ExternalLink size={14} />
+                      打开示例文件
+                    </button>
+                  </div>
+                </div>
+                <div className="settings-block">
+                  <span className="section-label">OpenClaw 运行配置</span>
+                  <div className="contract-list">
+                    <code>{openClawCommandLabel(openClawStatus?.command_available)}</code>
+                    <code>{openClawStatus?.config_path ?? '~/.openclaw/openclaw.json'}</code>
+                    <code>{configPresenceLabel(openClawStatus?.config_exists)}</code>
+                    <code>{openClawStatus?.gateway_url ?? settings?.openclaw_gateway_url ?? 'ws://127.0.0.1:18789'}</code>
+                    <code>{openClawStatus?.resolved_agent ?? settings?.openclaw_agent ?? 'codex'}</code>
+                  </div>
+                  <p className="panel-note">
+                    OpenClaw 网关地址与默认 Agent 继续由本机外部配置驱动，这里只读展示，避免出现“界面已改但运行态未切换”。
+                  </p>
+                  <div className="hero-actions hero-actions--compact">
+                    <button
+                      type="button"
+                      className="ghost-button"
+                      disabled={!isAbsoluteLocalPath(openClawStatus?.config_path)}
+                      onClick={() =>
+                        void openLocalPath(openClawStatus?.config_path, {
+                          label: 'OpenClaw 配置目录',
+                          revealInFolder: true,
+                        })
+                      }
+                    >
+                      <ExternalLink size={14} />
+                      打开配置目录
+                    </button>
+                  </div>
+                </div>
+              </div>
+              <div className="hero-actions hero-actions--compact">
+                <button
+                  type="button"
+                  className="primary-button"
+                  disabled={!serviceAvailable || settingsMutation.isPending || settingsQuery.isLoading || !settingsDraftDirty}
+                  onClick={() => {
+                    void saveSettings()
+                  }}
+                >
+                  <Save size={14} />
+                  保存设置
+                </button>
+                <button
+                  type="button"
+                  className="ghost-button"
+                  disabled={settingsMutation.isPending || settingsQuery.isLoading || !settingsDraftDirty}
+                  onClick={restoreSettingsDraft}
+                >
+                  恢复已保存值
+                </button>
               </div>
               <p className="panel-note">
-                网页登录与账户入口继续使用 {settings?.bybit_web_entry ?? 'https://www.bybit-global.com/'}；
-                程序读取账户与行情时走 API 域名，两者用途不同。
+                网页登录、账户设置和 API Key 创建继续使用 {settingsDraft.bybitWebEntry || 'https://www.bybit-global.com/'}；
+                程序读取行情与账户时走 API 域名，两者用途不同。Grafana 项留空表示关闭本地仪表盘跳转配置。
               </p>
             </article>
 
@@ -5778,6 +8461,13 @@ function App() {
                     <div className="terminal-summary-strip__item">
                       <span>最新回测</span>
                       <strong>{latestStrategyBacktest?.metrics.annual_return ?? '--'}</strong>
+                      <small>
+                        {latestStrategyBacktestDecisionMeta && latestStrategyBacktestDecisionMeta.label !== '可继续判断'
+                          ? latestStrategyBacktestDecisionMeta.description
+                          : latestStrategyBacktestWindowMeta?.attention
+                          ? latestStrategyBacktestWindowMeta.description
+                          : latestStrategyBacktestSampleMeta?.description ?? '等待回测结果'}
+                      </small>
                     </div>
                     <div className="terminal-summary-strip__item">
                       <span>待处理提案</span>
@@ -5979,9 +8669,73 @@ function App() {
                   )}
 
                   {selectedStrategyReview && (
-                    <p className="panel-note">
-                      最近 AI 复盘: {selectedStrategyReview.summary}
-                    </p>
+                    <>
+                      <p className="panel-note">
+                        最近 AI 复盘: {selectedStrategyReview.summary}
+                        {selectedStrategyReviewDecisionMeta
+                          ? ` · 结论门禁 ${selectedStrategyReviewDecisionMeta.description}`
+                          : ''}
+                        {selectedStrategyReviewLineageMeta ? ` · ${selectedStrategyReviewLineageMeta.detail}` : ''}
+                      </p>
+                      <div className="inline-actions inline-actions--tight">
+                        <button
+                          type="button"
+                          className="micro-action"
+                          onClick={() => openReplayReview(selectedStrategyReview.id, selectedStrategy.id, 'selected')}
+                        >
+                          打开复盘
+                        </button>
+                        {selectedStrategyReview.source_change_request_id && (
+                          <button
+                            type="button"
+                            className="micro-action"
+                            onClick={() => openChangeRequest(selectedStrategyReview.source_change_request_id, selectedStrategy.id)}
+                          >
+                            来源变更
+                          </button>
+                        )}
+                        {selectedStrategyReview.source_backtest_id && (
+                          <button
+                            type="button"
+                            className="micro-action"
+                            onClick={() => openBacktestDetail(selectedStrategyReview.source_backtest_id, selectedStrategy.id)}
+                          >
+                            来源回测
+                          </button>
+                        )}
+                        {selectedStrategyReview.source_review_id && (
+                          <button
+                            type="button"
+                            className="micro-action"
+                            onClick={() => openSourceReview(selectedStrategyReview.source_review_id, selectedStrategy.id)}
+                          >
+                            来源复盘
+                          </button>
+                        )}
+                        {selectedStrategyReview.source_proposal_id && (
+                          <button
+                            type="button"
+                            className="micro-action"
+                            onClick={() => openStrategyProposal(selectedStrategyReview.source_proposal_id, selectedStrategy.id)}
+                          >
+                            来源提案
+                          </button>
+                        )}
+                        {selectedStrategyReviewDecisionMeta?.recommendedRange &&
+                          selectedStrategyReviewDecisionMeta?.recommendedTimeframe && (
+                            <button
+                              type="button"
+                              className="micro-action"
+                              disabled={!serviceAvailable || backtestMutation.isPending}
+                              onClick={() => {
+                                void rerunBacktestFromReview(selectedStrategyReview)
+                              }}
+                            >
+                              按建议重跑
+                            </button>
+                          )}
+                      </div>
+                    </>
                   )}
 
                   <div className="composite-grid">
@@ -6011,8 +8765,165 @@ function App() {
                           </div>
                           <div className="stack-row">
                             <strong>成交数</strong>
-                            <span>{latestStrategyBacktest.metrics.trades} 笔</span>
+                            <span>
+                              {latestStrategyBacktest.metrics.trades} 笔
+                              {latestStrategyBacktestSampleMeta ? ` · ${latestStrategyBacktestSampleMeta.description}` : ''}
+                              {latestStrategyBacktestWindowMeta?.attention
+                                ? ` · ${latestStrategyBacktestWindowMeta.label}`
+                                : ''}
+                            </span>
                           </div>
+                          {latestStrategyBacktestDecisionMeta && (
+                            <div className="stack-row">
+                              <strong>结论门禁</strong>
+                              <span>{latestStrategyBacktestDecisionMeta.description}</span>
+                            </div>
+                          )}
+                          {latestStrategyBacktestWindowMeta && (
+                            <div className="stack-row">
+                              <strong>样本窗口</strong>
+                              <span>{latestStrategyBacktestWindowMeta.detail}</span>
+                            </div>
+                          )}
+                          {latestStrategyBacktestDecisionMeta?.nextAction && (
+                            <div className="stack-row">
+                              <strong>门禁建议</strong>
+                              <span>{latestStrategyBacktestDecisionMeta.nextAction}</span>
+                            </div>
+                          )}
+                          {latestStrategyBacktestLineageMeta && (
+                            <div className="stack-row">
+                              <strong>来源链路</strong>
+                              <span>
+                                {latestStrategyBacktestLineageMeta.detail}
+                                {latestStrategyBacktest?.source_change_request_id && (
+                                  <>
+                                    {' '}
+                                    <button
+                                      type="button"
+                                      className="ghost-button ghost-button--inline"
+                                      onClick={() =>
+                                        openChangeRequest(
+                                          latestStrategyBacktest.source_change_request_id,
+                                          latestStrategyBacktest.strategy_id,
+                                        )
+                                      }
+                                    >
+                                      来源变更
+                                    </button>
+                                  </>
+                                )}
+                                {latestStrategyBacktest?.source_backtest_id && (
+                                  <>
+                                    {' '}
+                                    <button
+                                      type="button"
+                                      className="ghost-button ghost-button--inline"
+                                      onClick={() =>
+                                        openBacktestDetail(latestStrategyBacktest.source_backtest_id, latestStrategyBacktest.strategy_id)
+                                      }
+                                    >
+                                      来源回测
+                                    </button>
+                                  </>
+                                )}
+                                {latestStrategyBacktest?.source_review_id && (
+                                  <>
+                                    {' '}
+                                    <button
+                                      type="button"
+                                      className="ghost-button ghost-button--inline"
+                                      onClick={() =>
+                                        openSourceReview(latestStrategyBacktest.source_review_id, latestStrategyBacktest.strategy_id)
+                                      }
+                                    >
+                                      来源复盘
+                                    </button>
+                                  </>
+                                )}
+                                {latestStrategyBacktest?.source_proposal_id && (
+                                  <>
+                                    {' '}
+                                    <button
+                                      type="button"
+                                      className="ghost-button ghost-button--inline"
+                                      onClick={() =>
+                                        openStrategyProposal(
+                                          latestStrategyBacktest.source_proposal_id,
+                                          latestStrategyBacktest.strategy_id,
+                                        )
+                                      }
+                                    >
+                                      来源提案
+                                    </button>
+                                  </>
+                                )}
+                              </span>
+                            </div>
+                          )}
+                          {latestStrategyBacktestReviewJobMeta &&
+                            latestStrategyBacktestReviewJob &&
+                            (latestStrategyBacktestReviewJob.status !== 'completed' || !latestStrategyBacktestReview) && (
+                              <div className="stack-row">
+                                <strong>复盘任务</strong>
+                                <span>
+                                  <span className={jobStatusToneClass(latestStrategyBacktestReviewJob.status)}>
+                                    {latestStrategyBacktestReviewJobMeta.label}
+                                  </span>
+                                  {' · '}
+                                  {latestStrategyBacktestReviewJobMeta.detail}
+                                  {' '}
+                                  <button
+                                    type="button"
+                                    className="ghost-button ghost-button--inline"
+                                    onClick={() => openAiSchedulerJob(latestStrategyBacktestReviewJob.id)}
+                                  >
+                                    打开任务
+                                  </button>
+                                  {latestStrategyBacktestReviewJobMeta.canRetry && (
+                                    <button
+                                      type="button"
+                                      className="ghost-button ghost-button--inline"
+                                      disabled={!serviceAvailable || retryAgentJobMutation.isPending}
+                                      onClick={() => {
+                                        void retryAgentJob(latestStrategyBacktestReviewJob.id)
+                                      }}
+                                    >
+                                      重试
+                                    </button>
+                                  )}
+                                </span>
+                              </div>
+                            )}
+                          {latestStrategyBacktestDecisionMeta?.recommendedRange &&
+                            latestStrategyBacktestDecisionMeta?.recommendedTimeframe && (
+                              <div className="stack-row">
+                                <strong>门禁重跑</strong>
+                                <span>
+                                  {latestStrategyBacktestDecisionMeta.recommendedRange}
+                                  {' @ '}
+                                  {latestStrategyBacktestDecisionMeta.recommendedTimeframe}
+                                  {' '}
+                                  <button
+                                    type="button"
+                                    className="ghost-button ghost-button--inline"
+                                    disabled={!serviceAvailable || backtestMutation.isPending}
+                                    title={latestStrategyBacktestDecisionMeta.nextAction ?? '按当前结论门禁建议重跑'}
+                                    onClick={() => {
+                                      void rerunBacktestFromRecommendation(latestStrategyBacktest)
+                                    }}
+                                  >
+                                    按建议重跑
+                                  </button>
+                                </span>
+                              </div>
+                            )}
+                          {latestStrategyBacktestWindowMeta?.nextAction && (
+                            <div className="stack-row">
+                              <strong>补样本建议</strong>
+                              <span>{latestStrategyBacktestWindowMeta.nextAction}</span>
+                            </div>
+                          )}
                           {selectedStrategyRuntime && (
                             <div className="stack-row">
                               <strong>运行态</strong>
@@ -6036,18 +8947,193 @@ function App() {
                         <strong>{strategyChangeRequests.length} 条</strong>
                       </div>
                       <div className="job-list">
-                        {strategyChangeRequests.map((request, index) => (
-                          <div key={request.id} className="job-row job-row--fade" style={{ animationDelay: `${index * 28}ms` }}>
-                            <div className="console-row__main">
-                              <strong>{request.summary}</strong>
-                              <p>{request.type} · {request.requested_by}</p>
+                        {strategyChangeRequests.map((request, index) => {
+                          const requestStrategyId = getChangeRequestStrategyId(request, selectedStrategy?.id ?? null)
+                          const linkedBacktestId = getChangeRequestLinkedBacktestId(request)
+                          const linkedBacktest = linkedBacktestId ? backtests.find((item) => item.id === linkedBacktestId) ?? null : null
+                          const linkedBacktestDecisionMeta = getChangeRequestLinkedBacktestDecisionMeta(request)
+                          const linkedBacktestWindowMeta = getChangeRequestLinkedBacktestWindowMeta(request, linkedBacktest)
+                          const linkedBacktestRerunRecommendation = getChangeRequestLinkedBacktestRecommendation(
+                            request,
+                            linkedBacktest,
+                          )
+                          const sourceBacktestId = getChangeRequestSourceBacktestId(request)
+                          const sourceReviewId = getChangeRequestSourceReviewId(request)
+                          const sourceProposalId = getChangeRequestSourceProposalId(request)
+                          return (
+                            <div
+                              key={request.id}
+                              className={`job-row job-row--fade ${selectedChangeRequestId === request.id ? 'job-row--active' : ''}`}
+                              style={{ animationDelay: `${index * 28}ms` }}
+                            >
+                              <div className="console-row__main">
+                                <strong>{request.summary}</strong>
+                                <p>{request.type} · {request.requested_by} · {changeRequestTriggerReasonLabel(request.trigger_reason)}</p>
+                                {request.follow_up_job_type && (
+                                  <p>
+                                    跟踪任务 {request.follow_up_job_type}
+                                    {request.follow_up_job_status ? (
+                                      <>
+                                        {' · '}
+                                        <span className={jobStatusToneClass(request.follow_up_job_status)}>
+                                          {jobStatusLabel(request.follow_up_job_status)}
+                                        </span>
+                                      </>
+                                    ) : null}
+                                    {request.linked_review_title ? ` · 结果 ${request.linked_review_title}` : ''}
+                                    {!request.linked_review_title && request.follow_up_result_summary
+                                      ? ` · ${request.follow_up_result_summary}`
+                                      : ''}
+                                  </p>
+                                )}
+                                {linkedBacktestId && (
+                                  <p>
+                                    已生成回测 {linkedBacktestId}
+                                    {request.linked_backtest_timeframe ? ` · ${request.linked_backtest_timeframe}` : ''}
+                                    {request.linked_backtest_data_range ? ` · ${request.linked_backtest_data_range}` : ''}
+                                  </p>
+                                )}
+                                {linkedBacktestDecisionMeta && (
+                                  <p>
+                                    结论门禁 {linkedBacktestDecisionMeta.label} · {linkedBacktestDecisionMeta.description}
+                                    {linkedBacktestDecisionMeta.nextAction ? ` · 建议 ${linkedBacktestDecisionMeta.nextAction}` : ''}
+                                  </p>
+                                )}
+                                {linkedBacktestWindowMeta?.attention && (
+                                  <p>
+                                    样本窗口 {linkedBacktestWindowMeta.label} · {linkedBacktestWindowMeta.description}
+                                    {linkedBacktestWindowMeta.nextAction ? ` · 建议 ${linkedBacktestWindowMeta.nextAction}` : ''}
+                                  </p>
+                                )}
+                              </div>
+                              <div className="job-meta">
+                                <span className="console-tag">{changeRequestStatusLabel(request.status)}</span>
+                                {linkedBacktestDecisionMeta && (
+                                  <span className={linkedBacktestDecisionMeta.chipClass}>{linkedBacktestDecisionMeta.label}</span>
+                                )}
+                                {!linkedBacktestDecisionMeta && linkedBacktestWindowMeta?.attention && (
+                                  <span className={linkedBacktestWindowMeta.chipClass}>{linkedBacktestWindowMeta.label}</span>
+                                )}
+                                {request.linked_review_period && (
+                                  <span className={reviewPeriodChipClass(request.linked_review_period)}>
+                                    {reviewPeriodLabel(request.linked_review_period)}
+                                  </span>
+                                )}
+                                {selectedChangeRequestId === request.id && <span className="console-tag console-tag--warn">当前定位</span>}
+                                <small>{formatTime(request.updated_at)}</small>
+                              </div>
+                              <div className="toggle-card__actions">
+                                <button
+                                  type="button"
+                                  className="ghost-button"
+                                  onClick={() => openChangeRequest(request.id, requestStrategyId)}
+                                >
+                                  查看变更
+                                </button>
+                                {linkedBacktestId && requestStrategyId && (
+                                  <button
+                                    type="button"
+                                    className="ghost-button"
+                                    onClick={() => openBacktestDetail(linkedBacktestId, requestStrategyId)}
+                                  >
+                                    打开回测
+                                  </button>
+                                )}
+                                {linkedBacktestDecisionMeta?.recommendedRange &&
+                                  linkedBacktestDecisionMeta?.recommendedTimeframe && (
+                                    <button
+                                      type="button"
+                                      className="ghost-button"
+                                      disabled={!serviceAvailable || backtestMutation.isPending}
+                                      onClick={() => {
+                                        void rerunBacktestFromChangeRequest(request)
+                                      }}
+                                    >
+                                      按建议重跑
+                                    </button>
+                                  )}
+                                {!linkedBacktestDecisionMeta?.recommendedRange &&
+                                  linkedBacktestRerunRecommendation?.recommendedRange &&
+                                  linkedBacktestRerunRecommendation?.recommendedTimeframe && (
+                                    <button
+                                      type="button"
+                                      className="ghost-button"
+                                      disabled={!serviceAvailable || backtestMutation.isPending}
+                                      onClick={() => {
+                                        void rerunBacktestFromChangeRequest(request)
+                                      }}
+                                    >
+                                      按建议重跑
+                                    </button>
+                                  )}
+                                {request.follow_up_job_id && (
+                                  <button
+                                    type="button"
+                                    className="ghost-button"
+                                    onClick={() => openAiSchedulerJob(request.follow_up_job_id)}
+                                  >
+                                    打开任务
+                                  </button>
+                                )}
+                                {request.linked_review_id && requestStrategyId && (
+                                  <button
+                                    type="button"
+                                    className="ghost-button"
+                                    onClick={() => openReviewInspector(request.linked_review_id, requestStrategyId)}
+                                  >
+                                    查看结果
+                                  </button>
+                                )}
+                                {request.follow_up_job_id &&
+                                  (request.follow_up_job_status === 'failed' ||
+                                    request.follow_up_job_status === 'cancelled') && (
+                                    <button
+                                      type="button"
+                                      className="ghost-button"
+                                      disabled={!serviceAvailable || retryAgentJobMutation.isPending}
+                                      onClick={() => {
+                                        void retryAgentJob(request.follow_up_job_id, { focusJob: true })
+                                      }}
+                                    >
+                                      重试跟踪
+                                    </button>
+                                  )}
+                                {sourceBacktestId && requestStrategyId && (
+                                  <button
+                                    type="button"
+                                    className="ghost-button"
+                                    onClick={() => openBacktestDetail(sourceBacktestId, requestStrategyId)}
+                                  >
+                                    来源回测
+                                  </button>
+                                )}
+                                {sourceReviewId && requestStrategyId && (
+                                  <button
+                                    type="button"
+                                    className="ghost-button"
+                                    onClick={() => openSourceReview(sourceReviewId, requestStrategyId)}
+                                  >
+                                    来源复盘
+                                  </button>
+                                )}
+                                {sourceProposalId && requestStrategyId && (
+                                  <button
+                                    type="button"
+                                    className="ghost-button"
+                                    onClick={() =>
+                                      openStrategyProposal(
+                                        sourceProposalId,
+                                        requestStrategyId,
+                                      )
+                                    }
+                                  >
+                                    来源提案
+                                  </button>
+                                )}
+                              </div>
                             </div>
-                            <div className="job-meta">
-                              <span className="console-tag">{changeRequestStatusLabel(request.status)}</span>
-                              <small>{formatTime(request.updated_at)}</small>
-                            </div>
-                          </div>
-                        ))}
+                          )
+                        })}
                         {strategyChangeRequests.length === 0 && (
                           <div className="empty-state empty-state--inline">当前策略没有待落实的请求</div>
                         )}
@@ -6068,18 +9154,45 @@ function App() {
                         </p>
                       )}
                       <div className="job-list">
-                        {strategyProposals.map((proposal, index) => (
-                          <div key={proposal.id} className="job-row job-row--fade" style={{ animationDelay: `${index * 28}ms` }}>
-                            <div className="console-row__main">
-                              <strong>{proposal.title}</strong>
-                              <p>{proposalTypeLabel(proposal.proposal_type)} · {proposal.expected_impact}</p>
+                        {strategyProposals.map((proposal, index) => {
+                          const linkedBacktest = proposalBacktestMap.get(proposal.id) ?? null
+                          const linkedReview = proposalReviewMap.get(proposal.id) ?? null
+                          return (
+                            <div
+                              key={proposal.id}
+                              className={`job-row job-row--fade ${selectedProposalId === proposal.id ? 'job-row--active' : ''}`}
+                              style={{ animationDelay: `${index * 28}ms` }}
+                            >
+                              <div className="console-row__main">
+                                <strong>{proposal.title}</strong>
+                                <p>{proposalTypeLabel(proposal.proposal_type)} · {proposal.expected_impact}</p>
+                              </div>
+                              <div className="job-meta">
+                                <span className="console-tag">{proposalStatusLabel(proposal.status)}</span>
+                                {selectedProposalId === proposal.id && <span className="console-tag console-tag--warn">来源提案</span>}
+                                {linkedBacktest && (
+                                  <button
+                                    type="button"
+                                    className="micro-action"
+                                    onClick={() => openBacktestDetail(linkedBacktest.id, proposal.strategy_id)}
+                                  >
+                                    生成回测
+                                  </button>
+                                )}
+                                {linkedReview && (
+                                  <button
+                                    type="button"
+                                    className="micro-action"
+                                    onClick={() => openReplayReview(linkedReview.id, proposal.strategy_id, 'selected')}
+                                  >
+                                    生成复盘
+                                  </button>
+                                )}
+                                <small>{formatTime(proposal.created_at)}</small>
+                              </div>
                             </div>
-                            <div className="job-meta">
-                              <span className="console-tag">{proposalStatusLabel(proposal.status)}</span>
-                              <small>{formatTime(proposal.created_at)}</small>
-                            </div>
-                          </div>
-                        ))}
+                          )
+                        })}
                         {strategyProposals.length === 0 && (
                           <div className="empty-state empty-state--inline">当前策略暂时没有 AI 提案</div>
                         )}
@@ -6149,6 +9262,13 @@ function App() {
                 <div>
                   <span>最近结果</span>
                   <strong>{latestWorkspaceBacktest?.metrics.annual_return ?? '--'}</strong>
+                  <small>
+                    {latestWorkspaceBacktestDecisionMeta && latestWorkspaceBacktestDecisionMeta.label !== '可继续判断'
+                      ? latestWorkspaceBacktestDecisionMeta.description
+                      : latestWorkspaceBacktestWindowMeta?.attention
+                      ? latestWorkspaceBacktestWindowMeta.description
+                      : latestWorkspaceBacktestSampleMeta?.description ?? '等待回测结果'}
+                  </small>
                 </div>
                 <div>
                   <span>AI 提案</span>
@@ -6175,7 +9295,7 @@ function App() {
                     value={backtestTimeframeDraft}
                     onChange={(event) => setBacktestTimeframeDraft(event.target.value)}
                   >
-                    {backtestTimeframePresets.map((preset) => (
+                    {backtestTimeframeOptions.map((preset) => (
                       <option key={preset.value} value={preset.value}>
                         {preset.label}
                       </option>
@@ -6185,7 +9305,7 @@ function App() {
                 <label className="field">
                   <span>区间</span>
                   <select value={backtestRangeDraft} onChange={(event) => setBacktestRangeDraft(event.target.value)}>
-                    {backtestRangePresets.map((preset) => (
+                    {backtestRangeOptions.map((preset) => (
                       <option key={preset.value} value={preset.value}>
                         {preset.label}
                       </option>
@@ -6227,7 +9347,10 @@ function App() {
                 </div>
               </div>
               <div className="job-list">
-                {backtestsForWorkspace.map((item, index) => (
+                {backtestsForWorkspace.map((item, index) => {
+                  const sampleMeta = backtestSampleQualityMeta(item)
+                  const windowMeta = backtestWindowMeta(item)
+                  return (
                   <button
                     key={item.id}
                     type="button"
@@ -6237,14 +9360,22 @@ function App() {
                   >
                     <div className="console-row__main">
                       <strong>{item.strategy_name}</strong>
-                      <p>{item.data_range} · {item.timeframe} · {item.metrics.annual_return}</p>
+                      <p>
+                        {item.data_range} · {item.timeframe} · {item.metrics.annual_return}
+                        {windowMeta?.attention ? ` · ${windowMeta.description}` : ''}
+                      </p>
                     </div>
                     <div className="job-meta">
+                      {sampleMeta && item.sample_quality !== 'sufficient' && (
+                        <span className={sampleMeta.chipClass}>{sampleMeta.label}</span>
+                      )}
+                      {windowMeta?.attention && <span className={windowMeta.chipClass}>{windowMeta.label}</span>}
                       <span className="console-tag">{item.status}</span>
                       <small>{formatTime(item.finished_at ?? item.started_at)}</small>
                     </div>
                   </button>
-                ))}
+                  )
+                })}
                 {backtestsForWorkspace.length === 0 && (
                   <div className="empty-state empty-state--inline">当前筛选条件下还没有回测记录</div>
                 )}
@@ -6257,7 +9388,15 @@ function App() {
                   <span className="section-label">回测详情</span>
                   <h3>{selectedBacktest?.strategy_name ?? '等待选择回测结果'}</h3>
                 </div>
-                {selectedBacktest && <span className="chip chip--warning">{selectedBacktest.timeframe}</span>}
+                <div className="chip-row">
+                  {selectedBacktestSampleMeta && (
+                    <span className={selectedBacktestSampleMeta.chipClass}>{selectedBacktestSampleMeta.label}</span>
+                  )}
+                  {selectedBacktestWindowMeta?.attention && (
+                    <span className={selectedBacktestWindowMeta.chipClass}>{selectedBacktestWindowMeta.label}</span>
+                  )}
+                  {selectedBacktest && <span className="chip chip--warning">{selectedBacktest.timeframe}</span>}
+                </div>
               </div>
               {selectedBacktest ? (
                 <>
@@ -6296,6 +9435,149 @@ function App() {
                           <strong>数据粒度</strong>
                           <span>{selectedBacktest.data_granularity}</span>
                         </div>
+                        <div className="stack-row">
+                          <strong>样本质量</strong>
+                          <span>{selectedBacktestSampleMeta?.description ?? '未标注'}</span>
+                        </div>
+                        {selectedBacktestDecisionMeta && (
+                          <div className="stack-row">
+                            <strong>结论门禁</strong>
+                            <span>{selectedBacktestDecisionMeta.description}</span>
+                          </div>
+                        )}
+                        {selectedBacktestWindowMeta && (
+                          <div className="stack-row">
+                            <strong>样本窗口</strong>
+                            <span>{selectedBacktestWindowMeta.detail}</span>
+                          </div>
+                        )}
+                        {selectedBacktestDecisionMeta?.nextAction && (
+                          <div className="stack-row">
+                            <strong>门禁建议</strong>
+                            <span>{selectedBacktestDecisionMeta.nextAction}</span>
+                          </div>
+                        )}
+                        {selectedBacktestLineageMeta && (
+                          <div className="stack-row">
+                            <strong>来源链路</strong>
+                            <span>
+                              {selectedBacktestLineageMeta.detail}
+                              {selectedBacktest.source_change_request_id && (
+                                <>
+                                  {' '}
+                                  <button
+                                    type="button"
+                                    className="ghost-button ghost-button--inline"
+                                    onClick={() => openChangeRequest(selectedBacktest.source_change_request_id, selectedBacktest.strategy_id)}
+                                  >
+                                    来源变更
+                                  </button>
+                                </>
+                              )}
+                              {selectedBacktest.source_backtest_id && (
+                                <>
+                                  {' '}
+                                  <button
+                                    type="button"
+                                    className="ghost-button ghost-button--inline"
+                                    onClick={() => openBacktestDetail(selectedBacktest.source_backtest_id, selectedBacktest.strategy_id)}
+                                  >
+                                    来源回测
+                                  </button>
+                                </>
+                              )}
+                              {selectedBacktest.source_review_id && (
+                                <>
+                                  {' '}
+                                  <button
+                                    type="button"
+                                    className="ghost-button ghost-button--inline"
+                                    onClick={() => openSourceReview(selectedBacktest.source_review_id, selectedBacktest.strategy_id)}
+                                  >
+                                    来源复盘
+                                  </button>
+                                </>
+                              )}
+                              {selectedBacktest.source_proposal_id && (
+                                <>
+                                  {' '}
+                                  <button
+                                    type="button"
+                                    className="ghost-button ghost-button--inline"
+                                    onClick={() =>
+                                      openStrategyProposal(selectedBacktest.source_proposal_id, selectedBacktest.strategy_id)
+                                    }
+                                  >
+                                    来源提案
+                                  </button>
+                                </>
+                              )}
+                            </span>
+                          </div>
+                        )}
+                        {selectedBacktestReviewJobMeta &&
+                          selectedBacktestReviewJob &&
+                          (selectedBacktestReviewJob.status !== 'completed' || !selectedBacktestReview) && (
+                            <div className="stack-row">
+                              <strong>复盘任务</strong>
+                              <span>
+                                <span className={jobStatusToneClass(selectedBacktestReviewJob.status)}>
+                                  {selectedBacktestReviewJobMeta.label}
+                                </span>
+                                {' · '}
+                                {selectedBacktestReviewJobMeta.detail}
+                                {' '}
+                                <button
+                                  type="button"
+                                  className="ghost-button ghost-button--inline"
+                                  onClick={() => openAiSchedulerJob(selectedBacktestReviewJob.id)}
+                                >
+                                  打开任务
+                                </button>
+                                {selectedBacktestReviewJobMeta.canRetry && (
+                                  <button
+                                    type="button"
+                                    className="ghost-button ghost-button--inline"
+                                    disabled={!serviceAvailable || retryAgentJobMutation.isPending}
+                                    onClick={() => {
+                                      void retryAgentJob(selectedBacktestReviewJob.id)
+                                    }}
+                                  >
+                                    重试
+                                  </button>
+                                )}
+                              </span>
+                            </div>
+                          )}
+                        {selectedBacktestDecisionMeta?.recommendedRange &&
+                          selectedBacktestDecisionMeta?.recommendedTimeframe && (
+                            <div className="stack-row">
+                              <strong>门禁重跑</strong>
+                              <span>
+                                {selectedBacktestDecisionMeta.recommendedRange}
+                                {' @ '}
+                                {selectedBacktestDecisionMeta.recommendedTimeframe}
+                                {' '}
+                                <button
+                                  type="button"
+                                  className="ghost-button ghost-button--inline"
+                                  disabled={!serviceAvailable || backtestMutation.isPending}
+                                  title={selectedBacktestDecisionMeta.nextAction ?? '按当前结论门禁建议重跑'}
+                                  onClick={() => {
+                                    void rerunBacktestFromRecommendation(selectedBacktest)
+                                  }}
+                                >
+                                  按建议重跑
+                                </button>
+                              </span>
+                            </div>
+                          )}
+                        {selectedBacktestWindowMeta?.nextAction && (
+                          <div className="stack-row">
+                            <strong>补样本建议</strong>
+                            <span>{selectedBacktestWindowMeta.nextAction}</span>
+                          </div>
+                        )}
                         <div className="stack-row">
                           <strong>手续费 / 滑点</strong>
                           <span>{selectedBacktest.fee_model} · {selectedBacktest.slippage_model}</span>
@@ -6345,26 +9627,136 @@ function App() {
                         <h3>复盘摘要与待处理提案</h3>
                       </div>
                     </div>
-                    {selectedStrategyReview ? (
+                    {selectedBacktestReview ? (
                       <>
-                        <p className="panel-note">{selectedStrategyReview.summary}</p>
+                        <p className="panel-note">{selectedBacktestReview.summary}</p>
+                        <div className="inline-actions">
+                          <button
+                            type="button"
+                            className="ghost-button"
+                            onClick={() =>
+                              openReplayReview(selectedBacktestReview.id, selectedBacktestReview.strategy_id, 'selected')
+                            }
+                          >
+                            打开复盘结果
+                          </button>
+                          {selectedBacktestReview.source_job_id && (
+                            <button
+                              type="button"
+                              className="ghost-button"
+                              onClick={() => openAiSchedulerJob(selectedBacktestReview.source_job_id)}
+                            >
+                              打开来源任务
+                            </button>
+                          )}
+                          {selectedBacktestReview.decision_recommended_data_range &&
+                            selectedBacktestReview.decision_recommended_timeframe && (
+                              <button
+                                type="button"
+                                className="ghost-button"
+                                disabled={!serviceAvailable || backtestMutation.isPending}
+                                onClick={() => {
+                                  void rerunBacktestFromReview(selectedBacktestReview)
+                                }}
+                              >
+                                按复盘建议重跑
+                              </button>
+                            )}
+                        </div>
                         <div className="job-list">
-                          {strategyProposals.map((proposal) => (
-                            <div key={proposal.id} className="job-row">
-                              <div className="console-row__main">
-                                <strong>{proposal.title}</strong>
-                                <p>{proposalTypeLabel(proposal.proposal_type)} · {proposal.expected_impact}</p>
+                          {selectedBacktestProposals.map((proposal) => {
+                            const linkedBacktest = proposalBacktestMap.get(proposal.id) ?? null
+                            const linkedReview = proposalReviewMap.get(proposal.id) ?? null
+                            const blockedReason = proposalAcceptBlockedReason(proposal.proposal_type, snapshot?.scheduler)
+                            return (
+                              <div
+                                key={proposal.id}
+                                className={`job-row job-row--fade ${selectedProposalId === proposal.id ? 'job-row--active' : ''}`}
+                              >
+                                <div className="console-row__main">
+                                  <strong>{proposal.title}</strong>
+                                  <p>{proposalTypeLabel(proposal.proposal_type)} · {proposal.expected_impact}</p>
+                                </div>
+                                <div className="job-meta">
+                                  <span className="console-tag">{proposalStatusLabel(proposal.status)}</span>
+                                  {selectedProposalId === proposal.id && (
+                                    <span className="console-tag console-tag--warn">来源提案</span>
+                                  )}
+                                  {linkedBacktest && (
+                                    <button
+                                      type="button"
+                                      className="micro-action"
+                                      onClick={() => openBacktestDetail(linkedBacktest.id, proposal.strategy_id)}
+                                    >
+                                      生成回测
+                                    </button>
+                                  )}
+                                  {linkedReview && (
+                                    <button
+                                      type="button"
+                                      className="micro-action"
+                                      onClick={() => openReplayReview(linkedReview.id, proposal.strategy_id, 'selected')}
+                                    >
+                                      生成复盘
+                                    </button>
+                                  )}
+                                  <small>{formatTime(proposal.created_at)}</small>
+                                </div>
+                                {(proposal.status === 'pending' || proposal.status === 'testing') && (
+                                  <div className="toggle-card__actions">
+                                    <button
+                                      type="button"
+                                      title={blockedReason ?? `接受 ${proposalTypeLabel(proposal.proposal_type)}`}
+                                      disabled={!serviceAvailable || proposalMutation.isPending || Boolean(blockedReason)}
+                                      onClick={() => handleProposalAction(proposal.id, 'accept')}
+                                    >
+                                      接受 {proposalTypeLabel(proposal.proposal_type)}
+                                    </button>
+                                    <button
+                                      type="button"
+                                      disabled={!serviceAvailable || proposalMutation.isPending}
+                                      onClick={() => handleProposalAction(proposal.id, 'reject')}
+                                    >
+                                      拒绝
+                                    </button>
+                                  </div>
+                                )}
                               </div>
-                              <div className="job-meta">
-                                <span className="console-tag">{proposalStatusLabel(proposal.status)}</span>
-                                <small>{formatTime(proposal.created_at)}</small>
-                              </div>
-                            </div>
-                          ))}
+                            )
+                          })}
+                          {selectedBacktestProposals.length === 0 && (
+                            <div className="empty-state empty-state--inline">当前这轮回测还没有待处理提案</div>
+                          )}
+                        </div>
+                      </>
+                    ) : selectedBacktestReviewJobMeta && selectedBacktestReviewJob ? (
+                      <>
+                        <p className="panel-note">
+                          当前这轮回测的 AI 复盘任务{selectedBacktestReviewJobMeta.label}。{selectedBacktestReviewJobMeta.detail}
+                        </p>
+                        <div className="inline-actions">
+                          <button
+                            type="button"
+                            className="ghost-button"
+                            onClick={() => openAiSchedulerJob(selectedBacktestReviewJob.id)}
+                          >
+                            打开 AI 任务
+                          </button>
+                          {selectedBacktestReviewJobMeta.canRetry && (
+                            <button
+                              type="button"
+                              disabled={!serviceAvailable || retryAgentJobMutation.isPending}
+                              onClick={() => {
+                                void retryAgentJob(selectedBacktestReviewJob.id)
+                              }}
+                            >
+                              重试回测复盘
+                            </button>
+                          )}
                         </div>
                       </>
                     ) : (
-                      <div className="empty-state empty-state--inline">当前策略还没有关联的 AI 复盘记录</div>
+                      <div className="empty-state empty-state--inline">当前这轮回测还没有关联的 AI 复盘记录</div>
                     )}
                   </div>
                 </>
@@ -6437,6 +9829,20 @@ function App() {
                   </div>
                 </div>
               )}
+              {latestSchedulerCommand && (
+                <div
+                  className={`service-banner service-banner--${latestSchedulerCommand.tone === 'warning' ? 'warning' : 'success'} service-banner--inline`}
+                >
+                  <Bot size={16} />
+                  <div>
+                    <strong>最近调度动作 · {latestSchedulerCommand.commandLabel}</strong>
+                    <p>{latestSchedulerCommand.summary}</p>
+                    {latestSchedulerCommand.impactDetail && <p>{latestSchedulerCommand.impactDetail}</p>}
+                    <p>发生于 {formatTime(latestSchedulerCommand.occurredAt)}</p>
+                    {renderLatestSchedulerCommandActions()}
+                  </div>
+                </div>
+              )}
               <div className="terminal-summary-strip terminal-summary-strip--compact scheduler-summary-strip">
                 <div className="terminal-summary-strip__item">
                   <span>当前模式</span>
@@ -6492,7 +9898,14 @@ function App() {
                     <strong>{scheduler?.jobs.length ?? 0} 条</strong>
                   </div>
                   <div className="job-list">
-                    {scheduler?.jobs.map((job, index) => (
+                  {scheduler?.jobs.map((job, index) => {
+                    const jobStrategyId = getAgentJobStrategyId(job)
+                    const jobBacktestId = getAgentJobBacktestId(job)
+                    const jobChangeRequestId = getAgentJobChangeRequestId(job)
+                    const sourceBacktestId = getAgentJobSourceBacktestId(job)
+                    const sourceReviewId = getAgentJobSourceReviewId(job)
+                    const sourceProposalId = getAgentJobSourceProposalId(job)
+                    return (
                       <div
                         key={job.id}
                         className={`job-row job-row--fade${aiSchedulerFocusedJobId === job.id ? ' job-row--active' : ''}`}
@@ -6509,37 +9922,82 @@ function App() {
                             {getAgentJobRetriedFrom(job) ? ` · 源任务 ${getAgentJobRetriedFrom(job)}` : ''}
                           </p>
                         </div>
-                      <div className="job-meta">
-                        <span className={jobStatusToneClass(job.status)}>{jobStatusLabel(job.status)}</span>
-                        {getAgentJobLinkedReviewPeriod(job) && (
-                          <span className={reviewPeriodChipClass(getAgentJobLinkedReviewPeriod(job))}>
-                            {reviewPeriodLabel(getAgentJobLinkedReviewPeriod(job))}
-                          </span>
-                        )}
-                        {getAgentJobLinkedReviewId(job) && (
-                          <button
-                            type="button"
-                            className="micro-action"
-                            onClick={() =>
-                              openReviewInspector(getAgentJobLinkedReviewId(job), getAgentJobStrategyId(job))
-                            }
-                          >
-                            查看结果
-                          </button>
-                        )}
-                        {getAgentJobStrategyId(job) && (
-                          <button
-                            type="button"
-                            className="micro-action"
-                            onClick={() => openStrategyActivity(getAgentJobStrategyId(job))}
-                          >
-                            打开策略
-                          </button>
-                        )}
-                        {canRetryAgentJob(job.status) && (
-                          <button
-                            type="button"
-                            className="micro-action"
+                        <div className="job-meta">
+                          <span className={jobStatusToneClass(job.status)}>{jobStatusLabel(job.status)}</span>
+                          {getAgentJobLinkedReviewPeriod(job) && (
+                            <span className={reviewPeriodChipClass(getAgentJobLinkedReviewPeriod(job))}>
+                              {reviewPeriodLabel(getAgentJobLinkedReviewPeriod(job))}
+                            </span>
+                          )}
+                          {getAgentJobLinkedReviewId(job) && (
+                            <button
+                              type="button"
+                              className="micro-action"
+                              onClick={() =>
+                                openReviewInspector(getAgentJobLinkedReviewId(job), getAgentJobStrategyId(job))
+                              }
+                            >
+                              查看结果
+                            </button>
+                          )}
+                          {jobChangeRequestId && jobStrategyId && (
+                            <button
+                              type="button"
+                              className="micro-action"
+                              onClick={() => openChangeRequest(jobChangeRequestId, jobStrategyId)}
+                            >
+                              查看变更
+                            </button>
+                          )}
+                          {jobBacktestId && jobStrategyId && (
+                            <button
+                              type="button"
+                              className="micro-action"
+                              onClick={() => openBacktestDetail(jobBacktestId, jobStrategyId)}
+                            >
+                              打开回测
+                            </button>
+                          )}
+                          {sourceBacktestId && jobStrategyId && sourceBacktestId !== jobBacktestId && (
+                            <button
+                              type="button"
+                              className="micro-action"
+                              onClick={() => openBacktestDetail(sourceBacktestId, jobStrategyId)}
+                            >
+                              来源回测
+                            </button>
+                          )}
+                          {sourceReviewId && jobStrategyId && sourceReviewId !== getAgentJobLinkedReviewId(job) && (
+                            <button
+                              type="button"
+                              className="micro-action"
+                              onClick={() => openSourceReview(sourceReviewId, jobStrategyId)}
+                            >
+                              来源复盘
+                            </button>
+                          )}
+                          {sourceProposalId && jobStrategyId && (
+                            <button
+                              type="button"
+                              className="micro-action"
+                              onClick={() => openStrategyProposal(sourceProposalId, jobStrategyId)}
+                            >
+                              来源提案
+                            </button>
+                          )}
+                          {getAgentJobStrategyId(job) && (
+                            <button
+                              type="button"
+                              className="micro-action"
+                              onClick={() => openStrategyActivity(getAgentJobStrategyId(job))}
+                            >
+                              打开策略
+                            </button>
+                          )}
+                          {canRetryAgentJob(job.status) && (
+                            <button
+                              type="button"
+                              className="micro-action"
                               disabled={!serviceAvailable || retryAgentJobMutation.isPending}
                               onClick={() => retryAgentJob(job.id)}
                             >
@@ -6549,7 +10007,8 @@ function App() {
                           <small>{formatTime(job.updated_at)}</small>
                         </div>
                       </div>
-                    ))}
+                    )
+                  })}
                     {!scheduler?.jobs.length && <div className="empty-state empty-state--inline">当前没有排队任务</div>}
                   </div>
                 </div>
@@ -6563,6 +10022,15 @@ function App() {
                       (() => {
                         const meta = eventCategoryMeta(event.event_type)
                         const Icon = meta.icon
+                        const linkedReviewId = getAuditLinkedReviewId(event.payload)
+                        const auditJobId = getAuditJobId(event.payload)
+                        const auditChangeRequestId = getAuditChangeRequestId(event.payload)
+                        const eventStrategyId = event.strategy_id ?? getAuditStrategyId(event.payload)
+                        const backtestId = getAuditBacktestId(event.payload)
+                        const sourceBacktestId = getAuditSourceBacktestId(event.payload)
+                        const sourceReviewId = getAuditSourceReviewId(event.payload)
+                        const sourceProposalId = getAuditSourceProposalId(event.payload)
+                        const impactMeta = auditImpactMeta(event.payload)
                         return (
                           <div key={event.id} className="job-row job-row--fade" style={{ animationDelay: `${index * 26}ms` }}>
                             <div className="console-row__main">
@@ -6571,28 +10039,78 @@ function App() {
                                 {meta.label} · {event.event_type}
                               </strong>
                               <p>{event.source === 'openclaw' ? 'OpenClaw' : '桌面控制端'} · {event.symbol ?? '系统'} · {event.strategy_id ?? '无策略'}</p>
+                              {impactMeta && <p>{impactMeta.detail}</p>}
                             </div>
                             <div className="job-meta">
                               <span className="console-tag">{event.severity}</span>
-                              {getAuditLinkedReviewId(event.payload) && (
+                              {auditJobId && (
                                 <button
                                   type="button"
                                   className="micro-action"
-                                  onClick={() =>
-                                    openReviewInspector(
-                                      getAuditLinkedReviewId(event.payload),
-                                      event.strategy_id ?? getAuditStrategyId(event.payload),
-                                    )
-                                  }
+                                  onClick={() => openAiSchedulerJob(auditJobId)}
+                                >
+                                  打开任务
+                                </button>
+                              )}
+                              {linkedReviewId && (
+                                <button
+                                  type="button"
+                                  className="micro-action"
+                                  onClick={() => openReviewInspector(linkedReviewId, eventStrategyId)}
                                 >
                                   查看结果
                                 </button>
                               )}
-                              {!getAuditLinkedReviewId(event.payload) && (event.strategy_id || getAuditStrategyId(event.payload)) && (
+                              {auditChangeRequestId && eventStrategyId && (
                                 <button
                                   type="button"
                                   className="micro-action"
-                                  onClick={() => openStrategyActivity(event.strategy_id ?? getAuditStrategyId(event.payload))}
+                                  onClick={() => openChangeRequest(auditChangeRequestId, eventStrategyId)}
+                                >
+                                  查看变更
+                                </button>
+                              )}
+                              {backtestId && eventStrategyId && (
+                                <button
+                                  type="button"
+                                  className="micro-action"
+                                  onClick={() => openBacktestDetail(backtestId, eventStrategyId)}
+                                >
+                                  打开回测
+                                </button>
+                              )}
+                              {sourceBacktestId && eventStrategyId && sourceBacktestId !== backtestId && (
+                                <button
+                                  type="button"
+                                  className="micro-action"
+                                  onClick={() => openBacktestDetail(sourceBacktestId, eventStrategyId)}
+                                >
+                                  来源回测
+                                </button>
+                              )}
+                              {sourceReviewId && eventStrategyId && sourceReviewId !== linkedReviewId && (
+                                <button
+                                  type="button"
+                                  className="micro-action"
+                                  onClick={() => openSourceReview(sourceReviewId, eventStrategyId)}
+                                >
+                                  来源复盘
+                                </button>
+                              )}
+                              {sourceProposalId && eventStrategyId && (
+                                <button
+                                  type="button"
+                                  className="micro-action"
+                                  onClick={() => openStrategyProposal(sourceProposalId, eventStrategyId)}
+                                >
+                                  来源提案
+                                </button>
+                              )}
+                              {!linkedReviewId && eventStrategyId && (
+                                <button
+                                  type="button"
+                                  className="micro-action"
+                                  onClick={() => openStrategyActivity(eventStrategyId)}
                                 >
                                   打开策略
                                 </button>
@@ -7092,18 +10610,73 @@ function App() {
               {replayFocusReview ? (
                 <div className="replay-focus">
                   <div className="replay-focus__summary">
-                    <span className={reviewPeriodChipClass(replayFocusReview.period)}>
-                      {reviewPeriodLabel(replayFocusReview.period)}
-                    </span>
+                    <div className="chip-row">
+                      <span className={reviewPeriodChipClass(replayFocusReview.period)}>
+                        {reviewPeriodLabel(replayFocusReview.period)}
+                      </span>
+                      {replayFocusReviewDecisionMeta && replayFocusReviewDecisionMeta.label !== '可继续判断' && (
+                        <span className={replayFocusReviewDecisionMeta.chipClass}>{replayFocusReviewDecisionMeta.label}</span>
+                      )}
+                    </div>
                     <strong>{replayFocusReview.title}</strong>
                     <p>{replayFocusReview.summary}</p>
+                    {replayFocusReviewDecisionMeta && (
+                      <p className="panel-note">
+                        结论门禁: {replayFocusReviewDecisionMeta.description}
+                        {replayFocusReviewDecisionMeta.nextAction ? ` · 建议 ${replayFocusReviewDecisionMeta.nextAction}` : ''}
+                      </p>
+                    )}
                     {(replayFocusReview.source_job_type || replayFocusReview.source_job_status) && (
                       <p className="panel-note">
                         {replayFocusReview.source_job_type ? `来源任务 · ${replayFocusReview.source_job_type}` : '来源任务'}
                         {replayFocusReview.source_job_status ? ` · ${jobStatusLabel(replayFocusReview.source_job_status)}` : ''}
                       </p>
                     )}
+                    {replayFocusReviewLineageMeta && (
+                      <p className="panel-note">来源链路: {replayFocusReviewLineageMeta.detail}</p>
+                    )}
                     <div className="inline-actions inline-actions--tight">
+                      {replayFocusReview.source_change_request_id && (
+                        <button
+                          type="button"
+                          className="micro-action"
+                          onClick={() => openChangeRequest(replayFocusReview.source_change_request_id, replayFocusReview.strategy_id)}
+                        >
+                          打开来源变更
+                        </button>
+                      )}
+                      {replayFocusReview.source_backtest_id && (
+                        <button
+                          type="button"
+                          className="micro-action"
+                          onClick={() => openBacktestDetail(replayFocusReview.source_backtest_id, replayFocusReview.strategy_id)}
+                        >
+                          打开来源回测
+                        </button>
+                      )}
+                      {replayFocusReview.source_review_id && (
+                        <button
+                          type="button"
+                          className="micro-action"
+                          onClick={() => openSourceReview(replayFocusReview.source_review_id, replayFocusReview.strategy_id)}
+                        >
+                          打开来源复盘
+                        </button>
+                      )}
+                      {replayFocusReview.source_proposal_id && replayFocusReview.strategy_id && (
+                        <button
+                          type="button"
+                          className="micro-action"
+                          onClick={() =>
+                            openStrategyProposal(
+                              replayFocusReview.source_proposal_id,
+                              replayFocusReview.strategy_id,
+                            )
+                          }
+                        >
+                          打开来源提案
+                        </button>
+                      )}
                       {replayFocusReview.source_job_id && (
                         <button
                           type="button"
@@ -7122,6 +10695,20 @@ function App() {
                           打开策略
                         </button>
                       )}
+                      {replayFocusReview.strategy_id &&
+                        replayFocusReviewDecisionMeta?.recommendedRange &&
+                        replayFocusReviewDecisionMeta?.recommendedTimeframe && (
+                          <button
+                            type="button"
+                            className="micro-action"
+                            disabled={!serviceAvailable || backtestMutation.isPending}
+                            onClick={() => {
+                              void rerunBacktestFromReview(replayFocusReview)
+                            }}
+                          >
+                            按建议重跑
+                          </button>
+                        )}
                     </div>
                   </div>
                   <div className="replay-focus__signals">
@@ -7309,47 +10896,74 @@ function App() {
                   <span className="chip chip--muted">{replayProposalFeed.length} 条</span>
                 </div>
               <div className="job-list">
-                {replayProposalFeed.map((item, index) => (
-                  <div key={item.proposal.id} className="job-row job-row--fade" style={{ animationDelay: `${index * 26}ms` }}>
-                    <div className="console-row__main">
-                      <strong>
-                        <Sparkles size={13} />
-                        {item.proposal.title}
-                      </strong>
-                      <p>{item.reviewTitle} · {proposalTypeLabel(item.proposal.proposal_type)} · {item.proposal.expected_impact}</p>
-                    </div>
-                    <div className="job-meta">
-                      <span className="console-tag">{proposalStatusLabel(item.proposal.status)}</span>
-                      <small>{formatTime(item.proposal.created_at)}</small>
-                      {(item.proposal.status === 'pending' || item.proposal.status === 'testing') && (
-                        <div className="inline-actions">
-                          {(() => {
-                            const blockedReason = proposalAcceptBlockedReason(item.proposal.proposal_type, snapshot?.scheduler)
-                            return (
+                {replayProposalFeed.map((item, index) => {
+                  const linkedBacktest = proposalBacktestMap.get(item.proposal.id) ?? null
+                  const linkedReview = proposalReviewMap.get(item.proposal.id) ?? null
+                  return (
+                    <div
+                      key={item.proposal.id}
+                      className={`job-row job-row--fade ${selectedProposalId === item.proposal.id ? 'job-row--active' : ''}`}
+                      style={{ animationDelay: `${index * 26}ms` }}
+                    >
+                      <div className="console-row__main">
+                        <strong>
+                          <Sparkles size={13} />
+                          {item.proposal.title}
+                        </strong>
+                        <p>{item.reviewTitle} · {proposalTypeLabel(item.proposal.proposal_type)} · {item.proposal.expected_impact}</p>
+                      </div>
+                      <div className="job-meta">
+                        <span className="console-tag">{proposalStatusLabel(item.proposal.status)}</span>
+                        {selectedProposalId === item.proposal.id && <span className="console-tag console-tag--warn">来源提案</span>}
+                        {linkedBacktest && (
                           <button
                             type="button"
-                            className="ghost-button ghost-button--inline"
-                            title={blockedReason ?? '接受当前提案'}
-                            disabled={!serviceAvailable || proposalMutation.isPending || Boolean(blockedReason)}
-                            onClick={() => handleProposalAction(item.proposal.id, 'accept')}
+                            className="micro-action"
+                            onClick={() => openBacktestDetail(linkedBacktest.id, item.proposal.strategy_id)}
                           >
-                            接受
+                            生成回测
                           </button>
-                            )
-                          })()}
+                        )}
+                        {linkedReview && (
                           <button
                             type="button"
-                            className="ghost-button ghost-button--inline"
-                            disabled={!serviceAvailable || proposalMutation.isPending}
-                            onClick={() => handleProposalAction(item.proposal.id, 'reject')}
+                            className="micro-action"
+                            onClick={() => openReplayReview(linkedReview.id, item.proposal.strategy_id, 'selected')}
                           >
-                            拒绝
+                            生成复盘
                           </button>
-                        </div>
-                      )}
+                        )}
+                        <small>{formatTime(item.proposal.created_at)}</small>
+                        {(item.proposal.status === 'pending' || item.proposal.status === 'testing') && (
+                          <div className="inline-actions">
+                            {(() => {
+                              const blockedReason = proposalAcceptBlockedReason(item.proposal.proposal_type, snapshot?.scheduler)
+                              return (
+                                <button
+                                  type="button"
+                                  className="ghost-button ghost-button--inline"
+                                  title={blockedReason ?? '接受当前提案'}
+                                  disabled={!serviceAvailable || proposalMutation.isPending || Boolean(blockedReason)}
+                                  onClick={() => handleProposalAction(item.proposal.id, 'accept')}
+                                >
+                                  接受
+                                </button>
+                              )
+                            })()}
+                            <button
+                              type="button"
+                              className="ghost-button ghost-button--inline"
+                              disabled={!serviceAvailable || proposalMutation.isPending}
+                              onClick={() => handleProposalAction(item.proposal.id, 'reject')}
+                            >
+                              拒绝
+                            </button>
+                          </div>
+                        )}
+                      </div>
                     </div>
-                  </div>
-                ))}
+                  )
+                })}
                 {!replayProposalFeed.length && <div className="empty-state empty-state--inline">当前没有可处理的提案</div>}
               </div>
             </article>
@@ -7424,6 +11038,14 @@ function App() {
                 {filteredAuditEvents.map((item, index) => {
                   const meta = eventCategoryMeta(item.event_type)
                   const MetaIcon = meta.icon
+                  const auditLinkedReviewId = getAuditLinkedReviewId(item.payload)
+                  const auditJobId = getAuditJobId(item.payload)
+                  const auditStrategyId = getAuditStrategyId(item.payload)
+                  const auditBacktestId = getAuditBacktestId(item.payload)
+                  const auditSourceBacktestId = getAuditSourceBacktestId(item.payload)
+                  const auditSourceReviewId = getAuditSourceReviewId(item.payload)
+                  const auditSourceProposalId = getAuditSourceProposalId(item.payload)
+                  const impactMeta = auditImpactMeta(item.payload)
                   return (
                     <div key={item.id} className="audit-row audit-row--fade" style={{ animationDelay: `${index * 24}ms` }}>
                       <div className="console-row__main">
@@ -7432,28 +11054,69 @@ function App() {
                           {meta.label} · {item.event_type}
                         </strong>
                         <p>{item.source} · {item.symbol ?? '全局'} · {summarizeAuditEvent(item.payload)}</p>
+                        {impactMeta && <p>{impactMeta.detail}</p>}
                       </div>
                       <div className="trade-meta">
                         <span className={`status-chip status-${item.severity}`}>{item.severity}</span>
-                        {getAuditLinkedReviewId(item.payload) && (
+                        {auditJobId && (
                           <button
                             type="button"
                             className="micro-action"
-                            onClick={() =>
-                              openReviewInspector(
-                                getAuditLinkedReviewId(item.payload),
-                                getAuditStrategyId(item.payload),
-                              )
-                            }
+                            onClick={() => openAiSchedulerJob(auditJobId)}
+                          >
+                            打开任务
+                          </button>
+                        )}
+                        {auditLinkedReviewId && (
+                          <button
+                            type="button"
+                            className="micro-action"
+                            onClick={() => openReviewInspector(auditLinkedReviewId, auditStrategyId)}
                           >
                             查看结果
                           </button>
                         )}
-                        {!getAuditLinkedReviewId(item.payload) && getAuditStrategyId(item.payload) && (
+                        {auditBacktestId && auditStrategyId && (
                           <button
                             type="button"
                             className="micro-action"
-                            onClick={() => openStrategyActivity(getAuditStrategyId(item.payload))}
+                            onClick={() => openBacktestDetail(auditBacktestId, auditStrategyId)}
+                          >
+                            打开回测
+                          </button>
+                        )}
+                        {auditSourceBacktestId && auditStrategyId && auditSourceBacktestId !== auditBacktestId && (
+                          <button
+                            type="button"
+                            className="micro-action"
+                            onClick={() => openBacktestDetail(auditSourceBacktestId, auditStrategyId)}
+                          >
+                            来源回测
+                          </button>
+                        )}
+                        {auditSourceReviewId && auditStrategyId && auditSourceReviewId !== auditLinkedReviewId && (
+                          <button
+                            type="button"
+                            className="micro-action"
+                            onClick={() => openSourceReview(auditSourceReviewId, auditStrategyId)}
+                          >
+                            来源复盘
+                          </button>
+                        )}
+                        {auditSourceProposalId && auditStrategyId && (
+                          <button
+                            type="button"
+                            className="micro-action"
+                            onClick={() => openStrategyProposal(auditSourceProposalId, auditStrategyId)}
+                          >
+                            来源提案
+                          </button>
+                        )}
+                        {!auditLinkedReviewId && auditStrategyId && (
+                          <button
+                            type="button"
+                            className="micro-action"
+                            onClick={() => openStrategyActivity(auditStrategyId)}
                           >
                             打开策略
                           </button>

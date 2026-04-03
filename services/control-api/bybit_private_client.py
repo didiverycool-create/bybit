@@ -51,6 +51,10 @@ class BybitPrivateClient:
         }
         return config
 
+    @property
+    def example_config_path(self) -> Path:
+        return Path(__file__).resolve().parent / "private-api.example.json"
+
     @staticmethod
     def _infer_mode(base_url: str, explicit_mode: Optional[str]) -> AccountMode:
         if explicit_mode in {"paper", "demo", "live"}:
@@ -79,6 +83,9 @@ class BybitPrivateClient:
             configured=bool(api_key and api_secret),
             can_query_private=bool(api_key and api_secret),
             source=config.get("source", "none"),
+            config_path=str(self.config_path),
+            config_exists=self.config_path.exists(),
+            example_config_path=str(self.example_config_path),
             api_base_url=api_base_url,
             account_type=str(config.get("account_type") or "UNIFIED"),
             mode=mode,

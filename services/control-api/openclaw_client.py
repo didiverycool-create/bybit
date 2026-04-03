@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -266,6 +267,9 @@ class OpenClawGatewayClient:
 
         return OpenClawStatus(
             configured=bool(config),
+            config_path=str(self.config_path),
+            config_exists=self.config_path.exists(),
+            command_available=shutil.which("openclaw") is not None,
             gateway_url=gateway_url,
             auth_mode=gateway.get("auth", {}).get("mode"),
             default_agent=agents.get("defaultAgent"),

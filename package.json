@@ -9,6 +9,7 @@
   "scripts": {
     "dev": "npm --workspace apps/desktop run dev",
     "dev:desktop": "npm --workspace apps/desktop run dev",
+    "dev:desktop:repair": "npm --workspace apps/desktop run dev:repair",
     "build": "npm --workspace apps/desktop run build",
     "build:desktop": "npm --workspace apps/desktop run build",
     "lint": "npm --workspace apps/desktop run lint",

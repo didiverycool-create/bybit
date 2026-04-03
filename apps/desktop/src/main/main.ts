@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, Menu, Notification, Tray, nativeImage } from "electron";
+import { app, BrowserWindow, ipcMain, Menu, Notification, Tray, nativeImage, screen, shell } from "electron";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -14,8 +14,131 @@ type DesktopNotificationPayload = {
   silent?: boolean;
 };
 
+type DesktopOpenPathPayload = {
+  path?: string;
+  revealInFolder?: boolean;
+};
+
+type DesktopOpenPathResult = {
+  ok: boolean;
+  path?: string;
+  message?: string;
+};
+
 let mainWindow: BrowserWindow | null = null;
 let appTray: Tray | null = null;
+
+type WindowBoundsState = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  maximized: boolean;
+};
+
+const defaultWindowWidth = 1600;
+const defaultWindowHeight = 1020;
+const minWindowWidth = 1280;
+const minWindowHeight = 820;
+const windowStateFileName = "window-state.json";
+
+function windowStateFilePath() {
+  return path.join(app.getPath("userData"), windowStateFileName);
+}
+
+function coerceNumber(value: unknown) {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function readWindowBoundsState(): WindowBoundsState | null {
+  try {
+    const raw = fs.readFileSync(windowStateFilePath(), "utf-8");
+    const parsed = JSON.parse(raw) as Partial<WindowBoundsState>;
+    const x = coerceNumber(parsed.x);
+    const y = coerceNumber(parsed.y);
+    const width = coerceNumber(parsed.width);
+    const height = coerceNumber(parsed.height);
+    if (x == null || y == null || width == null || height == null) {
+      return null;
+    }
+    return {
+      x,
+      y,
+      width,
+      height,
+      maximized: parsed.maximized === true,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function resolveWindowBoundsState() {
+  const saved = readWindowBoundsState();
+  if (!saved) {
+    return {
+      bounds: {
+        width: defaultWindowWidth,
+        height: defaultWindowHeight,
+      },
+      maximized: false,
+    };
+  }
+
+  const width = Math.max(minWindowWidth, Math.round(saved.width));
+  const height = Math.max(minWindowHeight, Math.round(saved.height));
+  const bounds = {
+    x: Math.round(saved.x),
+    y: Math.round(saved.y),
+    width,
+    height,
+  };
+  const display = screen.getDisplayMatching(bounds);
+  const workArea = display.workArea;
+  const intersectsVisibleArea =
+    bounds.x < workArea.x + workArea.width &&
+    bounds.x + bounds.width > workArea.x &&
+    bounds.y < workArea.y + workArea.height &&
+    bounds.y + bounds.height > workArea.y;
+
+  if (!intersectsVisibleArea) {
+    return {
+      bounds: {
+        width: defaultWindowWidth,
+        height: defaultWindowHeight,
+      },
+      maximized: false,
+    };
+  }
+
+  return {
+    bounds,
+    maximized: saved.maximized,
+  };
+}
+
+function snapshotWindowBoundsState(win: BrowserWindow): WindowBoundsState {
+  const bounds = win.isMaximized() ? win.getNormalBounds() : win.getBounds();
+  return {
+    x: bounds.x,
+    y: bounds.y,
+    width: bounds.width,
+    height: bounds.height,
+    maximized: win.isMaximized(),
+  };
+}
+
+function persistWindowBoundsState(win: BrowserWindow) {
+  try {
+    fs.writeFileSync(
+      windowStateFilePath(),
+      JSON.stringify(snapshotWindowBoundsState(win), null, 2),
+      "utf-8",
+    );
+  } catch (error) {
+    console.error("[window-state:save-failed]", error);
+  }
+}
 
 function createTrayIcon() {
   const svg = `
@@ -81,11 +204,11 @@ function createTray() {
 }
 
 function createWindow() {
+  const initialWindowState = resolveWindowBoundsState();
   const win = new BrowserWindow({
-    width: 1600,
-    height: 1020,
-    minWidth: 1280,
-    minHeight: 820,
+    ...initialWindowState.bounds,
+    minWidth: minWindowWidth,
+    minHeight: minWindowHeight,
     show: false,
     backgroundColor: "#0b1220",
     title: "Bybit 量化交易控制端",
@@ -177,14 +300,23 @@ function createWindow() {
   }
 
   win.once("ready-to-show", () => {
+    if (initialWindowState.maximized) {
+      win.maximize();
+    }
     win.show();
     win.focus();
+    persistWindowBoundsState(win);
     updateTrayMenu();
   });
 
+  win.on("move", () => persistWindowBoundsState(win));
+  win.on("resize", () => persistWindowBoundsState(win));
+  win.on("maximize", () => persistWindowBoundsState(win));
+  win.on("unmaximize", () => persistWindowBoundsState(win));
   win.on("show", () => updateTrayMenu());
   win.on("hide", () => updateTrayMenu());
   win.on("focus", () => updateTrayMenu());
+  win.on("close", () => persistWindowBoundsState(win));
   win.on("closed", () => {
     if (mainWindow === win) {
       mainWindow = null;
@@ -229,6 +361,89 @@ ipcMain.handle("desktop-notification:show", (_event, payload: DesktopNotificatio
   notification.show();
   return true;
 });
+
+ipcMain.handle(
+  "desktop-path:open",
+  async (_event, payload: DesktopOpenPathPayload): Promise<DesktopOpenPathResult> => {
+    const requestedPath = typeof payload?.path === "string" ? payload.path.trim() : "";
+    if (!requestedPath) {
+      return {
+        ok: false,
+        message: "未提供有效路径。",
+      };
+    }
+
+    if (!path.isAbsolute(requestedPath)) {
+      return {
+        ok: false,
+        path: requestedPath,
+        message: "当前路径不是本机绝对路径，无法直接打开。",
+      };
+    }
+
+    const normalizedPath = path.normalize(requestedPath);
+    const targetExists = fs.existsSync(normalizedPath);
+    const revealDirectory = path.dirname(normalizedPath);
+
+    try {
+      if (payload?.revealInFolder) {
+        if (targetExists) {
+          shell.showItemInFolder(normalizedPath);
+          return {
+            ok: true,
+            path: normalizedPath,
+          };
+        }
+        if (!fs.existsSync(revealDirectory)) {
+          return {
+            ok: false,
+            path: normalizedPath,
+            message: "目标路径和所在目录都不存在，无法打开。",
+          };
+        }
+        const openDirectoryError = await shell.openPath(revealDirectory);
+        if (openDirectoryError) {
+          return {
+            ok: false,
+            path: revealDirectory,
+            message: openDirectoryError,
+          };
+        }
+        return {
+          ok: true,
+          path: revealDirectory,
+        };
+      }
+
+      if (!targetExists) {
+        return {
+          ok: false,
+          path: normalizedPath,
+          message: "目标文件不存在，无法直接打开。",
+        };
+      }
+
+      const openError = await shell.openPath(normalizedPath);
+      if (openError) {
+        return {
+          ok: false,
+          path: normalizedPath,
+          message: openError,
+        };
+      }
+      return {
+        ok: true,
+        path: normalizedPath,
+      };
+    } catch (error) {
+      return {
+        ok: false,
+        path: normalizedPath,
+        message: error instanceof Error ? error.message : String(error),
+      };
+    }
+  },
+);
 
 app.whenReady().then(() => {
   createWindow();
