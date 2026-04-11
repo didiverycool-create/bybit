@@ -1,9 +1,19 @@
 import { app, BrowserWindow, ipcMain, Menu, Notification, Tray, nativeImage, screen, shell } from "electron";
 import fs from "node:fs";
 import path from "node:path";
+import { runRequestedSmokeOnLoad, shouldCloseRequestedSmokeOnLogMessage } from "./runRequestedSmokeOnLoad";
 
 const isDev = !app.isPackaged;
 const shouldOpenDevTools = process.env.BYBIT_OPEN_DEVTOOLS === "1";
+const shouldRunMarketSwitchSmoke = isDev && process.env.BYBIT_SMOKE_MARKET_SWITCH === "1";
+const shouldRunStrategyActivitySmoke = isDev && process.env.BYBIT_SMOKE_STRATEGY_ACTIVITY === "1";
+const strategyActivitySmokeRenderBudgetMs = Number(
+  process.env.BYBIT_SMOKE_STRATEGY_ACTIVITY_RENDER_BUDGET_MS ?? "30000",
+);
+const controlApiBase =
+  process.env.BYBIT_CONTROL_API_BASE ??
+  process.env.VITE_CONTROL_API_BASE ??
+  "http://127.0.0.1:8787";
 
 app.disableHardwareAcceleration();
 
@@ -221,83 +231,44 @@ function createWindow() {
   mainWindow = win;
 
   if (isDev) {
+    let requestedSmokeStarted = false;
     win.loadURL("http://localhost:5173");
     if (shouldOpenDevTools) {
       win.webContents.openDevTools({ mode: "detach" });
     }
     win.webContents.on("console-message", (_event, level, message, line, sourceId) => {
       console.log(`[renderer:${level}] ${sourceId}:${line} ${message}`);
+      if (
+        shouldCloseRequestedSmokeOnLogMessage(message, {
+          shouldRunStrategyActivitySmoke,
+          shouldRunMarketSwitchSmoke,
+        })
+      ) {
+        setTimeout(() => {
+          if (!win.isDestroyed()) {
+            win.close();
+          }
+        }, 100);
+      }
     });
     win.webContents.on("did-fail-load", (_event, errorCode, errorDescription, validatedURL) => {
       console.error(`[renderer:load-failed] ${errorCode} ${errorDescription} ${validatedURL}`);
     });
     win.webContents.on("did-finish-load", async () => {
-      try {
-        const snapshot = await win.webContents.executeJavaScript(`
-          (() => {
-            const root = document.querySelector('#root');
-            const shell = document.querySelector('.app-shell');
-            const sidebar = document.querySelector('.sidebar');
-            const workspace = document.querySelector('.workspace');
-            const brand = document.querySelector('.brand');
-            const shellStyle = shell ? getComputedStyle(shell) : null;
-            const sidebarStyle = sidebar ? getComputedStyle(sidebar) : null;
-            const workspaceStyle = workspace ? getComputedStyle(workspace) : null;
-            const brandStyle = brand ? getComputedStyle(brand) : null;
-            const sample = (x, y) => {
-              const el = document.elementFromPoint(x, y);
-              return {
-                x,
-                y,
-                tag: el?.tagName ?? null,
-                className: el?.className ?? null,
-                text: el?.textContent?.trim().slice(0, 40) ?? null,
-              };
-            };
-            const title = document.title;
-            return {
-              title,
-              rootHtmlLength: root?.innerHTML.length ?? 0,
-              hasAppShell: Boolean(shell),
-              shellRect: shell ? shell.getBoundingClientRect().toJSON() : null,
-              sidebarRect: sidebar ? sidebar.getBoundingClientRect().toJSON() : null,
-              workspaceRect: workspace ? workspace.getBoundingClientRect().toJSON() : null,
-              shellDisplay: shellStyle?.display ?? null,
-              shellGrid: shellStyle?.gridTemplateColumns ?? null,
-              shellOpacity: shellStyle?.opacity ?? null,
-              sidebarVisibility: sidebarStyle?.visibility ?? null,
-              sidebarOpacity: sidebarStyle?.opacity ?? null,
-              workspaceVisibility: workspaceStyle?.visibility ?? null,
-              workspaceOpacity: workspaceStyle?.opacity ?? null,
-              brandRect: brand ? brand.getBoundingClientRect().toJSON() : null,
-              brandDisplay: brandStyle?.display ?? null,
-              brandColor: brandStyle?.color ?? null,
-              sampleTopLeft: sample(40, 90),
-              sampleSidebar: sample(120, 150),
-              sampleWorkspace: sample(420, 160),
-              bodyTextLength: document.body.innerText.length,
-              bodyTextPreview: document.body.innerText.slice(0, 120),
-            };
-          })()
-        `);
-        console.log("[renderer:dom]", JSON.stringify(snapshot));
-        setTimeout(async () => {
-          try {
-            const image = await win.webContents.capturePage();
-            const output = "/tmp/bybit-electron-capture.png";
-            fs.writeFileSync(output, image.toPNG());
-            console.log("[renderer:capture]", output);
-          } catch (error) {
-            console.error("[renderer:capture-failed]", error);
-          }
-        }, 1800);
-      } catch (error) {
-        console.error("[renderer:dom-failed]", error);
+      if (requestedSmokeStarted || (!shouldRunStrategyActivitySmoke && !shouldRunMarketSwitchSmoke)) {
+        return;
       }
+      requestedSmokeStarted = true;
+      await runRequestedSmokeOnLoad(win, {
+        shouldRunStrategyActivitySmoke,
+        shouldRunMarketSwitchSmoke,
+        controlApiBase,
+        strategyActivitySmokeRenderBudgetMs,
+      });
     });
   } else {
     win.loadFile(path.join(__dirname, "../../dist/index.html"));
-  }
+  } 
 
   win.once("ready-to-show", () => {
     if (initialWindowState.maximized) {

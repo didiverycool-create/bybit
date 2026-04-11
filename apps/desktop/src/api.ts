@@ -17,7 +17,6 @@ import type {
   LatestSchedulerCommand,
   MarketDetail,
   MarketLiveSnapshot,
-  MarketRecentTrade,
   NewsEvent,
   OpenClawStatus,
   OpsLiveSnapshot,
@@ -46,6 +45,36 @@ import type {
 const API_BASE = (import.meta.env.VITE_CONTROL_API_BASE as string | undefined) ?? 'http://127.0.0.1:8787'
 export const CONTROL_API_BASE = API_BASE
 
+let pageUnloading = false
+
+if (typeof window !== 'undefined') {
+  window.addEventListener('beforeunload', () => {
+    pageUnloading = true
+  })
+  window.addEventListener('pagehide', () => {
+    pageUnloading = true
+  })
+  window.addEventListener('pageshow', () => {
+    pageUnloading = false
+  })
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') {
+      pageUnloading = false
+    }
+  })
+}
+
+function shouldSuppressTransientFallback(error: unknown): boolean {
+  if (!pageUnloading) {
+    return false
+  }
+  if (error instanceof DOMException && error.name === 'AbortError') {
+    return true
+  }
+  const message = error instanceof Error ? error.message : String(error)
+  return /failed to fetch/i.test(message)
+}
+
 async function fetchJson<T>(path: string, fallback: T): Promise<T> {
   try {
     const response = await fetch(`${API_BASE}${path}`)
@@ -54,9 +83,29 @@ async function fetchJson<T>(path: string, fallback: T): Promise<T> {
     }
     return (await response.json()) as T
   } catch (error) {
-    console.warn(`使用本地 fallback: ${path}`, error)
+    if (!shouldSuppressTransientFallback(error)) {
+      console.warn(`使用本地 fallback: ${path}`, error)
+    }
     return fallback
   }
+}
+
+async function fetchJsonStrict<T>(path: string): Promise<T> {
+  const response = await fetch(`${API_BASE}${path}`)
+  if (!response.ok) {
+    const text = await response.text()
+    let detail = text || `HTTP ${response.status}`
+    try {
+      const parsed = JSON.parse(text) as { detail?: string }
+      if (typeof parsed.detail === 'string' && parsed.detail.trim()) {
+        detail = parsed.detail.trim()
+      }
+    } catch {
+      // keep raw text fallback
+    }
+    throw new Error(detail)
+  }
+  return (await response.json()) as T
 }
 
 async function fetchText(path: string, fallback: string): Promise<string> {
@@ -67,7 +116,9 @@ async function fetchText(path: string, fallback: string): Promise<string> {
     }
     return await response.text()
   } catch (error) {
-    console.warn(`使用本地 fallback 文本: ${path}`, error)
+    if (!shouldSuppressTransientFallback(error)) {
+      console.warn(`使用本地 fallback 文本: ${path}`, error)
+    }
     return fallback
   }
 }
@@ -241,162 +292,6 @@ const fallbackSnapshot: ControlSnapshot = {
     top_issue: null,
   },
 }
-
-const fallbackWatchlist: WatchlistInstrument[] = [
-  {
-    symbol: 'BTCUSDT',
-    market: 'perp',
-    last_price: 86125.4,
-    change_24h: 3.82,
-    volume_24h: 1389000000,
-    signal: 'active',
-    position_side: 'long',
-    risk_level: 'medium',
-    alert_enabled: true,
-    alert_threshold_pct: 2.8,
-  },
-  {
-    symbol: 'ETHUSDT',
-    market: 'perp',
-    last_price: 4832.6,
-    change_24h: 2.17,
-    volume_24h: 912000000,
-    signal: 'watch',
-    position_side: 'flat',
-    risk_level: 'medium',
-    alert_enabled: true,
-    alert_threshold_pct: 2,
-  },
-]
-
-function normalizeMarketTimeframe(timeframe: string) {
-  const normalized = String(timeframe || '1h').trim().toLowerCase()
-  return (
-    {
-      '15': '15m',
-      '15m': '15m',
-      '60': '1h',
-      '1h': '1h',
-      '240': '4h',
-      '4h': '4h',
-      d: '1d',
-      '1d': '1d',
-    }[normalized] ?? '1h'
-  )
-}
-
-function buildFallbackCandles(base: number, timeframe = '1h') {
-  const normalized = normalizeMarketTimeframe(timeframe)
-  const stepHours =
-    {
-      '15m': 0.25,
-      '1h': 1,
-      '4h': 4,
-      '1d': 24,
-    }[normalized] ?? 1
-  return Array.from({ length: 24 }, (_, index) => {
-    const close = base + Math.sin(index / 3) * base * 0.008
-    return {
-      time: new Date(Date.now() - (24 - index) * stepHours * 3600_000).toISOString(),
-      open: close * 0.992,
-      high: close * 1.008,
-      low: close * 0.986,
-      close,
-      volume: 1200 + index * 37,
-    }
-  })
-}
-
-function buildFallbackRecentTrades(base: number): MarketRecentTrade[] {
-  return Array.from({ length: 10 }, (_, index) => {
-    const side = index % 3 === 1 ? 'sell' : 'buy'
-    const priceShift = (0.0008 + index * 0.00035) * base
-    const price = side === 'buy' ? base + priceShift : base - priceShift
-    const size = Number((0.35 + index * 0.22).toFixed(4))
-    return {
-      side,
-      price: Number(price.toFixed(2)),
-      size,
-      value: Number((price * size).toFixed(2)),
-      occurred_at: new Date(Date.now() - index * 90_000).toISOString(),
-      is_block_trade: size >= 1.8,
-    }
-  })
-}
-
-const fallbackMarketDetails: Record<string, MarketDetail> = {
-  BTCUSDT: {
-    symbol: 'BTCUSDT',
-    market: 'perp',
-    timeframe: '1h',
-    candles: buildFallbackCandles(86125.4),
-    bids: Array.from({ length: 6 }, (_, index) => ({
-      price: 86125.4 - index * 2.5,
-      size: 8 + index * 1.6,
-      total: 8 + index * 4,
-    })),
-    asks: Array.from({ length: 6 }, (_, index) => ({
-      price: 86125.4 + index * 2.5,
-      size: 7 + index * 1.3,
-      total: 7 + index * 3.8,
-    })),
-    recent_public_trades: buildFallbackRecentTrades(86125.4),
-    headline: 'BTC 仍处于趋势策略的主跟踪通道',
-    stats: {
-      '24h振幅': '6.95%',
-      资金费率: '0.012%',
-      持仓偏向: '多头占优',
-      风险热度: '中',
-    },
-    source: 'mock',
-    updated_at: new Date().toISOString(),
-  },
-  ETHUSDT: {
-    symbol: 'ETHUSDT',
-    market: 'perp',
-    timeframe: '1h',
-    candles: buildFallbackCandles(4832.6),
-    bids: Array.from({ length: 6 }, (_, index) => ({
-      price: 4832.6 - index * 0.8,
-      size: 12 + index * 2.2,
-      total: 12 + index * 5.5,
-    })),
-    asks: Array.from({ length: 6 }, (_, index) => ({
-      price: 4832.6 + index * 0.8,
-      size: 10 + index * 1.8,
-      total: 10 + index * 4.9,
-    })),
-    recent_public_trades: buildFallbackRecentTrades(4832.6),
-    headline: 'ETH 当前用于均值回归参数验证',
-    stats: {
-      '24h振幅': '5.42%',
-      资金费率: '0.009%',
-      持仓偏向: '中性',
-      风险热度: '中',
-    },
-    source: 'mock',
-    updated_at: new Date().toISOString(),
-  },
-}
-
-function buildFallbackMarketDetail(symbol: string, timeframe = '1h'): MarketDetail {
-  const normalized = normalizeMarketTimeframe(timeframe)
-  const detail = fallbackMarketDetails[symbol] ?? fallbackMarketDetails.BTCUSDT
-  const latestClose = detail.candles.at(-1)?.close ?? detail.candles[0]?.close ?? 1
-  return {
-    ...detail,
-    timeframe: normalized,
-    candles: buildFallbackCandles(latestClose, normalized),
-    recent_public_trades: buildFallbackRecentTrades(latestClose),
-  }
-}
-
-const fallbackMarketLiveSnapshot = (symbol: string, timeframe = '1h'): MarketLiveSnapshot => ({
-  selected_symbol: symbol,
-  watchlist: fallbackWatchlist,
-  detail: buildFallbackMarketDetail(symbol, timeframe),
-  generated_at: new Date().toISOString(),
-})
 
 const fallbackStrategies: StrategySummary[] = [
   {
@@ -891,6 +786,19 @@ const fallbackWorkspacePreferences: WorkspacePreferences = {
   selected_market_timeframe: '1h',
   selected_strategy_id: 'trend-btc-01',
   selected_backtest_id: null,
+  selected_scheduler_job_id: null,
+  selected_strategy_detail_panel: null,
+  selected_strategy_tracking_kind: null,
+  selected_strategy_tracking_summary: '',
+  selected_strategy_tracking_detail: '',
+  selected_strategy_editor_strategy_id: null,
+  selected_strategy_editor_parameter_drafts: {},
+  selected_strategy_editor_risk_budget_draft: '',
+  selected_review_inspector_id: null,
+  selected_review_inspector_strategy_id: null,
+  selected_review_id: null,
+  selected_proposal_id: null,
+  selected_change_request_id: null,
   backtest_filter: 'selected',
   replay_tracking_scope: 'all',
   alert_severity_filter: 'all',
@@ -938,15 +846,132 @@ const fallbackStrategyActivity = (strategyId: string): StrategyActivitySnapshot 
   market: 'perp',
   mode: fallbackStrategies.find((item) => item.id === strategyId)?.mode ?? 'paper',
   runtime: fallbackStrategyRuntime.find((item) => item.strategy_id === strategyId) ?? null,
+  latest_backtest: null,
+  latest_actionable_backtest: null,
+  latest_backtest_record: null,
+  latest_actionable_backtest_record: null,
+  latest_backtest_review: null,
+  latest_backtest_job: null,
+  latest_actionable_backtest_review: null,
+  latest_actionable_backtest_job: null,
+  latest_backtest_review_record: null,
+  latest_backtest_job_record: null,
+  latest_actionable_backtest_review_record: null,
+  latest_actionable_backtest_job_record: null,
+  latest_primary_review: null,
+  latest_actionable_primary_review: null,
+  latest_primary_review_record: null,
+  latest_actionable_primary_review_record: null,
+  latest_tracking_review: null,
+  latest_tracking_job: null,
+  latest_tracking_review_record: null,
+  latest_tracking_job_record: null,
+  latest_proposal: null,
+  latest_actionable_proposal: null,
+  latest_proposal_change_request: null,
+  latest_proposal_backtest: null,
+  latest_proposal_review: null,
+  latest_proposal_job: null,
+  latest_proposal_backtest_record: null,
+  latest_proposal_review_record: null,
+  latest_proposal_job_record: null,
+  latest_actionable_proposal_change_request: null,
+  latest_actionable_proposal_backtest: null,
+  latest_actionable_proposal_review: null,
+  latest_actionable_proposal_job: null,
+  latest_actionable_proposal_backtest_record: null,
+  latest_actionable_proposal_review_record: null,
+  latest_actionable_proposal_job_record: null,
+  latest_change_request: null,
+  latest_actionable_change_request: null,
+  latest_change_request_backtest_record: null,
+  latest_change_request_review_record: null,
+  latest_change_request_job_record: null,
+  latest_change_request_source_backtest_record: null,
+  latest_change_request_source_review_record: null,
+  latest_change_request_source_proposal_record: null,
+  latest_actionable_change_request_backtest_record: null,
+  latest_actionable_change_request_review_record: null,
+  latest_actionable_change_request_job_record: null,
+  latest_actionable_change_request_source_backtest_record: null,
+  latest_actionable_change_request_source_review_record: null,
+  latest_actionable_change_request_source_proposal_record: null,
+  latest_retryable_tracking_job: null,
+  latest_retryable_tracking_job_record: null,
+  latest_active_order: null,
+  latest_historical_order: null,
+  latest_order: null,
+  latest_pending_alert: null,
+  latest_trade: null,
+  latest_alert: null,
+  latest_active_order_record: null,
+  latest_historical_order_record: null,
+  latest_order_record: null,
+  latest_pending_alert_record: null,
+  latest_trade_record: null,
+  latest_alert_record: null,
+  latest_audit_event: null,
+  latest_audit_event_record: null,
+  recent_proposals: [],
+  recent_change_requests: [],
+  recent_backtests: [],
+  recent_reviews: [],
   active_orders: fallbackOrders.filter((item) => item.origin === 'strategy').slice(0, 6),
   recent_orders: fallbackOrders.filter((item) => item.origin === 'strategy').slice(0, 8),
   recent_trades: fallbackTrades.filter((item) => item.origin === 'strategy').slice(0, 8),
   recent_alerts: fallbackAlerts.filter((item) => item.source_type === 'system').slice(0, 6),
-  recent_audit_events: fallbackAuditEvents
+  recent_audit_events: fallbackAudit
     .filter((item) => item.strategy_id === strategyId || item.event_type.startsWith('strategy.'))
     .slice(0, 12),
+  recent_agent_jobs: [],
   generated_at: new Date().toISOString(),
 })
+
+function normalizeExecutionPreview(preview: ExecutionPreview): ExecutionPreview {
+  return {
+    ...preview,
+    warnings: Array.isArray(preview?.warnings) ? preview.warnings.filter((item): item is string => typeof item === 'string') : [],
+  }
+}
+
+function normalizeReviewDocument(review?: ReviewDocument | null): ReviewDocument | null {
+  if (!review) return null
+  return {
+    ...review,
+    highlights: Array.isArray(review.highlights) ? review.highlights.filter((item): item is string => typeof item === 'string') : [],
+    risks: Array.isArray(review.risks) ? review.risks.filter((item): item is string => typeof item === 'string') : [],
+    proposals: Array.isArray(review.proposals) ? review.proposals : [],
+  }
+}
+
+function normalizeStrategyActivitySnapshot(activity: StrategyActivitySnapshot): StrategyActivitySnapshot {
+  return {
+    ...activity,
+    latest_backtest_review_record: normalizeReviewDocument(activity.latest_backtest_review_record),
+    latest_actionable_backtest_review_record: normalizeReviewDocument(activity.latest_actionable_backtest_review_record),
+    latest_primary_review_record: normalizeReviewDocument(activity.latest_primary_review_record),
+    latest_actionable_primary_review_record: normalizeReviewDocument(activity.latest_actionable_primary_review_record),
+    latest_tracking_review_record: normalizeReviewDocument(activity.latest_tracking_review_record),
+    latest_proposal_review_record: normalizeReviewDocument(activity.latest_proposal_review_record),
+    latest_actionable_proposal_review_record: normalizeReviewDocument(activity.latest_actionable_proposal_review_record),
+    latest_change_request_review_record: normalizeReviewDocument(activity.latest_change_request_review_record),
+    latest_change_request_source_review_record: normalizeReviewDocument(activity.latest_change_request_source_review_record),
+    latest_actionable_change_request_review_record: normalizeReviewDocument(activity.latest_actionable_change_request_review_record),
+    latest_actionable_change_request_source_review_record: normalizeReviewDocument(
+      activity.latest_actionable_change_request_source_review_record,
+    ),
+    recent_proposals: Array.isArray(activity.recent_proposals) ? activity.recent_proposals : [],
+    recent_change_requests: Array.isArray(activity.recent_change_requests) ? activity.recent_change_requests : [],
+    recent_backtests: Array.isArray(activity.recent_backtests) ? activity.recent_backtests : [],
+    recent_reviews: Array.isArray(activity.recent_reviews) ? activity.recent_reviews : [],
+    active_orders: Array.isArray(activity.active_orders) ? activity.active_orders : [],
+    recent_orders: Array.isArray(activity.recent_orders) ? activity.recent_orders : [],
+    recent_trades: Array.isArray(activity.recent_trades) ? activity.recent_trades : [],
+    recent_alerts: Array.isArray(activity.recent_alerts) ? activity.recent_alerts : [],
+    recent_audit_events: Array.isArray(activity.recent_audit_events) ? activity.recent_audit_events : [],
+    recent_agent_jobs: Array.isArray(activity.recent_agent_jobs) ? activity.recent_agent_jobs : [],
+  }
+}
 
 export const api = {
   getServiceHealth,
@@ -958,7 +983,7 @@ export const api = {
       requested_by: 'desktop_operator',
       reason: '桌面端恢复策略运行线程',
     }),
-  getWatchlist: () => fetchJson('/api/market/watchlist', fallbackWatchlist),
+  getWatchlist: () => fetchJsonStrict<WatchlistInstrument[]>('/api/market/watchlist'),
   addWatchlistItem: (payload: { symbol: string; market: 'spot' | 'perp'; requested_by?: string }) =>
     postJson<WatchlistInstrument>('/api/market/watchlist', payload),
   removeWatchlistItem: (symbol: string) =>
@@ -966,19 +991,19 @@ export const api = {
       `/api/market/watchlist/${encodeURIComponent(symbol)}?requested_by=desktop_operator`,
     ),
   getMarketDetail: (symbol: string, timeframe = '1h') =>
-    fetchJson(
+    fetchJsonStrict<MarketDetail>(
       `/api/market/${symbol}?timeframe=${encodeURIComponent(timeframe)}`,
-      buildFallbackMarketDetail(symbol, timeframe),
     ),
   getMarketLiveSnapshot: (symbol: string, timeframe = '1h') =>
-    fetchJson(
+    fetchJsonStrict<MarketLiveSnapshot>(
       `/api/market/live?symbol=${encodeURIComponent(symbol)}&timeframe=${encodeURIComponent(timeframe)}`,
-      fallbackMarketLiveSnapshot(symbol, timeframe),
     ),
   getStrategies: () => fetchJson('/api/strategies', fallbackStrategies),
   getStrategyRuntime: () => fetchJson('/api/strategies/live', fallbackStrategyRuntime),
-  getStrategyActivity: (strategyId: string) =>
-    fetchJson(`/api/strategies/${encodeURIComponent(strategyId)}/activity`, fallbackStrategyActivity(strategyId)),
+  getStrategyActivity: async (strategyId: string) =>
+    normalizeStrategyActivitySnapshot(
+      await fetchJson(`/api/strategies/${encodeURIComponent(strategyId)}/activity`, fallbackStrategyActivity(strategyId)),
+    ),
   getStrategyExecutionPreview: async (strategyId: string, mode?: 'paper' | 'demo' | 'live') => {
     const path = `/api/strategies/${encodeURIComponent(strategyId)}/execution-preview${mode ? `?mode=${encodeURIComponent(mode)}` : ''}`
     try {
@@ -993,22 +1018,24 @@ export const api = {
         } catch {
           // ignore
         }
-        return {
+        return normalizeExecutionPreview({
           ...fallbackStrategyExecutionPreview,
           mode: mode ?? fallbackStrategyExecutionPreview.mode,
           strategy_id: strategyId,
           blocked_reason: detail,
           warnings: [detail],
-        }
+        })
       }
-      return (await response.json()) as ExecutionPreview
+      return normalizeExecutionPreview((await response.json()) as ExecutionPreview)
     } catch (error) {
-      console.warn(`使用本地 fallback: ${path}`, error)
-      return {
+      if (!shouldSuppressTransientFallback(error)) {
+        console.warn(`使用本地 fallback: ${path}`, error)
+      }
+      return normalizeExecutionPreview({
         ...fallbackStrategyExecutionPreview,
         mode: mode ?? fallbackStrategyExecutionPreview.mode,
         strategy_id: strategyId,
-      }
+      })
     }
   },
   getStrategyLiveSnapshot: () =>
@@ -1034,8 +1061,10 @@ export const api = {
   getAccountOrders: () => fetchJson('/api/account/orders', fallbackOrders),
   getAccountOrderHistory: () => fetchJson('/api/account/order-history', fallbackOrders),
   getTrades: () => fetchJson('/api/trades', fallbackTrades),
-  getReviews: (options?: { strategyId?: string | null; backtestId?: string | null; periods?: string[] }) =>
-    fetchJson(`/api/ai/reviews${buildReviewQueryString(options)}`, filterFallbackReviews(fallbackReviews, options)),
+  getReviews: async (options?: { strategyId?: string | null; backtestId?: string | null; periods?: string[] }) =>
+    (
+      await fetchJson(`/api/ai/reviews${buildReviewQueryString(options)}`, filterFallbackReviews(fallbackReviews, options))
+    ).map((review) => normalizeReviewDocument(review) ?? review),
   getAuditEvents: () => fetchJson('/api/audit/events', fallbackAudit),
   getSettings: () => fetchJson('/api/settings', fallbackSettings),
   updateSettings: (payload: {
@@ -1194,6 +1223,19 @@ export const api = {
     selected_market_timeframe: '15m' | '1h' | '4h' | '1d'
     selected_strategy_id?: string | null
     selected_backtest_id?: string | null
+    selected_scheduler_job_id?: string | null
+    selected_strategy_detail_panel?: 'activity' | 'tracking' | 'editor' | null
+    selected_strategy_tracking_kind?: 'issue' | 'change' | null
+    selected_strategy_tracking_summary?: string
+    selected_strategy_tracking_detail?: string
+    selected_strategy_editor_strategy_id?: string | null
+    selected_strategy_editor_parameter_drafts?: Record<string, string>
+    selected_strategy_editor_risk_budget_draft?: string
+    selected_review_inspector_id?: string | null
+    selected_review_inspector_strategy_id?: string | null
+    selected_review_id?: string | null
+    selected_proposal_id?: string | null
+    selected_change_request_id?: string | null
     backtest_filter: 'selected' | 'all'
     replay_tracking_scope: 'all' | 'selected'
     alert_severity_filter: 'all' | 'P0' | 'P1' | 'P2'

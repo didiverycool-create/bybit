@@ -7,6 +7,7 @@ import sys
 import threading
 import time
 import unittest
+from unittest.mock import patch
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -23,7 +24,7 @@ if str(CONTROL_API_DIR) not in sys.path:
 import main as control_main  # type: ignore  # noqa: E402
 from bybit_private_client import BybitPrivateClient  # type: ignore  # noqa: E402
 from bybit_public_client import BybitPublicMarketClient  # type: ignore  # noqa: E402
-from models import AlertRecord, AccountMode, BacktestMetrics, BacktestRun, BybitPrivateStatus, CandlePoint, ChangeRequestCreate, Direction, OpenClawStatus, OrderBookLevel, StrategyParameter, StrategyRuntimeSnapshot, WatchlistInstrument  # type: ignore  # noqa: E402
+from models import AgentJob, AlertRecord, AccountMode, BacktestMetrics, BacktestRun, BybitPrivateStatus, CandlePoint, ChangeRequestCreate, Direction, MarketRecentTrade, OpenClawStatus, OrderBookLevel, OrderRecord, ReviewDocument, StrategyParameter, StrategyRuntimeSnapshot, TradeRecord, WatchlistInstrument  # type: ignore  # noqa: E402
 from seed import build_market_detail_for_watchlist, build_state  # type: ignore  # noqa: E402
 
 
@@ -515,6 +516,8 @@ class StubBybitPublicMarketClient:
             "last_error": None,
             "tested_at": "2026-03-31T09:00:00+08:00",
         }
+        self.enrich_watchlist_calls = 0
+        self.enrich_watchlist_fast_calls = 0
 
     @staticmethod
     def normalize_timeframe(timeframe: str) -> str:
@@ -611,6 +614,7 @@ class StubBybitPublicMarketClient:
         }
 
     def enrich_watchlist(self, watchlist: list[WatchlistInstrument]) -> list[WatchlistInstrument]:
+        self.enrich_watchlist_calls += 1
         enriched: list[WatchlistInstrument] = []
         for item in watchlist:
             realtime_item = self._lookup_item(item.symbol, item.market)
@@ -628,6 +632,10 @@ class StubBybitPublicMarketClient:
             )
         return enriched
 
+    def enrich_watchlist_fast(self, watchlist: list[WatchlistInstrument]) -> list[WatchlistInstrument]:
+        self.enrich_watchlist_fast_calls += 1
+        return self.enrich_watchlist(watchlist)
+
     def enrich_market_detail(
         self,
         symbol: str,
@@ -635,6 +643,7 @@ class StubBybitPublicMarketClient:
         fallback_detail: Any,
         watch_item: Optional[WatchlistInstrument] = None,
         timeframe: str = "1h",
+        allow_rest_refresh: bool = True,
     ) -> Any:
         item = watch_item or self._lookup_item(symbol, market)
         detail = build_market_detail_for_watchlist(item)
@@ -953,6 +962,7 @@ class FakeRealtimeFeed:
         symbol: str,
         candles: list[CandlePoint],
         market: Optional[str] = None,
+        timeframe: str = "1h",
     ) -> list[CandlePoint]:  # noqa: ARG002
         if candles and candles[-1].time == self.live_candle.time:
             return [*candles[:-1], self.live_candle]
@@ -1022,6 +1032,7 @@ class MultiMarketRealtimeFeed:
         symbol: str,
         candles: list[CandlePoint],
         market: Optional[str] = None,
+        timeframe: str = "1h",
     ) -> list[CandlePoint]:  # noqa: ARG002
         return [*candles, self._live_candles[self._normalize_market(market)]]
 
@@ -1139,6 +1150,197 @@ class FakeRealtimeTradePriorityClient(BybitPublicMarketClient):
         return {"list": []}
 
 
+class NonHourlyRealtimePriorityClient(BybitPublicMarketClient):
+    def __init__(self) -> None:
+        super().__init__(base_url="https://api.bybit.com")
+        self.rest_ticker_called = False
+        self.rest_orderbook_called = False
+        self.rest_trade_called = False
+        self.realtime = FakeRealtimeFeed(
+            live_candle=CandlePoint(
+                time="2026-03-31T06:00:00+08:00",
+                open=66_620,
+                high=66_820,
+                low=66_540,
+                close=66_727.3,
+                volume=1_075.993,
+            ),
+            recent_trades=[
+                {
+                    "side": "buy",
+                    "price": 66727.3,
+                    "size": 0.42,
+                    "value": 28025.466,
+                    "occurred_at": "2026-03-31T06:00:05+08:00",
+                    "is_block_trade": False,
+                }
+            ],
+            orderbook_snapshot={
+                "bids": [OrderBookLevel(price=66726.8, size=12.4, total=12.4)],
+                "asks": [OrderBookLevel(price=66727.1, size=11.1, total=11.1)],
+            },
+        )
+
+    def get_ticker(self, symbol: str, market: str) -> Dict[str, Any]:  # noqa: ARG002
+        self.rest_ticker_called = True
+        return {
+            "lastPrice": "66000",
+            "price24hPcnt": "0.01",
+            "highPrice24h": "66100",
+            "lowPrice24h": "65900",
+        }
+
+    def get_orderbook(self, symbol: str, market: str, limit: int = 8) -> Dict[str, Any]:  # noqa: ARG002
+        self.rest_orderbook_called = True
+        return {
+            "bids": [OrderBookLevel(price=66000.0, size=8.0, total=8.0)][:limit],
+            "asks": [OrderBookLevel(price=66010.0, size=7.5, total=7.5)][:limit],
+        }
+
+    def get_recent_public_trades(self, symbol: str, market: str, limit: int = 12) -> list[Any]:  # noqa: ARG002
+        self.rest_trade_called = True
+        return super().get_recent_public_trades(symbol, market, limit=limit)
+
+    def get_candles(self, symbol: str, market: str, interval: str = "60", limit: int = 48) -> list[CandlePoint]:  # noqa: ARG002
+        return [
+            CandlePoint(
+                time="2026-03-31T05:30:00+08:00",
+                open=66_410,
+                high=66_520,
+                low=66_350,
+                close=66_480,
+                volume=1_800,
+            ),
+            CandlePoint(
+                time="2026-03-31T05:45:00+08:00",
+                open=66_480,
+                high=66_710,
+                low=66_420,
+                close=66_620,
+                volume=1_950,
+            ),
+        ][:limit]
+
+
+class RealtimeTickerOnlyMarketClient(BybitPublicMarketClient):
+    def __init__(self) -> None:
+        super().__init__(base_url="https://api.bybit.com")
+        self.rest_ticker_called = False
+        self.rest_orderbook_called = False
+        self.rest_trade_called = False
+        self.realtime = FakeRealtimeFeed(
+            live_candle=CandlePoint(
+                time="2026-03-31T06:00:00+08:00",
+                open=66_620,
+                high=66_820,
+                low=66_540,
+                close=66_727.3,
+                volume=1_075.993,
+            ),
+            recent_trades=[],
+            orderbook_snapshot={"bids": [], "asks": []},
+        )
+
+    def get_ticker(self, symbol: str, market: str) -> Dict[str, Any]:  # noqa: ARG002
+        self.rest_ticker_called = True
+        return {
+            "lastPrice": "66000",
+            "price24hPcnt": "0.01",
+            "highPrice24h": "66100",
+            "lowPrice24h": "65900",
+        }
+
+    def get_orderbook(self, symbol: str, market: str, limit: int = 8) -> Dict[str, Any]:  # noqa: ARG002
+        self.rest_orderbook_called = True
+        return {
+            "bids": [OrderBookLevel(price=66000.0, size=8.0, total=8.0)][:limit],
+            "asks": [OrderBookLevel(price=66010.0, size=7.5, total=7.5)][:limit],
+        }
+
+    def get_recent_public_trades(self, symbol: str, market: str, limit: int = 12) -> list[Any]:  # noqa: ARG002
+        self.rest_trade_called = True
+        return [
+            MarketRecentTrade(
+                side="buy",
+                price=66_727.3,
+                size=0.42,
+                value=28_025.466,
+                occurred_at="2026-03-31T06:00:05+08:00",
+                is_block_trade=False,
+            )
+        ][:limit]
+
+    def get_candles(self, symbol: str, market: str, interval: str = "60", limit: int = 48) -> list[CandlePoint]:  # noqa: ARG002
+        return [
+            CandlePoint(
+                time="2026-03-31T05:30:00+08:00",
+                open=66_410,
+                high=66_520,
+                low=66_350,
+                close=66_480,
+                volume=1_800,
+            ),
+            CandlePoint(
+                time="2026-03-31T05:45:00+08:00",
+                open=66_480,
+                high=66_710,
+                low=66_420,
+                close=66_620,
+                volume=1_950,
+            ),
+        ][:limit]
+
+
+class RecordingHistoryPrimeMarketClient(BybitPublicMarketClient):
+    def __init__(self) -> None:
+        super().__init__(base_url="https://api.bybit.com")
+        self.primed_symbols: list[str] = []
+        self.realtime = type(
+            "HistoryPrimeRealtimeFeed",
+            (),
+            {
+                "update_watchlist": staticmethod(lambda watchlist: None),
+                "enrich_watchlist": staticmethod(lambda watchlist: list(watchlist)),
+            },
+        )()
+
+    def schedule_watchlist_history_prime(self, watchlist: list[WatchlistInstrument]) -> None:
+        self.primed_symbols = [item.symbol for item in watchlist]
+
+
+class HistoryCachingPrimeMarketClient(BybitPublicMarketClient):
+    def __init__(self) -> None:
+        super().__init__(base_url="https://api.bybit.com")
+        self.history_calls: list[tuple[str, str]] = []
+        self.realtime = type(
+            "HistoryCachingRealtimeFeed",
+            (),
+            {
+                "update_watchlist": staticmethod(lambda watchlist: None),
+                "enrich_watchlist": staticmethod(lambda watchlist: list(watchlist)),
+            },
+        )()
+
+    def get_candles_history(self, symbol: str, market: str, timeframe: str = "1h", limit: int = 48) -> list[CandlePoint]:
+        self.history_calls.append((symbol, timeframe))
+        return [
+            CandlePoint(
+                time=f"2026-03-31T{(index % 24):02d}:00:00+08:00",
+                open=100 + index,
+                high=101 + index,
+                low=99 + index,
+                close=100.5 + index,
+                volume=1_000 + index,
+            )
+            for index in range(limit)
+        ]
+
+
+class FailingRealtimeHistoryClient(NonHourlyRealtimePriorityClient):
+    def get_candles(self, symbol: str, market: str, interval: str = "60", limit: int = 48) -> list[CandlePoint]:  # noqa: ARG002
+        raise RuntimeError("temporary kline failure")
+
+
 class FakeRealtimeOrderbookPriorityClient(BybitPublicMarketClient):
     def __init__(self) -> None:
         super().__init__(base_url="https://api.bybit.com")
@@ -1179,6 +1381,23 @@ class FakeRecentTradeMarketClient(BybitPublicMarketClient):
                 {"T": "1711812840000", "S": "Sell", "p": "67701.1", "v": "1.204", "BT": True},
             ]
         }
+
+
+class StaleCacheFallbackMarketClient(BybitPublicMarketClient):
+    def __init__(self) -> None:
+        super().__init__(base_url="https://api.bybit.com")
+
+    def get_ticker(self, symbol: str, market: str) -> Dict[str, Any]:  # noqa: ARG002
+        raise RuntimeError("ticker refresh failed")
+
+    def get_candles(self, symbol: str, market: str, interval: str = "60", limit: int = 48) -> list[CandlePoint]:  # noqa: ARG002
+        raise RuntimeError("candle refresh failed")
+
+    def get_orderbook(self, symbol: str, market: str, limit: int = 8) -> Dict[str, Any]:  # noqa: ARG002
+        raise RuntimeError("orderbook refresh failed")
+
+    def _request(self, path: str, params: Dict[str, object]) -> Dict[str, Any]:  # noqa: ARG002
+        raise RuntimeError("trade refresh failed")
 
 
 class PartialRealtimeWatchlistFeed:
@@ -1239,6 +1458,18 @@ class PartialRealtimeWatchlistClient(BybitPublicMarketClient):
 
 
 class BybitPublicMarketClientUnitTests(unittest.TestCase):
+    def test_candle_cache_ttl_is_timeframe_aware(self) -> None:
+        client = BybitPublicMarketClient(base_url="https://api.bybit.com")
+
+        self.assertEqual(client._candle_cache_ttl_for_timeframe("15m"), 20.0)
+        self.assertEqual(client._candle_cache_ttl_for_timeframe("1h"), 20.0)
+        self.assertEqual(client._candle_cache_ttl_for_timeframe("4h"), 45.0)
+        self.assertEqual(client._candle_cache_ttl_for_timeframe("1d"), 120.0)
+        self.assertEqual(client._candle_cache_ttl_for_timeframe("15m", history=True), 45.0)
+        self.assertEqual(client._candle_cache_ttl_for_timeframe("1h", history=True), 60.0)
+        self.assertEqual(client._candle_cache_ttl_for_timeframe("4h", history=True), 90.0)
+        self.assertEqual(client._candle_cache_ttl_for_timeframe("1d", history=True), 180.0)
+
     def test_probe_rest_connectivity_caches_latest_result(self) -> None:
         class ProbeConnectivityClient(BybitPublicMarketClient):
             def __init__(self) -> None:
@@ -1291,6 +1522,233 @@ class BybitPublicMarketClientUnitTests(unittest.TestCase):
         self.assertEqual(trades[1].side, "sell")
         self.assertAlmostEqual(trades[0].value, 67705.9 * 0.752, places=4)
         self.assertTrue(trades[1].is_block_trade)
+
+    def test_realtime_market_detail_reuses_ws_priority_for_non_hourly_timeframe(self) -> None:
+        client = NonHourlyRealtimePriorityClient()
+        item = WatchlistInstrument(
+            symbol="BTCUSDT",
+            market="perp",
+            last_price=66_727.3,
+            change_24h=1.2,
+            volume_24h=1_000_000,
+            signal="active",
+            position_side="flat",
+            risk_level="medium",
+        )
+        fallback_detail = build_market_detail_for_watchlist(item)
+
+        detail = client.enrich_market_detail(
+            symbol="BTCUSDT",
+            market="perp",
+            fallback_detail=fallback_detail,
+            watch_item=item,
+            timeframe="15m",
+        )
+
+        self.assertEqual(detail.source, "bybit_ws")
+        self.assertFalse(client.rest_ticker_called)
+        self.assertFalse(client.rest_orderbook_called)
+        self.assertFalse(client.rest_trade_called)
+        self.assertEqual(len(detail.candles), 3)
+        self.assertAlmostEqual(detail.candles[-1].close, 66727.3)
+        self.assertAlmostEqual(detail.recent_public_trades[0]["price"], 66727.3)
+        self.assertAlmostEqual(detail.bids[0].price, 66726.8)
+        self.assertAlmostEqual(detail.asks[0].price, 66727.1)
+
+    def test_realtime_market_detail_skips_rest_refresh_when_disabled(self) -> None:
+        client = NonHourlyRealtimePriorityClient()
+        item = WatchlistInstrument(
+            symbol="BTCUSDT",
+            market="perp",
+            last_price=66_727.3,
+            change_24h=1.2,
+            volume_24h=1_000_000,
+            signal="active",
+            position_side="flat",
+            risk_level="medium",
+        )
+        fallback_detail = build_market_detail_for_watchlist(item)
+
+        detail = client.enrich_market_detail(
+            symbol="BTCUSDT",
+            market="perp",
+            fallback_detail=fallback_detail,
+            watch_item=item,
+            timeframe="15m",
+            allow_rest_refresh=False,
+        )
+
+        self.assertEqual(detail.source, fallback_detail.source)
+        self.assertFalse(client.rest_ticker_called)
+        self.assertFalse(client.rest_orderbook_called)
+        self.assertFalse(client.rest_trade_called)
+        self.assertAlmostEqual(detail.recent_public_trades[0]["price"], 66727.3)
+        self.assertAlmostEqual(detail.bids[0].price, 66726.8)
+        self.assertAlmostEqual(detail.asks[0].price, 66727.1)
+        self.assertEqual(detail.source, fallback_detail.source)
+        self.assertEqual(detail.headline, fallback_detail.headline)
+        self.assertEqual(len(detail.candles), len(fallback_detail.candles))
+
+    def test_realtime_market_detail_keeps_ws_path_non_blocking_when_depth_snapshots_are_missing(self) -> None:
+        client = RealtimeTickerOnlyMarketClient()
+        item = WatchlistInstrument(
+            symbol="BTCUSDT",
+            market="perp",
+            last_price=66_727.3,
+            change_24h=1.2,
+            volume_24h=1_000_000,
+            signal="active",
+            position_side="flat",
+            risk_level="medium",
+        )
+        fallback_detail = build_market_detail_for_watchlist(item)
+
+        detail = client.enrich_market_detail(
+            symbol="BTCUSDT",
+            market="perp",
+            fallback_detail=fallback_detail,
+            watch_item=item,
+            timeframe="15m",
+            allow_rest_refresh=True,
+        )
+
+        self.assertEqual(detail.source, "bybit_ws")
+        self.assertFalse(client.rest_ticker_called)
+        self.assertFalse(client.rest_orderbook_called)
+        self.assertFalse(client.rest_trade_called)
+        self.assertEqual(len(detail.candles), 3)
+        self.assertEqual(detail.bids, fallback_detail.bids)
+        self.assertEqual(detail.asks, fallback_detail.asks)
+
+    def test_enrich_watchlist_fast_schedules_history_prime(self) -> None:
+        client = RecordingHistoryPrimeMarketClient()
+        watchlist = [
+            WatchlistInstrument(
+                symbol="BTCUSDT",
+                market="perp",
+                last_price=66_000,
+                change_24h=0.8,
+                volume_24h=1_100_000,
+                signal="watch",
+                position_side="flat",
+                risk_level="medium",
+            ),
+            WatchlistInstrument(
+                symbol="ETHUSDT",
+                market="perp",
+                last_price=3_200,
+                change_24h=1.1,
+                volume_24h=910_000,
+                signal="watch",
+                position_side="flat",
+                risk_level="medium",
+            ),
+        ]
+
+        client.enrich_watchlist_fast(watchlist)
+
+        self.assertEqual(client.primed_symbols, ["BTCUSDT", "ETHUSDT"])
+
+    def test_prime_watchlist_history_cache_populates_cached_timeframes(self) -> None:
+        client = HistoryCachingPrimeMarketClient()
+        watchlist = [
+            WatchlistInstrument(
+                symbol="BNBUSDT",
+                market="perp",
+                last_price=588.1,
+                change_24h=0.6,
+                volume_24h=178_420,
+                signal="watch",
+                position_side="flat",
+                risk_level="medium",
+            )
+        ]
+
+        client._prime_watchlist_history_cache(watchlist)
+
+        self.assertEqual(
+            client.history_calls,
+            [
+                ("BNBUSDT", "15m"),
+                ("BNBUSDT", "1h"),
+                ("BNBUSDT", "4h"),
+                ("BNBUSDT", "1d"),
+            ],
+        )
+        self.assertEqual(len(client.get_candles_cached_only("BNBUSDT", "perp", timeframe="1d")), 48)
+        self.assertEqual(len(client.get_candles_cached_only("BNBUSDT", "perp", timeframe="15m")), 48)
+
+    def test_realtime_market_detail_does_not_degrade_to_single_live_candle_when_history_fetch_fails(self) -> None:
+        client = FailingRealtimeHistoryClient()
+        fallback_detail = control_main.MarketDetail(
+            symbol="BTCUSDT",
+            market="perp",
+            timeframe="15m",
+            candles=[],
+            bids=[],
+            asks=[],
+            recent_public_trades=[],
+            headline="BTCUSDT 当前未拿到 Bybit 最新 K 线，请稍后自动重试。",
+            stats={"数据源": "Bybit 实时拉取待恢复"},
+            source="mock",
+            updated_at=None,
+        )
+
+        detail = client.enrich_market_detail(
+            symbol="BTCUSDT",
+            market="perp",
+            fallback_detail=fallback_detail,
+            watch_item=None,
+            timeframe="15m",
+            allow_rest_refresh=True,
+        )
+
+        self.assertEqual(detail.source, fallback_detail.source)
+        self.assertEqual(detail.candles, [])
+        self.assertAlmostEqual(detail.recent_public_trades[0]["price"], 66727.3)
+        self.assertAlmostEqual(detail.bids[0].price, 66726.8)
+        self.assertAlmostEqual(detail.asks[0].price, 66727.1)
+
+    def test_market_client_cached_helpers_fall_back_to_stale_cache_on_refresh_failure(self) -> None:
+        client = StaleCacheFallbackMarketClient()
+        expired_at = time.monotonic() - 30
+        cached_candle = CandlePoint(
+            time="2026-03-31T05:00:00+08:00",
+            open=66_400,
+            high=66_520,
+            low=66_210,
+            close=66_480,
+            volume=1_800,
+        )
+        cached_trade = MarketRecentTrade(
+            side="buy",
+            price=66_480,
+            size=0.25,
+            value=16_620,
+            occurred_at="2026-03-31T05:00:05+08:00",
+            is_block_trade=False,
+        )
+        cached_orderbook = {
+            "bids": [OrderBookLevel(price=66_470, size=12.4, total=12.4)],
+            "asks": [OrderBookLevel(price=66_490, size=11.8, total=11.8)],
+        }
+        client._ticker_cache[("BTCUSDT", "perp")] = (expired_at, {"lastPrice": "66480"})  # type: ignore[attr-defined]
+        client._candle_cache[("BTCUSDT", "perp", "15", 48)] = (expired_at, [cached_candle])  # type: ignore[attr-defined]
+        client._orderbook_cache[("BTCUSDT", "perp", 8)] = (expired_at, cached_orderbook)  # type: ignore[attr-defined]
+        client._recent_trade_cache[("BTCUSDT", "perp", 12)] = (expired_at, [cached_trade])  # type: ignore[attr-defined]
+
+        ticker = client.get_ticker_cached("BTCUSDT", "perp")
+        candles = client.get_candles_cached("BTCUSDT", "perp", timeframe="15m")
+        orderbook = client.get_orderbook_cached("BTCUSDT", "perp", limit=8)
+        trades = client.get_recent_public_trades("BTCUSDT", "perp", limit=12)
+
+        self.assertEqual(ticker["lastPrice"], "66480")
+        self.assertEqual(len(candles), 1)
+        self.assertAlmostEqual(candles[0].close, 66_480)
+        self.assertAlmostEqual(orderbook["bids"][0].price, 66_470)
+        self.assertAlmostEqual(orderbook["asks"][0].price, 66_490)
+        self.assertEqual(len(trades), 1)
+        self.assertAlmostEqual(trades[0].price, 66_480)
 
     def test_realtime_market_detail_uses_rest_history_instead_of_stale_fallback(self) -> None:
         stale_item = WatchlistInstrument(
@@ -2994,6 +3452,10 @@ class ControlApiIntegrationTests(unittest.TestCase):
         control_main.private_trade_cache.update({"status_key": None, "updated_at": 0.0, "items": []})
         control_main.private_order_history_cache.update({"status_key": None, "updated_at": 0.0, "items": []})
         control_main.market_data.base_url = control_main.repo.state.settings.api_base_url
+        if hasattr(control_main.market_data, "enrich_watchlist_calls"):
+            control_main.market_data.enrich_watchlist_calls = 0
+        if hasattr(control_main.market_data, "enrich_watchlist_fast_calls"):
+            control_main.market_data.enrich_watchlist_fast_calls = 0
         control_main.strategy_runtime_state.update({"running": False, "last_refresh_at": None, "last_error": None, "started_once": False})
         self.addCleanup(self._restore_state)
 
@@ -3093,6 +3555,19 @@ class ControlApiIntegrationTests(unittest.TestCase):
             "selected_market_timeframe": "4h",
             "selected_strategy_id": "eth-revert-02",
             "selected_backtest_id": "bt-002",
+            "selected_scheduler_job_id": "job-oc-001",
+            "selected_strategy_detail_panel": "tracking",
+            "selected_strategy_tracking_kind": "change",
+            "selected_strategy_tracking_summary": "ETH 变更需要继续跟踪",
+            "selected_strategy_tracking_detail": "重点观察回测样本是否完整覆盖。",
+            "selected_strategy_editor_strategy_id": "eth-revert-02",
+            "selected_strategy_editor_parameter_drafts": {"lookback": "18"},
+            "selected_strategy_editor_risk_budget_draft": "22%",
+            "selected_review_inspector_id": "review-20260330-daily",
+            "selected_review_inspector_strategy_id": "trend-btc-01",
+            "selected_review_id": "review-20260330-daily",
+            "selected_proposal_id": "prop-001",
+            "selected_change_request_id": "cr-002",
             "backtest_filter": "all",
             "replay_tracking_scope": "selected",
             "alert_severity_filter": "P1",
@@ -3119,6 +3594,19 @@ class ControlApiIntegrationTests(unittest.TestCase):
         self.assertEqual(updated["selected_market_timeframe"], "4h")
         self.assertEqual(updated["selected_strategy_id"], "eth-revert-02")
         self.assertEqual(updated["selected_backtest_id"], "bt-002")
+        self.assertEqual(updated["selected_scheduler_job_id"], "job-oc-001")
+        self.assertIsNone(updated["selected_strategy_detail_panel"])
+        self.assertIsNone(updated["selected_strategy_tracking_kind"])
+        self.assertEqual(updated["selected_strategy_tracking_summary"], "")
+        self.assertEqual(updated["selected_strategy_tracking_detail"], "")
+        self.assertIsNone(updated["selected_strategy_editor_strategy_id"])
+        self.assertEqual(updated["selected_strategy_editor_parameter_drafts"], {})
+        self.assertEqual(updated["selected_strategy_editor_risk_budget_draft"], "")
+        self.assertEqual(updated["selected_review_inspector_id"], "review-20260330-daily")
+        self.assertEqual(updated["selected_review_inspector_strategy_id"], "trend-btc-01")
+        self.assertEqual(updated["selected_review_id"], "review-20260330-daily")
+        self.assertEqual(updated["selected_proposal_id"], "prop-001")
+        self.assertEqual(updated["selected_change_request_id"], "cr-002")
         self.assertEqual(updated["backtest_filter"], "all")
         self.assertEqual(updated["replay_tracking_scope"], "selected")
         self.assertEqual(updated["alert_severity_filter"], "P1")
@@ -3139,6 +3627,565 @@ class ControlApiIntegrationTests(unittest.TestCase):
         self.assertEqual(get_status, 200)
         self.assertEqual(persisted, updated)
         self.assertNotEqual(initial_preferences, updated)
+
+    def test_workspace_preferences_get_clears_missing_change_request_selection(self) -> None:
+        control_main.repo.state.workspace_preferences.selected_scheduler_job_id = "job-missing"
+        control_main.repo.state.workspace_preferences.selected_review_inspector_id = "review-missing"
+        control_main.repo.state.workspace_preferences.selected_review_inspector_strategy_id = "strategy-missing"
+        control_main.repo.state.workspace_preferences.selected_review_id = "review-missing"
+        control_main.repo.state.workspace_preferences.selected_proposal_id = "prop-missing"
+        control_main.repo.state.workspace_preferences.selected_change_request_id = "cr-missing"
+        control_main.repo._persist()
+
+        status, preferences = self._get("/api/workspace/preferences")
+        self.assertEqual(status, 200)
+        self.assertIsNone(preferences["selected_scheduler_job_id"])
+        self.assertIsNone(preferences["selected_review_inspector_id"])
+        self.assertIsNone(preferences["selected_review_inspector_strategy_id"])
+        self.assertIsNone(preferences["selected_review_id"])
+        self.assertIsNone(preferences["selected_proposal_id"])
+        self.assertIsNone(preferences["selected_change_request_id"])
+        self.assertIsNone(control_main.repo.state.workspace_preferences.selected_scheduler_job_id)
+        self.assertIsNone(control_main.repo.state.workspace_preferences.selected_review_inspector_id)
+        self.assertIsNone(control_main.repo.state.workspace_preferences.selected_review_inspector_strategy_id)
+        self.assertIsNone(control_main.repo.state.workspace_preferences.selected_review_id)
+        self.assertIsNone(control_main.repo.state.workspace_preferences.selected_proposal_id)
+        self.assertIsNone(control_main.repo.state.workspace_preferences.selected_change_request_id)
+
+    def test_workspace_preferences_get_clears_missing_symbol_strategy_and_backtest_selection(self) -> None:
+        control_main.repo.state.workspace_preferences.selected_symbol = "DOGEUSDT"
+        control_main.repo.state.workspace_preferences.selected_strategy_id = "strategy-missing"
+        control_main.repo.state.workspace_preferences.selected_backtest_id = "bt-missing"
+        control_main.repo.state.workspace_preferences.selected_change_request_id = "cr-missing"
+        control_main.repo.state.workspace_preferences.selected_review_inspector_id = "review-missing"
+        control_main.repo._persist()
+
+        status, preferences = self._get("/api/workspace/preferences")
+        self.assertEqual(status, 200)
+        self.assertEqual(preferences["selected_symbol"], control_main.repo.state.watchlist[0].symbol)
+        self.assertEqual(preferences["selected_strategy_id"], control_main.repo.state.strategies[0].id)
+        self.assertIsNone(preferences["selected_backtest_id"])
+        self.assertIsNone(preferences["selected_review_inspector_id"])
+        self.assertIsNone(preferences["selected_change_request_id"])
+
+    def test_workspace_preferences_update_returns_and_audits_sanitized_selection(self) -> None:
+        payload = {
+            "active_section": "strategy",
+            "layout_preset": "balanced",
+            "selected_mode": "paper",
+            "selected_symbol": "DOGEUSDT",
+            "selected_market_timeframe": "1h",
+            "selected_strategy_id": "strategy-missing",
+            "selected_backtest_id": "bt-missing",
+            "selected_scheduler_job_id": "job-missing",
+            "selected_review_inspector_id": "review-missing",
+            "selected_review_inspector_strategy_id": "strategy-missing",
+            "selected_review_id": "review-missing",
+            "selected_proposal_id": "prop-missing",
+            "selected_change_request_id": "cr-missing",
+            "backtest_filter": "selected",
+            "replay_tracking_scope": "selected",
+            "alert_severity_filter": "all",
+            "alert_status_filter": "pending",
+            "alert_scope_filter": "all",
+            "trade_mode_filter": "all",
+            "trade_origin_filter": "all",
+            "trade_scope_filter": "all",
+            "audit_severity_filter": "all",
+            "audit_source_filter": "all",
+            "audit_scope_filter": "all",
+            "audit_search": "",
+            "overview_card_order": ["strategy_watch", "ai_center", "account_center"],
+            "overview_visible_cards": ["strategy_watch", "account_center"],
+            "overview_collapsed_cards": [],
+        }
+
+        status, updated = self._post("/api/workspace/preferences", payload)
+        self.assertEqual(status, 200)
+        self.assertEqual(updated["selected_symbol"], control_main.repo.state.watchlist[0].symbol)
+        self.assertEqual(updated["selected_strategy_id"], control_main.repo.state.strategies[0].id)
+        self.assertIsNone(updated["selected_backtest_id"])
+        self.assertIsNone(updated["selected_scheduler_job_id"])
+        self.assertIsNone(updated["selected_review_inspector_id"])
+        self.assertIsNone(updated["selected_review_inspector_strategy_id"])
+        self.assertIsNone(updated["selected_review_id"])
+        self.assertIsNone(updated["selected_proposal_id"])
+        self.assertIsNone(updated["selected_change_request_id"])
+
+        audit_status, audit_events = self._get("/api/audit/events")
+        self.assertEqual(audit_status, 200)
+        event = next(
+            item for item in audit_events if item["event_type"] == "workspace.preferences.updated"
+        )
+        self.assertEqual(event["payload"]["selected_symbol"], control_main.repo.state.watchlist[0].symbol)
+        self.assertEqual(event["payload"]["selected_strategy_id"], control_main.repo.state.strategies[0].id)
+        self.assertIsNone(event["payload"]["selected_backtest_id"])
+        self.assertIsNone(event["payload"]["selected_scheduler_job_id"])
+        self.assertIsNone(event["payload"]["selected_review_inspector_id"])
+        self.assertIsNone(event["payload"]["selected_review_inspector_strategy_id"])
+        self.assertIsNone(event["payload"]["selected_review_id"])
+        self.assertIsNone(event["payload"]["selected_proposal_id"])
+        self.assertIsNone(event["payload"]["selected_change_request_id"])
+
+    def test_workspace_preferences_update_clears_strategy_detail_panel_outside_strategy_section(self) -> None:
+        payload = {
+            "active_section": "backtest",
+            "layout_preset": "balanced",
+            "selected_mode": "paper",
+            "selected_symbol": "ETHUSDT",
+            "selected_market_timeframe": "1h",
+            "selected_strategy_id": "eth-revert-02",
+            "selected_backtest_id": "bt-002",
+            "selected_scheduler_job_id": None,
+            "selected_strategy_detail_panel": "tracking",
+            "selected_strategy_tracking_kind": "change",
+            "selected_strategy_tracking_summary": "这轮回测需要继续观察",
+            "selected_strategy_tracking_detail": "先补样本再决定是否继续。",
+            "selected_strategy_editor_strategy_id": "eth-revert-02",
+            "selected_strategy_editor_parameter_drafts": {"lookback": "18"},
+            "selected_strategy_editor_risk_budget_draft": "22%",
+            "selected_review_inspector_id": None,
+            "selected_review_inspector_strategy_id": None,
+            "selected_review_id": None,
+            "selected_proposal_id": None,
+            "selected_change_request_id": None,
+            "backtest_filter": "selected",
+            "replay_tracking_scope": "selected",
+            "alert_severity_filter": "all",
+            "alert_status_filter": "pending",
+            "alert_scope_filter": "all",
+            "trade_mode_filter": "all",
+            "trade_origin_filter": "all",
+            "trade_scope_filter": "all",
+            "audit_severity_filter": "all",
+            "audit_source_filter": "all",
+            "audit_scope_filter": "all",
+            "audit_search": "",
+            "overview_card_order": ["strategy_watch", "ai_center", "account_center"],
+            "overview_visible_cards": ["strategy_watch", "account_center"],
+            "overview_collapsed_cards": [],
+        }
+
+        status, updated = self._post("/api/workspace/preferences", payload)
+        self.assertEqual(status, 200)
+        self.assertEqual(updated["selected_strategy_id"], "eth-revert-02")
+        self.assertEqual(updated["selected_backtest_id"], "bt-002")
+        self.assertIsNone(updated["selected_strategy_detail_panel"])
+        self.assertIsNone(updated["selected_strategy_tracking_kind"])
+        self.assertEqual(updated["selected_strategy_tracking_summary"], "")
+        self.assertEqual(updated["selected_strategy_tracking_detail"], "")
+        self.assertIsNone(updated["selected_strategy_editor_strategy_id"])
+        self.assertEqual(updated["selected_strategy_editor_parameter_drafts"], {})
+        self.assertEqual(updated["selected_strategy_editor_risk_budget_draft"], "")
+
+    def test_workspace_preferences_update_persists_strategy_detail_panel_on_strategy_section(self) -> None:
+        payload = {
+            "active_section": "strategy",
+            "layout_preset": "balanced",
+            "selected_mode": "paper",
+            "selected_symbol": "ETHUSDT",
+            "selected_market_timeframe": "1h",
+            "selected_strategy_id": "eth-revert-02",
+            "selected_backtest_id": None,
+            "selected_scheduler_job_id": None,
+            "selected_strategy_detail_panel": "tracking",
+            "selected_strategy_tracking_kind": "change",
+            "selected_strategy_tracking_summary": "这轮变更需要继续跟踪",
+            "selected_strategy_tracking_detail": "优先观察样本窗口与回测结论门禁。",
+            "selected_strategy_editor_strategy_id": "eth-revert-02",
+            "selected_strategy_editor_parameter_drafts": {
+                "lookback": "18",
+            },
+            "selected_strategy_editor_risk_budget_draft": "22%",
+            "selected_review_inspector_id": None,
+            "selected_review_inspector_strategy_id": None,
+            "selected_review_id": None,
+            "selected_proposal_id": None,
+            "selected_change_request_id": None,
+            "backtest_filter": "selected",
+            "replay_tracking_scope": "selected",
+            "alert_severity_filter": "all",
+            "alert_status_filter": "pending",
+            "alert_scope_filter": "all",
+            "trade_mode_filter": "all",
+            "trade_origin_filter": "all",
+            "trade_scope_filter": "all",
+            "audit_severity_filter": "all",
+            "audit_source_filter": "all",
+            "audit_scope_filter": "all",
+            "audit_search": "",
+            "overview_card_order": ["strategy_watch", "ai_center", "account_center"],
+            "overview_visible_cards": ["strategy_watch", "account_center"],
+            "overview_collapsed_cards": [],
+        }
+
+        status, updated = self._post("/api/workspace/preferences", payload)
+        self.assertEqual(status, 200)
+        self.assertEqual(updated["selected_symbol"], "ETHUSDT")
+        self.assertEqual(updated["selected_strategy_id"], "eth-revert-02")
+        self.assertEqual(updated["selected_strategy_detail_panel"], "tracking")
+        self.assertEqual(updated["selected_strategy_tracking_kind"], "change")
+        self.assertEqual(updated["selected_strategy_tracking_summary"], "这轮变更需要继续跟踪")
+        self.assertEqual(updated["selected_strategy_tracking_detail"], "优先观察样本窗口与回测结论门禁。")
+        self.assertEqual(updated["selected_strategy_editor_strategy_id"], "eth-revert-02")
+        self.assertEqual(updated["selected_strategy_editor_parameter_drafts"], {"lookback": "18"})
+        self.assertEqual(updated["selected_strategy_editor_risk_budget_draft"], "22%")
+
+    def test_workspace_preferences_update_persists_strategy_editor_drafts_on_strategy_section(self) -> None:
+        payload = {
+            "active_section": "strategy",
+            "layout_preset": "balanced",
+            "selected_mode": "paper",
+            "selected_symbol": "BTCUSDT",
+            "selected_market_timeframe": "1h",
+            "selected_strategy_id": "trend-btc-01",
+            "selected_backtest_id": None,
+            "selected_scheduler_job_id": None,
+            "selected_strategy_detail_panel": "editor",
+            "selected_strategy_tracking_kind": None,
+            "selected_strategy_tracking_summary": "",
+            "selected_strategy_tracking_detail": "",
+            "selected_strategy_editor_strategy_id": "trend-btc-01",
+            "selected_strategy_editor_parameter_drafts": {
+                "lookback": "26",
+                "confirmation": "2",
+            },
+            "selected_strategy_editor_risk_budget_draft": "18%",
+            "selected_review_inspector_id": None,
+            "selected_review_inspector_strategy_id": None,
+            "selected_review_id": None,
+            "selected_proposal_id": None,
+            "selected_change_request_id": None,
+            "backtest_filter": "selected",
+            "replay_tracking_scope": "selected",
+            "alert_severity_filter": "all",
+            "alert_status_filter": "pending",
+            "alert_scope_filter": "all",
+            "trade_mode_filter": "all",
+            "trade_origin_filter": "all",
+            "trade_scope_filter": "all",
+            "audit_severity_filter": "all",
+            "audit_source_filter": "all",
+            "audit_scope_filter": "all",
+            "audit_search": "",
+            "overview_card_order": ["strategy_watch", "ai_center", "account_center"],
+            "overview_visible_cards": ["strategy_watch", "account_center"],
+            "overview_collapsed_cards": [],
+        }
+
+        status, updated = self._post("/api/workspace/preferences", payload)
+        self.assertEqual(status, 200)
+        self.assertEqual(updated["selected_strategy_detail_panel"], "editor")
+        self.assertEqual(updated["selected_strategy_editor_strategy_id"], "trend-btc-01")
+        self.assertEqual(
+            updated["selected_strategy_editor_parameter_drafts"],
+            {"lookback": "26", "confirmation": "2"},
+        )
+        self.assertEqual(updated["selected_strategy_editor_risk_budget_draft"], "18%")
+        self.assertIsNone(updated["selected_strategy_tracking_kind"])
+        self.assertEqual(updated["selected_strategy_tracking_summary"], "")
+        self.assertEqual(updated["selected_strategy_tracking_detail"], "")
+
+    def test_workspace_preferences_update_clears_strategy_editor_drafts_when_strategy_realigns(self) -> None:
+        payload = {
+            "active_section": "strategy",
+            "layout_preset": "balanced",
+            "selected_mode": "paper",
+            "selected_symbol": "BTCUSDT",
+            "selected_market_timeframe": "1h",
+            "selected_strategy_id": "strategy-missing",
+            "selected_backtest_id": None,
+            "selected_scheduler_job_id": None,
+            "selected_strategy_detail_panel": "tracking",
+            "selected_strategy_tracking_kind": "issue",
+            "selected_strategy_tracking_summary": "继续观察",
+            "selected_strategy_tracking_detail": "等待切回正确策略。",
+            "selected_strategy_editor_strategy_id": "strategy-missing",
+            "selected_strategy_editor_parameter_drafts": {
+                "lookback": "26",
+            },
+            "selected_strategy_editor_risk_budget_draft": "18%",
+            "selected_review_inspector_id": None,
+            "selected_review_inspector_strategy_id": None,
+            "selected_review_id": None,
+            "selected_proposal_id": None,
+            "selected_change_request_id": None,
+            "backtest_filter": "selected",
+            "replay_tracking_scope": "selected",
+            "alert_severity_filter": "all",
+            "alert_status_filter": "pending",
+            "alert_scope_filter": "all",
+            "trade_mode_filter": "all",
+            "trade_origin_filter": "all",
+            "trade_scope_filter": "all",
+            "audit_severity_filter": "all",
+            "audit_source_filter": "all",
+            "audit_scope_filter": "all",
+            "audit_search": "",
+            "overview_card_order": ["strategy_watch", "ai_center", "account_center"],
+            "overview_visible_cards": ["strategy_watch", "account_center"],
+            "overview_collapsed_cards": [],
+        }
+
+        status, updated = self._post("/api/workspace/preferences", payload)
+        self.assertEqual(status, 200)
+        self.assertEqual(updated["selected_strategy_id"], control_main.repo.state.strategies[0].id)
+        self.assertEqual(updated["selected_symbol"], control_main.repo.state.watchlist[0].symbol)
+        self.assertEqual(updated["selected_strategy_detail_panel"], "tracking")
+        self.assertIsNone(updated["selected_strategy_editor_strategy_id"])
+        self.assertEqual(updated["selected_strategy_editor_parameter_drafts"], {})
+        self.assertEqual(updated["selected_strategy_editor_risk_budget_draft"], "")
+
+    def test_workspace_preferences_update_prefers_editor_strategy_when_restoring_editor_panel(self) -> None:
+        payload = {
+            "active_section": "strategy",
+            "layout_preset": "balanced",
+            "selected_mode": "paper",
+            "selected_symbol": "BTCUSDT",
+            "selected_market_timeframe": "1h",
+            "selected_strategy_id": "strategy-missing",
+            "selected_backtest_id": None,
+            "selected_scheduler_job_id": None,
+            "selected_strategy_detail_panel": "editor",
+            "selected_strategy_tracking_kind": None,
+            "selected_strategy_tracking_summary": "",
+            "selected_strategy_tracking_detail": "",
+            "selected_strategy_editor_strategy_id": "trend-btc-01",
+            "selected_strategy_editor_parameter_drafts": {
+                "lookback": "26",
+            },
+            "selected_strategy_editor_risk_budget_draft": "18%",
+            "selected_review_inspector_id": None,
+            "selected_review_inspector_strategy_id": None,
+            "selected_review_id": None,
+            "selected_proposal_id": None,
+            "selected_change_request_id": None,
+            "backtest_filter": "selected",
+            "replay_tracking_scope": "selected",
+            "alert_severity_filter": "all",
+            "alert_status_filter": "pending",
+            "alert_scope_filter": "all",
+            "trade_mode_filter": "all",
+            "trade_origin_filter": "all",
+            "trade_scope_filter": "all",
+            "audit_severity_filter": "all",
+            "audit_source_filter": "all",
+            "audit_scope_filter": "all",
+            "audit_search": "",
+            "overview_card_order": ["strategy_watch", "ai_center", "account_center"],
+            "overview_visible_cards": ["strategy_watch", "account_center"],
+            "overview_collapsed_cards": [],
+        }
+
+        status, updated = self._post("/api/workspace/preferences", payload)
+        self.assertEqual(status, 200)
+        self.assertEqual(updated["selected_strategy_id"], "trend-btc-01")
+        self.assertEqual(updated["selected_symbol"], "BTCUSDT")
+        self.assertEqual(updated["selected_strategy_detail_panel"], "editor")
+        self.assertEqual(updated["selected_strategy_editor_strategy_id"], "trend-btc-01")
+        self.assertEqual(updated["selected_strategy_editor_parameter_drafts"], {"lookback": "26"})
+        self.assertEqual(updated["selected_strategy_editor_risk_budget_draft"], "18%")
+
+    def test_workspace_preferences_update_aligns_strategy_to_selected_scheduler_job_on_scheduler_section(self) -> None:
+        control_main.repo.state.agent_jobs.append(
+            AgentJob(
+                id="job-eth-scheduler",
+                job_type="review_strategy_change",
+                context={"strategy_id": "eth-revert-02"},
+                strategy_id="eth-revert-02",
+                allowed_actions=["cancel"],
+                timeout=120,
+                idempotency_key="job-eth-scheduler",
+                writeback_target="scheduler",
+                status="queued",
+                created_at="2026-03-30T00:00:00+08:00",
+                updated_at="2026-03-30T00:00:00+08:00",
+            )
+        )
+
+        payload = {
+            "active_section": "scheduler",
+            "layout_preset": "balanced",
+            "selected_mode": "paper",
+            "selected_symbol": "BTCUSDT",
+            "selected_market_timeframe": "1h",
+            "selected_strategy_id": "trend-btc-01",
+            "selected_backtest_id": None,
+            "selected_scheduler_job_id": "job-eth-scheduler",
+            "selected_review_id": None,
+            "selected_proposal_id": None,
+            "selected_change_request_id": None,
+            "backtest_filter": "selected",
+            "replay_tracking_scope": "selected",
+            "alert_severity_filter": "all",
+            "alert_status_filter": "pending",
+            "alert_scope_filter": "all",
+            "trade_mode_filter": "all",
+            "trade_origin_filter": "all",
+            "trade_scope_filter": "all",
+            "audit_severity_filter": "all",
+            "audit_source_filter": "all",
+            "audit_scope_filter": "all",
+            "audit_search": "",
+            "overview_card_order": ["strategy_watch", "ai_center", "account_center"],
+            "overview_visible_cards": ["strategy_watch", "account_center"],
+            "overview_collapsed_cards": [],
+        }
+
+        status, updated = self._post("/api/workspace/preferences", payload)
+        self.assertEqual(status, 200)
+        self.assertEqual(updated["selected_symbol"], "ETHUSDT")
+        self.assertEqual(updated["selected_strategy_id"], "eth-revert-02")
+        self.assertEqual(updated["selected_scheduler_job_id"], "job-eth-scheduler")
+
+    def test_workspace_preferences_update_aligns_strategy_to_selected_review_on_replay_section(self) -> None:
+        control_main.repo.state.reviews.append(
+            ReviewDocument(
+                id="review-eth-replay",
+                period="backtest",
+                strategy_id="eth-revert-02",
+                title="ETH replay focus",
+                summary="ETH 策略回放聚焦项。",
+                highlights=[],
+                risks=[],
+                proposals=[],
+                created_at="2026-03-30T00:00:00+08:00",
+            )
+        )
+
+        payload = {
+            "active_section": "replay",
+            "layout_preset": "balanced",
+            "selected_mode": "paper",
+            "selected_symbol": "BTCUSDT",
+            "selected_market_timeframe": "1h",
+            "selected_strategy_id": "trend-btc-01",
+            "selected_backtest_id": None,
+            "selected_review_id": "review-eth-replay",
+            "selected_proposal_id": None,
+            "selected_change_request_id": None,
+            "backtest_filter": "selected",
+            "replay_tracking_scope": "selected",
+            "alert_severity_filter": "all",
+            "alert_status_filter": "pending",
+            "alert_scope_filter": "all",
+            "trade_mode_filter": "all",
+            "trade_origin_filter": "all",
+            "trade_scope_filter": "all",
+            "audit_severity_filter": "all",
+            "audit_source_filter": "all",
+            "audit_scope_filter": "all",
+            "audit_search": "",
+            "overview_card_order": ["strategy_watch", "ai_center", "account_center"],
+            "overview_visible_cards": ["strategy_watch", "account_center"],
+            "overview_collapsed_cards": [],
+        }
+
+        status, updated = self._post("/api/workspace/preferences", payload)
+        self.assertEqual(status, 200)
+        self.assertEqual(updated["selected_symbol"], "ETHUSDT")
+        self.assertEqual(updated["selected_strategy_id"], "eth-revert-02")
+        self.assertEqual(updated["selected_review_id"], "review-eth-replay")
+
+    def test_workspace_preferences_update_aligns_strategy_to_selected_proposal_on_strategy_section(self) -> None:
+        payload = {
+            "active_section": "strategy",
+            "layout_preset": "balanced",
+            "selected_mode": "paper",
+            "selected_symbol": "ETHUSDT",
+            "selected_market_timeframe": "1h",
+            "selected_strategy_id": "eth-revert-02",
+            "selected_backtest_id": None,
+            "selected_proposal_id": "prop-002",
+            "selected_change_request_id": None,
+            "backtest_filter": "selected",
+            "replay_tracking_scope": "selected",
+            "alert_severity_filter": "all",
+            "alert_status_filter": "pending",
+            "alert_scope_filter": "all",
+            "trade_mode_filter": "all",
+            "trade_origin_filter": "all",
+            "trade_scope_filter": "all",
+            "audit_severity_filter": "all",
+            "audit_source_filter": "all",
+            "audit_scope_filter": "all",
+            "audit_search": "",
+            "overview_card_order": ["strategy_watch", "ai_center", "account_center"],
+            "overview_visible_cards": ["strategy_watch", "account_center"],
+            "overview_collapsed_cards": [],
+        }
+
+        status, updated = self._post("/api/workspace/preferences", payload)
+        self.assertEqual(status, 200)
+        self.assertEqual(updated["selected_symbol"], "BTCUSDT")
+        self.assertEqual(updated["selected_strategy_id"], "trend-btc-01")
+        self.assertEqual(updated["selected_proposal_id"], "prop-002")
+
+    def test_workspace_preferences_update_aligns_strategy_to_selected_change_request_on_strategy_section(self) -> None:
+        payload = {
+            "active_section": "strategy",
+            "layout_preset": "balanced",
+            "selected_mode": "paper",
+            "selected_symbol": "BTCUSDT",
+            "selected_market_timeframe": "1h",
+            "selected_strategy_id": "eth-revert-02",
+            "selected_backtest_id": None,
+            "selected_change_request_id": "cr-003",
+            "backtest_filter": "selected",
+            "replay_tracking_scope": "selected",
+            "alert_severity_filter": "all",
+            "alert_status_filter": "pending",
+            "alert_scope_filter": "all",
+            "trade_mode_filter": "all",
+            "trade_origin_filter": "all",
+            "trade_scope_filter": "all",
+            "audit_severity_filter": "all",
+            "audit_source_filter": "all",
+            "audit_scope_filter": "all",
+            "audit_search": "",
+            "overview_card_order": ["strategy_watch", "ai_center", "account_center"],
+            "overview_visible_cards": ["strategy_watch", "account_center"],
+            "overview_collapsed_cards": [],
+        }
+
+        status, updated = self._post("/api/workspace/preferences", payload)
+        self.assertEqual(status, 200)
+        self.assertEqual(updated["selected_symbol"], "BTCUSDT")
+        self.assertEqual(updated["selected_strategy_id"], "trend-btc-01")
+        self.assertEqual(updated["selected_change_request_id"], "cr-003")
+
+    def test_workspace_preferences_update_aligns_strategy_to_selected_backtest_on_backtest_section(self) -> None:
+        payload = {
+            "active_section": "backtest",
+            "layout_preset": "balanced",
+            "selected_mode": "paper",
+            "selected_symbol": "ETHUSDT",
+            "selected_market_timeframe": "1h",
+            "selected_strategy_id": "trend-btc-01",
+            "selected_backtest_id": "bt-002",
+            "selected_change_request_id": None,
+            "backtest_filter": "selected",
+            "replay_tracking_scope": "selected",
+            "alert_severity_filter": "all",
+            "alert_status_filter": "pending",
+            "alert_scope_filter": "all",
+            "trade_mode_filter": "all",
+            "trade_origin_filter": "all",
+            "trade_scope_filter": "all",
+            "audit_severity_filter": "all",
+            "audit_source_filter": "all",
+            "audit_scope_filter": "all",
+            "audit_search": "",
+            "overview_card_order": ["strategy_watch", "ai_center", "account_center"],
+            "overview_visible_cards": ["strategy_watch", "account_center"],
+            "overview_collapsed_cards": [],
+        }
+
+        status, updated = self._post("/api/workspace/preferences", payload)
+        self.assertEqual(status, 200)
+        self.assertEqual(updated["selected_symbol"], "ETHUSDT")
+        self.assertEqual(updated["selected_strategy_id"], "eth-revert-02")
+        self.assertEqual(updated["selected_backtest_id"], "bt-002")
 
     def test_alert_acknowledge_updates_alert_summary_and_audit(self) -> None:
         initial_snapshot_status, initial_snapshot = self._get("/api/control/snapshot")
@@ -3872,8 +4919,123 @@ class ControlApiIntegrationTests(unittest.TestCase):
         self.assertEqual(payload["detail"]["source"], "bybit_rest")
         self.assertGreaterEqual(len(payload["detail"]["recent_public_trades"]), 1)
         self.assertGreaterEqual(len(payload["watchlist"]), 4)
+        self.assertGreaterEqual(len(payload["watchlist_details"]), 4)
+        self.assertEqual(
+            [item["symbol"] for item in payload["watchlist_details"]],
+            [item["symbol"] for item in payload["watchlist"]],
+        )
+        self.assertTrue(any(item["symbol"] == "ETHUSDT" for item in payload["watchlist_details"]))
         self.assertTrue(any(item["symbol"] == "ETHUSDT" for item in payload["watchlist"]))
+        self.assertEqual(payload["diagnostics"]["requested_symbol"], "ETHUSDT")
+        self.assertEqual(payload["diagnostics"]["effective_symbol"], "ETHUSDT")
+        self.assertEqual(payload["diagnostics"]["timeframe"], "1h")
+        self.assertEqual(payload["diagnostics"]["detail_source"], payload["detail"]["source"])
+        self.assertEqual(payload["diagnostics"]["detail_candle_count"], len(payload["detail"]["candles"]))
+        self.assertEqual(payload["diagnostics"]["watchlist_symbol_count"], len(payload["watchlist_details"]))
+        self.assertGreaterEqual(payload["diagnostics"]["watchlist_real_detail_count"], 1)
+        self.assertIn("bybit_rest", payload["diagnostics"]["watchlist_source_breakdown"])
         self.assertIn("generated_at", payload)
+
+    def test_market_live_snapshot_uses_renderable_fallback_candles_when_live_fetch_fails(self) -> None:
+        class FailingMarketLiveClient(StubBybitPublicMarketClient):
+            def enrich_market_detail(
+                self,
+                symbol: str,
+                market: str,
+                fallback_detail: Any,
+                watch_item: Optional[WatchlistInstrument] = None,
+                timeframe: str = "1h",
+                allow_rest_refresh: bool = True,
+            ) -> Any:
+                raise RuntimeError("Bybit public api request failed: timed out")
+
+        original_market_data = control_main.market_data
+        control_main.market_data = FailingMarketLiveClient()
+        try:
+            status, payload = self._get("/api/market/live?symbol=BNBUSDT&timeframe=1d")
+        finally:
+            control_main.market_data = original_market_data
+
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["detail"]["symbol"], "BNBUSDT")
+        self.assertEqual(payload["detail"]["timeframe"], "1d")
+        self.assertGreater(len(payload["detail"]["candles"]), 0)
+        self.assertIn("已回退到本地基线继续展示", payload["detail"]["headline"])
+        self.assertEqual(payload["diagnostics"]["detail_source"], "fallback")
+        self.assertEqual(payload["diagnostics"]["detail_candle_count"], len(payload["detail"]["candles"]))
+        self.assertGreaterEqual(payload["diagnostics"]["watchlist_fallback_detail_count"], 1)
+        selected_watch_item = next(item for item in payload["watchlist"] if item["symbol"] == "BNBUSDT")
+        self.assertEqual(payload["detail"]["candles"][-1]["close"], selected_watch_item["last_price"])
+
+    def test_market_live_snapshot_refreshes_selected_symbol_when_fast_path_has_no_candles(self) -> None:
+        class SelectedSymbolRefreshMarketClient(StubBybitPublicMarketClient):
+            def __init__(self) -> None:
+                super().__init__()
+                self.calls: list[tuple[str, str, bool]] = []
+
+            def enrich_market_detail(
+                self,
+                symbol: str,
+                market: str,
+                fallback_detail: Any,
+                watch_item: Optional[WatchlistInstrument] = None,
+                timeframe: str = "1h",
+                allow_rest_refresh: bool = True,
+            ) -> Any:
+                normalized_symbol = symbol.upper()
+                self.calls.append((normalized_symbol, timeframe, allow_rest_refresh))
+                item = watch_item or self._lookup_item(normalized_symbol, market)
+                if normalized_symbol == "ETHUSDT" and not allow_rest_refresh:
+                    return fallback_detail.model_copy(
+                        update={
+                            "symbol": normalized_symbol,
+                            "timeframe": timeframe,
+                            "candles": [],
+                            "source": "fallback",
+                            "updated_at": fallback_detail.updated_at,
+                        }
+                    )
+                detail = build_market_detail_for_watchlist(item)
+                return detail.model_copy(
+                    update={
+                        "symbol": normalized_symbol,
+                        "timeframe": timeframe,
+                        "source": "bybit_rest",
+                        "updated_at": "2026-03-31T09:30:00+08:00",
+                    }
+                )
+
+        original_market_data = control_main.market_data
+        client = SelectedSymbolRefreshMarketClient()
+        control_main.market_data = client
+        try:
+            status, payload = self._get("/api/market/live?symbol=ETHUSDT&timeframe=1h")
+        finally:
+            control_main.market_data = original_market_data
+
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["selected_symbol"], "ETHUSDT")
+        self.assertEqual(payload["detail"]["symbol"], "ETHUSDT")
+        self.assertEqual(payload["detail"]["source"], "bybit_rest")
+        self.assertGreater(len(payload["detail"]["candles"]), 0)
+        self.assertEqual(payload["diagnostics"]["detail_source"], "bybit_rest")
+        self.assertGreater(payload["diagnostics"]["detail_candle_count"], 0)
+        self.assertIn(("ETHUSDT", "1h", False), client.calls)
+        self.assertIn(("ETHUSDT", "1h", True), client.calls)
+
+    def test_market_watchlist_endpoint_prefers_fast_path_by_default(self) -> None:
+        status, payload = self._get("/api/market/watchlist")
+        self.assertEqual(status, 200)
+        self.assertGreaterEqual(len(payload), 4)
+        self.assertEqual(control_main.market_data.enrich_watchlist_fast_calls, 1)
+        self.assertEqual(control_main.market_data.enrich_watchlist_calls, 1)
+
+    def test_market_watchlist_endpoint_supports_explicit_full_refresh(self) -> None:
+        status, payload = self._get("/api/market/watchlist?refresh=true")
+        self.assertEqual(status, 200)
+        self.assertGreaterEqual(len(payload), 4)
+        self.assertEqual(control_main.market_data.enrich_watchlist_fast_calls, 0)
+        self.assertEqual(control_main.market_data.enrich_watchlist_calls, 1)
 
     def test_strategy_runtime_endpoint_generates_paper_trade_once_for_signal_change(self) -> None:
         original_market = control_main.market_data
@@ -6972,6 +8134,22 @@ class ControlApiIntegrationTests(unittest.TestCase):
             },
         )
         self.assertEqual(review_change_status, 200)
+        followup_change_status, followup_change = self._post(
+            "/api/change-requests",
+            {
+                "type": "proposal.script_patch_proposal",
+                "payload": {"strategy_id": "trend-btc-01", "proposal_id": "prop-manual-followup-001"},
+                "requested_by": "unit_test",
+                "source_proposal_id": "prop-manual-followup-001",
+                "trigger_reason": "proposal_accept",
+                "manual_followup_required": True,
+                "manual_followup_detail": "脚本补丁提案已转成待处理 ChangeRequest，需后续人工或编排链落实。",
+                "target_mode": "paper",
+                "priority": "high",
+                "summary": "策略活动测试脚本补丁待跟进",
+            },
+        )
+        self.assertEqual(followup_change_status, 200)
 
         _status, _runtime_payload = self._get("/api/strategies/live")
         activity_status, activity = self._get("/api/strategies/trend-btc-01/activity")
@@ -6981,13 +8159,57 @@ class ControlApiIntegrationTests(unittest.TestCase):
         self.assertEqual(activity["symbol"], "BTCUSDT")
         self.assertEqual(activity["mode"], "live")
         self.assertEqual(activity["runtime"]["strategy_id"], "trend-btc-01")
+        self.assertEqual(activity["latest_backtest"]["id"], "bt-001")
+        self.assertEqual(activity["latest_backtest"]["timeframe"], "1h")
+        self.assertEqual(activity["latest_backtest_record"]["id"], "bt-001")
+        self.assertEqual(activity["latest_backtest_record"]["timeframe"], "1h")
+        self.assertIsNone(activity["latest_actionable_backtest"])
+        self.assertIsNone(activity["latest_actionable_backtest_record"])
+        self.assertIsNone(activity["latest_backtest_review"])
+        self.assertIsNone(activity["latest_backtest_job"])
+        self.assertIsNone(activity["latest_actionable_backtest_review"])
+        self.assertIsNone(activity["latest_actionable_backtest_job"])
+        self.assertIsNone(activity["latest_backtest_review_record"])
+        self.assertIsNone(activity["latest_backtest_job_record"])
+        self.assertIsNone(activity["latest_actionable_backtest_review_record"])
+        self.assertIsNone(activity["latest_actionable_backtest_job_record"])
+        self.assertTrue(any(item["id"] == "bt-001" for item in activity["recent_backtests"]))
         self.assertTrue(any(item["id"] == "review-20260330-daily" for item in activity["recent_reviews"]))
         self.assertEqual(activity["latest_primary_review"]["id"], "review-20260330-daily")
+        self.assertEqual(activity["latest_primary_review_record"]["id"], "review-20260330-daily")
+        self.assertIsNone(activity["latest_actionable_primary_review"])
+        self.assertIsNone(activity["latest_actionable_primary_review_record"])
         self.assertIsNone(activity["latest_tracking_review"])
+        self.assertIsNone(activity["latest_tracking_review_record"])
         self.assertIn(
             activity["latest_tracking_job"]["job_type"],
             {"review_strategy_change", "review_strategy_issue"},
         )
+        self.assertEqual(activity["latest_tracking_job_record"]["id"], activity["latest_tracking_job"]["id"])
+        self.assertIsNone(activity["latest_retryable_tracking_job_record"])
+        self.assertEqual(activity["latest_audit_event_record"]["event_type"], "openclaw.job.queued")
+        self.assertEqual(activity["latest_audit_event_record"]["summary"], "任务已入队：review_strategy_issue")
+        self.assertEqual(activity["latest_audit_event_record"]["priority"], 1)
+        self.assertTrue(activity["latest_audit_event_record"]["is_key_event"])
+        self.assertEqual(
+            activity["latest_audit_event_record"]["payload"]["job_type"],
+            activity["latest_tracking_job"]["job_type"],
+        )
+        self.assertIn("latest_ops", activity)
+        self.assertEqual(activity["latest_ops"]["latest_order_record"]["order_id"], "hist-live-strategy-001")
+        self.assertEqual(activity["latest_ops"]["latest_trade_record"]["id"], activity["latest_trade_record"]["id"])
+        self.assertEqual(activity["latest_ops"]["latest_alert_record"]["id"], activity["latest_alert_record"]["id"])
+        self.assertEqual(
+            activity["latest_ops"]["latest_audit_event_record"]["event_type"],
+            activity["latest_audit_event_record"]["event_type"],
+        )
+        self.assertIn("latest_runtime", activity)
+        self.assertEqual(
+            activity["latest_runtime"]["latest_ops"]["latest_order_record"]["order_id"],
+            "hist-live-strategy-001",
+        )
+        self.assertEqual(activity["latest_order_record"]["order_id"], "hist-live-strategy-001")
+        self.assertEqual(activity["latest_order_record"]["symbol"], "BTCUSDT")
         self.assertTrue(any(item["order_id"] == "hist-live-strategy-001" for item in activity["recent_orders"]))
         self.assertTrue(any(item["event_type"] == "exchange_order.filled" for item in activity["recent_audit_events"]))
         self.assertTrue(any(item["job_type"] == "review_strategy_change" for item in activity["recent_agent_jobs"]))
@@ -6998,6 +8220,90 @@ class ControlApiIntegrationTests(unittest.TestCase):
                 for item in activity["recent_agent_jobs"]
             )
         )
+        self.assertTrue(any(item["id"] == review_change["id"] for item in activity["recent_change_requests"]))
+        self.assertEqual(activity["latest_change_request"]["id"], activity["recent_change_requests"][0]["id"])
+        self.assertIsNone(activity["latest_change_request_source_backtest_record"])
+        self.assertIsNone(activity["latest_change_request_source_review_record"])
+        self.assertIsNone(activity["latest_change_request_source_proposal_record"])
+        self.assertIsNone(activity["latest_actionable_change_request_source_backtest_record"])
+        self.assertIsNone(activity["latest_actionable_change_request_source_review_record"])
+        self.assertIsNone(activity["latest_actionable_change_request_source_proposal_record"])
+        manual_followup_change = next(
+            (item for item in activity["recent_change_requests"] if item["id"] == followup_change["id"]),
+            None,
+        )
+        self.assertIsNotNone(manual_followup_change)
+        assert manual_followup_change is not None
+        self.assertTrue(manual_followup_change["manual_followup_required"])
+        self.assertEqual(
+            manual_followup_change["manual_followup_detail"],
+            "脚本补丁提案已转成待处理 ChangeRequest，需后续人工或编排链落实。",
+        )
+        self.assertTrue(any(item["id"] == "prop-002" for item in activity["recent_proposals"]))
+        self.assertEqual(activity["latest_proposal"]["id"], activity["recent_proposals"][0]["id"])
+        self.assertEqual(activity["latest_actionable_proposal"]["id"], "prop-002")
+        self.assertIsNone(activity["latest_proposal_change_request"])
+        self.assertIsNone(activity["latest_proposal_backtest"])
+        self.assertIsNone(activity["latest_proposal_review"])
+        self.assertIsNone(activity["latest_proposal_job"])
+        self.assertIsNone(activity["latest_proposal_backtest_record"])
+        self.assertIsNone(activity["latest_proposal_review_record"])
+        self.assertIsNone(activity["latest_proposal_job_record"])
+        self.assertIsNone(activity["latest_actionable_proposal_change_request"])
+        self.assertIsNone(activity["latest_actionable_proposal_backtest"])
+        self.assertIsNone(activity["latest_actionable_proposal_review"])
+        self.assertIsNone(activity["latest_actionable_proposal_job"])
+        self.assertIsNone(activity["latest_actionable_proposal_backtest_record"])
+        self.assertIsNone(activity["latest_actionable_proposal_review_record"])
+        self.assertIsNone(activity["latest_actionable_proposal_job_record"])
+        self.assertIsNone(activity["latest_change_request_backtest_record"])
+        self.assertIsNone(activity["latest_change_request_review_record"])
+        self.assertIsNone(activity["latest_change_request_job_record"])
+        self.assertIsNone(activity["latest_actionable_change_request_backtest_record"])
+        self.assertIsNone(activity["latest_actionable_change_request_review_record"])
+        self.assertIsNone(activity["latest_actionable_change_request_job_record"])
+        self.assertIsNone(activity["latest_actionable_change_request"])
+        self.assertIsNone(activity["latest_retryable_tracking_job"])
+        latest_proposal = next((item for item in activity["recent_proposals"] if item["id"] == "prop-002"), None)
+        self.assertIsNotNone(latest_proposal)
+        assert latest_proposal is not None
+        self.assertEqual(latest_proposal["strategy_id"], "trend-btc-01")
+        self.assertEqual(latest_proposal["proposal_type"], "publish_recommendation")
+        self.assertEqual(latest_proposal["status"], "pending")
+
+    def test_get_strategy_activity_uses_cached_runtime_snapshot(self) -> None:
+        control_main.repo.state.strategy_runtime_snapshots = [
+            StrategyRuntimeSnapshot(
+                strategy_id="trend-btc-01",
+                strategy_name="BTC 趋势跟随",
+                symbol="BTCUSDT",
+                market="perp",
+                mode=AccountMode.LIVE,
+                runtime_status="running",
+                signal="long",
+                confidence=72.0,
+                last_price=68000.0,
+                reference_price=67920.0,
+                change_24h=2.1,
+                note="使用缓存运行态快照。",
+                next_action="继续观察缓存运行态。",
+                last_evaluated_at="2026-04-05T10:00:00+08:00",
+            )
+        ]
+
+        with patch.object(
+            control_main,
+            "build_strategy_runtime_response",
+            side_effect=AssertionError("strategy activity 不应触发重型 runtime 刷新"),
+        ):
+            activity_status, activity = self._get("/api/strategies/trend-btc-01/activity")
+
+        self.assertEqual(activity_status, 200)
+        self.assertEqual(activity["strategy_id"], "trend-btc-01")
+        self.assertIsNotNone(activity["runtime"])
+        self.assertEqual(activity["runtime"]["strategy_id"], "trend-btc-01")
+        self.assertIsNotNone(activity["runtime"]["signal"])
+        self.assertIsNotNone(activity["runtime"]["last_price"])
 
     def test_strategy_runtime_rejected_exchange_order_creates_system_alert(self) -> None:
         original_market = control_main.market_data
@@ -8771,6 +10077,19 @@ class ControlApiIntegrationTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(payload["detail"]["timeframe"], "4h")
         self.assertEqual(payload["detail"]["source"], "bybit_rest")
+        self.assertEqual(payload["diagnostics"]["timeframe"], "4h")
+        self.assertGreaterEqual(len(payload["watchlist_details"]), 4)
+        self.assertTrue(all(item["timeframe"] == "4h" for item in payload["watchlist_details"]))
+        self.assertTrue(any(item["symbol"] == "ETHUSDT" for item in payload["watchlist_details"]))
+
+    def test_market_live_snapshot_auto_corrects_missing_symbol_to_valid_watchlist_item(self) -> None:
+        status, payload = self._get("/api/market/live?symbol=DOGEUSDT&timeframe=1h")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["diagnostics"]["requested_symbol"], "DOGEUSDT")
+        self.assertTrue(payload["diagnostics"]["selection_corrected"])
+        self.assertEqual(payload["selected_symbol"], payload["diagnostics"]["effective_symbol"])
+        self.assertEqual(payload["detail"]["symbol"], payload["selected_symbol"])
+        self.assertTrue(any(item["symbol"] == payload["selected_symbol"] for item in payload["watchlist"]))
 
     def test_market_live_snapshot_rejects_invalid_timeframe(self) -> None:
         status, payload = self._get("/api/market/live?symbol=ETHUSDT&timeframe=2h")
@@ -8830,6 +10149,13 @@ class ControlApiIntegrationTests(unittest.TestCase):
         self.assertIn("bybit_control_private_ws_authenticated", metrics_body)
         self.assertIn("bybit_control_private_ws_stale", metrics_body)
         self.assertIn("bybit_control_private_ws_stale_seconds", metrics_body)
+        self.assertIn("bybit_control_market_live_snapshot_error", metrics_body)
+        self.assertIn("bybit_control_market_live_generation_ms", metrics_body)
+        self.assertIn("bybit_control_market_live_detail_candle_count", metrics_body)
+        self.assertIn("bybit_control_market_live_selection_corrected", metrics_body)
+        self.assertIn("bybit_control_market_live_watchlist_real_detail_count", metrics_body)
+        self.assertIn("bybit_control_market_live_watchlist_fallback_detail_count", metrics_body)
+        self.assertIn("bybit_control_market_live_watchlist_source_breakdown", metrics_body)
         self.assertIn("bybit_control_paper_realized_pnl", metrics_body)
         self.assertIn("bybit_control_paper_win_rate", metrics_body)
         self.assertIn("bybit_control_paper_open_orders", metrics_body)
@@ -8851,6 +10177,20 @@ class ControlApiIntegrationTests(unittest.TestCase):
         self.assertEqual(metrics_body.count("# TYPE bybit_control_private_ws_stale "), 1)
         self.assertEqual(metrics_body.count("# HELP bybit_control_private_ws_stale_seconds "), 1)
         self.assertEqual(metrics_body.count("# TYPE bybit_control_private_ws_stale_seconds "), 1)
+        self.assertEqual(metrics_body.count("# HELP bybit_control_market_live_snapshot_error "), 1)
+        self.assertEqual(metrics_body.count("# TYPE bybit_control_market_live_snapshot_error "), 1)
+        self.assertEqual(metrics_body.count("# HELP bybit_control_market_live_generation_ms "), 1)
+        self.assertEqual(metrics_body.count("# TYPE bybit_control_market_live_generation_ms "), 1)
+        self.assertEqual(metrics_body.count("# HELP bybit_control_market_live_detail_candle_count "), 1)
+        self.assertEqual(metrics_body.count("# TYPE bybit_control_market_live_detail_candle_count "), 1)
+        self.assertEqual(metrics_body.count("# HELP bybit_control_market_live_selection_corrected "), 1)
+        self.assertEqual(metrics_body.count("# TYPE bybit_control_market_live_selection_corrected "), 1)
+        self.assertEqual(metrics_body.count("# HELP bybit_control_market_live_watchlist_real_detail_count "), 1)
+        self.assertEqual(metrics_body.count("# TYPE bybit_control_market_live_watchlist_real_detail_count "), 1)
+        self.assertEqual(metrics_body.count("# HELP bybit_control_market_live_watchlist_fallback_detail_count "), 1)
+        self.assertEqual(metrics_body.count("# TYPE bybit_control_market_live_watchlist_fallback_detail_count "), 1)
+        self.assertEqual(metrics_body.count("# HELP bybit_control_market_live_watchlist_source_breakdown "), 1)
+        self.assertEqual(metrics_body.count("# TYPE bybit_control_market_live_watchlist_source_breakdown "), 1)
         self.assertEqual(metrics_body.count("# HELP bybit_control_alerts_total "), 1)
         self.assertEqual(metrics_body.count("# TYPE bybit_control_alerts_total "), 1)
         self.assertEqual(metrics_body.count("# HELP bybit_control_watchlist_signal_state "), 1)
@@ -8873,6 +10213,30 @@ class ControlApiIntegrationTests(unittest.TestCase):
         self.assertEqual(metrics_body.count("# TYPE bybit_control_strategy_stale_order_guard "), 1)
         self.assertEqual(metrics_body.count("# HELP bybit_control_strategy_issue_total "), 1)
         self.assertEqual(metrics_body.count("# TYPE bybit_control_strategy_issue_total "), 1)
+        self.assertRegex(
+            metrics_body,
+            r'bybit_control_market_live_snapshot_error\{requested_symbol="BTCUSDT",timeframe="1h"\} 0',
+        )
+        self.assertRegex(
+            metrics_body,
+            r'bybit_control_market_live_generation_ms\{requested_symbol="BTCUSDT",effective_symbol="BTCUSDT",timeframe="1h",detail_source="(?:bybit_ws|bybit_rest|fallback|mock)"\} \d+',
+        )
+        self.assertRegex(
+            metrics_body,
+            r'bybit_control_market_live_detail_candle_count\{requested_symbol="BTCUSDT",effective_symbol="BTCUSDT",timeframe="1h",detail_source="(?:bybit_ws|bybit_rest|fallback|mock)"\} \d+',
+        )
+        self.assertIn(
+            'bybit_control_market_live_selection_corrected{requested_symbol="BTCUSDT",effective_symbol="BTCUSDT",timeframe="1h"} 0',
+            metrics_body,
+        )
+        self.assertRegex(
+            metrics_body,
+            r'bybit_control_market_live_watchlist_real_detail_count\{timeframe="1h"\} \d+',
+        )
+        self.assertRegex(
+            metrics_body,
+            r'bybit_control_market_live_watchlist_fallback_detail_count\{timeframe="1h"\} \d+',
+        )
 
     def test_settings_endpoint_updates_local_settings_and_grafana_status(self) -> None:
         status, payload = self._post(
@@ -9455,6 +10819,9 @@ class ControlApiIntegrationTests(unittest.TestCase):
                 "type": "strategy.parameter.update",
                 "payload": {"strategy_id": "trend-btc-01", "fast_ma": 15},
                 "requested_by": "unit_test",
+                "source_backtest_id": "bt-001",
+                "source_review_id": "review-20260330-daily",
+                "source_proposal_id": "prop-002",
                 "target_mode": "paper",
                 "priority": "high",
                 "summary": "补齐变更跟踪结果写回",
@@ -9490,6 +10857,25 @@ class ControlApiIntegrationTests(unittest.TestCase):
         self.assertEqual(updated["linked_review_id"], review.id)
         self.assertEqual(updated["linked_review_title"], review.title)
         self.assertEqual(updated["linked_review_period"], review.period)
+        activity_context = control_main._build_strategy_activity_review_context("trend-btc-01")
+        self.assertIsNotNone(activity_context)
+        assert activity_context is not None
+        self.assertEqual(activity_context["latest_change_request_job_record"]["id"], job.id)
+        self.assertEqual(activity_context["latest_change_request_review_record"]["id"], review.id)
+        self.assertEqual(activity_context["latest_change_request_source_backtest_record"]["id"], "bt-001")
+        self.assertEqual(
+            activity_context["latest_change_request_source_review_record"]["id"],
+            "review-20260330-daily",
+        )
+        self.assertEqual(activity_context["latest_change_request_source_proposal_record"]["id"], "prop-002")
+
+        activity_status, activity = self._get("/api/strategies/trend-btc-01/activity")
+        self.assertEqual(activity_status, 200)
+        self.assertEqual(activity["latest_change_request_job_record"]["id"], job.id)
+        self.assertEqual(activity["latest_change_request_review_record"]["id"], review.id)
+        self.assertEqual(activity["latest_change_request_source_backtest_record"]["id"], "bt-001")
+        self.assertEqual(activity["latest_change_request_source_review_record"]["id"], "review-20260330-daily")
+        self.assertEqual(activity["latest_change_request_source_proposal_record"]["id"], "prop-002")
 
     def test_change_request_follow_up_fields_update_after_strategy_change_review_failure(self) -> None:
         status, change_request = self._post(
@@ -9498,6 +10884,9 @@ class ControlApiIntegrationTests(unittest.TestCase):
                 "type": "strategy.risk_update",
                 "payload": {"strategy_id": "trend-btc-01", "risk_budget": "10%"},
                 "requested_by": "unit_test",
+                "source_backtest_id": "bt-001",
+                "source_review_id": "review-20260330-daily",
+                "source_proposal_id": "prop-002",
                 "target_mode": "paper",
                 "priority": "high",
                 "summary": "补齐变更跟踪失败写回",
@@ -9522,6 +10911,32 @@ class ControlApiIntegrationTests(unittest.TestCase):
         self.assertEqual(updated["follow_up_job_status"], "failed")
         self.assertEqual(updated["follow_up_result_summary"], "OpenClaw 任务执行失败。")
         self.assertIsNone(updated["linked_review_id"])
+        activity_context = control_main._build_strategy_activity_review_context("trend-btc-01")
+        self.assertIsNotNone(activity_context)
+        assert activity_context is not None
+        self.assertIn(change_request["id"], str(activity_context["latest_actionable_change_request"] or ""))
+        self.assertIn(follow_up_job_id, str(activity_context["latest_retryable_tracking_job"] or ""))
+        self.assertEqual(activity_context["latest_actionable_change_request_job_record"]["id"], follow_up_job_id)
+        self.assertIsNone(activity_context["latest_actionable_change_request_review_record"])
+        self.assertEqual(activity_context["latest_actionable_change_request_source_backtest_record"]["id"], "bt-001")
+        self.assertEqual(
+            activity_context["latest_actionable_change_request_source_review_record"]["id"],
+            "review-20260330-daily",
+        )
+        self.assertEqual(activity_context["latest_actionable_change_request_source_proposal_record"]["id"], "prop-002")
+
+        activity_status, activity = self._get("/api/strategies/trend-btc-01/activity")
+        self.assertEqual(activity_status, 200)
+        self.assertEqual(activity["latest_actionable_change_request"]["id"], change_request["id"])
+        self.assertEqual(activity["latest_retryable_tracking_job"]["id"], follow_up_job_id)
+        self.assertEqual(activity["latest_actionable_change_request_job_record"]["id"], follow_up_job_id)
+        self.assertIsNone(activity["latest_actionable_change_request_review_record"])
+        self.assertEqual(activity["latest_actionable_change_request_source_backtest_record"]["id"], "bt-001")
+        self.assertEqual(
+            activity["latest_actionable_change_request_source_review_record"]["id"],
+            "review-20260330-daily",
+        )
+        self.assertEqual(activity["latest_actionable_change_request_source_proposal_record"]["id"], "prop-002")
 
     def test_change_request_follow_up_fields_reset_when_retrying_cancelled_tracking_job(self) -> None:
         status, change_request = self._post(
@@ -9763,6 +11178,25 @@ class ControlApiIntegrationTests(unittest.TestCase):
         self.assertEqual(job["context"]["issue_type"], "manual_issue_review")
         self.assertIn("review_strategy_activity", job["context"])
         self.assertIn("execution_health", job["context"])
+        activity_context = job["context"]["review_strategy_activity"]
+        self.assertEqual(activity_context["strategy_id"], "trend-btc-01")
+        self.assertIsNotNone(activity_context["latest_backtest"])
+        self.assertTrue(any("bt-" in item for item in activity_context["recent_backtests"]))
+        self.assertTrue(
+            any(
+                job["id"] in item and "review_strategy_issue" in item and "queued" in item
+                for item in activity_context["recent_agent_jobs"]
+            )
+        )
+        self.assertIn(job["id"], str(activity_context["latest_tracking_job"] or ""))
+        self.assertEqual(activity_context["latest_tracking_job_record"]["id"], job["id"])
+        self.assertIn("latest_proposal", activity_context)
+        self.assertIn("latest_proposal_change_request", activity_context)
+        self.assertIn("latest_proposal_backtest", activity_context)
+        self.assertIn("latest_proposal_review", activity_context)
+        self.assertIn("latest_proposal_job", activity_context)
+        self.assertIn("latest_change_request", activity_context)
+        self.assertIn("recent_reviews", activity_context)
 
         repeated_status, repeated_job = self._post(
             "/api/strategies/trend-btc-01/review",
@@ -9805,6 +11239,24 @@ class ControlApiIntegrationTests(unittest.TestCase):
         self.assertEqual(job["context"]["change_type"], "manual_change_review")
         self.assertIn("review_strategy_activity", job["context"])
         self.assertIn("execution_health", job["context"])
+        activity_context = job["context"]["review_strategy_activity"]
+        self.assertEqual(activity_context["strategy_id"], "eth-revert-02")
+        self.assertIsNotNone(activity_context["latest_backtest"])
+        self.assertTrue(any("bt-" in item for item in activity_context["recent_backtests"]))
+        self.assertTrue(
+            any(
+                job["id"] in item and "review_strategy_change" in item and "queued" in item
+                for item in activity_context["recent_agent_jobs"]
+            )
+        )
+        self.assertIn(job["id"], str(activity_context["latest_tracking_job"] or ""))
+        self.assertIn("latest_proposal", activity_context)
+        self.assertIn("latest_proposal_change_request", activity_context)
+        self.assertIn("latest_proposal_backtest", activity_context)
+        self.assertIn("latest_proposal_review", activity_context)
+        self.assertIn("latest_proposal_job", activity_context)
+        self.assertIn("latest_change_request", activity_context)
+        self.assertIn("recent_reviews", activity_context)
 
         activity_status, activity = self._get("/api/strategies/eth-revert-02/activity")
         self.assertEqual(activity_status, 200)
@@ -9815,6 +11267,305 @@ class ControlApiIntegrationTests(unittest.TestCase):
                 for item in activity["recent_audit_events"]
             )
         )
+
+    def test_review_strategy_activity_context_uses_high_value_audit_summary(self) -> None:
+        audit_event = control_main.ExecutionEvent(
+            id="audit-review-strategy-activity-001",
+            event_type="scheduler.command",
+            severity="warning",
+            source="desktop-control",
+            symbol="BTCUSDT",
+            strategy_id="trend-btc-01",
+            payload={
+                "summary": "已终止 2 个任务。",
+                "cancelled_job_types": ["review_strategy_change", "generate_backtest_review"],
+                "cancelled_backtest_ids": ["bt-audit-001"],
+                "manual_followup_required": True,
+                "manual_followup_detail": "脚本补丁仍待人工落实。",
+            },
+            trace_id="trace-audit-review-strategy-activity-001",
+            occurred_at=datetime.now(timezone.utc).astimezone().isoformat(),
+        )
+        control_main.repo.state.audit_events.insert(0, audit_event)
+        self.addCleanup(
+            lambda: control_main.repo.state.audit_events.remove(audit_event)
+            if audit_event in control_main.repo.state.audit_events
+            else None
+        )
+
+        activity_context = control_main.repo._build_review_strategy_activity_context_locked("trend-btc-01")
+        self.assertIsNotNone(activity_context)
+        assert activity_context is not None
+        latest_audit_event = str(activity_context["latest_audit_event"] or "")
+        self.assertIn("scheduler.command", latest_audit_event)
+        self.assertIn("已终止 2 个任务", latest_audit_event)
+        self.assertIn("回测 bt-audit-001", latest_audit_event)
+        self.assertIn("需人工跟进", latest_audit_event)
+        self.assertIn("脚本补丁仍待人工落实", latest_audit_event)
+        self.assertEqual(activity_context["latest_audit_event_record"]["event_type"], "scheduler.command")
+        self.assertEqual(activity_context["latest_audit_event_record"]["summary"], "已终止 2 个任务。")
+        self.assertIn("回测 bt-audit-001", str(activity_context["latest_audit_event_record"]["impact_detail"] or ""))
+        self.assertEqual(activity_context["latest_audit_event_record"]["priority"], 0)
+        self.assertTrue(activity_context["latest_audit_event_record"]["is_key_event"])
+        self.assertEqual(activity_context["latest_audit_event_record"]["payload"]["summary"], "已终止 2 个任务。")
+        self.assertEqual(
+            activity_context["latest_audit_event_record"]["payload"]["cancelled_backtest_ids"],
+            ["bt-audit-001"],
+        )
+        self.assertIn("latest_ops", activity_context)
+        self.assertEqual(activity_context["latest_ops"]["latest_audit_event_record"]["event_type"], "scheduler.command")
+        self.assertIn("latest_runtime", activity_context)
+        self.assertEqual(activity_context["latest_runtime"]["latest_ops"]["latest_audit_event_record"]["event_type"], "scheduler.command")
+        self.assertTrue(
+            any(
+                "已终止 2 个任务" in item
+                and "回测 bt-audit-001" in item
+                and "需人工跟进" in item
+                for item in activity_context["recent_audit_events"]
+            )
+        )
+
+        public_context = control_main._build_strategy_activity_review_context("trend-btc-01")
+        self.assertIsNotNone(public_context)
+        assert public_context is not None
+        self.assertTrue(
+            any(
+                "已终止 2 个任务" in item
+                and "回测 bt-audit-001" in item
+                and "需人工跟进" in item
+                for item in public_context["recent_audit_events"]
+            )
+        )
+
+        activity_status, activity = self._get("/api/strategies/trend-btc-01/activity")
+        self.assertEqual(activity_status, 200)
+        self.assertIn("已终止 2 个任务", str(activity.get("latest_audit_event") or ""))
+        self.assertIn("回测 bt-audit-001", str(activity.get("latest_audit_event") or ""))
+        self.assertIn("需人工跟进", str(activity.get("latest_audit_event") or ""))
+        self.assertEqual(activity["latest_audit_event_record"]["event_type"], "scheduler.command")
+        self.assertEqual(activity["latest_audit_event_record"]["summary"], "已终止 2 个任务。")
+        self.assertIn("回测 bt-audit-001", str(activity["latest_audit_event_record"]["impact_detail"] or ""))
+        self.assertEqual(activity["latest_audit_event_record"]["payload"]["summary"], "已终止 2 个任务。")
+
+    def test_review_strategy_activity_context_includes_latest_alert_order_and_trade(self) -> None:
+        now = datetime.now(timezone.utc).astimezone().isoformat()
+        later = (datetime.now(timezone.utc).astimezone() + timedelta(seconds=5)).isoformat()
+        latest_trade_time = (datetime.now(timezone.utc).astimezone() + timedelta(seconds=10)).isoformat()
+        latest_alert_time = (datetime.now(timezone.utc).astimezone() + timedelta(seconds=15)).isoformat()
+        strategy_id = "eth-revert-02"
+        symbol = "ETHUSDT"
+        order = OrderRecord(
+            source="paper",
+            origin="strategy",
+            strategy_id=strategy_id,
+            order_id="order-review-context-001",
+            symbol=symbol,
+            market="perp",
+            side="buy",
+            order_type="limit",
+            qty="0.500",
+            price="3568",
+            status="filled",
+            created_at=now,
+        )
+        active_order = OrderRecord(
+            source="paper",
+            origin="strategy",
+            strategy_id=strategy_id,
+            order_id="order-review-context-active-001",
+            symbol=symbol,
+            market="perp",
+            side="sell",
+            order_type="limit",
+            qty="0.250",
+            price="999999",
+            status="New",
+            created_at=later,
+        )
+        trade = TradeRecord(
+            id="trade-review-context-001",
+            symbol=symbol,
+            market="perp",
+            mode="paper",
+            origin="strategy",
+            side="buy",
+            quantity=0.5,
+            price=3568.0,
+            pnl="+12.80 USDT",
+            strategy_id=strategy_id,
+            created_at=now,
+            status="filled",
+        )
+        latest_trade = TradeRecord(
+            id="trade-review-context-002",
+            symbol=symbol,
+            market="perp",
+            mode="paper",
+            origin="strategy",
+            side="sell",
+            quantity=0.25,
+            price=3576.0,
+            pnl="+18.60 USDT",
+            strategy_id=strategy_id,
+            created_at=latest_trade_time,
+            status="filled",
+        )
+        alert = AlertRecord(
+            id="alert-review-context-001",
+            severity="P1",
+            symbol=symbol,
+            title="ETH 执行受阻",
+            description="最近一次策略执行需要人工复核。",
+            triggered_at=now,
+            suggested_action="先检查最近执行日志。",
+            source_type="system",
+            rule_key="strategy-manual-execution:eth-revert-02:context",
+        )
+        latest_alert = AlertRecord(
+            id="alert-review-context-002",
+            severity="P0",
+            symbol=symbol,
+            title="ETH 二次执行阻断",
+            description="最新一次执行阻断仍需立即人工确认。",
+            triggered_at=latest_alert_time,
+            suggested_action="立即核对最新阻断详情。",
+            acknowledged=True,
+            source_type="system",
+            rule_key="strategy-manual-execution:eth-revert-02:context-latest",
+        )
+        latest_pending_alert_time = (datetime.now(timezone.utc).astimezone() + timedelta(seconds=12)).isoformat()
+        pending_alert = AlertRecord(
+            id="alert-review-context-003",
+            severity="P1",
+            symbol=symbol,
+            title="ETH 待处理执行提醒",
+            description="这条提醒仍未确认，需要继续处理。",
+            triggered_at=latest_pending_alert_time,
+            suggested_action="优先确认这条待处理提醒。",
+            acknowledged=False,
+            source_type="system",
+            rule_key="strategy-manual-execution:eth-revert-02:context-pending",
+        )
+        control_main.repo.state.paper_orders.insert(0, active_order)
+        control_main.repo.state.paper_order_history.insert(0, order)
+        control_main.repo.state.trades.insert(0, trade)
+        control_main.repo.state.trades.append(latest_trade)
+        control_main.repo.state.alerts.insert(0, alert)
+        control_main.repo.state.alerts.append(pending_alert)
+        control_main.repo.state.alerts.append(latest_alert)
+        self.addCleanup(
+            lambda: control_main.repo.state.paper_orders.remove(active_order)
+            if active_order in control_main.repo.state.paper_orders
+            else None
+        )
+        self.addCleanup(
+            lambda: control_main.repo.state.paper_order_history.remove(order)
+            if order in control_main.repo.state.paper_order_history
+            else None
+        )
+        self.addCleanup(
+            lambda: control_main.repo.state.trades.remove(trade)
+            if trade in control_main.repo.state.trades
+            else None
+        )
+        self.addCleanup(
+            lambda: control_main.repo.state.trades.remove(latest_trade)
+            if latest_trade in control_main.repo.state.trades
+            else None
+        )
+        self.addCleanup(
+            lambda: control_main.repo.state.alerts.remove(alert)
+            if alert in control_main.repo.state.alerts
+            else None
+        )
+        self.addCleanup(
+            lambda: control_main.repo.state.alerts.remove(pending_alert)
+            if pending_alert in control_main.repo.state.alerts
+            else None
+        )
+        self.addCleanup(
+            lambda: control_main.repo.state.alerts.remove(latest_alert)
+            if latest_alert in control_main.repo.state.alerts
+            else None
+        )
+
+        activity_context = control_main.repo._build_review_strategy_activity_context_locked(strategy_id)
+        self.assertIsNotNone(activity_context)
+        assert activity_context is not None
+        self.assertIn("ETHUSDT sell 0.25@3576.0", str(activity_context["latest_trade"] or ""))
+        self.assertIn("pnl +18.60 USDT", str(activity_context["latest_trade"] or ""))
+        self.assertEqual(activity_context["latest_trade_record"]["id"], "trade-review-context-002")
+        self.assertEqual(activity_context["latest_trade_record"]["symbol"], symbol)
+        self.assertIn("latest_ops", activity_context)
+        self.assertEqual(activity_context["latest_ops"]["latest_trade_record"]["id"], "trade-review-context-002")
+        self.assertIn("latest_runtime", activity_context)
+        self.assertEqual(activity_context["latest_runtime"]["latest_ops"]["latest_trade_record"]["id"], "trade-review-context-002")
+        self.assertIn("ETHUSDT sell 0.25@3576.0", str(activity_context["recent_trades"][0] or ""))
+        self.assertIn("ETHUSDT sell 0.250@999999", str(activity_context["latest_order"] or ""))
+        self.assertIn("New", str(activity_context["latest_order"] or ""))
+        self.assertIn("ETHUSDT sell 0.250@999999", str(activity_context["latest_active_order"] or ""))
+        self.assertIn("New", str(activity_context["latest_active_order"] or ""))
+        self.assertIn("ETHUSDT buy 0.500@3568", str(activity_context["latest_historical_order"] or ""))
+        self.assertIn("filled", str(activity_context["latest_historical_order"] or ""))
+        self.assertEqual(activity_context["latest_active_order_record"]["order_id"], "order-review-context-active-001")
+        self.assertEqual(activity_context["latest_historical_order_record"]["order_id"], "order-review-context-001")
+        self.assertEqual(activity_context["latest_order_record"]["order_id"], "order-review-context-active-001")
+        self.assertEqual(activity_context["latest_order_record"]["symbol"], symbol)
+        self.assertIn("P0 ETH 二次执行阻断", str(activity_context["latest_alert"] or ""))
+        self.assertIn("最新一次执行阻断仍需立即人工确认", str(activity_context["latest_alert"] or ""))
+        self.assertEqual(activity_context["latest_alert_record"]["id"], "alert-review-context-002")
+        self.assertEqual(activity_context["latest_alert_record"]["symbol"], symbol)
+        self.assertIn("P1 ETH 待处理执行提醒", str(activity_context["latest_pending_alert"] or ""))
+        self.assertIn("仍未确认", str(activity_context["latest_pending_alert"] or ""))
+        self.assertEqual(activity_context["latest_pending_alert_record"]["id"], "alert-review-context-003")
+        self.assertIn("ETH 二次执行阻断", str(activity_context["recent_alerts"][0] or ""))
+
+        public_context = control_main._build_strategy_activity_review_context(strategy_id)
+        self.assertIsNotNone(public_context)
+        assert public_context is not None
+        self.assertIn("ETHUSDT sell 0.25@3576.0", str(public_context["latest_trade"] or ""))
+        self.assertIn("filled", str(public_context["latest_trade"] or ""))
+        self.assertEqual(public_context["latest_trade_record"]["id"], "trade-review-context-002")
+        self.assertIn("ETHUSDT sell 0.25@3576.0", str(public_context["recent_trades"][0] or ""))
+        self.assertIn("ETHUSDT sell 0.250@999999", str(public_context["latest_order"] or ""))
+        self.assertIn("New", str(public_context["latest_order"] or ""))
+        self.assertIn("ETHUSDT sell 0.250@999999", str(public_context["latest_active_order"] or ""))
+        self.assertIn("New", str(public_context["latest_active_order"] or ""))
+        self.assertIn("ETHUSDT buy 0.500@3568", str(public_context["latest_historical_order"] or ""))
+        self.assertIn("filled", str(public_context["latest_historical_order"] or ""))
+        self.assertEqual(public_context["latest_active_order_record"]["order_id"], "order-review-context-active-001")
+        self.assertEqual(public_context["latest_historical_order_record"]["order_id"], "order-review-context-001")
+        self.assertEqual(public_context["latest_order_record"]["order_id"], "order-review-context-active-001")
+        self.assertIn("ETH 二次执行阻断", str(public_context["latest_alert"] or ""))
+        self.assertIn("ETH 待处理执行提醒", str(public_context["latest_pending_alert"] or ""))
+        self.assertEqual(public_context["latest_pending_alert_record"]["id"], "alert-review-context-003")
+        self.assertEqual(public_context["latest_alert_record"]["id"], "alert-review-context-002")
+        self.assertIn("ETH 二次执行阻断", str(public_context["recent_alerts"][0] or ""))
+
+        activity_status, activity = self._get(f"/api/strategies/{strategy_id}/activity")
+        self.assertEqual(activity_status, 200)
+        self.assertIn("ETHUSDT 卖 0.250@999999", str(activity.get("latest_order") or ""))
+        self.assertIn("New", str(activity.get("latest_order") or ""))
+        self.assertIn("ETHUSDT 卖 0.250@999999", str(activity.get("latest_active_order") or ""))
+        self.assertIn("New", str(activity.get("latest_active_order") or ""))
+        self.assertIn("ETHUSDT 买 0.500@3568", str(activity.get("latest_historical_order") or ""))
+        self.assertIn("filled", str(activity.get("latest_historical_order") or ""))
+        self.assertEqual(activity["latest_active_order_record"]["order_id"], "order-review-context-active-001")
+        self.assertEqual(activity["latest_historical_order_record"]["order_id"], "order-review-context-001")
+        self.assertEqual(activity["latest_order_record"]["order_id"], "order-review-context-active-001")
+        self.assertIn("ETHUSDT 卖 0.25@3576.0", str(activity.get("latest_trade") or ""))
+        self.assertIn("filled", str(activity.get("latest_trade") or ""))
+        self.assertIn("latest_ops", activity)
+        self.assertEqual(activity["latest_ops"]["latest_trade_record"]["id"], "trade-review-context-002")
+        self.assertIn("latest_runtime", activity)
+        self.assertEqual(activity["latest_runtime"]["latest_ops"]["latest_trade_record"]["id"], "trade-review-context-002")
+        self.assertEqual(activity["latest_trade_record"]["id"], "trade-review-context-002")
+        self.assertEqual(activity["recent_trades"][0]["id"], "trade-review-context-002")
+        self.assertIn("P0 ETH 二次执行阻断", str(activity.get("latest_alert") or ""))
+        self.assertIn("P1 ETH 待处理执行提醒", str(activity.get("latest_pending_alert") or ""))
+        self.assertEqual(activity["latest_pending_alert_record"]["id"], "alert-review-context-003")
+        self.assertEqual(activity["latest_alert_record"]["id"], "alert-review-context-002")
+        self.assertEqual(activity["recent_alerts"][0]["id"], "alert-review-context-002")
 
     def test_build_backtest_payload_prefers_strategy_market_resolution_when_watchlist_missing(self) -> None:
         original_market_data = control_main.market_data
@@ -10575,6 +12326,41 @@ class ControlApiIntegrationTests(unittest.TestCase):
         self.assertEqual(linked_review["source_job_status"], "completed")
 
     def test_strategy_activity_review_summary_carries_backtest_lineage_metadata(self) -> None:
+        backtest = control_main.BacktestRun(
+            id="bt-child-001",
+            strategy_id="trend-btc-01",
+            strategy_name="BTC 趋势跟随",
+            source_change_request_id="cr-parent-001",
+            source_backtest_id="bt-parent-001",
+            source_review_id="review-parent-001",
+            source_proposal_id="prop-parent-001",
+            trigger_reason="proposal_accept",
+            status="completed",
+            started_at=datetime.now(timezone.utc).astimezone().isoformat(),
+            finished_at=datetime.now(timezone.utc).astimezone().isoformat(),
+            symbol_scope=["BTCUSDT"],
+            timeframe="4h",
+            data_range="最近 180 天",
+            data_granularity="kline",
+            fee_model="paper-fee",
+            slippage_model="fixed-0.10%",
+            parameter_snapshot={"fast_ma": 21},
+            metrics=BacktestMetrics(
+                annual_return="+12.4%",
+                max_drawdown="-3.2%",
+                sharpe="1.18",
+                win_rate="56.0%",
+                pnl="+12,300 USDT",
+                trades=42,
+            ),
+            decision_readiness="sample_incomplete",
+            decision_readiness_detail="样本窗口仍可继续拉长。",
+            decision_recommended_data_range="最近 240 天",
+            decision_recommended_timeframe="4h",
+            decision_readiness_action="建议补齐更长样本后再判断。",
+            notes="补齐活动摘要链路测试。",
+        )
+        control_main.repo.state.backtests.insert(0, backtest)
         review = control_main.ReviewDocument(
             id="review-unit-backtest-lineage",
             period="backtest",
@@ -10590,6 +12376,9 @@ class ControlApiIntegrationTests(unittest.TestCase):
             trigger_reason="proposal_accept",
             title="BTC 回测复盘",
             summary="本轮回测来自接受提案后的补样本重跑。",
+            decision_recommended_data_range="最近 240 天",
+            decision_recommended_timeframe="4h",
+            decision_readiness_action="建议继续补样本后重跑。",
             highlights=["已完成补样本。"],
             risks=["仍需继续观察。"],
             proposals=[],
@@ -10611,9 +12400,22 @@ class ControlApiIntegrationTests(unittest.TestCase):
         self.assertEqual(linked_review["source_review_id"], "review-parent-001")
         self.assertEqual(linked_review["source_proposal_id"], "prop-parent-001")
         self.assertEqual(linked_review["trigger_reason"], "proposal_accept")
+        self.assertEqual(activity["latest_backtest"]["id"], "bt-child-001")
+        self.assertEqual(activity["latest_actionable_backtest"]["id"], "bt-child-001")
+        self.assertEqual(activity["latest_actionable_backtest_review"]["id"], review.id)
+        self.assertEqual(activity["latest_actionable_backtest_review"]["backtest_id"], "bt-child-001")
+        self.assertIsNone(activity["latest_actionable_backtest_job"])
         self.assertEqual(activity["latest_primary_review"]["id"], review.id)
+        self.assertEqual(activity["latest_actionable_primary_review"]["id"], review.id)
         self.assertEqual(activity["latest_primary_review"]["source_change_request_id"], "cr-parent-001")
         self.assertEqual(activity["latest_primary_review"]["source_backtest_id"], "bt-parent-001")
+        activity_context = control_main._build_strategy_activity_review_context("trend-btc-01")
+        self.assertIsNotNone(activity_context)
+        assert activity_context is not None
+        self.assertIn("bt-child-001", str(activity_context["latest_actionable_backtest"] or ""))
+        self.assertIn(review.id, str(activity_context["latest_actionable_backtest_review"] or ""))
+        self.assertIsNone(activity_context["latest_actionable_backtest_job"])
+        self.assertIn(review.id, str(activity_context["latest_actionable_primary_review"] or ""))
 
     def test_strategy_pause_and_risk_update_requests_apply_immediately(self) -> None:
         pause_status, pause_request = self._post(
@@ -10697,6 +12499,47 @@ class ControlApiIntegrationTests(unittest.TestCase):
         self.assertEqual(review_job["context"]["source_proposal_id"], "prop-001")
         self.assertEqual(review_job["context"]["trigger_reason"], "proposal_accept")
         self.assertEqual(change_requests[0]["follow_up_job_id"], review_job["id"])
+        self.assertEqual(review_job["context"]["review_strategy_activity"]["strategy_id"], proposal["strategy_id"])
+        self.assertTrue(
+            any(
+                "prop-001" in item
+                and "param_update" in item
+                and "accepted" in item
+                and change_requests[0]["id"] in item
+                and "变更" in item
+                and "review_strategy_change" in item
+                and "queued" in item
+                for item in review_job["context"]["review_strategy_activity"]["recent_proposals"]
+            )
+        )
+        self.assertTrue(
+            any(
+                change_requests[0]["id"] in item
+                and "proposal.param_update" in item
+                and change_requests[0]["status"] in item
+                for item in review_job["context"]["review_strategy_activity"]["recent_change_requests"]
+            )
+        )
+        self.assertTrue(
+            any(
+                review_job["id"] in item
+                and "review_strategy_change" in item
+                and "queued" in item
+                for item in review_job["context"]["review_strategy_activity"]["recent_agent_jobs"]
+            )
+        )
+        self.assertIsNone(review_job["context"]["review_strategy_activity"]["latest_actionable_proposal"])
+        self.assertIsNone(review_job["context"]["review_strategy_activity"]["latest_actionable_backtest"])
+        self.assertIsNone(review_job["context"]["review_strategy_activity"]["latest_actionable_backtest_review"])
+        self.assertIsNone(review_job["context"]["review_strategy_activity"]["latest_actionable_backtest_job"])
+        self.assertIsNone(review_job["context"]["review_strategy_activity"]["latest_actionable_primary_review"])
+        self.assertIsNone(review_job["context"]["review_strategy_activity"]["latest_actionable_change_request"])
+        self.assertIsNone(review_job["context"]["review_strategy_activity"]["latest_retryable_tracking_job"])
+        self.assertIn(
+            review_job["id"],
+            str(review_job["context"]["review_strategy_activity"]["latest_tracking_job"] or ""),
+        )
+        self.assertIn("recent_reviews", review_job["context"]["review_strategy_activity"])
 
         snapshot_status, snapshot = self._get("/api/control/snapshot")
         self.assertEqual(snapshot_status, 200)
@@ -10757,6 +12600,47 @@ class ControlApiIntegrationTests(unittest.TestCase):
         self.assertEqual(review_job["context"]["source_review_id"], "review-20260330-daily")
         self.assertEqual(review_job["context"]["source_proposal_id"], "prop-003")
         self.assertEqual(review_job["context"]["trigger_reason"], "proposal_accept")
+        activity_context = review_job["context"]["review_strategy_activity"]
+        self.assertIn("prop-003", str(activity_context["latest_proposal"] or ""))
+        self.assertIn(result["created_backtest"]["id"], str(activity_context["latest_proposal_backtest"] or ""))
+        self.assertIsNone(activity_context["latest_proposal_change_request"])
+        self.assertIsNone(activity_context["latest_proposal_review"])
+        self.assertIn(review_job["id"], str(activity_context["latest_proposal_job"] or ""))
+        self.assertEqual(activity_context["latest_proposal_backtest_record"]["id"], result["created_backtest"]["id"])
+        self.assertIsNone(activity_context["latest_proposal_review_record"])
+        self.assertEqual(activity_context["latest_proposal_job_record"]["id"], review_job["id"])
+        self.assertEqual(activity_context["latest_backtest_record"]["id"], result["created_backtest"]["id"])
+        self.assertEqual(
+            activity_context["latest_actionable_backtest_record"]["id"],
+            result["created_backtest"]["id"],
+        )
+        self.assertIn(result["created_backtest"]["id"], str(activity_context["latest_backtest"] or ""))
+        self.assertIn(review_job["id"], str(activity_context["latest_backtest_job"] or ""))
+        self.assertIsNone(activity_context["latest_backtest_review"])
+        self.assertEqual(activity_context["latest_backtest_job_record"]["id"], review_job["id"])
+        self.assertEqual(activity_context["latest_actionable_backtest_job_record"]["id"], review_job["id"])
+        self.assertIsNone(activity_context["latest_backtest_review_record"])
+        self.assertIsNone(activity_context["latest_actionable_backtest_review_record"])
+
+        activity_status, activity = self._get("/api/strategies/sol-breakout-03/activity")
+        self.assertEqual(activity_status, 200)
+        self.assertEqual(activity["latest_proposal"]["id"], "prop-003")
+        self.assertEqual(activity["latest_proposal_backtest"]["id"], result["created_backtest"]["id"])
+        self.assertEqual(activity["latest_proposal_job"]["id"], review_job["id"])
+        self.assertEqual(activity["latest_proposal_backtest_record"]["id"], result["created_backtest"]["id"])
+        self.assertIsNone(activity["latest_proposal_review_record"])
+        self.assertEqual(activity["latest_proposal_job_record"]["id"], review_job["id"])
+        self.assertEqual(activity["latest_backtest_record"]["id"], result["created_backtest"]["id"])
+        self.assertEqual(activity["latest_actionable_backtest_record"]["id"], result["created_backtest"]["id"])
+        self.assertEqual(activity["latest_backtest_job_record"]["id"], review_job["id"])
+        self.assertEqual(activity["latest_actionable_backtest_job_record"]["id"], review_job["id"])
+        self.assertIsNone(activity["latest_backtest_review_record"])
+        self.assertIsNone(activity["latest_actionable_backtest_review_record"])
+        self.assertIsNone(activity["latest_proposal_change_request"])
+        self.assertIsNone(activity["latest_proposal_review"])
+        self.assertIsNone(activity["latest_actionable_proposal_backtest_record"])
+        self.assertIsNone(activity["latest_actionable_proposal_review_record"])
+        self.assertIsNone(activity["latest_actionable_proposal_job_record"])
 
     def test_backtest_launch_change_request_preserves_source_change_request_lineage(self) -> None:
         status, change_request = self._post(
@@ -11093,6 +12977,20 @@ class ControlApiIntegrationTests(unittest.TestCase):
         self.assertEqual(updated["linked_review_title"], review.title)
         self.assertEqual(updated["linked_review_period"], "backtest")
 
+        activity_status, activity = self._get("/api/strategies/trend-btc-01/activity")
+        self.assertEqual(activity_status, 200)
+        self.assertEqual(activity["latest_backtest"]["id"], linked_backtest["id"])
+        self.assertEqual(activity["latest_backtest_job"]["id"], review_job["id"])
+        self.assertEqual(activity["latest_backtest_job"]["backtest_id"], linked_backtest["id"])
+        self.assertEqual(activity["latest_backtest_job"]["source_change_request_id"], change_request["id"])
+        self.assertEqual(activity["latest_backtest_review"]["id"], review.id)
+        self.assertEqual(activity["latest_backtest_review"]["backtest_id"], linked_backtest["id"])
+        self.assertEqual(activity["latest_actionable_backtest"]["id"], linked_backtest["id"])
+        self.assertEqual(activity["latest_backtest_record"]["id"], linked_backtest["id"])
+        self.assertEqual(activity["latest_actionable_backtest_record"]["id"], linked_backtest["id"])
+        self.assertEqual(activity["latest_actionable_backtest_review"]["id"], review.id)
+        self.assertEqual(activity["latest_actionable_backtest_job"]["id"], review_job["id"])
+
     def test_change_request_endpoint_mirrors_linked_backtest_window_hints_without_backtest_lookup(self) -> None:
         record = control_main.repo.create_change_request(
             ChangeRequestCreate(
@@ -11409,6 +13307,21 @@ class ControlApiIntegrationTests(unittest.TestCase):
         self.assertIn("补足完整样本", review_job["context"]["decision_readiness_detail"])
         self.assertIn("缩短到 最近 19995 天", review_job["context"]["decision_readiness_action"])
         self.assertEqual(review_job["context"]["review_strategy_activity"]["strategy_id"], "trend-btc-01")
+        self.assertIn(backtest["id"], str(review_job["context"]["review_strategy_activity"]["latest_backtest"] or ""))
+        self.assertIn(review_job["id"], str(review_job["context"]["review_strategy_activity"]["latest_backtest_job"] or ""))
+        self.assertIsNone(review_job["context"]["review_strategy_activity"]["latest_backtest_review"])
+        self.assertTrue(
+            any(backtest["id"] in item for item in review_job["context"]["review_strategy_activity"]["recent_backtests"])
+        )
+        self.assertTrue(
+            any(
+                review_job["id"] in item
+                and "generate_backtest_review" in item
+                and "queued" in item
+                for item in review_job["context"]["review_strategy_activity"]["recent_agent_jobs"]
+            )
+        )
+        self.assertIn("recent_reviews", review_job["context"]["review_strategy_activity"])
 
     def test_backtest_endpoint_surfaces_available_history_range_when_exchange_history_is_short(self) -> None:
         original_market_data = control_main.market_data
@@ -11560,7 +13473,7 @@ class ControlApiIntegrationTests(unittest.TestCase):
     def test_accepting_backtest_request_proposal_rejects_invalid_timeframe_without_mutating_status(self) -> None:
         proposal = next(
             item
-            for review in control_main.repo.snapshot().reviews
+            for review in control_main.repo.state.reviews
             for item in review.proposals
             if item.id == "prop-003"
         )
@@ -11597,7 +13510,7 @@ class ControlApiIntegrationTests(unittest.TestCase):
     def test_publish_recommendation_requires_recommendation_without_mutating_status(self) -> None:
         proposal = next(
             item
-            for review in control_main.repo.snapshot().reviews
+            for review in control_main.repo.state.reviews
             for item in review.proposals
             if item.id == "prop-002"
         )
@@ -11617,7 +13530,7 @@ class ControlApiIntegrationTests(unittest.TestCase):
             proposal.payload = original_payload
 
     def test_accepting_script_patch_proposal_creates_queued_change_request_and_manual_followup_event(self) -> None:
-        review = control_main.repo.snapshot().reviews[0]
+        review = control_main.repo.state.reviews[0]
         proposal = control_main.StrategyProposal(
             id="prop-script-001",
             proposal_type="script_patch_proposal",
@@ -11650,6 +13563,11 @@ class ControlApiIntegrationTests(unittest.TestCase):
         self.assertEqual(result["created_change_request"]["source_review_id"], "review-20260330-daily")
         self.assertEqual(result["created_change_request"]["source_proposal_id"], "prop-script-001")
         self.assertEqual(result["created_change_request"]["trigger_reason"], "proposal_accept")
+        self.assertTrue(result["created_change_request"]["manual_followup_required"])
+        self.assertEqual(
+            result["created_change_request"]["manual_followup_detail"],
+            "脚本补丁提案已转成待处理 ChangeRequest，需后续人工或编排链落实。",
+        )
 
         change_requests_status, change_requests = self._get("/api/change-requests")
         self.assertEqual(change_requests_status, 200)
@@ -11662,6 +13580,11 @@ class ControlApiIntegrationTests(unittest.TestCase):
         self.assertEqual(patch_request["source_review_id"], "review-20260330-daily")
         self.assertEqual(patch_request["source_proposal_id"], "prop-script-001")
         self.assertEqual(patch_request["trigger_reason"], "proposal_accept")
+        self.assertTrue(patch_request["manual_followup_required"])
+        self.assertEqual(
+            patch_request["manual_followup_detail"],
+            "脚本补丁提案已转成待处理 ChangeRequest，需后续人工或编排链落实。",
+        )
 
         audit_status, audit_events = self._get("/api/audit/events")
         self.assertEqual(audit_status, 200)
@@ -11675,6 +13598,27 @@ class ControlApiIntegrationTests(unittest.TestCase):
             None,
         )
         self.assertIsNotNone(followup_event)
+
+        review_status, review_job = self._post(
+            "/api/strategies/trend-btc-01/review",
+            {
+                "review_kind": "issue",
+                "summary": "跟踪脚本补丁提案后续落实情况。",
+                "detail": "确认这条脚本补丁提案生成的变更是否仍需人工跟进。",
+                "requested_by": "unit_test",
+                "request_key": "manual-script-patch-followup-001",
+            },
+        )
+        self.assertEqual(review_status, 200)
+        self.assertTrue(
+            any(
+                "prop-script-001" in item
+                and patch_request["id"] in item
+                and "需人工跟进" in item
+                and "变更" in item
+                for item in review_job["context"]["review_strategy_activity"]["recent_proposals"]
+            )
+        )
 
     def test_manual_change_request_defaults_to_manual_create_trigger_reason(self) -> None:
         status, created = self._post(

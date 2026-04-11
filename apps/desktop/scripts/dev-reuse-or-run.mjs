@@ -2,28 +2,34 @@
 
 import { spawn } from "node:child_process";
 import { execFileSync } from "node:child_process";
+import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
 
 function printUsageAndExit() {
   console.error(
-    "Usage: dev-reuse-or-run.mjs [--replace-unhealthy <command-substring>] <http> <target> <command> [args...]",
+    "Usage: dev-reuse-or-run.mjs [--replace-stale <command-substring> <watch-path>] [--replace-unhealthy <command-substring>] <http> <target> <command> [args...]",
   );
   process.exit(1);
 }
 
 async function isHttpReady(url) {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 1500);
-
-  try {
-    const response = await fetch(url, { signal: controller.signal });
-    return response.ok;
-  } catch {
-    return false;
-  } finally {
-    clearTimeout(timeout);
+  const candidates = buildHttpLoopbackCandidates(url);
+  for (const candidate of candidates) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 1500);
+    try {
+      const response = await fetch(candidate, { signal: controller.signal });
+      if (response.ok) {
+        return true;
+      }
+    } catch {
+      // ignore and continue trying loopback aliases
+    } finally {
+      clearTimeout(timeout);
+    }
   }
+  return false;
 }
 
 function sleep(ms) {
@@ -69,33 +75,71 @@ function parseNetworkTarget(target) {
   }
 }
 
+function isLoopbackHost(host) {
+  return host === "localhost" || host === "127.0.0.1" || host === "::1";
+}
+
+function buildLoopbackHosts(host) {
+  if (!isLoopbackHost(host)) {
+    return [host];
+  }
+  return Array.from(new Set([host, "localhost", "127.0.0.1", "::1"]));
+}
+
+function buildHttpLoopbackCandidates(target) {
+  try {
+    const url = new URL(target);
+    if (url.protocol !== "http:" && url.protocol !== "https:") {
+      return [target];
+    }
+    return buildLoopbackHosts(url.hostname).map((host) => {
+      const candidate = new URL(url.toString());
+      candidate.hostname = host;
+      return candidate.toString();
+    });
+  } catch {
+    return [target];
+  }
+}
+
 async function isTcpPortOccupied(target) {
   const parsed = parseNetworkTarget(target);
   if (!parsed) {
     return false;
   }
 
-  return await new Promise((resolve) => {
-    const socket = net.createConnection({
-      host: parsed.host,
-      port: parsed.port,
+  if (isLoopbackHost(parsed.host)) {
+    return getListeningPids(target).length > 0;
+  }
+
+  for (const host of buildLoopbackHosts(parsed.host)) {
+    // Non-loopback hosts return themselves unchanged.
+    const isOccupied = await new Promise((resolve) => {
+      const socket = net.createConnection({
+        host,
+        port: parsed.port,
+      });
+
+      let settled = false;
+      const finish = (value) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        socket.destroy();
+        resolve(value);
+      };
+
+      socket.setTimeout(1000);
+      socket.once("connect", () => finish(true));
+      socket.once("timeout", () => finish(false));
+      socket.once("error", () => finish(false));
     });
-
-    let settled = false;
-    const finish = (value) => {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      socket.destroy();
-      resolve(value);
-    };
-
-    socket.setTimeout(1000);
-    socket.once("connect", () => finish(true));
-    socket.once("timeout", () => finish(false));
-    socket.once("error", () => finish(false));
-  });
+    if (isOccupied) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function getListeningPids(target) {
@@ -168,6 +212,81 @@ function matchesReplaceExpectation(processCommand, processCwd, expectation) {
   return false;
 }
 
+function getProcessStartedAtMs(pid) {
+  try {
+    const output = execFileSync("ps", ["-p", String(pid), "-o", "lstart="], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    const startedAtMs = Date.parse(output);
+    return Number.isFinite(startedAtMs) ? startedAtMs : null;
+  } catch {
+    return null;
+  }
+}
+
+function isWatchableFile(filePath) {
+  const extension = path.extname(filePath).toLowerCase();
+  return [
+    ".py",
+    ".js",
+    ".mjs",
+    ".cjs",
+    ".ts",
+    ".tsx",
+    ".jsx",
+    ".json",
+    ".toml",
+    ".yaml",
+    ".yml",
+    ".ini",
+    ".cfg",
+  ].includes(extension);
+}
+
+function shouldSkipWalk(entryPath) {
+  const base = path.basename(entryPath);
+  return [
+    ".git",
+    "node_modules",
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".runtime",
+    "dist",
+    "dist-electron",
+  ].includes(base);
+}
+
+function getLatestWatchedMtimeMs(inputPath) {
+  const resolvedPath = path.resolve(process.cwd(), inputPath);
+  const visit = (currentPath) => {
+    let stat;
+    try {
+      stat = fs.statSync(currentPath);
+    } catch {
+      return 0;
+    }
+    if (stat.isFile()) {
+      return isWatchableFile(currentPath) ? stat.mtimeMs : 0;
+    }
+    if (!stat.isDirectory() || shouldSkipWalk(currentPath)) {
+      return 0;
+    }
+    let latest = 0;
+    try {
+      const entries = fs.readdirSync(currentPath, { withFileTypes: true });
+      for (const entry of entries) {
+        latest = Math.max(latest, visit(path.join(currentPath, entry.name)));
+      }
+    } catch {
+      return latest;
+    }
+    return latest;
+  };
+  return visit(resolvedPath);
+}
+
 async function terminatePid(pid, signal = "SIGTERM") {
   try {
     process.kill(pid, signal);
@@ -190,13 +309,59 @@ function keepAlive(target) {
   process.on("SIGTERM", shutdown);
 }
 
+async function replaceListeningProcess(target, marker, reason) {
+  const listeningPids = getListeningPids(target);
+  const expectation = buildReplaceExpectation(marker);
+  const replaceablePid = listeningPids.find((pid) => {
+    const processCommand = getProcessCommand(pid);
+    const processCwd = getProcessCwd(pid);
+    return matchesReplaceExpectation(processCommand, processCwd, expectation);
+  });
+  if (!replaceablePid) {
+    return false;
+  }
+
+  const processCommand = getProcessCommand(replaceablePid);
+  const processCwd = getProcessCwd(replaceablePid);
+  console.log(
+    `[dev] Replacing ${reason} listener ${replaceablePid} (${processCommand || "unknown command"}${processCwd ? ` @ ${processCwd}` : ""}) at ${target}...`,
+  );
+  await terminatePid(replaceablePid, "SIGTERM");
+  if (await waitForPortRelease(target, 20, 250)) {
+    console.log(`[dev] ${target} has been released after SIGTERM.`);
+    return true;
+  }
+
+  console.log(`[dev] ${target} still occupied after SIGTERM; sending SIGKILL to ${replaceablePid}.`);
+  await terminatePid(replaceablePid, "SIGKILL");
+  if (!(await waitForPortRelease(target, 20, 250))) {
+    console.error(`[dev] ${target} remained occupied after replacing ${reason} process ${replaceablePid}.`);
+    process.exit(1);
+  }
+  console.log(`[dev] ${target} has been released after SIGKILL.`);
+  return true;
+}
+
 async function main() {
   const rawArgs = process.argv.slice(2);
   let replaceUnhealthyMatch = null;
+  let replaceStale = null;
 
-  if (rawArgs[0] === "--replace-unhealthy") {
-    replaceUnhealthyMatch = rawArgs[1] || null;
-    rawArgs.splice(0, 2);
+  while (rawArgs[0]?.startsWith("--")) {
+    if (rawArgs[0] === "--replace-unhealthy") {
+      replaceUnhealthyMatch = rawArgs[1] || null;
+      rawArgs.splice(0, 2);
+      continue;
+    }
+    if (rawArgs[0] === "--replace-stale") {
+      replaceStale = {
+        marker: rawArgs[1] || null,
+        watchPath: rawArgs[2] || null,
+      };
+      rawArgs.splice(0, 3);
+      continue;
+    }
+    break;
   }
 
   const [mode, target, ...command] = rawArgs;
@@ -205,8 +370,34 @@ async function main() {
   }
 
   if (await isHttpReady(target)) {
-    keepAlive(target);
-    return;
+    if (replaceStale?.marker && replaceStale.watchPath) {
+      const listeningPids = getListeningPids(target);
+      const expectation = buildReplaceExpectation(replaceStale.marker);
+      const matchedPid = listeningPids.find((pid) => {
+        const processCommand = getProcessCommand(pid);
+        const processCwd = getProcessCwd(pid);
+        return matchesReplaceExpectation(processCommand, processCwd, expectation);
+      });
+      if (matchedPid) {
+        const processStartedAtMs = getProcessStartedAtMs(matchedPid);
+        const latestWatchedMtimeMs = getLatestWatchedMtimeMs(replaceStale.watchPath);
+        if (latestWatchedMtimeMs > 0 && processStartedAtMs > 0 && latestWatchedMtimeMs > processStartedAtMs + 1000) {
+          const replaced = await replaceListeningProcess(target, replaceStale.marker, "stale");
+          if (replaced) {
+            console.log(`[dev] ${target} is now free; starting replacement process.`);
+          }
+        } else {
+          keepAlive(target);
+          return;
+        }
+      } else {
+        keepAlive(target);
+        return;
+      }
+    } else {
+      keepAlive(target);
+      return;
+    }
   }
 
   if (await isTcpPortOccupied(target)) {
@@ -216,35 +407,12 @@ async function main() {
       return;
     }
     if (replaceUnhealthyMatch) {
-      const listeningPids = getListeningPids(target);
-      const expectation = buildReplaceExpectation(replaceUnhealthyMatch);
-      const replaceablePid = listeningPids.find((pid) => {
-        const processCommand = getProcessCommand(pid);
-        const processCwd = getProcessCwd(pid);
-        return matchesReplaceExpectation(processCommand, processCwd, expectation);
-      });
-      if (!replaceablePid) {
+      const replaced = await replaceListeningProcess(target, replaceUnhealthyMatch, "unhealthy");
+      if (!replaced) {
         console.error(
           `[dev] ${target} is unhealthy, but no listening process matched "${replaceUnhealthyMatch}". Refusing to replace it automatically.`,
         );
         process.exit(1);
-      }
-
-      const processCommand = getProcessCommand(replaceablePid);
-      const processCwd = getProcessCwd(replaceablePid);
-      console.log(
-        `[dev] Replacing unhealthy listener ${replaceablePid} (${processCommand || "unknown command"}${processCwd ? ` @ ${processCwd}` : ""}) at ${target}...`,
-      );
-      await terminatePid(replaceablePid, "SIGTERM");
-      if (await waitForPortRelease(target, 20, 250)) {
-        console.log(`[dev] ${target} has been released after SIGTERM.`);
-      } else {
-        console.log(`[dev] ${target} still occupied after SIGTERM; sending SIGKILL to ${replaceablePid}.`);
-        await terminatePid(replaceablePid, "SIGKILL");
-        if (!(await waitForPortRelease(target, 20, 250))) {
-          console.error(`[dev] ${target} remained occupied after replacing unhealthy process ${replaceablePid}.`);
-          process.exit(1);
-        }
       }
       console.log(`[dev] ${target} is now free; starting replacement process.`);
     } else {

@@ -73,7 +73,10 @@ class BybitPublicRealtimeUnitTests(unittest.TestCase):
                 "op": "subscribe",
                 "args": [
                     "tickers.BTCUSDT",
+                    "kline.15.BTCUSDT",
                     "kline.60.BTCUSDT",
+                    "kline.240.BTCUSDT",
+                    "kline.D.BTCUSDT",
                     "publicTrade.BTCUSDT",
                     "orderbook.50.BTCUSDT",
                 ],
@@ -158,6 +161,56 @@ class BybitPublicRealtimeUnitTests(unittest.TestCase):
         spot_orderbook = client.get_orderbook_snapshot("BTCUSDT", market="spot")
         self.assertEqual(spot_orderbook["bids"][0].price, 101.4)
         self.assertEqual(spot_orderbook["asks"][0].price, 101.6)
+
+    def test_merge_candles_uses_requested_timeframe(self) -> None:
+        client = bybit_public_realtime.BybitPublicRealtimeClient()
+
+        client._handle_message(
+            json.dumps(
+                {
+                    "topic": "kline.15.BTCUSDT",
+                    "data": [
+                        {
+                            "start": "1775000000000",
+                            "open": "100.0",
+                            "high": "101.0",
+                            "low": "99.0",
+                            "close": "100.5",
+                            "volume": "11.0",
+                        }
+                    ],
+                }
+            ),
+            "linear",
+        )
+        client._handle_message(
+            json.dumps(
+                {
+                    "topic": "kline.240.BTCUSDT",
+                    "data": [
+                        {
+                            "start": "1775003600000",
+                            "open": "200.0",
+                            "high": "205.0",
+                            "low": "198.0",
+                            "close": "202.5",
+                            "volume": "22.0",
+                        }
+                    ],
+                }
+            ),
+            "linear",
+        )
+
+        merged_15m = client.merge_candles("BTCUSDT", [], market="perp", timeframe="15m")
+        merged_4h = client.merge_candles("BTCUSDT", [], market="perp", timeframe="4h")
+        merged_1h = client.merge_candles("BTCUSDT", [], market="perp", timeframe="1h")
+
+        self.assertEqual(len(merged_15m), 1)
+        self.assertEqual(merged_15m[0].close, 100.5)
+        self.assertEqual(len(merged_4h), 1)
+        self.assertEqual(merged_4h[0].close, 202.5)
+        self.assertEqual(merged_1h, [])
 
 
 if __name__ == "__main__":

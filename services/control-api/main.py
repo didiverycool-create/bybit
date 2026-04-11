@@ -18,6 +18,7 @@ from pydantic import BaseModel
 
 from bybit_private_client import BybitPrivateClient
 from bybit_public_client import BybitPublicMarketClient
+from datetime_utils import parse_optional_iso_datetime
 try:
     from bybit_private_realtime import BybitPrivateRealtimeClient
 except ModuleNotFoundError:
@@ -113,6 +114,8 @@ from models import (
     BybitPublicSymbolDiagnostic,
     BybitPrivateStatus,
     BybitTradeProbeResult,
+    BacktestRun,
+    CandlePoint,
     ChangeRequestCreate,
     ClosePaperPositionPayload,
     Direction,
@@ -126,6 +129,7 @@ from models import (
     LatestSchedulerCommand,
     ManualOrderRequest,
     MarketDetail,
+    MarketLiveDiagnostics,
     MarketLiveSnapshot,
     NewsEvent,
     OpsLiveSnapshot,
@@ -146,6 +150,9 @@ from models import (
     SchedulerSnapshot,
     SettingsPayload,
     SettingsUpdatePayload,
+    StrategyActivityBacktestSummary,
+    StrategyActivityLatestOpsSnapshot,
+    StrategyActivityLatestRuntimeSnapshot,
     StrategyActivityReviewSummary,
     StrategyExecutionRequest,
     StrategyExecutionResult,
@@ -2547,6 +2554,8 @@ def build_prometheus_metrics() -> str:
     }
     lines: List[str] = []
     metric_headers_written = set()
+    market_live_snapshot: Optional[MarketLiveSnapshot] = None
+    market_live_error: Optional[str] = None
 
     def add_metric_line(metric_name: str, help_text: str, value_line: str, metric_type: str = "gauge") -> None:
         if metric_name not in metric_headers_written:
@@ -2554,6 +2563,24 @@ def build_prometheus_metrics() -> str:
             lines.append(f"# TYPE {metric_name} {metric_type}")
             metric_headers_written.add(metric_name)
         lines.append(value_line)
+
+    def prometheus_label_value(value: object) -> str:
+        return str(value if value is not None else "").replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"')
+
+    def prometheus_labels(**labels: object) -> str:
+        return ",".join(f'{key}="{prometheus_label_value(raw_value)}"' for key, raw_value in labels.items())
+
+    workspace_symbol = state.workspace_preferences.selected_symbol
+    workspace_timeframe = state.workspace_preferences.selected_market_timeframe
+    try:
+        market_live_snapshot = build_market_live_snapshot_payload(
+            workspace_symbol,
+            timeframe=workspace_timeframe,
+        )
+    except HTTPException as exc:
+        market_live_error = str(exc.detail or exc)
+    except Exception as exc:
+        market_live_error = str(exc)
 
     add_metric_line(
         "bybit_control_watchlist_total",
@@ -2568,7 +2595,10 @@ def build_prometheus_metrics() -> str:
     add_metric_line(
         "bybit_control_scheduler_status",
         "Scheduler state as numeric code",
-        f'bybit_control_scheduler_status{{status="{state.control_snapshot.scheduler.status}"}} {scheduler_status_map.get(state.control_snapshot.scheduler.status, 0)}',
+        (
+            f"bybit_control_scheduler_status{{{prometheus_labels(status=state.control_snapshot.scheduler.status)}}} "
+            f"{scheduler_status_map.get(state.control_snapshot.scheduler.status, 0)}"
+        ),
     )
     add_metric_line(
         "bybit_control_scheduler_freeze_publish",
@@ -2717,6 +2747,71 @@ def build_prometheus_metrics() -> str:
         "Number of positions tracked by private Bybit websocket cache",
         f"bybit_control_private_ws_positions {int(private_realtime_status.get('positions_count') or 0)}",
     )
+    add_metric_line(
+        "bybit_control_market_live_snapshot_error",
+        "Whether the current workspace market live snapshot failed to build",
+        (
+            f"bybit_control_market_live_snapshot_error"
+            f"{{{prometheus_labels(requested_symbol=workspace_symbol, timeframe=workspace_timeframe)}}} "
+            f"{1 if market_live_error else 0}"
+        ),
+    )
+    if market_live_snapshot is not None:
+        diagnostics = market_live_snapshot.diagnostics
+        add_metric_line(
+            "bybit_control_market_live_generation_ms",
+            "How many milliseconds were needed to build the current workspace market live snapshot",
+            (
+                f"bybit_control_market_live_generation_ms"
+                f"{{{prometheus_labels(requested_symbol=diagnostics.requested_symbol, effective_symbol=diagnostics.effective_symbol, timeframe=diagnostics.timeframe, detail_source=diagnostics.detail_source)}}} "
+                f"{diagnostics.generated_in_ms}"
+            ),
+        )
+        add_metric_line(
+            "bybit_control_market_live_detail_candle_count",
+            "How many candles the current workspace market live detail contains",
+            (
+                f"bybit_control_market_live_detail_candle_count"
+                f"{{{prometheus_labels(requested_symbol=diagnostics.requested_symbol, effective_symbol=diagnostics.effective_symbol, timeframe=diagnostics.timeframe, detail_source=diagnostics.detail_source)}}} "
+                f"{diagnostics.detail_candle_count}"
+            ),
+        )
+        add_metric_line(
+            "bybit_control_market_live_selection_corrected",
+            "Whether the current workspace market live request had to be corrected to a valid watchlist symbol",
+            (
+                f"bybit_control_market_live_selection_corrected"
+                f"{{{prometheus_labels(requested_symbol=diagnostics.requested_symbol, effective_symbol=diagnostics.effective_symbol, timeframe=diagnostics.timeframe)}}} "
+                f"{1 if diagnostics.selection_corrected else 0}"
+            ),
+        )
+        add_metric_line(
+            "bybit_control_market_live_watchlist_real_detail_count",
+            "How many watchlist symbols currently resolve to real public market details for the selected timeframe",
+            (
+                f"bybit_control_market_live_watchlist_real_detail_count"
+                f"{{{prometheus_labels(timeframe=diagnostics.timeframe)}}} "
+                f"{diagnostics.watchlist_real_detail_count}"
+            ),
+        )
+        add_metric_line(
+            "bybit_control_market_live_watchlist_fallback_detail_count",
+            "How many watchlist symbols currently fall back to non-real market details for the selected timeframe",
+            (
+                f"bybit_control_market_live_watchlist_fallback_detail_count"
+                f"{{{prometheus_labels(timeframe=diagnostics.timeframe)}}} "
+                f"{diagnostics.watchlist_fallback_detail_count}"
+            ),
+        )
+        for source, count in sorted(diagnostics.watchlist_source_breakdown.items()):
+            add_metric_line(
+                "bybit_control_market_live_watchlist_source_breakdown",
+                "Current watchlist detail source distribution for the selected timeframe",
+                (
+                    f"bybit_control_market_live_watchlist_source_breakdown"
+                    f"{{{prometheus_labels(timeframe=diagnostics.timeframe, source=source)}}} {count}"
+                ),
+            )
 
     for severity, count in state.control_snapshot.alerts_summary.items():
         add_metric_line(
@@ -2877,51 +2972,7 @@ def _single_or_none(items: List[str]) -> Optional[str]:
 
 
 def _build_scheduler_command_impact_detail(payload: Dict[str, Any]) -> Optional[str]:
-    job_types = _non_empty_string_list(payload.get("cancelled_job_types"))
-    strategy_ids = _non_empty_string_list(payload.get("cancelled_strategy_ids"))
-    backtest_ids = _non_empty_string_list(payload.get("cancelled_backtest_ids"))
-    source_change_request_ids = _non_empty_string_list(payload.get("cancelled_source_change_request_ids"))
-    source_backtest_ids = _non_empty_string_list(payload.get("cancelled_source_backtest_ids"))
-    source_review_ids = _non_empty_string_list(payload.get("cancelled_source_review_ids"))
-    source_proposal_ids = _non_empty_string_list(payload.get("cancelled_source_proposal_ids"))
-    trigger_reasons = _non_empty_string_list(payload.get("cancelled_trigger_reasons"))
-    decision_readiness_values = _non_empty_string_list(payload.get("cancelled_decision_readiness_values"))
-    parts: List[str] = []
-    if job_types:
-        parts.append(f"任务 {' / '.join(job_types)}")
-    if strategy_ids:
-        parts.append(f"策略 {strategy_ids[0]}" if len(strategy_ids) == 1 else f"策略 {len(strategy_ids)} 条")
-    if backtest_ids:
-        parts.append(f"回测 {backtest_ids[0]}" if len(backtest_ids) == 1 else f"回测 {len(backtest_ids)} 轮")
-    if source_change_request_ids:
-        parts.append(
-            f"来源变更 {source_change_request_ids[0]}"
-            if len(source_change_request_ids) == 1
-            else f"来源变更 {len(source_change_request_ids)} 条"
-        )
-    if source_backtest_ids:
-        parts.append(
-            f"来源回测 {source_backtest_ids[0]}"
-            if len(source_backtest_ids) == 1
-            else f"来源回测 {len(source_backtest_ids)} 轮"
-        )
-    if source_review_ids:
-        parts.append(
-            f"来源复盘 {source_review_ids[0]}"
-            if len(source_review_ids) == 1
-            else f"来源复盘 {len(source_review_ids)} 条"
-        )
-    if source_proposal_ids:
-        parts.append(
-            f"来源提案 {source_proposal_ids[0]}"
-            if len(source_proposal_ids) == 1
-            else f"来源提案 {len(source_proposal_ids)} 条"
-        )
-    if trigger_reasons:
-        parts.append(f"触发 {' / '.join(trigger_reasons)}")
-    if decision_readiness_values:
-        parts.append(f"门禁 {' / '.join(decision_readiness_values)}")
-    return " · ".join(parts) if parts else None
+    return AppRepository._build_audit_event_impact_detail(payload)
 
 
 def _build_latest_scheduler_command(audit_events: List[ExecutionEvent]) -> Optional[LatestSchedulerCommand]:
@@ -3272,6 +3323,149 @@ def build_watchlist_item(symbol: str, market: str) -> tuple[WatchlistInstrument,
         timeframe=fallback_detail.timeframe,
     )
     return item, detail
+
+
+def _market_fallback_timeframe_delta(timeframe: str) -> timedelta:
+    normalized_timeframe = market_data.normalize_timeframe(timeframe)
+    return {
+        "15m": timedelta(minutes=15),
+        "1h": timedelta(hours=1),
+        "4h": timedelta(hours=4),
+        "1d": timedelta(days=1),
+    }[normalized_timeframe]
+
+
+def _align_market_fallback_anchor(timeframe: str, anchor: datetime) -> datetime:
+    normalized_timeframe = market_data.normalize_timeframe(timeframe)
+    localized_anchor = anchor.astimezone()
+    if normalized_timeframe == "15m":
+        return localized_anchor.replace(minute=(localized_anchor.minute // 15) * 15, second=0, microsecond=0)
+    if normalized_timeframe == "1h":
+        return localized_anchor.replace(minute=0, second=0, microsecond=0)
+    if normalized_timeframe == "4h":
+        return localized_anchor.replace(hour=(localized_anchor.hour // 4) * 4, minute=0, second=0, microsecond=0)
+    return localized_anchor.replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def _retime_market_fallback_candles(
+    candles: List[CandlePoint],
+    timeframe: str,
+    *,
+    anchor_time: Optional[str] = None,
+    target_last_close: Optional[float] = None,
+) -> List[CandlePoint]:
+    if not candles:
+        return []
+    aligned_anchor = _align_market_fallback_anchor(
+        timeframe,
+        parse_optional_iso_datetime(anchor_time) or datetime.now(timezone.utc).astimezone(),
+    )
+    timeframe_delta = _market_fallback_timeframe_delta(timeframe)
+    range_start = aligned_anchor - timeframe_delta * (len(candles) - 1)
+    retimed: List[CandlePoint] = []
+    for index, candle in enumerate(candles):
+        retimed.append(
+            candle.model_copy(
+                update={
+                    "time": (range_start + timeframe_delta * index).isoformat(),
+                }
+            )
+        )
+    if target_last_close is not None and retimed:
+        last_candle = retimed[-1]
+        rounded_close = round(float(target_last_close), 2)
+        rounded_high = round(max(last_candle.high, last_candle.open, rounded_close), 2)
+        rounded_low = round(min(last_candle.low, last_candle.open, rounded_close), 2)
+        retimed[-1] = last_candle.model_copy(
+            update={
+                "close": rounded_close,
+                "high": rounded_high,
+                "low": rounded_low,
+            }
+        )
+    return retimed
+
+
+def build_runtime_market_fallback_detail(
+    symbol: str,
+    market: str,
+    timeframe: str,
+    watch_item: Optional[WatchlistInstrument],
+    base_detail: Optional[MarketDetail] = None,
+    failure_reason: Optional[str] = None,
+) -> MarketDetail:
+    normalized_timeframe = market_data.normalize_timeframe(timeframe)
+    real_base = base_detail if base_detail and base_detail.source in {"bybit_rest", "bybit_ws"} else None
+    same_timeframe_base = (
+        real_base is not None and market_data.normalize_timeframe(real_base.timeframe) == normalized_timeframe
+    )
+    seed_detail = build_market_detail_for_watchlist(watch_item) if watch_item is not None else None
+    fallback_candles: List[CandlePoint] = []
+    if real_base is not None and real_base.candles:
+        fallback_candles = (
+            list(real_base.candles)
+            if same_timeframe_base
+            else _retime_market_fallback_candles(
+                list(real_base.candles),
+                normalized_timeframe,
+                anchor_time=real_base.updated_at or real_base.candles[-1].time,
+                target_last_close=watch_item.last_price if watch_item is not None else None,
+            )
+        )
+    elif seed_detail is not None and seed_detail.candles:
+        fallback_candles = _retime_market_fallback_candles(
+            list(seed_detail.candles),
+            normalized_timeframe,
+            anchor_time=seed_detail.updated_at or seed_detail.candles[-1].time,
+            target_last_close=watch_item.last_price if watch_item is not None else None,
+        )
+    stats: Dict[str, str] = {}
+    if real_base is not None:
+        stats.update(real_base.stats)
+        stats["数据源"] = "Bybit 本地缓存" if same_timeframe_base else "Fallback K 线 + Bybit 本地缓存盘口"
+    elif seed_detail is not None:
+        stats.update(seed_detail.stats)
+        stats["数据源"] = "Fallback K 线"
+    elif watch_item is not None:
+        stats.update(
+            {
+                "数据源": "Fallback K 线",
+                "24h涨跌": f"{watch_item.change_24h:+.2f}%",
+                "24h成交额": f"{watch_item.volume_24h:,.0f}",
+            }
+        )
+    else:
+        stats["数据源"] = "Fallback K 线"
+    if failure_reason:
+        stats["拉取状态"] = "等待下一次重试"
+
+    if fallback_candles:
+        if real_base is not None and same_timeframe_base:
+            headline = f"{symbol} 当前未拿到最新 K 线，已保留最近一次成功快照。"
+        else:
+            headline = f"{symbol} 当前未拿到 Bybit 最新 {normalized_timeframe} K 线，已回退到本地基线继续展示。"
+    else:
+        headline = f"{symbol} 当前未拿到 Bybit 最新 K 线，请稍后自动重试。"
+
+    return MarketDetail(
+        symbol=symbol,
+        market="spot" if market == "spot" else "perp",
+        timeframe=normalized_timeframe,
+        candles=fallback_candles,
+        bids=list(real_base.bids) if real_base is not None else [],
+        asks=list(real_base.asks) if real_base is not None else [],
+        recent_public_trades=(
+            list(real_base.recent_public_trades)
+            if real_base is not None
+            else list(seed_detail.recent_public_trades)
+            if seed_detail is not None
+            else []
+        ),
+        headline=headline,
+        stats=stats,
+        source=real_base.source if real_base is not None and same_timeframe_base else "fallback",
+        updated_at=real_base.updated_at if real_base is not None else seed_detail.updated_at if seed_detail is not None else None,
+    )
 
 
 def build_backtest_payload(strategy: Any, data_range: str, timeframe: str) -> Optional[Dict[str, Any]]:
@@ -3645,6 +3839,49 @@ def _strategy_matches_audit_event(event: ExecutionEvent, strategy_id: str, symbo
     return event.event_type.startswith("strategy.") or event.event_type.startswith("exchange_order.")
 
 
+def _build_strategy_activity_latest_ops_snapshot(
+    *,
+    latest_active_order_summary: Optional[str],
+    latest_historical_order_summary: Optional[str],
+    latest_order_summary: Optional[str],
+    latest_pending_alert_summary: Optional[str],
+    latest_trade_summary: Optional[str],
+    latest_alert_summary: Optional[str],
+    latest_audit_event_summary: Optional[str],
+    latest_active_order_record: Optional[OrderRecord],
+    latest_historical_order_record: Optional[OrderRecord],
+    latest_order_record: Optional[OrderRecord],
+    latest_pending_alert_record: Optional[AlertRecord],
+    latest_trade_record: Optional[TradeRecord],
+    latest_alert_record: Optional[AlertRecord],
+    latest_audit_event_record: Optional[ExecutionEvent],
+) -> StrategyActivityLatestOpsSnapshot:
+    return StrategyActivityLatestOpsSnapshot(
+        latest_active_order=latest_active_order_summary,
+        latest_historical_order=latest_historical_order_summary,
+        latest_order=latest_order_summary,
+        latest_pending_alert=latest_pending_alert_summary,
+        latest_trade=latest_trade_summary,
+        latest_alert=latest_alert_summary,
+        latest_audit_event=latest_audit_event_summary,
+        latest_active_order_record=latest_active_order_record,
+        latest_historical_order_record=latest_historical_order_record,
+        latest_order_record=latest_order_record,
+        latest_pending_alert_record=latest_pending_alert_record,
+        latest_trade_record=latest_trade_record,
+        latest_alert_record=latest_alert_record,
+        latest_audit_event_record=latest_audit_event_record,
+    )
+
+
+def _build_strategy_activity_latest_runtime_snapshot(
+    *,
+    runtime: Optional[StrategyRuntimeSnapshot],
+    latest_ops: StrategyActivityLatestOpsSnapshot,
+) -> StrategyActivityLatestRuntimeSnapshot:
+    return StrategyActivityLatestRuntimeSnapshot(runtime=runtime, latest_ops=latest_ops)
+
+
 def build_strategy_activity_payload(strategy_id: str) -> StrategyActivitySnapshot:
     state = repo.snapshot()
     strategy = next((item for item in state.strategies if item.id == strategy_id), None)
@@ -3652,9 +3889,10 @@ def build_strategy_activity_payload(strategy_id: str) -> StrategyActivitySnapsho
         raise KeyError(strategy_id)
     symbol = strategy.symbols[0] if strategy.symbols else "--"
     market = next((item.market for item in state.watchlist if item.symbol == symbol), "perp")
-    runtime_items = build_strategy_runtime_response()
-    runtime = next((item for item in runtime_items if item.strategy_id == strategy_id), None)
-    if runtime is not None and runtime.execution_preview is None and runtime.runtime_status != "paused":
+    runtime = _build_lightweight_strategy_activity_runtime_snapshot(state, strategy)
+    if runtime is not None:
+        runtime = _decorate_strategy_runtime_item(runtime)
+    if runtime is not None and runtime.runtime_status != "paused":
         strategy_mode_preview: Optional[ExecutionPreview]
         if strategy.mode != AccountMode.PAPER:
             runtime_block_reason = _runtime_worker_execution_block_reason(_build_strategy_runtime_worker_health())
@@ -3662,14 +3900,22 @@ def build_strategy_activity_payload(strategy_id: str) -> StrategyActivitySnapsho
                 strategy_mode_preview = _build_blocked_strategy_execution_preview(runtime, strategy.mode, runtime_block_reason)
             else:
                 try:
-                    strategy_mode_preview = _build_strategy_execution_preview_from_state(strategy_id, strategy.mode)
+                    strategy_mode_preview = _build_strategy_execution_preview_from_state(
+                        strategy_id,
+                        strategy.mode,
+                        runtime_snapshot_override=runtime,
+                    )
                 except RuntimeError as exc:
                     strategy_mode_preview = _build_blocked_strategy_execution_preview(runtime, strategy.mode, str(exc))
                 except ValueError as exc:
                     strategy_mode_preview = _build_blocked_strategy_execution_preview(runtime, strategy.mode, str(exc))
         else:
             try:
-                strategy_mode_preview = _build_strategy_execution_preview_from_state(strategy_id, strategy.mode)
+                strategy_mode_preview = _build_strategy_execution_preview_from_state(
+                    strategy_id,
+                    strategy.mode,
+                    runtime_snapshot_override=runtime,
+                )
             except RuntimeError:
                 strategy_mode_preview = None
         if strategy_mode_preview is not None:
@@ -3683,7 +3929,17 @@ def build_strategy_activity_payload(strategy_id: str) -> StrategyActivitySnapsho
     recent_orders = [item for item in history_source if _strategy_matches_order(item, strategy_id, symbol, market)]
     recent_trades = [item for item in trades_source if _strategy_matches_trade(item, strategy_id, symbol, market)]
     recent_alerts = [item for item in state.alerts if _strategy_matches_alert(item, strategy_id, symbol)]
-    recent_audit_events = [item for item in state.audit_events if _strategy_matches_audit_event(item, strategy_id, symbol)]
+    recent_audit_events = [
+        AppRepository._decorate_execution_event(item)
+        for item in state.audit_events
+        if _strategy_matches_audit_event(item, strategy_id, symbol)
+    ]
+    recent_review_records = [
+        review
+        for review in state.reviews
+        if review.strategy_id == strategy_id or any(proposal.strategy_id == strategy_id for proposal in review.proposals)
+    ]
+    recent_review_records.sort(key=lambda item: item.created_at, reverse=True)
     recent_reviews = [
         StrategyActivityReviewSummary(
             id=review.id,
@@ -3702,16 +3958,59 @@ def build_strategy_activity_payload(strategy_id: str) -> StrategyActivitySnapsho
             proposal_count=sum(1 for proposal in review.proposals if proposal.strategy_id == strategy_id),
             created_at=review.created_at,
         )
-        for review in state.reviews
-        if review.strategy_id == strategy_id or any(proposal.strategy_id == strategy_id for proposal in review.proposals)
+        for review in recent_review_records
     ]
-    recent_reviews.sort(key=lambda item: item.created_at, reverse=True)
+    recent_proposals = [
+        proposal
+        for review in state.reviews
+        for proposal in review.proposals
+        if proposal.strategy_id == strategy_id
+    ]
+    recent_proposals.sort(key=lambda item: item.created_at, reverse=True)
+    recent_change_requests = [
+        item
+        for item in state.change_requests
+        if (str(item.payload.get("strategy_id") or "") == strategy_id)
+    ]
+    recent_change_requests.sort(key=lambda item: item.updated_at or item.created_at, reverse=True)
+    recent_backtest_records = [item for item in state.backtests if item.strategy_id == strategy_id]
+    recent_backtest_records.sort(key=lambda item: item.finished_at or item.started_at, reverse=True)
+    recent_backtests = [
+        StrategyActivityBacktestSummary(
+            id=item.id,
+            status=item.status,
+            timeframe=item.timeframe,
+            data_range=item.data_range,
+            sample_quality=item.sample_quality,
+            history_source=item.history_source,
+            decision_readiness=item.decision_readiness,
+            source_change_request_id=item.source_change_request_id,
+            source_backtest_id=item.source_backtest_id,
+            source_review_id=item.source_review_id,
+            source_proposal_id=item.source_proposal_id,
+            trigger_reason=item.trigger_reason,
+            created_at=item.started_at,
+            finished_at=item.finished_at,
+        )
+        for item in recent_backtest_records
+    ]
+    recent_agent_job_records = [
+        item
+        for item in state.agent_jobs
+        if str(item.context.get("strategy_id") or "") == strategy_id
+    ]
+    recent_agent_job_records.sort(key=lambda item: item.updated_at or item.created_at, reverse=True)
     recent_agent_jobs = [
         StrategyActivityJobSummary(
             id=item.id,
             job_type=item.job_type,
             status=item.status,
             strategy_id=str(item.context.get("strategy_id") or "") or None,
+            backtest_id=str(item.context.get("backtest_id") or "") or None,
+            source_change_request_id=str(item.context.get("source_change_request_id") or "") or None,
+            source_backtest_id=str(item.context.get("source_backtest_id") or "") or None,
+            source_review_id=str(item.context.get("source_review_id") or "") or None,
+            source_proposal_id=str(item.context.get("source_proposal_id") or "") or None,
             requested_by=str(item.context.get("requested_by") or "") or None,
             result_summary=item.result_summary,
             linked_review_id=str(item.context.get("linked_review_id") or "") or None,
@@ -3723,15 +4022,468 @@ def build_strategy_activity_payload(strategy_id: str) -> StrategyActivitySnapsho
             retry_count=int(item.context.get("retry_count") or 0),
             retried_from_job_id=str(item.context.get("retried_from_job_id") or "") or None,
         )
-        for item in state.agent_jobs
-        if str(item.context.get("strategy_id") or "") == strategy_id
+        for item in recent_agent_job_records
     ]
-    recent_agent_jobs.sort(key=lambda item: item.updated_at or item.created_at, reverse=True)
-    latest_primary_review = next((item for item in recent_reviews if item.period not in {"strategy_issue", "strategy_change"}), None)
-    latest_tracking_review = next((item for item in recent_reviews if item.period in {"strategy_issue", "strategy_change"}), None)
-    latest_tracking_job = next(
-        (item for item in recent_agent_jobs if item.job_type in {"review_strategy_issue", "review_strategy_change"}),
+
+    def get_change_request_source_proposal_id(change_request: ChangeRequest) -> Optional[str]:
+        source_proposal_id = str(change_request.source_proposal_id or "").strip()
+        if source_proposal_id:
+            return source_proposal_id
+        payload_proposal_id = str(change_request.payload.get("proposal_id") or "").strip()
+        return payload_proposal_id or None
+
+    def get_change_request_source_backtest_id(change_request: ChangeRequest) -> Optional[str]:
+        source_backtest_id = str(change_request.source_backtest_id or "").strip()
+        return source_backtest_id or None
+
+    def get_change_request_source_review_id(change_request: ChangeRequest) -> Optional[str]:
+        source_review_id = str(change_request.source_review_id or "").strip()
+        return source_review_id or None
+
+    proposal_change_request_map: Dict[str, ChangeRequest] = {}
+    for change_request in recent_change_requests:
+        source_proposal_id = get_change_request_source_proposal_id(change_request)
+        if source_proposal_id and source_proposal_id not in proposal_change_request_map:
+            proposal_change_request_map[source_proposal_id] = change_request
+
+    proposal_backtest_map: Dict[str, StrategyActivityBacktestSummary] = {}
+    for backtest in recent_backtests:
+        source_proposal_id = str(backtest.source_proposal_id or "").strip()
+        if source_proposal_id and source_proposal_id not in proposal_backtest_map:
+            proposal_backtest_map[source_proposal_id] = backtest
+
+    proposal_review_map: Dict[str, StrategyActivityReviewSummary] = {}
+    for review in recent_reviews:
+        source_proposal_id = str(review.source_proposal_id or "").strip()
+        if source_proposal_id and source_proposal_id not in proposal_review_map:
+            proposal_review_map[source_proposal_id] = review
+
+    proposal_by_id = {item.id: item for item in recent_proposals}
+    backtest_summary_by_id = {item.id: item for item in recent_backtests}
+    backtest_record_by_id = {item.id: item for item in recent_backtest_records}
+    review_summary_by_id = {item.id: item for item in recent_reviews}
+    review_record_by_id = {item.id: item for item in recent_review_records}
+    agent_job_summary_by_id = {item.id: item for item in recent_agent_jobs}
+    agent_job_record_by_id = {item.id: item for item in recent_agent_job_records}
+
+    review_summary_by_backtest_id: Dict[str, StrategyActivityReviewSummary] = {}
+    for review in recent_reviews:
+        backtest_id = str(review.backtest_id or "").strip()
+        if backtest_id and backtest_id not in review_summary_by_backtest_id:
+            review_summary_by_backtest_id[backtest_id] = review
+
+    agent_job_summary_by_backtest_id: Dict[str, StrategyActivityJobSummary] = {}
+    retryable_agent_job_summary_by_backtest_id: Dict[str, StrategyActivityJobSummary] = {}
+    for job in recent_agent_jobs:
+        backtest_id = str(job.backtest_id or "").strip()
+        if backtest_id and backtest_id not in agent_job_summary_by_backtest_id:
+            agent_job_summary_by_backtest_id[backtest_id] = job
+        if (
+            backtest_id
+            and job.status in {"failed", "cancelled"}
+            and backtest_id not in retryable_agent_job_summary_by_backtest_id
+        ):
+            retryable_agent_job_summary_by_backtest_id[backtest_id] = job
+
+    def get_linked_backtest_for_proposal(proposal: Optional[StrategyProposal]) -> Optional[StrategyActivityBacktestSummary]:
+        if proposal is None:
+            return None
+        linked_backtest = proposal_backtest_map.get(proposal.id)
+        if linked_backtest is not None:
+            return linked_backtest
+        linked_change_request = proposal_change_request_map.get(proposal.id)
+        if linked_change_request and linked_change_request.linked_backtest_id:
+            return backtest_summary_by_id.get(linked_change_request.linked_backtest_id)
+        linked_review = proposal_review_map.get(proposal.id)
+        if linked_review and linked_review.backtest_id:
+            return backtest_summary_by_id.get(linked_review.backtest_id)
+        return None
+
+    def get_linked_review_for_proposal(proposal: Optional[StrategyProposal]) -> Optional[StrategyActivityReviewSummary]:
+        if proposal is None:
+            return None
+        linked_review = proposal_review_map.get(proposal.id)
+        if linked_review is not None:
+            return linked_review
+        linked_change_request = proposal_change_request_map.get(proposal.id)
+        if linked_change_request and linked_change_request.linked_review_id:
+            return review_summary_by_id.get(linked_change_request.linked_review_id)
+        linked_backtest = get_linked_backtest_for_proposal(proposal)
+        if linked_backtest is not None:
+            return review_summary_by_backtest_id.get(linked_backtest.id)
+        return None
+
+    def get_linked_job_for_proposal(proposal: Optional[StrategyProposal]) -> Optional[StrategyActivityJobSummary]:
+        if proposal is None:
+            return None
+        linked_change_request = proposal_change_request_map.get(proposal.id)
+        if linked_change_request and linked_change_request.follow_up_job_id:
+            linked_job = agent_job_summary_by_id.get(linked_change_request.follow_up_job_id)
+            if linked_job is not None:
+                return linked_job
+        linked_review = get_linked_review_for_proposal(proposal)
+        if linked_review and linked_review.source_job_id:
+            linked_job = agent_job_summary_by_id.get(linked_review.source_job_id)
+            if linked_job is not None:
+                return linked_job
+        linked_backtest = get_linked_backtest_for_proposal(proposal)
+        if linked_backtest is not None:
+            return agent_job_summary_by_backtest_id.get(linked_backtest.id)
+        return None
+
+    def summarize_order(order: OrderRecord) -> str:
+        side = "买" if order.side == "buy" else "卖"
+        return f"{order.symbol} {side} {order.qty}@{order.price} · {order.status}"
+
+    def summarize_trade(trade: TradeRecord) -> str:
+        side = "买" if trade.side == "buy" else "卖"
+        parts = [f"{trade.symbol} {side} {trade.quantity}@{trade.price}", str(trade.status or "filled")]
+        pnl = str(trade.pnl or "").strip()
+        if pnl and pnl != "--":
+            parts.append(f"pnl {pnl}")
+        return " · ".join(parts)
+
+    def summarize_alert(alert: AlertRecord) -> str:
+        detail = alert.description.strip()
+        action = str(alert.suggested_action or "").strip()
+        if action:
+            detail = f"{detail} · {action}" if detail else action
+        return f"{alert.severity} {alert.title}{f' · {detail}' if detail else ''}"
+
+    active_orders.sort(key=lambda item: parse_optional_iso_datetime(item.created_at), reverse=True)
+    recent_orders.sort(key=lambda item: parse_optional_iso_datetime(item.created_at), reverse=True)
+    recent_trades.sort(key=lambda item: parse_optional_iso_datetime(item.created_at), reverse=True)
+    recent_alerts.sort(key=lambda item: parse_optional_iso_datetime(item.triggered_at), reverse=True)
+    recent_audit_events.sort(key=lambda item: parse_optional_iso_datetime(item.occurred_at), reverse=True)
+
+    def _read_text(value: object) -> Optional[str]:
+        if not isinstance(value, str):
+            return None
+        text = value.strip()
+        return text or None
+
+    def _has_change_request_rerun_recommendation(change_request: ChangeRequest) -> bool:
+        linked_backtest = (
+            backtest_summary_by_id.get(change_request.linked_backtest_id)
+            if change_request.linked_backtest_id
+            else None
+        )
+        linked_history_source_reason = (
+            _read_text(getattr(linked_backtest, "history_source_reason", None))
+            or _read_text(change_request.linked_backtest_history_source_reason)
+            or "none"
+        )
+        decision_range = _read_text(getattr(linked_backtest, "decision_recommended_data_range", None)) or _read_text(
+            change_request.linked_backtest_decision_recommended_data_range
+        )
+        decision_timeframe = _read_text(
+            getattr(linked_backtest, "decision_recommended_timeframe", None)
+        ) or _read_text(change_request.linked_backtest_decision_recommended_timeframe)
+        if linked_history_source_reason != "exchange_fetch_failed" and decision_range and decision_timeframe:
+            return True
+        full_window_range = _read_text(
+            getattr(linked_backtest, "full_window_recommended_data_range", None)
+        ) or _read_text(change_request.linked_backtest_full_window_recommended_data_range)
+        full_window_timeframe = _read_text(
+            getattr(linked_backtest, "full_window_recommended_timeframe", None)
+        ) or _read_text(change_request.linked_backtest_full_window_recommended_timeframe)
+        if full_window_range and full_window_timeframe:
+            return True
+        history_range = _read_text(
+            getattr(linked_backtest, "history_source_recommended_data_range", None)
+        ) or _read_text(change_request.linked_backtest_history_source_recommended_data_range)
+        history_timeframe = _read_text(
+            getattr(linked_backtest, "history_source_recommended_timeframe", None)
+        ) or _read_text(change_request.linked_backtest_history_source_recommended_timeframe)
+        return linked_history_source_reason != "exchange_fetch_failed" and bool(history_range and history_timeframe)
+
+    def _has_backtest_rerun_recommendation(backtest: BacktestRun) -> bool:
+        history_source_reason = _read_text(getattr(backtest, "history_source_reason", None)) or "none"
+        decision_range = _read_text(getattr(backtest, "decision_recommended_data_range", None))
+        decision_timeframe = _read_text(getattr(backtest, "decision_recommended_timeframe", None))
+        if history_source_reason != "exchange_fetch_failed" and decision_range and decision_timeframe:
+            return True
+        full_window_range = _read_text(getattr(backtest, "full_window_recommended_data_range", None))
+        full_window_timeframe = _read_text(getattr(backtest, "full_window_recommended_timeframe", None))
+        if full_window_range and full_window_timeframe:
+            return True
+        history_range = _read_text(getattr(backtest, "history_source_recommended_data_range", None))
+        history_timeframe = _read_text(getattr(backtest, "history_source_recommended_timeframe", None))
+        return history_source_reason != "exchange_fetch_failed" and bool(history_range and history_timeframe)
+
+    def _has_review_rerun_recommendation(review: ReviewDocument) -> bool:
+        decision_range = _read_text(getattr(review, "decision_recommended_data_range", None))
+        decision_timeframe = _read_text(getattr(review, "decision_recommended_timeframe", None))
+        return bool(decision_range and decision_timeframe)
+
+    recent_primary_review_records = [item for item in recent_review_records if item.period not in {"strategy_issue", "strategy_change"}]
+    recent_primary_review_summaries = [item for item in recent_reviews if item.period not in {"strategy_issue", "strategy_change"}]
+    recent_tracking_review_records = [item for item in recent_reviews if item.period in {"strategy_issue", "strategy_change"}]
+    recent_tracking_job_records = [
+        item
+        for item in recent_agent_jobs
+        if item.job_type in {"review_strategy_issue", "review_strategy_change"}
+    ]
+    recent_actionable_proposal_records = [item for item in recent_proposals if item.status in {"pending", "testing"}]
+    recent_actionable_backtest_records = [
+        item
+        for item in recent_backtest_records
+        if _has_backtest_rerun_recommendation(item)
+        or item.id in retryable_agent_job_summary_by_backtest_id
+    ]
+
+    latest_backtest_record = next(iter(recent_backtest_records), None)
+    latest_backtest = next(iter(recent_backtests), None)
+    latest_actionable_backtest_record = next(iter(recent_actionable_backtest_records), None)
+    latest_actionable_backtest = (
+        backtest_summary_by_id[latest_actionable_backtest_record.id]
+        if latest_actionable_backtest_record is not None
+        else None
+    )
+    latest_backtest_review = (
+        review_summary_by_backtest_id.get(latest_backtest.id)
+        if latest_backtest
+        else None
+    )
+    latest_backtest_job = (
+        agent_job_summary_by_backtest_id.get(latest_backtest.id)
+        if latest_backtest
+        else None
+    )
+    latest_backtest_review_record = (
+        review_record_by_id.get(latest_backtest_review.id) if latest_backtest_review is not None else None
+    )
+    latest_backtest_job_record = (
+        agent_job_record_by_id.get(latest_backtest_job.id) if latest_backtest_job is not None else None
+    )
+    latest_actionable_backtest_review = (
+        review_summary_by_backtest_id.get(latest_actionable_backtest.id)
+        if latest_actionable_backtest
+        else None
+    )
+    latest_actionable_backtest_job = (
+        agent_job_summary_by_backtest_id.get(latest_actionable_backtest.id)
+        if latest_actionable_backtest
+        else None
+    )
+    latest_actionable_backtest_review_record = (
+        review_record_by_id.get(latest_actionable_backtest_review.id)
+        if latest_actionable_backtest_review is not None
+        else None
+    )
+    latest_actionable_backtest_job_record = (
+        agent_job_record_by_id.get(latest_actionable_backtest_job.id)
+        if latest_actionable_backtest_job is not None
+        else None
+    )
+    latest_primary_review = next(iter(recent_primary_review_summaries), None)
+    latest_primary_review_record = (
+        review_record_by_id.get(latest_primary_review.id) if latest_primary_review is not None else None
+    )
+    latest_actionable_primary_review = next(
+        (
+            review_summary_by_id[item.id]
+            for item in recent_primary_review_records
+            if _has_review_rerun_recommendation(item)
+        ),
         None,
+    )
+    latest_actionable_primary_review_record = (
+        review_record_by_id.get(latest_actionable_primary_review.id)
+        if latest_actionable_primary_review is not None
+        else None
+    )
+    latest_tracking_review = next(iter(recent_tracking_review_records), None)
+    latest_tracking_review_record = (
+        review_record_by_id.get(latest_tracking_review.id) if latest_tracking_review is not None else None
+    )
+    latest_tracking_job = next(iter(recent_tracking_job_records), None)
+    latest_tracking_job_record = (
+        agent_job_record_by_id.get(latest_tracking_job.id) if latest_tracking_job is not None else None
+    )
+    latest_proposal = next(iter(recent_proposals), None)
+    latest_actionable_proposal = next(iter(recent_actionable_proposal_records), None)
+    latest_proposal_change_request = (
+        proposal_change_request_map.get(latest_proposal.id) if latest_proposal is not None else None
+    )
+    latest_proposal_backtest = get_linked_backtest_for_proposal(latest_proposal)
+    latest_proposal_review = get_linked_review_for_proposal(latest_proposal)
+    latest_proposal_job = get_linked_job_for_proposal(latest_proposal)
+    latest_proposal_backtest_record = (
+        backtest_record_by_id.get(latest_proposal_backtest.id)
+        if latest_proposal_backtest is not None
+        else None
+    )
+    latest_proposal_review_record = (
+        review_record_by_id.get(latest_proposal_review.id)
+        if latest_proposal_review is not None
+        else None
+    )
+    latest_proposal_job_record = (
+        agent_job_record_by_id.get(latest_proposal_job.id)
+        if latest_proposal_job is not None
+        else None
+    )
+    latest_actionable_proposal_change_request = (
+        proposal_change_request_map.get(latest_actionable_proposal.id)
+        if latest_actionable_proposal is not None
+        else None
+    )
+    latest_actionable_proposal_backtest = get_linked_backtest_for_proposal(latest_actionable_proposal)
+    latest_actionable_proposal_review = get_linked_review_for_proposal(latest_actionable_proposal)
+    latest_actionable_proposal_job = get_linked_job_for_proposal(latest_actionable_proposal)
+    latest_actionable_proposal_backtest_record = (
+        backtest_record_by_id.get(latest_actionable_proposal_backtest.id)
+        if latest_actionable_proposal_backtest is not None
+        else None
+    )
+    latest_actionable_proposal_review_record = (
+        review_record_by_id.get(latest_actionable_proposal_review.id)
+        if latest_actionable_proposal_review is not None
+        else None
+    )
+    latest_actionable_proposal_job_record = (
+        agent_job_record_by_id.get(latest_actionable_proposal_job.id)
+        if latest_actionable_proposal_job is not None
+        else None
+    )
+    latest_change_request = next(iter(recent_change_requests), None)
+    latest_change_request_backtest_record = (
+        backtest_record_by_id.get(latest_change_request.linked_backtest_id)
+        if latest_change_request and latest_change_request.linked_backtest_id
+        else None
+    )
+    latest_change_request_review_record = (
+        review_record_by_id.get(latest_change_request.linked_review_id)
+        if latest_change_request and latest_change_request.linked_review_id
+        else None
+    )
+    latest_change_request_job_record = (
+        agent_job_record_by_id.get(latest_change_request.follow_up_job_id)
+        if latest_change_request and latest_change_request.follow_up_job_id
+        else None
+    )
+    latest_change_request_source_backtest_record = (
+        backtest_record_by_id.get(get_change_request_source_backtest_id(latest_change_request))
+        if latest_change_request
+        else None
+    )
+    latest_change_request_source_review_record = (
+        review_record_by_id.get(get_change_request_source_review_id(latest_change_request))
+        if latest_change_request
+        else None
+    )
+    latest_change_request_source_proposal_record = (
+        proposal_by_id.get(get_change_request_source_proposal_id(latest_change_request))
+        if latest_change_request
+        else None
+    )
+    latest_actionable_change_request = next(
+        (
+            item
+            for item in recent_change_requests
+            if (
+                item.follow_up_job_id
+                and item.follow_up_job_status in {"failed", "cancelled"}
+            )
+            or _has_change_request_rerun_recommendation(item)
+        ),
+        None,
+    )
+    latest_actionable_change_request_backtest_record = (
+        backtest_record_by_id.get(latest_actionable_change_request.linked_backtest_id)
+        if latest_actionable_change_request and latest_actionable_change_request.linked_backtest_id
+        else None
+    )
+    latest_actionable_change_request_review_record = (
+        review_record_by_id.get(latest_actionable_change_request.linked_review_id)
+        if latest_actionable_change_request and latest_actionable_change_request.linked_review_id
+        else None
+    )
+    latest_actionable_change_request_job_record = (
+        agent_job_record_by_id.get(latest_actionable_change_request.follow_up_job_id)
+        if latest_actionable_change_request and latest_actionable_change_request.follow_up_job_id
+        else None
+    )
+    latest_actionable_change_request_source_backtest_record = (
+        backtest_record_by_id.get(get_change_request_source_backtest_id(latest_actionable_change_request))
+        if latest_actionable_change_request
+        else None
+    )
+    latest_actionable_change_request_source_review_record = (
+        review_record_by_id.get(get_change_request_source_review_id(latest_actionable_change_request))
+        if latest_actionable_change_request
+        else None
+    )
+    latest_actionable_change_request_source_proposal_record = (
+        proposal_by_id.get(get_change_request_source_proposal_id(latest_actionable_change_request))
+        if latest_actionable_change_request
+        else None
+    )
+    latest_retryable_tracking_job = next(
+        (
+            item
+            for item in recent_agent_jobs
+            if item.job_type in {"review_strategy_issue", "review_strategy_change"}
+            and item.status in {"failed", "cancelled"}
+        ),
+        None,
+    )
+    latest_retryable_tracking_job_record = (
+        agent_job_record_by_id.get(latest_retryable_tracking_job.id)
+        if latest_retryable_tracking_job is not None
+        else None
+    )
+    latest_key_audit_event = AppRepository._pick_latest_key_execution_event(recent_audit_events)
+    latest_active_order_record = max(
+        active_orders,
+        key=lambda item: parse_optional_iso_datetime(item.created_at),
+        default=None,
+    )
+    latest_historical_order_record = max(
+        recent_orders,
+        key=lambda item: parse_optional_iso_datetime(item.created_at),
+        default=None,
+    )
+    latest_trade_record = max(
+        recent_trades,
+        key=lambda item: parse_optional_iso_datetime(item.created_at),
+        default=None,
+    )
+    latest_alert_record = max(
+        recent_alerts,
+        key=lambda item: parse_optional_iso_datetime(item.triggered_at),
+        default=None,
+    )
+    latest_pending_alert_record = max(
+        [item for item in recent_alerts if not item.acknowledged],
+        key=lambda item: parse_optional_iso_datetime(item.triggered_at),
+        default=None,
+    )
+    latest_order_record = max(
+        [item for item in [latest_active_order_record, latest_historical_order_record] if item is not None],
+        key=lambda item: parse_optional_iso_datetime(item.created_at),
+        default=None,
+    )
+    latest_ops = _build_strategy_activity_latest_ops_snapshot(
+        latest_active_order_summary=summarize_order(latest_active_order_record) if latest_active_order_record else None,
+        latest_historical_order_summary=(
+            summarize_order(latest_historical_order_record) if latest_historical_order_record else None
+        ),
+        latest_order_summary=summarize_order(latest_order_record) if latest_order_record else None,
+        latest_pending_alert_summary=summarize_alert(latest_pending_alert_record) if latest_pending_alert_record else None,
+        latest_trade_summary=summarize_trade(latest_trade_record) if latest_trade_record else None,
+        latest_alert_summary=summarize_alert(latest_alert_record) if latest_alert_record else None,
+        latest_audit_event_summary=AppRepository._summarize_execution_event(latest_key_audit_event)
+        if latest_key_audit_event
+        else None,
+        latest_active_order_record=latest_active_order_record,
+        latest_historical_order_record=latest_historical_order_record,
+        latest_order_record=latest_order_record,
+        latest_pending_alert_record=latest_pending_alert_record,
+        latest_trade_record=latest_trade_record,
+        latest_alert_record=latest_alert_record,
+        latest_audit_event_record=latest_key_audit_event,
     )
     return StrategyActivitySnapshot(
         strategy_id=strategy.id,
@@ -3740,14 +4492,96 @@ def build_strategy_activity_payload(strategy_id: str) -> StrategyActivitySnapsho
         market=market,
         mode=strategy.mode,
         runtime=runtime,
+        latest_runtime=_build_strategy_activity_latest_runtime_snapshot(runtime=runtime, latest_ops=latest_ops),
+        latest_ops=latest_ops,
+        latest_backtest=latest_backtest,
+        latest_actionable_backtest=latest_actionable_backtest,
+        latest_backtest_record=latest_backtest_record,
+        latest_actionable_backtest_record=latest_actionable_backtest_record,
+        latest_backtest_review=latest_backtest_review,
+        latest_backtest_job=latest_backtest_job,
+        latest_actionable_backtest_review=latest_actionable_backtest_review,
+        latest_actionable_backtest_job=latest_actionable_backtest_job,
+        latest_backtest_review_record=latest_backtest_review_record,
+        latest_backtest_job_record=latest_backtest_job_record,
+        latest_actionable_backtest_review_record=latest_actionable_backtest_review_record,
+        latest_actionable_backtest_job_record=latest_actionable_backtest_job_record,
         latest_primary_review=latest_primary_review,
+        latest_actionable_primary_review=latest_actionable_primary_review,
+        latest_primary_review_record=latest_primary_review_record,
+        latest_actionable_primary_review_record=latest_actionable_primary_review_record,
         latest_tracking_review=latest_tracking_review,
         latest_tracking_job=latest_tracking_job,
+        latest_tracking_review_record=latest_tracking_review_record,
+        latest_tracking_job_record=latest_tracking_job_record,
+        latest_proposal=latest_proposal,
+        latest_actionable_proposal=latest_actionable_proposal,
+        latest_proposal_change_request=latest_proposal_change_request,
+        latest_proposal_backtest=latest_proposal_backtest,
+        latest_proposal_review=latest_proposal_review,
+        latest_proposal_job=latest_proposal_job,
+        latest_proposal_backtest_record=latest_proposal_backtest_record,
+        latest_proposal_review_record=latest_proposal_review_record,
+        latest_proposal_job_record=latest_proposal_job_record,
+        latest_actionable_proposal_change_request=latest_actionable_proposal_change_request,
+        latest_actionable_proposal_backtest=latest_actionable_proposal_backtest,
+        latest_actionable_proposal_review=latest_actionable_proposal_review,
+        latest_actionable_proposal_job=latest_actionable_proposal_job,
+        latest_actionable_proposal_backtest_record=latest_actionable_proposal_backtest_record,
+        latest_actionable_proposal_review_record=latest_actionable_proposal_review_record,
+        latest_actionable_proposal_job_record=latest_actionable_proposal_job_record,
+        latest_change_request=latest_change_request,
+        latest_actionable_change_request=latest_actionable_change_request,
+        latest_change_request_backtest_record=latest_change_request_backtest_record,
+        latest_change_request_review_record=latest_change_request_review_record,
+        latest_change_request_job_record=latest_change_request_job_record,
+        latest_change_request_source_backtest_record=latest_change_request_source_backtest_record,
+        latest_change_request_source_review_record=latest_change_request_source_review_record,
+        latest_change_request_source_proposal_record=latest_change_request_source_proposal_record,
+        latest_actionable_change_request_backtest_record=latest_actionable_change_request_backtest_record,
+        latest_actionable_change_request_review_record=latest_actionable_change_request_review_record,
+        latest_actionable_change_request_job_record=latest_actionable_change_request_job_record,
+        latest_actionable_change_request_source_backtest_record=latest_actionable_change_request_source_backtest_record,
+        latest_actionable_change_request_source_review_record=latest_actionable_change_request_source_review_record,
+        latest_actionable_change_request_source_proposal_record=latest_actionable_change_request_source_proposal_record,
+        latest_retryable_tracking_job=latest_retryable_tracking_job,
+        latest_retryable_tracking_job_record=latest_retryable_tracking_job_record,
+        latest_active_order=latest_ops.latest_active_order,
+        latest_active_order_record=(
+            latest_ops.latest_active_order_record.model_dump(mode="json") if latest_ops.latest_active_order_record else None
+        ),
+        latest_historical_order=latest_ops.latest_historical_order,
+        latest_historical_order_record=(
+            latest_ops.latest_historical_order_record.model_dump(mode="json")
+            if latest_ops.latest_historical_order_record
+            else None
+        ),
+        latest_order=latest_ops.latest_order,
+        latest_order_record=latest_ops.latest_order_record.model_dump(mode="json") if latest_ops.latest_order_record else None,
+        recent_orders=recent_orders[:20],
+        latest_trade=latest_ops.latest_trade,
+        latest_trade_record=latest_ops.latest_trade_record.model_dump(mode="json") if latest_ops.latest_trade_record else None,
+        recent_trades=recent_trades[:20],
+        latest_pending_alert=latest_ops.latest_pending_alert,
+        latest_pending_alert_record=(
+            latest_ops.latest_pending_alert_record.model_dump(mode="json")
+            if latest_ops.latest_pending_alert_record
+            else None
+        ),
+        latest_alert=latest_ops.latest_alert,
+        latest_alert_record=latest_ops.latest_alert_record.model_dump(mode="json") if latest_ops.latest_alert_record else None,
+        recent_alerts=recent_alerts[:12],
+        latest_audit_event=latest_ops.latest_audit_event,
+        latest_audit_event_record=(
+            latest_ops.latest_audit_event_record.model_dump(mode="json")
+            if latest_ops.latest_audit_event_record
+            else None
+        ),
+        recent_proposals=recent_proposals[:8],
+        recent_change_requests=recent_change_requests[:8],
+        recent_backtests=recent_backtests[:8],
         recent_reviews=recent_reviews[:8],
         active_orders=active_orders[:20],
-        recent_orders=recent_orders[:20],
-        recent_trades=recent_trades[:20],
-        recent_alerts=recent_alerts[:12],
         recent_audit_events=recent_audit_events[:30],
         recent_agent_jobs=recent_agent_jobs[:12],
         generated_at=datetime.now(timezone.utc).astimezone().isoformat(),
@@ -4830,40 +5664,99 @@ def format_sse(data: Dict[str, Any], event: str = "snapshot") -> str:
 
 
 def build_market_live_snapshot_payload(symbol: str, timeframe: str = "1h") -> MarketLiveSnapshot:
+    started_at = time.perf_counter()
     state = repo.snapshot()
     uppercase_symbol = symbol.upper()
-    detail = state.market_details.get(uppercase_symbol)
-    if not detail:
-        raise HTTPException(status_code=404, detail="找不到该品种")
-
     try:
         normalized_timeframe = market_data.normalize_timeframe(timeframe)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    watchlist = market_data.enrich_watchlist(state.watchlist)
+    watchlist = market_data.enrich_watchlist_fast(state.watchlist)
+    if not watchlist:
+        raise HTTPException(status_code=404, detail="当前还没有可用自选品种。")
     watch_item = next((item for item in watchlist if item.symbol == uppercase_symbol), None)
+    effective_symbol = uppercase_symbol
+    selection_corrected = False
     if watch_item is None:
+        watch_item = watchlist[0]
+        effective_symbol = watch_item.symbol
+        selection_corrected = True
+
+    watchlist_details: List[MarketDetail] = []
+    detail_map: Dict[str, MarketDetail] = {}
+    live_detail: Optional[MarketDetail] = None
+
+    for item in watchlist:
+        seed_detail = state.market_details.get(item.symbol)
+        fallback_detail = build_runtime_market_fallback_detail(
+            symbol=item.symbol,
+            market=item.market,
+            timeframe=normalized_timeframe,
+            watch_item=item,
+            base_detail=seed_detail,
+        )
+        try:
+            detail = market_data.enrich_market_detail(
+                symbol=item.symbol,
+                market=item.market,
+                fallback_detail=fallback_detail,
+                watch_item=item,
+                timeframe=normalized_timeframe,
+                allow_rest_refresh=False,
+            )
+            if item.symbol == effective_symbol and len(detail.candles) == 0:
+                detail = market_data.enrich_market_detail(
+                    symbol=item.symbol,
+                    market=item.market,
+                    fallback_detail=fallback_detail,
+                    watch_item=item,
+                    timeframe=normalized_timeframe,
+                    allow_rest_refresh=True,
+                )
+        except RuntimeError as exc:
+            detail = build_runtime_market_fallback_detail(
+                symbol=item.symbol,
+                market=item.market,
+                timeframe=normalized_timeframe,
+                watch_item=item,
+                base_detail=seed_detail,
+                failure_reason=str(exc),
+            )
+        detail_map[item.symbol] = detail
+        watchlist_details.append(detail)
+        if item.symbol == effective_symbol:
+            live_detail = detail
+
+    if live_detail is None:
         raise HTTPException(status_code=404, detail="当前自选中找不到该品种")
 
-    fallback_detail = detail.model_copy(update={"timeframe": normalized_timeframe})
-    try:
-        live_detail = market_data.enrich_market_detail(
-            symbol=uppercase_symbol,
-            market=detail.market,
-            fallback_detail=fallback_detail,
-            watch_item=watch_item,
-            timeframe=normalized_timeframe,
-        )
-    except RuntimeError:
-        live_detail = fallback_detail
+    repo.sync_market_watchlist(watchlist, detail_map)
 
-    repo.sync_market_watchlist(watchlist, {uppercase_symbol: live_detail})
+    source_breakdown: Dict[str, int] = {}
+    for item in watchlist_details:
+        source_breakdown[item.source] = source_breakdown.get(item.source, 0) + 1
+    watchlist_real_detail_count = sum(1 for item in watchlist_details if item.source in {"bybit_ws", "bybit_rest"})
+    generated_in_ms = int((time.perf_counter() - started_at) * 1000)
 
     return MarketLiveSnapshot(
-        selected_symbol=uppercase_symbol,
+        selected_symbol=effective_symbol,
         watchlist=watchlist,
         detail=live_detail,
+        watchlist_details=watchlist_details,
+        diagnostics=MarketLiveDiagnostics(
+            requested_symbol=uppercase_symbol,
+            effective_symbol=effective_symbol,
+            timeframe=normalized_timeframe,
+            selection_corrected=selection_corrected,
+            detail_source=live_detail.source,
+            detail_candle_count=len(live_detail.candles),
+            watchlist_symbol_count=len(watchlist_details),
+            watchlist_real_detail_count=watchlist_real_detail_count,
+            watchlist_fallback_detail_count=max(len(watchlist_details) - watchlist_real_detail_count, 0),
+            watchlist_source_breakdown=source_breakdown,
+            generated_in_ms=generated_in_ms,
+        ),
         generated_at=datetime.now(timezone.utc).astimezone().isoformat(),
     )
 
@@ -6222,6 +7115,42 @@ def refresh_strategy_runtime_once(auto_dispatch: bool = False) -> List[StrategyR
     return updated
 
 
+def _build_lightweight_strategy_activity_runtime_snapshot(
+    state: Any,
+    strategy: Any,
+) -> Optional[StrategyRuntimeSnapshot]:
+    cached_snapshot = next((item for item in state.strategy_runtime_snapshots if item.strategy_id == strategy.id), None)
+    if not strategy.symbols:
+        return cached_snapshot
+    symbol = strategy.symbols[0]
+    watch_item = next((item for item in state.watchlist if item.symbol == symbol), None)
+    if watch_item is None:
+        return cached_snapshot
+    fallback_detail = state.market_details.get(symbol) or build_market_detail_for_watchlist(watch_item)
+    evaluated_at = datetime.now(timezone.utc).astimezone().isoformat()
+    detail = fallback_detail.model_copy(update={"timeframe": "1h"})
+    if not isinstance(market_data, BybitPublicMarketClient):
+        try:
+            detail = market_data.enrich_market_detail(
+                symbol=symbol,
+                market=watch_item.market,
+                fallback_detail=detail,
+                watch_item=watch_item,
+                timeframe="1h",
+            )
+        except RuntimeError:
+            pass
+    try:
+        return evaluate_strategy_runtime(
+            strategy=strategy,
+            detail=detail,
+            watch_item=watch_item,
+            evaluated_at=evaluated_at,
+        )
+    except Exception:
+        return cached_snapshot
+
+
 def _build_blocked_strategy_execution_preview(
     snapshot: StrategyRuntimeSnapshot,
     mode: AccountMode,
@@ -6854,7 +7783,54 @@ def _sync_strategy_position_drift_issues(current_items: List[StrategyRuntimeSnap
         _sync_strategy_position_drift_issue(enriched, active_order_count=active_order_count)
 
 
-def _build_strategy_execution_preview_from_state(strategy_id: str, mode: Optional[AccountMode] = None) -> ExecutionPreview:
+def _get_strategy_signal_order_hint_for_runtime_snapshot(
+    strategy_id: str,
+    runtime_snapshot: StrategyRuntimeSnapshot,
+) -> Dict[str, Any]:
+    current_getter = repo.get_strategy_signal_order_hint
+    if getattr(current_getter, "__func__", None) is AppRepository.get_strategy_signal_order_hint:
+        with repo._lock:  # type: ignore[attr-defined]
+            strategy = repo._find_strategy(strategy_id)  # type: ignore[attr-defined]
+            target_signed_qty = repo._resolve_strategy_target_signed_qty_locked(  # type: ignore[attr-defined]
+                strategy,
+                runtime_snapshot,
+            )
+        if target_signed_qty is None:
+            raise ValueError("当前策略仍处于 watch 观察状态，暂时没有可提交的委托方向。")
+        price = round(runtime_snapshot.reference_price or runtime_snapshot.last_price, 6)
+        return {
+            "strategy_id": strategy.id,
+            "strategy_name": strategy.name,
+            "symbol": runtime_snapshot.symbol,
+            "market": runtime_snapshot.market,
+            "signal": runtime_snapshot.signal,
+            "risk_budget": strategy.risk_budget,
+            "target_signed_qty": target_signed_qty,
+            "price": price,
+            "note": runtime_snapshot.next_action,
+        }
+
+    with repo._lock:  # type: ignore[attr-defined]
+        original_snapshots = list(repo.state.strategy_runtime_snapshots)
+        next_snapshots = [
+            runtime_snapshot if item.strategy_id == strategy_id else item
+            for item in repo.state.strategy_runtime_snapshots
+        ]
+        if not any(item.strategy_id == strategy_id for item in repo.state.strategy_runtime_snapshots):
+            next_snapshots.append(runtime_snapshot)
+        repo.state.strategy_runtime_snapshots = next_snapshots
+    try:
+        return current_getter(strategy_id)
+    finally:
+        with repo._lock:  # type: ignore[attr-defined]
+            repo.state.strategy_runtime_snapshots = original_snapshots
+
+
+def _build_strategy_execution_preview_from_state(
+    strategy_id: str,
+    mode: Optional[AccountMode] = None,
+    runtime_snapshot_override: Optional[StrategyRuntimeSnapshot] = None,
+) -> ExecutionPreview:
     state = repo.snapshot()
     resolved_mode = mode or state.workspace_preferences.selected_mode
     runtime_health = _build_strategy_runtime_worker_health()
@@ -6862,7 +7838,10 @@ def _build_strategy_execution_preview_from_state(strategy_id: str, mode: Optiona
     if strategy is None:
         raise KeyError(strategy_id)
 
-    snapshot = next((item for item in state.strategy_runtime_snapshots if item.strategy_id == strategy_id), None)
+    snapshot = runtime_snapshot_override or next(
+        (item for item in state.strategy_runtime_snapshots if item.strategy_id == strategy_id),
+        None,
+    )
     if snapshot is None:
         raise RuntimeError("当前策略运行态尚未准备好，请先刷新策略页后再试。")
     if snapshot.runtime_status == "paused":
@@ -6901,7 +7880,10 @@ def _build_strategy_execution_preview_from_state(strategy_id: str, mode: Optiona
             f"最近真实策略委托连续拒绝，自动执行冷却剩余约 {rejection_guard_remaining} 分钟，请先人工复核交易所约束和委托参数。"
         )
 
-    hint = repo.get_strategy_signal_order_hint(strategy_id)
+    if runtime_snapshot_override is not None:
+        hint = _get_strategy_signal_order_hint_for_runtime_snapshot(strategy_id, snapshot)
+    else:
+        hint = repo.get_strategy_signal_order_hint(strategy_id)
     positions = parse_positions(use_private_only=True)
     position = next(
         (
@@ -7509,16 +8491,289 @@ def _build_strategy_activity_review_context(strategy_id: str) -> Optional[Dict[s
         )
 
     def summarize_trade(trade: TradeRecord) -> str:
-        return (
-            f"{trade.symbol} {trade.side.value} {trade.quantity}@{trade.price} · "
-            f"{trade.status} · pnl {trade.pnl}"
-        )
+        parts = [f"{trade.symbol} {trade.side.value} {trade.quantity}@{trade.price}", str(trade.status or "filled")]
+        pnl = str(trade.pnl or "").strip()
+        if pnl and pnl != "--":
+            parts.append(f"pnl {pnl}")
+        return " · ".join(parts)
 
     def summarize_alert(alert: AlertRecord) -> str:
         return f"{alert.severity} {alert.title} · {alert.description}"
 
     def summarize_event(event: ExecutionEvent) -> str:
-        return f"{event.event_type} · {event.source}"
+        return AppRepository._summarize_execution_event(event)
+
+    def summarize_backtest(backtest: StrategyActivityBacktestSummary) -> str:
+        parts = [
+            f"{backtest.id} · {backtest.timeframe} · {backtest.data_range}",
+            backtest.status,
+            backtest.decision_readiness,
+        ]
+        if backtest.history_source != "exchange_history":
+            parts.append(backtest.history_source)
+        if backtest.source_change_request_id:
+            parts.append(f"变更 {backtest.source_change_request_id}")
+        if backtest.source_backtest_id:
+            parts.append(f"来源回测 {backtest.source_backtest_id}")
+        if backtest.source_review_id:
+            parts.append(f"来源复盘 {backtest.source_review_id}")
+        if backtest.source_proposal_id:
+            parts.append(f"来源提案 {backtest.source_proposal_id}")
+        return " · ".join(parts)
+
+    def summarize_review(review: StrategyActivityReviewSummary) -> str:
+        parts = [f"{review.id} · {review.period}", review.title]
+        if review.source_job_type:
+            job_parts = [f"任务 {review.source_job_type}"]
+            if review.source_job_status:
+                job_parts.append(review.source_job_status)
+            parts.append(" / ".join(job_parts))
+        if review.source_change_request_id:
+            parts.append(f"变更 {review.source_change_request_id}")
+        if review.backtest_id:
+            parts.append(f"回测 {review.backtest_id}")
+        if review.source_proposal_id:
+            parts.append(f"提案 {review.source_proposal_id}")
+        return " · ".join(parts)
+
+    def summarize_agent_job(job: StrategyActivityJobSummary) -> str:
+        parts = [f"{job.id} · {job.job_type}", job.status.value]
+        if job.backtest_id:
+            parts.append(f"回测 {job.backtest_id}")
+        if job.linked_review_title:
+            parts.append(f"结果 {job.linked_review_title}")
+        elif job.linked_review_id:
+            parts.append(f"复盘 {job.linked_review_id}")
+        elif job.result_summary:
+            parts.append(job.result_summary)
+        return " · ".join(parts)
+
+    def summarize_change_request(change_request: ChangeRequest) -> str:
+        parts = [f"{change_request.id} · {change_request.type}", change_request.status.value]
+        if change_request.manual_followup_required:
+            parts.append("需人工跟进")
+        if change_request.linked_backtest_id:
+            parts.append(f"回测 {change_request.linked_backtest_id}")
+        if change_request.linked_review_id:
+            parts.append(f"复盘 {change_request.linked_review_id}")
+        return " · ".join(parts)
+
+    def get_change_request_source_proposal_id(change_request: ChangeRequest) -> Optional[str]:
+        source_proposal_id = str(change_request.source_proposal_id or "").strip()
+        if source_proposal_id:
+            return source_proposal_id
+        payload_proposal_id = str(change_request.payload.get("proposal_id") or "").strip()
+        return payload_proposal_id or None
+
+    proposal_change_request_map: Dict[str, ChangeRequest] = {}
+    for change_request in activity.recent_change_requests:
+        source_proposal_id = get_change_request_source_proposal_id(change_request)
+        if source_proposal_id and source_proposal_id not in proposal_change_request_map:
+            proposal_change_request_map[source_proposal_id] = change_request
+
+    proposal_backtest_map: Dict[str, StrategyActivityBacktestSummary] = {}
+    for backtest in activity.recent_backtests:
+        source_proposal_id = str(backtest.source_proposal_id or "").strip()
+        if source_proposal_id and source_proposal_id not in proposal_backtest_map:
+            proposal_backtest_map[source_proposal_id] = backtest
+
+    proposal_review_map: Dict[str, ReviewDocument] = {}
+    for review in activity.recent_reviews:
+        source_proposal_id = str(review.source_proposal_id or "").strip()
+        if source_proposal_id and source_proposal_id not in proposal_review_map:
+            proposal_review_map[source_proposal_id] = review
+
+    backtest_by_id = {item.id: item for item in activity.recent_backtests}
+    review_by_id = {item.id: item for item in activity.recent_reviews}
+    agent_job_by_id = {item.id: item for item in activity.recent_agent_jobs}
+    review_by_backtest_id: Dict[str, ReviewDocument] = {}
+    for review in activity.recent_reviews:
+        backtest_id = str(review.backtest_id or "").strip()
+        if backtest_id and backtest_id not in review_by_backtest_id:
+            review_by_backtest_id[backtest_id] = review
+    agent_job_by_backtest_id: Dict[str, StrategyActivityJobSummary] = {}
+    for job in activity.recent_agent_jobs:
+        backtest_id = str(job.backtest_id or "").strip()
+        if backtest_id and backtest_id not in agent_job_by_backtest_id:
+            agent_job_by_backtest_id[backtest_id] = job
+
+    def get_linked_change_request_for_proposal(proposal: Optional[StrategyProposal]) -> Optional[ChangeRequest]:
+        if proposal is None:
+            return None
+        if activity.latest_actionable_proposal and activity.latest_actionable_proposal.id == proposal.id:
+            return activity.latest_actionable_proposal_change_request
+        if activity.latest_proposal and activity.latest_proposal.id == proposal.id:
+            return activity.latest_proposal_change_request
+        return proposal_change_request_map.get(proposal.id)
+
+    def get_linked_backtest_for_proposal(
+        proposal: Optional[StrategyProposal],
+    ) -> Optional[StrategyActivityBacktestSummary]:
+        if proposal is None:
+            return None
+        if activity.latest_actionable_proposal and activity.latest_actionable_proposal.id == proposal.id:
+            if activity.latest_actionable_proposal_backtest is not None:
+                return activity.latest_actionable_proposal_backtest
+        if activity.latest_proposal and activity.latest_proposal.id == proposal.id:
+            if activity.latest_proposal_backtest is not None:
+                return activity.latest_proposal_backtest
+        linked_backtest = proposal_backtest_map.get(proposal.id)
+        if linked_backtest is not None:
+            return linked_backtest
+        linked_change_request = proposal_change_request_map.get(proposal.id)
+        if linked_change_request and linked_change_request.linked_backtest_id:
+            return backtest_by_id.get(linked_change_request.linked_backtest_id)
+        linked_review = proposal_review_map.get(proposal.id)
+        if linked_review and linked_review.backtest_id:
+            return backtest_by_id.get(linked_review.backtest_id)
+        return None
+
+    def get_linked_review_for_proposal(proposal: Optional[StrategyProposal]) -> Optional[ReviewDocument]:
+        if proposal is None:
+            return None
+        if activity.latest_actionable_proposal and activity.latest_actionable_proposal.id == proposal.id:
+            if activity.latest_actionable_proposal_review is not None:
+                return activity.latest_actionable_proposal_review
+        if activity.latest_proposal and activity.latest_proposal.id == proposal.id:
+            if activity.latest_proposal_review is not None:
+                return activity.latest_proposal_review
+        linked_review = proposal_review_map.get(proposal.id)
+        if linked_review is not None:
+            return linked_review
+        linked_change_request = proposal_change_request_map.get(proposal.id)
+        if linked_change_request and linked_change_request.linked_review_id:
+            return review_by_id.get(linked_change_request.linked_review_id)
+        linked_backtest = get_linked_backtest_for_proposal(proposal)
+        if linked_backtest is not None:
+            return review_by_backtest_id.get(linked_backtest.id)
+        return None
+
+    def get_linked_job_for_proposal(
+        proposal: Optional[StrategyProposal],
+    ) -> Optional[StrategyActivityJobSummary]:
+        if proposal is None:
+            return None
+        if activity.latest_actionable_proposal and activity.latest_actionable_proposal.id == proposal.id:
+            if activity.latest_actionable_proposal_job is not None:
+                return activity.latest_actionable_proposal_job
+        if activity.latest_proposal and activity.latest_proposal.id == proposal.id:
+            if activity.latest_proposal_job is not None:
+                return activity.latest_proposal_job
+        linked_change_request = get_linked_change_request_for_proposal(proposal)
+        if linked_change_request and linked_change_request.follow_up_job_id:
+            linked_job = agent_job_by_id.get(linked_change_request.follow_up_job_id)
+            if linked_job is not None:
+                return linked_job
+        linked_review = get_linked_review_for_proposal(proposal)
+        if linked_review and linked_review.source_job_id:
+            linked_job = agent_job_by_id.get(linked_review.source_job_id)
+            if linked_job is not None:
+                return linked_job
+        linked_backtest = get_linked_backtest_for_proposal(proposal)
+        if linked_backtest is not None:
+            return agent_job_by_backtest_id.get(linked_backtest.id)
+        return None
+
+    def summarize_proposal(proposal: StrategyProposal) -> str:
+        parts = [
+            proposal.id,
+            proposal.proposal_type,
+            proposal.status,
+            proposal.title,
+            proposal.expected_impact,
+        ]
+        linked_change_request = get_linked_change_request_for_proposal(proposal)
+        linked_backtest = get_linked_backtest_for_proposal(proposal)
+        linked_review = get_linked_review_for_proposal(proposal)
+        linked_job = get_linked_job_for_proposal(proposal)
+        if linked_change_request:
+            parts.append(f"变更 {linked_change_request.id}")
+            if linked_change_request.manual_followup_required:
+                parts.append("需人工跟进")
+            if linked_change_request.follow_up_job_type:
+                follow_up_parts = [f"跟踪 {linked_change_request.follow_up_job_type}"]
+                if linked_change_request.follow_up_job_status:
+                    follow_up_parts.append(linked_change_request.follow_up_job_status.value)
+                if linked_change_request.linked_review_title:
+                    follow_up_parts.append(f"结果 {linked_change_request.linked_review_title}")
+                elif linked_change_request.follow_up_result_summary:
+                    follow_up_parts.append(linked_change_request.follow_up_result_summary)
+                parts.append(" / ".join(follow_up_parts))
+        elif linked_job:
+            follow_up_parts = [f"任务 {linked_job.job_type}"]
+            if linked_job.status:
+                follow_up_parts.append(linked_job.status.value)
+            if linked_job.linked_review_title:
+                follow_up_parts.append(f"结果 {linked_job.linked_review_title}")
+            elif linked_job.result_summary:
+                follow_up_parts.append(linked_job.result_summary)
+            parts.append(" / ".join(follow_up_parts))
+        elif proposal.proposal_type == "script_patch_proposal" and proposal.status in {"pending", "testing"}:
+            parts.append("接受后需人工跟进")
+        if linked_backtest:
+            parts.append(f"回测 {linked_backtest.id}")
+        if linked_review:
+            parts.append(f"复盘 {linked_review.id}")
+        return " · ".join(parts)
+
+    latest_key_audit_event = AppRepository._pick_latest_key_execution_event(activity.recent_audit_events)
+    latest_active_order_record = max(
+        activity.active_orders,
+        key=lambda item: parse_optional_iso_datetime(item.created_at),
+        default=None,
+    )
+    latest_historical_order_record = max(
+        activity.recent_orders,
+        key=lambda item: parse_optional_iso_datetime(item.created_at),
+        default=None,
+    )
+    latest_trade_record = max(
+        activity.recent_trades,
+        key=lambda item: parse_optional_iso_datetime(item.created_at),
+        default=None,
+    )
+    latest_alert_record = max(
+        activity.recent_alerts,
+        key=lambda item: parse_optional_iso_datetime(item.triggered_at),
+        default=None,
+    )
+    latest_pending_alert_record = max(
+        [item for item in activity.recent_alerts if not item.acknowledged],
+        key=lambda item: parse_optional_iso_datetime(item.triggered_at),
+        default=None,
+    )
+    latest_order_record = max(
+        [
+            item
+            for item in [
+                latest_active_order_record,
+                latest_historical_order_record,
+            ]
+            if item is not None
+        ],
+        key=lambda item: parse_optional_iso_datetime(item.created_at),
+        default=None,
+    )
+    latest_ops = _build_strategy_activity_latest_ops_snapshot(
+        latest_active_order_summary=summarize_order(latest_active_order_record) if latest_active_order_record else None,
+        latest_historical_order_summary=(
+            summarize_order(latest_historical_order_record) if latest_historical_order_record else None
+        ),
+        latest_order_summary=summarize_order(latest_order_record) if latest_order_record else None,
+        latest_pending_alert_summary=summarize_alert(latest_pending_alert_record) if latest_pending_alert_record else None,
+        latest_trade_summary=summarize_trade(latest_trade_record) if latest_trade_record else None,
+        latest_alert_summary=summarize_alert(latest_alert_record) if latest_alert_record else None,
+        latest_audit_event_summary=AppRepository._summarize_execution_event(latest_key_audit_event)
+        if latest_key_audit_event
+        else None,
+        latest_active_order_record=latest_active_order_record,
+        latest_historical_order_record=latest_historical_order_record,
+        latest_order_record=latest_order_record,
+        latest_pending_alert_record=latest_pending_alert_record,
+        latest_trade_record=latest_trade_record,
+        latest_alert_record=latest_alert_record,
+        latest_audit_event_record=latest_key_audit_event,
+    )
 
     return {
         "strategy_id": activity.strategy_id,
@@ -7541,11 +8796,269 @@ def _build_strategy_activity_review_context(strategy_id: str) -> Optional[Dict[s
             if runtime is not None
             else None
         ),
+        "latest_runtime": _build_strategy_activity_latest_runtime_snapshot(runtime=runtime, latest_ops=latest_ops).model_dump(mode="json"),
+        "latest_ops": latest_ops.model_dump(mode="json"),
         "active_order_count": len(activity.active_orders),
         "active_orders": [summarize_order(order) for order in activity.active_orders[:3]],
+        "latest_active_order": latest_ops.latest_active_order,
+        "latest_active_order_record": (
+            latest_ops.latest_active_order_record.model_dump(mode="json") if latest_ops.latest_active_order_record else None
+        ),
+        "latest_historical_order": latest_ops.latest_historical_order,
+        "latest_historical_order_record": (
+            latest_ops.latest_historical_order_record.model_dump(mode="json")
+            if latest_ops.latest_historical_order_record
+            else None
+        ),
+        "latest_order": latest_ops.latest_order,
+        "latest_order_record": latest_ops.latest_order_record.model_dump(mode="json") if latest_ops.latest_order_record else None,
         "recent_orders": [summarize_order(order) for order in activity.recent_orders[:3]],
+        "latest_trade": latest_ops.latest_trade,
+        "latest_trade_record": latest_ops.latest_trade_record.model_dump(mode="json") if latest_ops.latest_trade_record else None,
         "recent_trades": [summarize_trade(trade) for trade in activity.recent_trades[:3]],
+        "latest_pending_alert": latest_ops.latest_pending_alert,
+        "latest_pending_alert_record": (
+            latest_ops.latest_pending_alert_record.model_dump(mode="json")
+            if latest_ops.latest_pending_alert_record
+            else None
+        ),
+        "latest_alert": latest_ops.latest_alert,
+        "latest_alert_record": latest_ops.latest_alert_record.model_dump(mode="json") if latest_ops.latest_alert_record else None,
         "recent_alerts": [summarize_alert(alert) for alert in activity.recent_alerts[:3]],
+        "latest_proposal": summarize_proposal(activity.latest_proposal) if activity.latest_proposal else None,
+        "latest_actionable_proposal": (
+            summarize_proposal(activity.latest_actionable_proposal)
+            if activity.latest_actionable_proposal
+            else None
+        ),
+        "latest_proposal_change_request": (
+            summarize_change_request(activity.latest_proposal_change_request)
+            if activity.latest_proposal_change_request
+            else None
+        ),
+        "latest_proposal_backtest": (
+            summarize_backtest(activity.latest_proposal_backtest) if activity.latest_proposal_backtest else None
+        ),
+        "latest_proposal_backtest_record": (
+            activity.latest_proposal_backtest_record.model_dump(mode="json")
+            if activity.latest_proposal_backtest_record
+            else None
+        ),
+        "latest_proposal_review": (
+            summarize_review(activity.latest_proposal_review) if activity.latest_proposal_review else None
+        ),
+        "latest_proposal_review_record": (
+            activity.latest_proposal_review_record.model_dump(mode="json")
+            if activity.latest_proposal_review_record
+            else None
+        ),
+        "latest_proposal_job": (
+            summarize_agent_job(activity.latest_proposal_job) if activity.latest_proposal_job else None
+        ),
+        "latest_proposal_job_record": (
+            activity.latest_proposal_job_record.model_dump(mode="json")
+            if activity.latest_proposal_job_record
+            else None
+        ),
+        "latest_actionable_proposal_change_request": (
+            summarize_change_request(activity.latest_actionable_proposal_change_request)
+            if activity.latest_actionable_proposal_change_request
+            else None
+        ),
+        "latest_actionable_proposal_backtest": (
+            summarize_backtest(activity.latest_actionable_proposal_backtest)
+            if activity.latest_actionable_proposal_backtest
+            else None
+        ),
+        "latest_actionable_proposal_backtest_record": (
+            activity.latest_actionable_proposal_backtest_record.model_dump(mode="json")
+            if activity.latest_actionable_proposal_backtest_record
+            else None
+        ),
+        "latest_actionable_proposal_review": (
+            summarize_review(activity.latest_actionable_proposal_review)
+            if activity.latest_actionable_proposal_review
+            else None
+        ),
+        "latest_actionable_proposal_review_record": (
+            activity.latest_actionable_proposal_review_record.model_dump(mode="json")
+            if activity.latest_actionable_proposal_review_record
+            else None
+        ),
+        "latest_actionable_proposal_job": (
+            summarize_agent_job(activity.latest_actionable_proposal_job)
+            if activity.latest_actionable_proposal_job
+            else None
+        ),
+        "latest_actionable_proposal_job_record": (
+            activity.latest_actionable_proposal_job_record.model_dump(mode="json")
+            if activity.latest_actionable_proposal_job_record
+            else None
+        ),
+        "recent_proposals": [summarize_proposal(proposal) for proposal in activity.recent_proposals[:3]],
+        "latest_change_request": summarize_change_request(activity.latest_change_request) if activity.latest_change_request else None,
+        "latest_actionable_change_request": (
+            summarize_change_request(activity.latest_actionable_change_request)
+            if activity.latest_actionable_change_request
+            else None
+        ),
+        "latest_change_request_backtest_record": (
+            activity.latest_change_request_backtest_record.model_dump(mode="json")
+            if activity.latest_change_request_backtest_record
+            else None
+        ),
+        "latest_change_request_review_record": (
+            activity.latest_change_request_review_record.model_dump(mode="json")
+            if activity.latest_change_request_review_record
+            else None
+        ),
+        "latest_change_request_job_record": (
+            activity.latest_change_request_job_record.model_dump(mode="json")
+            if activity.latest_change_request_job_record
+            else None
+        ),
+        "latest_change_request_source_backtest_record": (
+            activity.latest_change_request_source_backtest_record.model_dump(mode="json")
+            if activity.latest_change_request_source_backtest_record
+            else None
+        ),
+        "latest_change_request_source_review_record": (
+            activity.latest_change_request_source_review_record.model_dump(mode="json")
+            if activity.latest_change_request_source_review_record
+            else None
+        ),
+        "latest_change_request_source_proposal_record": (
+            activity.latest_change_request_source_proposal_record.model_dump(mode="json")
+            if activity.latest_change_request_source_proposal_record
+            else None
+        ),
+        "latest_actionable_change_request_backtest_record": (
+            activity.latest_actionable_change_request_backtest_record.model_dump(mode="json")
+            if activity.latest_actionable_change_request_backtest_record
+            else None
+        ),
+        "latest_actionable_change_request_review_record": (
+            activity.latest_actionable_change_request_review_record.model_dump(mode="json")
+            if activity.latest_actionable_change_request_review_record
+            else None
+        ),
+        "latest_actionable_change_request_job_record": (
+            activity.latest_actionable_change_request_job_record.model_dump(mode="json")
+            if activity.latest_actionable_change_request_job_record
+            else None
+        ),
+        "latest_actionable_change_request_source_backtest_record": (
+            activity.latest_actionable_change_request_source_backtest_record.model_dump(mode="json")
+            if activity.latest_actionable_change_request_source_backtest_record
+            else None
+        ),
+        "latest_actionable_change_request_source_review_record": (
+            activity.latest_actionable_change_request_source_review_record.model_dump(mode="json")
+            if activity.latest_actionable_change_request_source_review_record
+            else None
+        ),
+        "latest_actionable_change_request_source_proposal_record": (
+            activity.latest_actionable_change_request_source_proposal_record.model_dump(mode="json")
+            if activity.latest_actionable_change_request_source_proposal_record
+            else None
+        ),
+        "recent_change_requests": [
+            summarize_change_request(change_request)
+            for change_request in activity.recent_change_requests[:3]
+        ],
+        "latest_backtest": summarize_backtest(activity.latest_backtest) if activity.latest_backtest else None,
+        "latest_actionable_backtest": (
+            summarize_backtest(activity.latest_actionable_backtest)
+            if activity.latest_actionable_backtest
+            else None
+        ),
+        "latest_backtest_record": (
+            activity.latest_backtest_record.model_dump(mode="json") if activity.latest_backtest_record else None
+        ),
+        "latest_actionable_backtest_record": (
+            activity.latest_actionable_backtest_record.model_dump(mode="json")
+            if activity.latest_actionable_backtest_record
+            else None
+        ),
+        "latest_actionable_backtest_review": (
+            summarize_review(activity.latest_actionable_backtest_review)
+            if activity.latest_actionable_backtest_review
+            else None
+        ),
+        "latest_backtest_review_record": (
+            activity.latest_backtest_review_record.model_dump(mode="json")
+            if activity.latest_backtest_review_record
+            else None
+        ),
+        "latest_backtest_job_record": (
+            activity.latest_backtest_job_record.model_dump(mode="json")
+            if activity.latest_backtest_job_record
+            else None
+        ),
+        "latest_actionable_backtest_review_record": (
+            activity.latest_actionable_backtest_review_record.model_dump(mode="json")
+            if activity.latest_actionable_backtest_review_record
+            else None
+        ),
+        "latest_actionable_backtest_job_record": (
+            activity.latest_actionable_backtest_job_record.model_dump(mode="json")
+            if activity.latest_actionable_backtest_job_record
+            else None
+        ),
+        "latest_actionable_backtest_job": (
+            summarize_agent_job(activity.latest_actionable_backtest_job)
+            if activity.latest_actionable_backtest_job
+            else None
+        ),
+        "latest_backtest_review": summarize_review(activity.latest_backtest_review) if activity.latest_backtest_review else None,
+        "latest_backtest_job": summarize_agent_job(activity.latest_backtest_job) if activity.latest_backtest_job else None,
+        "recent_backtests": [summarize_backtest(backtest) for backtest in activity.recent_backtests[:3]],
+        "latest_primary_review": summarize_review(activity.latest_primary_review) if activity.latest_primary_review else None,
+        "latest_actionable_primary_review": (
+            summarize_review(activity.latest_actionable_primary_review)
+            if activity.latest_actionable_primary_review
+            else None
+        ),
+        "latest_primary_review_record": (
+            activity.latest_primary_review_record.model_dump(mode="json")
+            if activity.latest_primary_review_record
+            else None
+        ),
+        "latest_actionable_primary_review_record": (
+            activity.latest_actionable_primary_review_record.model_dump(mode="json")
+            if activity.latest_actionable_primary_review_record
+            else None
+        ),
+        "latest_tracking_review": summarize_review(activity.latest_tracking_review) if activity.latest_tracking_review else None,
+        "latest_tracking_job": summarize_agent_job(activity.latest_tracking_job) if activity.latest_tracking_job else None,
+        "latest_tracking_review_record": (
+            activity.latest_tracking_review_record.model_dump(mode="json")
+            if activity.latest_tracking_review_record
+            else None
+        ),
+        "latest_tracking_job_record": (
+            activity.latest_tracking_job_record.model_dump(mode="json")
+            if activity.latest_tracking_job_record
+            else None
+        ),
+        "latest_retryable_tracking_job": (
+            summarize_agent_job(activity.latest_retryable_tracking_job)
+            if activity.latest_retryable_tracking_job
+            else None
+        ),
+        "latest_retryable_tracking_job_record": (
+            activity.latest_retryable_tracking_job_record.model_dump(mode="json")
+            if activity.latest_retryable_tracking_job_record
+            else None
+        ),
+        "latest_audit_event": latest_ops.latest_audit_event,
+        "latest_audit_event_record": (
+            latest_ops.latest_audit_event_record.model_dump(mode="json")
+            if latest_ops.latest_audit_event_record
+            else None
+        ),
+        "recent_reviews": [summarize_review(review) for review in activity.recent_reviews[:3]],
+        "recent_agent_jobs": [summarize_agent_job(job) for job in activity.recent_agent_jobs[:4]],
         "recent_audit_events": [summarize_event(event) for event in activity.recent_audit_events[:4]],
     }
 
@@ -9164,8 +10677,12 @@ def get_prometheus_metrics():
 
 
 @app.get("/api/market/watchlist")
-def get_watchlist():
-    watchlist = market_data.enrich_watchlist(repo.snapshot().watchlist)
+def get_watchlist(refresh: bool = False):
+    watchlist = (
+        market_data.enrich_watchlist(repo.snapshot().watchlist)
+        if refresh
+        else market_data.enrich_watchlist_fast(repo.snapshot().watchlist)
+    )
     repo.sync_market_watchlist(watchlist)
     return watchlist
 
@@ -9210,7 +10727,11 @@ async def stream_market_live(symbol: str, timeframe: str = "1h", once: bool = Fa
 
     async def event_generator():
         while True:
-            snapshot = build_market_live_snapshot_payload(symbol, timeframe=normalized_timeframe)
+            snapshot = await asyncio.to_thread(
+                build_market_live_snapshot_payload,
+                symbol,
+                normalized_timeframe,
+            )
             yield format_sse(snapshot.model_dump(mode="json"))
             if once:
                 break
@@ -9223,25 +10744,39 @@ async def stream_market_live(symbol: str, timeframe: str = "1h", once: bool = Fa
 def get_market_detail(symbol: str, timeframe: str = "1h"):
     state = repo.snapshot()
     uppercase_symbol = symbol.upper()
-    detail = state.market_details.get(uppercase_symbol)
-    if not detail:
-        raise HTTPException(status_code=404, detail="找不到该品种")
     try:
         normalized_timeframe = market_data.normalize_timeframe(timeframe)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     watch_item = next((item for item in state.watchlist if item.symbol == uppercase_symbol), None)
-    fallback_detail = detail.model_copy(update={"timeframe": normalized_timeframe})
+    detail = state.market_details.get(uppercase_symbol)
+    market = watch_item.market if watch_item is not None else detail.market if detail is not None else None
+    if market is None:
+        raise HTTPException(status_code=404, detail="找不到该品种")
+    fallback_detail = build_runtime_market_fallback_detail(
+        symbol=uppercase_symbol,
+        market=market,
+        timeframe=normalized_timeframe,
+        watch_item=watch_item,
+        base_detail=detail,
+    )
     try:
         return market_data.enrich_market_detail(
             symbol=uppercase_symbol,
-            market=detail.market,
+            market=market,
             fallback_detail=fallback_detail,
             watch_item=watch_item,
             timeframe=normalized_timeframe,
         )
-    except RuntimeError:
-        return fallback_detail
+    except RuntimeError as exc:
+        return build_runtime_market_fallback_detail(
+            symbol=uppercase_symbol,
+            market=market,
+            timeframe=normalized_timeframe,
+            watch_item=watch_item,
+            base_detail=detail,
+            failure_reason=str(exc),
+        )
 
 
 @app.get("/api/strategies")
@@ -9295,7 +10830,7 @@ async def stream_strategy_runtime(once: bool = False, interval_ms: int = 4000):
 
     async def event_generator():
         while True:
-            snapshot = build_strategy_live_snapshot_payload()
+            snapshot = await asyncio.to_thread(build_strategy_live_snapshot_payload)
             yield format_sse(snapshot.model_dump(mode="json"))
             if once:
                 break
@@ -9359,7 +10894,7 @@ async def stream_account_live(once: bool = False, interval_ms: int = 4000, mode:
 
     async def event_generator():
         while True:
-            snapshot = build_account_live_snapshot_payload(mode=mode)
+            snapshot = await asyncio.to_thread(build_account_live_snapshot_payload, mode)
             yield format_sse(snapshot.model_dump(mode="json"))
             if once:
                 break
@@ -9419,7 +10954,7 @@ async def stream_ai_live(once: bool = False, interval_ms: int = 4000):
 
     async def event_generator():
         while True:
-            snapshot = build_ai_live_snapshot_payload()
+            snapshot = await asyncio.to_thread(build_ai_live_snapshot_payload)
             yield format_sse(snapshot.model_dump(mode="json"))
             if once:
                 break
@@ -9439,7 +10974,7 @@ async def stream_ops_live(once: bool = False, interval_ms: int = 4000):
 
     async def event_generator():
         while True:
-            snapshot = build_ops_live_snapshot_payload()
+            snapshot = await asyncio.to_thread(build_ops_live_snapshot_payload)
             yield format_sse(snapshot.model_dump(mode="json"))
             if once:
                 break
@@ -9796,6 +11331,8 @@ def post_bybit_trade_probe():
 def ensure_background_services_started() -> None:
     global agent_worker_thread
     market_data.start_realtime(repo.snapshot().watchlist)
+    if hasattr(market_data, "schedule_watchlist_history_prime"):
+        market_data.schedule_watchlist_history_prime(repo.snapshot().watchlist)
     ensure_private_realtime_started()
     if agent_worker_thread is None or not agent_worker_thread.is_alive():
         agent_worker_stop_event.clear()

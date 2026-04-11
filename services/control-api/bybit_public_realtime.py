@@ -15,6 +15,14 @@ except Exception:  # pragma: no cover - graceful fallback when dependency isn't 
 
 
 class BybitPublicRealtimeClient:
+    _KLINE_TOPIC_TO_TIMEFRAME = {
+        "15": "15m",
+        "60": "1h",
+        "240": "4h",
+        "D": "1d",
+    }
+    _TIMEFRAME_TO_KLINE_TOPIC = {value: key for key, value in _KLINE_TOPIC_TO_TIMEFRAME.items()}
+
     def __init__(self) -> None:
         self.enabled = connect is not None
         self._lock = threading.Lock()
@@ -23,7 +31,7 @@ class BybitPublicRealtimeClient:
         self._desired_symbols: Dict[str, Set[str]] = {"spot": set(), "linear": set()}
         self._ticker_cache: Dict[tuple[str, str], Dict[str, object]] = {}
         self._symbol_last_message_at: Dict[tuple[str, str], str] = {}
-        self._latest_kline: Dict[tuple[str, str], CandlePoint] = {}
+        self._latest_kline: Dict[tuple[str, str, str], CandlePoint] = {}
         self._recent_trades: Dict[tuple[str, str], List[MarketRecentTrade]] = {}
         self._orderbooks: Dict[tuple[str, str], Dict[str, Dict[float, float]]] = {}
         self._channel_connected: Dict[str, bool] = {"spot": False, "linear": False}
@@ -50,7 +58,10 @@ class BybitPublicRealtimeClient:
             for channel in ("spot", "linear")
             if self._cache_key(channel, normalized_symbol) in self._ticker_cache
             or self._cache_key(channel, normalized_symbol) in self._symbol_last_message_at
-            or self._cache_key(channel, normalized_symbol) in self._latest_kline
+            or any(
+                entry_key[0] == channel and entry_key[1] == normalized_symbol
+                for entry_key in self._latest_kline
+            )
             or self._cache_key(channel, normalized_symbol) in self._recent_trades
             or self._cache_key(channel, normalized_symbol) in self._orderbooks
         ]
@@ -78,10 +89,26 @@ class BybitPublicRealtimeClient:
         topics: List[str] = []
         for symbol in sorted(symbols):
             topics.append(f"tickers.{symbol}")
+            topics.append(f"kline.15.{symbol}")
             topics.append(f"kline.60.{symbol}")
+            topics.append(f"kline.240.{symbol}")
+            topics.append(f"kline.D.{symbol}")
             topics.append(f"publicTrade.{symbol}")
             topics.append(f"orderbook.50.{symbol}")
         return topics
+
+    @classmethod
+    def _normalize_timeframe(cls, timeframe: str) -> str:
+        normalized = str(timeframe or "1h").strip().lower()
+        if normalized in {"15", "15m"}:
+            return "15m"
+        if normalized in {"60", "1h"}:
+            return "1h"
+        if normalized in {"240", "4h"}:
+            return "4h"
+        if normalized in {"d", "1d"}:
+            return "1d"
+        return "1h"
 
     @staticmethod
     def _candle_from_ws_row(row: Dict[str, object]) -> CandlePoint:
@@ -200,10 +227,16 @@ class BybitPublicRealtimeClient:
         symbol: str,
         candles: List[CandlePoint],
         market: Optional[str] = None,
+        timeframe: str = "1h",
     ) -> List[CandlePoint]:
+        normalized_timeframe = self._normalize_timeframe(timeframe)
         with self._lock:
             cache_key = self._resolve_cache_key_locked(symbol, market)
-            live_candle = self._latest_kline.get(cache_key) if cache_key is not None else None
+            live_candle = (
+                self._latest_kline.get((cache_key[0], cache_key[1], normalized_timeframe))
+                if cache_key is not None
+                else None
+            )
         if live_candle is None:
             return candles
 
@@ -379,6 +412,9 @@ class BybitPublicRealtimeClient:
                 parts = topic.split(".")
                 if len(parts) < 3:
                     return
+                timeframe = self._KLINE_TOPIC_TO_TIMEFRAME.get(parts[1].upper())
+                if timeframe is None:
+                    return
                 symbol = parts[2]
                 cache_key = self._cache_key(channel, symbol)
                 self._symbol_last_message_at[cache_key] = now_iso
@@ -388,7 +424,7 @@ class BybitPublicRealtimeClient:
                     return
                 latest_row = rows[-1]
                 if isinstance(latest_row, dict):
-                    self._latest_kline[cache_key] = self._candle_from_ws_row(latest_row)
+                    self._latest_kline[(cache_key[0], cache_key[1], timeframe)] = self._candle_from_ws_row(latest_row)
                 return
 
             if topic.startswith("publicTrade."):

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from hashlib import md5
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -48,6 +50,7 @@ except ModuleNotFoundError:
             symbol: str,
             candles: List[CandlePoint],
             market: Optional[str] = None,
+            timeframe: str = "1h",
         ) -> List[CandlePoint]:
             return list(candles)
 
@@ -76,19 +79,43 @@ class BybitPublicMarketClient:
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.realtime = BybitPublicRealtimeClient()
+        self._cache_lock = threading.RLock()
+        self._ticker_cache: Dict[Tuple[str, str], Tuple[float, Dict[str, object]]] = {}
         self._candle_cache: Dict[Tuple[str, str, str, int], Tuple[float, List[CandlePoint]]] = {}
+        self._orderbook_cache: Dict[Tuple[str, str, int], Tuple[float, Dict[str, List[OrderBookLevel]]]] = {}
         self._recent_trade_cache: Dict[Tuple[str, str, int], Tuple[float, List[MarketRecentTrade]]] = {}
         self._announcement_cache: Dict[Tuple[str, int], Tuple[float, List[Dict]]] = {}
         self._instrument_cache: Dict[Tuple[str, str], Tuple[float, Dict[str, str]]] = {}
         self._connectivity_probe_cache: Optional[Tuple[float, Dict[str, object]]] = None
         self._candle_history_cache: Dict[Tuple[str, str, str, int], Tuple[float, List[CandlePoint]]] = {}
-        self._candle_cache_ttl = 20.0
+        self._ticker_cache_ttl = 3.0
+        self._candle_cache_ttls = {
+            "15m": 20.0,
+            "1h": 20.0,
+            "4h": 45.0,
+            "1d": 120.0,
+        }
+        self._orderbook_cache_ttl = 3.0
         self._recent_trade_cache_ttl = 3.0
         self._announcement_cache_ttl = 300.0
         self._instrument_cache_ttl = 600.0
         self._connectivity_probe_cache_ttl = 20.0
-        self._candle_history_cache_ttl = 20.0
+        self._candle_history_cache_ttls = {
+            "15m": 45.0,
+            "1h": 60.0,
+            "4h": 90.0,
+            "1d": 180.0,
+        }
         self._candle_page_limit = 600
+        self._ticker_cache_max_entries = 256
+        self._candle_cache_max_entries = 1024
+        self._orderbook_cache_max_entries = 256
+        self._recent_trade_cache_max_entries = 256
+        self._announcement_cache_max_entries = 64
+        self._instrument_cache_max_entries = 256
+        self._candle_history_cache_max_entries = 1024
+        self._history_prime_lock = threading.Lock()
+        self._history_prime_thread: Optional[threading.Thread] = None
 
     @staticmethod
     def normalize_timeframe(timeframe: str) -> str:
@@ -124,6 +151,39 @@ class BybitPublicMarketClient:
     @staticmethod
     def _now_iso() -> str:
         return datetime.now(timezone.utc).astimezone().isoformat()
+
+    @staticmethod
+    def _cache_symbol(symbol: str) -> str:
+        return symbol.upper()
+
+    def _candle_cache_ttl_for_timeframe(self, timeframe: str, *, history: bool = False) -> float:
+        normalized = self.normalize_timeframe(timeframe)
+        ttl_map = self._candle_history_cache_ttls if history else self._candle_cache_ttls
+        return ttl_map.get(normalized, 20.0 if not history else 60.0)
+
+    @staticmethod
+    def _prune_cache_locked(cache: Dict[Any, Tuple[float, Any]], max_entries: int) -> None:
+        overflow = len(cache) - max_entries
+        if overflow <= 0:
+            return
+        for cache_key, _cached_value in sorted(cache.items(), key=lambda item: item[1][0])[:overflow]:
+            cache.pop(cache_key, None)
+
+    def _get_cached_entry(self, cache: Dict[Any, Tuple[float, Any]], cache_key: Any) -> Optional[Tuple[float, Any]]:
+        with self._cache_lock:
+            return cache.get(cache_key)
+
+    def _set_cached_entry(
+        self,
+        cache: Dict[Any, Tuple[float, Any]],
+        cache_key: Any,
+        value: Tuple[float, Any],
+        *,
+        max_entries: int,
+    ) -> None:
+        with self._cache_lock:
+            cache[cache_key] = value
+            self._prune_cache_locked(cache, max_entries)
 
     @staticmethod
     def _to_float(value: Optional[str], default: float = 0.0) -> float:
@@ -182,7 +242,7 @@ class BybitPublicMarketClient:
         try:
             with urlopen(request, timeout=self.timeout) as response:
                 payload = json.loads(response.read().decode("utf-8"))
-        except (HTTPError, URLError, TimeoutError, json.JSONDecodeError) as exc:
+        except (HTTPError, URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
             raise RuntimeError(f"Bybit public api request failed: {exc}") from exc
 
         if payload.get("retCode") != 0:
@@ -191,7 +251,8 @@ class BybitPublicMarketClient:
 
     def probe_rest_connectivity(self, force: bool = False) -> Dict[str, object]:
         now = time.monotonic()
-        cached = self._connectivity_probe_cache
+        with self._cache_lock:
+            cached = self._connectivity_probe_cache
         if cached and not force and now - cached[0] < self._connectivity_probe_cache_ttl:
             return dict(cached[1])
 
@@ -210,7 +271,8 @@ class BybitPublicMarketClient:
                 "last_error": None,
                 "tested_at": tested_at,
             }
-        self._connectivity_probe_cache = (now, dict(result))
+        with self._cache_lock:
+            self._connectivity_probe_cache = (now, dict(result))
         return dict(result)
 
     def get_ticker(self, symbol: str, market: str) -> Dict:
@@ -222,6 +284,28 @@ class BybitPublicMarketClient:
         if not items:
             raise RuntimeError(f"Ticker not found for {symbol}")
         return items[0]
+
+    def get_ticker_cached(self, symbol: str, market: str) -> Dict:
+        cache_key = (self._cache_symbol(symbol), market)
+        cached = self._get_cached_entry(self._ticker_cache, cache_key)
+        now = time.monotonic()
+        if cached and now - cached[0] < self._ticker_cache_ttl:
+            return dict(cached[1])
+
+        try:
+            ticker = self.get_ticker(symbol, market)
+        except RuntimeError:
+            if cached:
+                return dict(cached[1])
+            raise
+
+        self._set_cached_entry(
+            self._ticker_cache,
+            cache_key,
+            (now, dict(ticker)),
+            max_entries=self._ticker_cache_max_entries,
+        )
+        return dict(ticker)
 
     def _build_candle_points(self, rows: List[List[str]]) -> List[CandlePoint]:
         candles: List[CandlePoint] = []
@@ -269,23 +353,33 @@ class BybitPublicMarketClient:
     def get_candles_cached(self, symbol: str, market: str, timeframe: str = "1h", limit: int = 48) -> List[CandlePoint]:
         normalized_timeframe = self.normalize_timeframe(timeframe)
         interval = self.interval_for_timeframe(normalized_timeframe)
-        cache_key = (symbol.upper(), market, interval, limit)
-        cached = self._candle_cache.get(cache_key)
+        cache_key = (self._cache_symbol(symbol), market, interval, limit)
+        cached = self._get_cached_entry(self._candle_cache, cache_key)
         now = time.monotonic()
-        if cached and now - cached[0] < self._candle_cache_ttl:
+        if cached and now - cached[0] < self._candle_cache_ttl_for_timeframe(normalized_timeframe):
             return list(cached[1])
 
-        candles = self.get_candles(symbol, market, interval=interval, limit=limit)
-        self._candle_cache[cache_key] = (now, list(candles))
+        try:
+            candles = self.get_candles(symbol, market, interval=interval, limit=limit)
+        except RuntimeError:
+            if cached:
+                return list(cached[1])
+            raise
+        self._set_cached_entry(
+            self._candle_cache,
+            cache_key,
+            (now, list(candles)),
+            max_entries=self._candle_cache_max_entries,
+        )
         return candles
 
     def get_candles_history(self, symbol: str, market: str, timeframe: str = "1h", limit: int = 48) -> List[CandlePoint]:
         normalized_timeframe = self.normalize_timeframe(timeframe)
         target_limit = max(int(limit), 1)
-        cache_key = (symbol.upper(), market, normalized_timeframe, target_limit)
-        cached = self._candle_history_cache.get(cache_key)
+        cache_key = (self._cache_symbol(symbol), market, normalized_timeframe, target_limit)
+        cached = self._get_cached_entry(self._candle_history_cache, cache_key)
         now = time.monotonic()
-        if cached and now - cached[0] < self._candle_history_cache_ttl:
+        if cached and now - cached[0] < self._candle_cache_ttl_for_timeframe(normalized_timeframe, history=True):
             return list(cached[1])
 
         interval = self.interval_for_timeframe(normalized_timeframe)
@@ -313,7 +407,12 @@ class BybitPublicMarketClient:
         candles = sorted(candles_by_time.values(), key=lambda item: item.time)
         if len(candles) > target_limit:
             candles = candles[-target_limit:]
-        self._candle_history_cache[cache_key] = (now, list(candles))
+        self._set_cached_entry(
+            self._candle_history_cache,
+            cache_key,
+            (now, list(candles)),
+            max_entries=self._candle_history_cache_max_entries,
+        )
         return candles
 
     def get_orderbook(self, symbol: str, market: str, limit: int = 8) -> Dict[str, List[OrderBookLevel]]:
@@ -350,25 +449,65 @@ class BybitPublicMarketClient:
             "asks": build_levels(result.get("a", [])),
         }
 
+    def get_orderbook_cached(self, symbol: str, market: str, limit: int = 8) -> Dict[str, List[OrderBookLevel]]:
+        cache_key = (self._cache_symbol(symbol), market, limit)
+        cached = self._get_cached_entry(self._orderbook_cache, cache_key)
+        now = time.monotonic()
+        if cached and now - cached[0] < self._orderbook_cache_ttl:
+            return {
+                "bids": list(cached[1]["bids"]),
+                "asks": list(cached[1]["asks"]),
+            }
+
+        try:
+            orderbook = self.get_orderbook(symbol, market, limit=limit)
+        except RuntimeError:
+            if cached:
+                return {
+                    "bids": list(cached[1]["bids"]),
+                    "asks": list(cached[1]["asks"]),
+                }
+            raise
+
+        cached_value = {
+            "bids": list(orderbook.get("bids", [])),
+            "asks": list(orderbook.get("asks", [])),
+        }
+        self._set_cached_entry(
+            self._orderbook_cache,
+            cache_key,
+            (now, cached_value),
+            max_entries=self._orderbook_cache_max_entries,
+        )
+        return {
+            "bids": list(cached_value["bids"]),
+            "asks": list(cached_value["asks"]),
+        }
+
     def get_recent_public_trades(self, symbol: str, market: str, limit: int = 12) -> List[MarketRecentTrade]:
         realtime_trades = self.realtime.get_recent_trades_snapshot(symbol, limit=limit, market=market)
         if realtime_trades:
             return realtime_trades
 
-        cache_key = (symbol.upper(), market, limit)
-        cached = self._recent_trade_cache.get(cache_key)
+        cache_key = (self._cache_symbol(symbol), market, limit)
+        cached = self._get_cached_entry(self._recent_trade_cache, cache_key)
         now = time.monotonic()
         if cached and now - cached[0] < self._recent_trade_cache_ttl:
             return list(cached[1])
 
-        result = self._request(
-            "/v5/market/recent-trade",
-            {
-                "category": self._category_for_market(market),
-                "symbol": symbol,
-                "limit": limit,
-            },
-        )
+        try:
+            result = self._request(
+                "/v5/market/recent-trade",
+                {
+                    "category": self._category_for_market(market),
+                    "symbol": symbol,
+                    "limit": limit,
+                },
+            )
+        except RuntimeError:
+            if cached:
+                return list(cached[1])
+            raise
 
         rows = result.get("list", [])
         trades: List[MarketRecentTrade] = []
@@ -404,12 +543,17 @@ class BybitPublicMarketClient:
             )
 
         ordered = sorted(trades, key=lambda item: item.occurred_at, reverse=True)
-        self._recent_trade_cache[cache_key] = (now, list(ordered))
+        self._set_cached_entry(
+            self._recent_trade_cache,
+            cache_key,
+            (now, list(ordered)),
+            max_entries=self._recent_trade_cache_max_entries,
+        )
         return ordered
 
     def get_announcements(self, locale: str = "zh-TW", limit: int = 8) -> List[Dict]:
         cache_key = (locale, limit)
-        cached = self._announcement_cache.get(cache_key)
+        cached = self._get_cached_entry(self._announcement_cache, cache_key)
         now = time.monotonic()
         if cached and now - cached[0] < self._announcement_cache_ttl:
             return list(cached[1])
@@ -429,12 +573,17 @@ class BybitPublicMarketClient:
                 raw_key = str(row_copy.get("url") or row_copy.get("title") or md5(json.dumps(row_copy, ensure_ascii=False).encode("utf-8")).hexdigest())
                 row_copy["id"] = f"ann-{md5(raw_key.encode('utf-8')).hexdigest()[:10]}"
             normalized.append(row_copy)
-        self._announcement_cache[cache_key] = (now, list(normalized))
+        self._set_cached_entry(
+            self._announcement_cache,
+            cache_key,
+            (now, list(normalized)),
+            max_entries=self._announcement_cache_max_entries,
+        )
         return normalized
 
     def get_instrument_constraints(self, symbol: str, market: str) -> Dict[str, str]:
         cache_key = (symbol.upper(), market)
-        cached = self._instrument_cache.get(cache_key)
+        cached = self._get_cached_entry(self._instrument_cache, cache_key)
         now = time.monotonic()
         if cached and now - cached[0] < self._instrument_cache_ttl:
             return dict(cached[1])
@@ -465,7 +614,12 @@ class BybitPublicMarketClient:
                 or "0"
             ),
         }
-        self._instrument_cache[cache_key] = (now, dict(constraints))
+        self._set_cached_entry(
+            self._instrument_cache,
+            cache_key,
+            (now, dict(constraints)),
+            max_entries=self._instrument_cache_max_entries,
+        )
         return constraints
 
     def enrich_watchlist(self, watchlist: List[WatchlistInstrument]) -> List[WatchlistInstrument]:
@@ -500,6 +654,123 @@ class BybitPublicMarketClient:
                 enriched.append(item)
         return enriched
 
+    def enrich_watchlist_fast(self, watchlist: List[WatchlistInstrument]) -> List[WatchlistInstrument]:
+        self.realtime.update_watchlist(watchlist)
+        self.schedule_watchlist_history_prime(watchlist)
+        realtime_watchlist = {
+            (item.symbol.upper(), item.market): item for item in self.realtime.enrich_watchlist(watchlist)
+        }
+
+        enriched: List[WatchlistInstrument] = []
+        for item in watchlist:
+            realtime_item = realtime_watchlist.get((item.symbol.upper(), item.market))
+            if realtime_item is not None:
+                enriched.append(realtime_item)
+                continue
+            cached_ticker = self.get_ticker_cached_only(item.symbol, item.market)
+            if cached_ticker:
+                enriched.append(
+                    item.model_copy(
+                        update={
+                            "last_price": self._to_float(cached_ticker.get("lastPrice"), item.last_price),
+                            "change_24h": round(
+                                self._to_float(cached_ticker.get("price24hPcnt"), item.change_24h / 100.0) * 100,
+                                2,
+                            ),
+                            "volume_24h": self._to_float(
+                                cached_ticker.get("turnover24h") or cached_ticker.get("volume24h"),
+                                item.volume_24h,
+                            ),
+                        }
+                    )
+                )
+                continue
+            enriched.append(item)
+        return enriched
+
+    def _prime_watchlist_history_cache(self, watchlist: List[WatchlistInstrument]) -> None:
+        def prime_symbol_timeframe(item: WatchlistInstrument, timeframe: str) -> None:
+            try:
+                candles = self.get_candles_history(item.symbol, item.market, timeframe=timeframe)
+                interval = self.interval_for_timeframe(timeframe)
+                now = time.monotonic()
+                self._set_cached_entry(
+                    self._candle_cache,
+                    (self._cache_symbol(item.symbol), item.market, interval, 48),
+                    (now, list(candles)),
+                    max_entries=self._candle_cache_max_entries,
+                )
+            except RuntimeError:
+                return
+
+        tasks = [(item, timeframe) for item in watchlist for timeframe in ("15m", "1h", "4h", "1d")]
+        if not tasks:
+            return
+        with ThreadPoolExecutor(max_workers=min(4, len(tasks))) as executor:
+            futures = [executor.submit(prime_symbol_timeframe, item, timeframe) for item, timeframe in tasks]
+            for future in futures:
+                future.result()
+
+    def schedule_watchlist_history_prime(self, watchlist: List[WatchlistInstrument]) -> None:
+        if not watchlist:
+            return
+        with self._history_prime_lock:
+            if self._history_prime_thread and self._history_prime_thread.is_alive():
+                return
+            snapshot = [item.model_copy() for item in watchlist]
+            thread = threading.Thread(
+                target=self._prime_watchlist_history_cache,
+                args=(snapshot,),
+                name="bybit-public-history-primer",
+                daemon=True,
+            )
+            self._history_prime_thread = thread
+            thread.start()
+
+    def get_ticker_cached_only(self, symbol: str, market: str) -> Optional[Dict[str, object]]:
+        cached = self._get_cached_entry(self._ticker_cache, (self._cache_symbol(symbol), market))
+        return dict(cached[1]) if cached else None
+
+    def get_candles_cached_only(
+        self,
+        symbol: str,
+        market: str,
+        timeframe: str = "1h",
+        limit: int = 48,
+    ) -> List[CandlePoint]:
+        normalized_timeframe = self.normalize_timeframe(timeframe)
+        target_limit = max(int(limit), 1)
+        history_cached = self._get_cached_entry(
+            self._candle_history_cache,
+            (self._cache_symbol(symbol), market, normalized_timeframe, target_limit),
+        )
+        if history_cached:
+            return list(history_cached[1])
+        interval = self.interval_for_timeframe(normalized_timeframe)
+        candle_cached = self._get_cached_entry(
+            self._candle_cache,
+            (self._cache_symbol(symbol), market, interval, target_limit),
+        )
+        return list(candle_cached[1]) if candle_cached else []
+
+    def get_orderbook_cached_only(self, symbol: str, market: str, limit: int = 8) -> Dict[str, List[OrderBookLevel]]:
+        cached = self._get_cached_entry(self._orderbook_cache, (self._cache_symbol(symbol), market, limit))
+        if not cached:
+            return {"bids": [], "asks": []}
+        return {
+            "bids": list(cached[1].get("bids", [])),
+            "asks": list(cached[1].get("asks", [])),
+        }
+
+    def get_recent_public_trades_cached_only(
+        self,
+        symbol: str,
+        market: str,
+        limit: int = 12,
+    ) -> List[MarketRecentTrade]:
+        cached = self._get_cached_entry(self._recent_trade_cache, (self._cache_symbol(symbol), market, limit))
+        return list(cached[1]) if cached else []
+
     def enrich_market_detail(
         self,
         symbol: str,
@@ -507,36 +778,73 @@ class BybitPublicMarketClient:
         fallback_detail: MarketDetail,
         watch_item: Optional[WatchlistInstrument] = None,
         timeframe: str = "1h",
+        allow_rest_refresh: bool = True,
     ) -> MarketDetail:
         normalized_timeframe = self.normalize_timeframe(timeframe)
         realtime_ticker = self.realtime.get_ticker_snapshot(symbol, market=market)
-        if realtime_ticker is not None and normalized_timeframe == "1h":
+        realtime_orderbook = self.realtime.get_orderbook_snapshot(symbol, limit=8, market=market)
+        realtime_trades = self.realtime.get_recent_trades_snapshot(symbol, limit=12, market=market)
+        has_realtime_orderbook = bool(realtime_orderbook["bids"] and realtime_orderbook["asks"])
+        has_realtime_trades = bool(realtime_trades)
+        if realtime_ticker is not None or has_realtime_orderbook or has_realtime_trades:
             try:
-                orderbook = self.get_orderbook(symbol, market)
+                orderbook = (
+                    realtime_orderbook
+                    if has_realtime_orderbook
+                    else self.get_orderbook_cached_only(symbol, market, limit=8)
+                )
             except RuntimeError:
                 orderbook = {"bids": fallback_detail.bids, "asks": fallback_detail.asks}
             try:
-                recent_public_trades = self.get_recent_public_trades(symbol, market)
+                recent_public_trades = (
+                    list(realtime_trades)
+                    if has_realtime_trades
+                    else self.get_recent_public_trades_cached_only(symbol, market, limit=12)
+                )
             except RuntimeError:
                 recent_public_trades = fallback_detail.recent_public_trades
+            try:
+                ticker = realtime_ticker or self.get_ticker_cached_only(symbol, market) or {}
+            except RuntimeError:
+                ticker = {}
 
             history_candles: List[CandlePoint]
             try:
-                history_candles = self.get_candles_cached(symbol, market, timeframe=normalized_timeframe)
+                history_candles = (
+                    self.get_candles_cached_only(symbol, market, timeframe=normalized_timeframe)
+                    if not allow_rest_refresh
+                    else self.get_candles_cached(symbol, market, timeframe=normalized_timeframe)
+                )
             except RuntimeError:
                 history_candles = fallback_detail.candles
 
-            merged_candles = self.realtime.merge_candles(symbol, history_candles, market=market)
-            if history_candles is fallback_detail.candles and merged_candles:
-                latest_close = merged_candles[-1].close
-                previous_close = merged_candles[-2].close if len(merged_candles) > 1 else 0.0
-                if previous_close > 0:
-                    drift_ratio = abs(latest_close - previous_close) / previous_close
-                    if drift_ratio >= 0.15:
-                        merged_candles = [merged_candles[-1]]
+            merged_candles = self.realtime.merge_candles(
+                symbol,
+                history_candles,
+                market=market,
+                timeframe=normalized_timeframe,
+            )
+            if not history_candles and len(merged_candles) <= 1:
+                merged_candles = []
+            rescued_by_rest = False
+            if not merged_candles and allow_rest_refresh:
+                try:
+                    merged_candles = list(
+                        self.get_candles(
+                            symbol,
+                            market,
+                            interval=self.interval_for_timeframe(normalized_timeframe),
+                            limit=48,
+                        )
+                    )
+                    rescued_by_rest = bool(merged_candles)
+                except RuntimeError:
+                    merged_candles = []
+                    rescued_by_rest = False
+            effective_candles = merged_candles or list(fallback_detail.candles)
 
-            high_price = self._to_float(realtime_ticker.get("highPrice24h"))
-            low_price = self._to_float(realtime_ticker.get("lowPrice24h"))
+            high_price = self._to_float(ticker.get("highPrice24h"))
+            low_price = self._to_float(ticker.get("lowPrice24h"))
             amplitude = ((high_price - low_price) / low_price * 100) if low_price else 0.0
             headline_suffix = "策略跟踪" if watch_item and watch_item.signal != "neutral" else "观察"
             live_bids = orderbook["bids"] or fallback_detail.bids
@@ -548,30 +856,106 @@ class BybitPublicMarketClient:
                 "24h高点": self._format_price(high_price) if high_price else "--",
                 "24h低点": self._format_price(low_price) if low_price else "--",
             }
-            funding_rate = realtime_ticker.get("fundingRate")
+            funding_rate = ticker.get("fundingRate")
             if funding_rate not in (None, ""):
                 stats["资金费率"] = f"{self._to_float(funding_rate) * 100:.4f}%"
-            open_interest_value = self._to_float(realtime_ticker.get("openInterestValue"))
+            open_interest_value = self._to_float(ticker.get("openInterestValue"))
+            if open_interest_value:
+                stats["持仓价值"] = f"{open_interest_value / 1_000_000_000:.2f}B"
+            if rescued_by_rest:
+                stats["数据源"] = "Bybit REST K 线 + 实时深度"
+            elif not merged_candles:
+                fallback_data_source = fallback_detail.stats.get("数据源")
+                stats["数据源"] = (
+                    str(fallback_data_source).strip()
+                    if isinstance(fallback_data_source, str) and fallback_data_source.strip()
+                    else ("Bybit 本地缓存" if fallback_detail.source in {"bybit_ws", "bybit_rest"} else "Bybit 实时拉取待恢复")
+                )
+
+            return fallback_detail.model_copy(
+                update={
+                    "timeframe": normalized_timeframe,
+                    "candles": effective_candles,
+                    "bids": live_bids,
+                    "asks": live_asks,
+                    "recent_public_trades": recent_public_trades or fallback_detail.recent_public_trades,
+                    "headline": (
+                        f"{symbol} 当前由 Bybit 公共行情驱动，处于{headline_suffix}状态"
+                        if rescued_by_rest
+                        else
+                        f"{symbol} 当前由 Bybit 公共实时行情驱动，处于{headline_suffix}状态"
+                        if merged_candles
+                        else fallback_detail.headline
+                    ),
+                    "stats": stats if merged_candles else {**fallback_detail.stats, **stats},
+                    "source": "bybit_rest" if rescued_by_rest else ("bybit_ws" if merged_candles else fallback_detail.source),
+                    "updated_at": (
+                        self.realtime.get_symbol_last_message_at(symbol, market=market)
+                        if hasattr(self.realtime, "get_symbol_last_message_at")
+                        else None
+                    )
+                    or self.realtime.get_status().get("last_message_at")
+                    or self._now_iso(),
+                }
+            )
+
+        if not allow_rest_refresh:
+            cached_orderbook = self.get_orderbook_cached_only(symbol, market, limit=8)
+            cached_trades = self.get_recent_public_trades_cached_only(symbol, market, limit=12)
+            cached_ticker = self.get_ticker_cached_only(symbol, market) or {}
+            cached_candles = self.get_candles_cached_only(symbol, market, timeframe=normalized_timeframe)
+            merged_candles = self.realtime.merge_candles(
+                symbol,
+                cached_candles or fallback_detail.candles,
+                market=market,
+                timeframe=normalized_timeframe,
+            )
+            live_bids = cached_orderbook["bids"] or fallback_detail.bids
+            live_asks = cached_orderbook["asks"] or fallback_detail.asks
+            stats: Dict[str, str] = {
+                "数据源": "本地快照",
+                **self._build_orderbook_stats(live_bids, live_asks),
+            }
+            high_price = self._to_float(cached_ticker.get("highPrice24h"))
+            low_price = self._to_float(cached_ticker.get("lowPrice24h"))
+            amplitude = ((high_price - low_price) / low_price * 100) if low_price else 0.0
+            if high_price or low_price:
+                stats.update(
+                    {
+                        "24h振幅": f"{amplitude:.2f}%",
+                        "24h高点": self._format_price(high_price) if high_price else "--",
+                        "24h低点": self._format_price(low_price) if low_price else "--",
+                    }
+                )
+            funding_rate = cached_ticker.get("fundingRate")
+            if funding_rate not in (None, ""):
+                stats["资金费率"] = f"{self._to_float(funding_rate) * 100:.4f}%"
+            open_interest_value = self._to_float(cached_ticker.get("openInterestValue"))
             if open_interest_value:
                 stats["持仓价值"] = f"{open_interest_value / 1_000_000_000:.2f}B"
 
             return fallback_detail.model_copy(
                 update={
                     "timeframe": normalized_timeframe,
-                    "candles": merged_candles,
+                    "candles": merged_candles or fallback_detail.candles,
                     "bids": live_bids,
                     "asks": live_asks,
-                    "recent_public_trades": recent_public_trades or fallback_detail.recent_public_trades,
-                    "headline": f"{symbol} 当前由 Bybit 公共实时行情驱动，处于{headline_suffix}状态",
-                    "stats": stats,
-                    "source": "bybit_ws",
-                    "updated_at": self.realtime.get_status().get("last_message_at") or self._now_iso(),
+                    "recent_public_trades": cached_trades or fallback_detail.recent_public_trades,
+                    "headline": fallback_detail.headline,
+                    "stats": {**fallback_detail.stats, **stats},
+                    "source": fallback_detail.source,
+                    "updated_at": (
+                        self.realtime.get_symbol_last_message_at(symbol, market=market)
+                        if hasattr(self.realtime, "get_symbol_last_message_at")
+                        else None
+                    )
+                    or fallback_detail.updated_at,
                 }
             )
 
-        ticker = self.get_ticker(symbol, market)
+        ticker = self.get_ticker_cached(symbol, market)
         candles = self.get_candles_cached(symbol, market, timeframe=normalized_timeframe)
-        orderbook = self.get_orderbook(symbol, market)
+        orderbook = self.get_orderbook_cached(symbol, market)
         recent_public_trades = self.get_recent_public_trades(symbol, market)
         updated_at = self._now_iso()
 

@@ -4,7 +4,7 @@ import json
 import re
 from datetime import datetime, timezone
 from pathlib import Path
-from threading import Lock
+from threading import RLock
 from typing import Any, Callable, Dict, Optional
 from uuid import uuid4
 
@@ -52,6 +52,7 @@ from models import (
     WorkspacePreferences,
     WorkspacePreferencesUpdate,
 )
+from datetime_utils import parse_optional_iso_datetime
 from seed import build_market_detail_for_watchlist, build_state
 
 
@@ -69,7 +70,7 @@ class AppRepository:
     ) -> None:
         self.path = path or Path(__file__).resolve().parent / ".runtime" / "state.json"
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._lock = Lock()
+        self._lock = RLock()
         self.backtest_runner = backtest_runner
         self.state = self._load()
         self._refresh_derived_state()
@@ -89,7 +90,11 @@ class AppRepository:
         self.path.write_text(target.model_dump_json(indent=2), encoding="utf-8")
 
     def snapshot(self) -> AppState:
-        return self.state
+        with self._lock:
+            self._sanitize_workspace_preferences_locked()
+            snapshot = self.state.model_copy(deep=True)
+            snapshot.audit_events = [self._decorate_execution_event(item) for item in snapshot.audit_events]
+            return snapshot
 
     @staticmethod
     def _normalize_setting_url(value: Optional[str], *, field_label: str) -> Optional[str]:
@@ -117,6 +122,155 @@ class AppRepository:
         return normalized
 
     @staticmethod
+    def _non_empty_string(value: Any) -> Optional[str]:
+        normalized = str(value or "").strip()
+        return normalized or None
+
+    @staticmethod
+    def _non_empty_string_list(value: Any) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        items: list[str] = []
+        for item in value:
+            normalized = AppRepository._non_empty_string(item)
+            if normalized and normalized not in items:
+                items.append(normalized)
+        return items
+
+    @staticmethod
+    def _build_audit_event_impact_detail(payload: Dict[str, Any]) -> Optional[str]:
+        job_types = AppRepository._non_empty_string_list(payload.get("cancelled_job_types"))
+        strategy_ids = AppRepository._non_empty_string_list(payload.get("cancelled_strategy_ids"))
+        backtest_ids = AppRepository._non_empty_string_list(payload.get("cancelled_backtest_ids"))
+        source_change_request_ids = AppRepository._non_empty_string_list(payload.get("cancelled_source_change_request_ids"))
+        source_backtest_ids = AppRepository._non_empty_string_list(payload.get("cancelled_source_backtest_ids"))
+        source_review_ids = AppRepository._non_empty_string_list(payload.get("cancelled_source_review_ids"))
+        source_proposal_ids = AppRepository._non_empty_string_list(payload.get("cancelled_source_proposal_ids"))
+        trigger_reasons = AppRepository._non_empty_string_list(payload.get("cancelled_trigger_reasons"))
+        decision_readiness_values = AppRepository._non_empty_string_list(payload.get("cancelled_decision_readiness_values"))
+        parts: list[str] = []
+        if job_types:
+            parts.append(f"任务 {' / '.join(job_types)}")
+        if strategy_ids:
+            parts.append(f"策略 {strategy_ids[0]}" if len(strategy_ids) == 1 else f"策略 {len(strategy_ids)} 条")
+        if backtest_ids:
+            parts.append(f"回测 {backtest_ids[0]}" if len(backtest_ids) == 1 else f"回测 {len(backtest_ids)} 轮")
+        if source_change_request_ids:
+            parts.append(
+                f"来源变更 {source_change_request_ids[0]}"
+                if len(source_change_request_ids) == 1
+                else f"来源变更 {len(source_change_request_ids)} 条"
+            )
+        if source_backtest_ids:
+            parts.append(
+                f"来源回测 {source_backtest_ids[0]}"
+                if len(source_backtest_ids) == 1
+                else f"来源回测 {len(source_backtest_ids)} 轮"
+            )
+        if source_review_ids:
+            parts.append(
+                f"来源复盘 {source_review_ids[0]}"
+                if len(source_review_ids) == 1
+                else f"来源复盘 {len(source_review_ids)} 条"
+            )
+        if source_proposal_ids:
+            parts.append(
+                f"来源提案 {source_proposal_ids[0]}"
+                if len(source_proposal_ids) == 1
+                else f"来源提案 {len(source_proposal_ids)} 条"
+            )
+        if trigger_reasons:
+            parts.append(f"触发 {' / '.join(trigger_reasons)}")
+        if decision_readiness_values:
+            parts.append(f"门禁 {' / '.join(decision_readiness_values)}")
+        manual_followup_required = payload.get("manual_followup_required") is True
+        manual_followup_detail = AppRepository._non_empty_string(payload.get("manual_followup_detail"))
+        if not manual_followup_detail and AppRepository._non_empty_string(payload.get("change_request_id")):
+            manual_followup_detail = AppRepository._non_empty_string(payload.get("detail"))
+        if manual_followup_required or manual_followup_detail:
+            parts.append(
+                f"需人工跟进 · {manual_followup_detail}"
+                if manual_followup_detail
+                else "需人工跟进"
+            )
+        return " · ".join(parts) if parts else None
+
+    @staticmethod
+    def _build_audit_event_summary(payload: Dict[str, Any]) -> str:
+        for key in ("summary", "result_summary", "command", "title", "detail", "symbol"):
+            normalized = AppRepository._non_empty_string(payload.get(key))
+            if normalized:
+                return normalized if key != "command" else f"命令 {normalized}"
+        return "事件已记录"
+
+    @staticmethod
+    def _summarize_execution_event(event: ExecutionEvent) -> str:
+        payload = event.payload if isinstance(event.payload, dict) else {}
+        summary = AppRepository._non_empty_string(getattr(event, "summary", None)) or AppRepository._build_audit_event_summary(
+            payload
+        )
+        impact_detail = AppRepository._non_empty_string(getattr(event, "impact_detail", None)) or AppRepository._build_audit_event_impact_detail(
+            payload
+        )
+        parts = [event.event_type]
+        if summary != "事件已记录":
+            parts.append(summary)
+        else:
+            source = AppRepository._non_empty_string(event.source)
+            if source:
+                parts.append(source)
+        if impact_detail and impact_detail != summary:
+            parts.append(impact_detail)
+        return " · ".join(parts)
+
+    @staticmethod
+    def _execution_event_priority(event: ExecutionEvent) -> int:
+        preset_priority = getattr(event, "priority", None)
+        if isinstance(preset_priority, int):
+            return preset_priority
+        event_type = str(event.event_type or "")
+        if event_type == "scheduler.command":
+            return 0
+        if event_type.startswith("openclaw.job."):
+            return 1
+        if event_type.startswith("strategy.issue.review.") or event_type.startswith("strategy.change.review."):
+            return 1
+        if event_type.startswith("change_request.") or event_type.startswith("strategy.review."):
+            return 2
+        if event_type.startswith("exchange_order."):
+            return 3
+        if event_type.startswith("strategy."):
+            return 4
+        if event_type.startswith("alert."):
+            return 5
+        return 6
+
+    @staticmethod
+    def _pick_latest_key_execution_event(events: List[ExecutionEvent]) -> Optional[ExecutionEvent]:
+        if not events:
+            return None
+        prioritized = min(
+            enumerate(events),
+            key=lambda item: (AppRepository._execution_event_priority(item[1]), item[0]),
+        )
+        return prioritized[1]
+
+    @staticmethod
+    def _decorate_execution_event(event: ExecutionEvent) -> ExecutionEvent:
+        payload = event.payload if isinstance(event.payload, dict) else {}
+        priority = AppRepository._execution_event_priority(event)
+        return event.model_copy(
+            update={
+                "summary": AppRepository._non_empty_string(getattr(event, "summary", None))
+                or AppRepository._build_audit_event_summary(payload),
+                "impact_detail": AppRepository._non_empty_string(getattr(event, "impact_detail", None))
+                or AppRepository._build_audit_event_impact_detail(payload),
+                "priority": priority,
+                "is_key_event": bool(getattr(event, "is_key_event", priority <= 2) or priority <= 2),
+            }
+        )
+
+    @staticmethod
     def _normalize_notification_channels(channels: Optional[list[str]]) -> Optional[list[str]]:
         if channels is None:
             return None
@@ -138,6 +292,210 @@ class AppRepository:
     def _normalize_workspace_filter_value(value: Optional[str], *, fallback: str = "all") -> str:
         normalized = str(value or "").strip()
         return normalized or fallback
+
+    def _sanitize_workspace_preferences_locked(self) -> bool:
+        preferences = self.state.workspace_preferences
+        updates: dict[str, Any] = {}
+        strategy_ids = {strategy.id for strategy in self.state.strategies}
+        strategy_symbols = {
+            strategy.id: strategy.symbols[0]
+            for strategy in self.state.strategies
+            if strategy.symbols and isinstance(strategy.symbols[0], str) and strategy.symbols[0].strip()
+        }
+        watchlist_symbols = {item.symbol for item in self.state.watchlist}
+        proposal_by_id = {
+            proposal.id: proposal
+            for review in self.state.reviews
+            for proposal in review.proposals
+        }
+        review_by_id = {review.id: review for review in self.state.reviews}
+        scheduler_job_by_id = {job.id: job for job in self.state.agent_jobs}
+
+        selected_symbol = preferences.selected_symbol
+        if self.state.watchlist and not any(item.symbol == selected_symbol for item in self.state.watchlist):
+            updates["selected_symbol"] = self.state.watchlist[0].symbol
+
+        selected_strategy_id = preferences.selected_strategy_id
+        if selected_strategy_id and selected_strategy_id not in strategy_ids:
+            updates["selected_strategy_id"] = self.state.strategies[0].id if self.state.strategies else None
+
+        selected_backtest_id = preferences.selected_backtest_id
+        selected_backtest = next((backtest for backtest in self.state.backtests if backtest.id == selected_backtest_id), None)
+        if selected_backtest_id and selected_backtest is None:
+            updates["selected_backtest_id"] = None
+
+        selected_scheduler_job_id = preferences.selected_scheduler_job_id
+        selected_scheduler_job = scheduler_job_by_id.get(selected_scheduler_job_id) if selected_scheduler_job_id else None
+        if selected_scheduler_job_id and selected_scheduler_job is None:
+            updates["selected_scheduler_job_id"] = None
+
+        selected_strategy_detail_panel = preferences.selected_strategy_detail_panel
+        if preferences.active_section != "strategy":
+            if selected_strategy_detail_panel is not None:
+                updates["selected_strategy_detail_panel"] = None
+            if preferences.selected_strategy_tracking_kind is not None:
+                updates["selected_strategy_tracking_kind"] = None
+            if preferences.selected_strategy_tracking_summary:
+                updates["selected_strategy_tracking_summary"] = ""
+            if preferences.selected_strategy_tracking_detail:
+                updates["selected_strategy_tracking_detail"] = ""
+            if preferences.selected_strategy_editor_strategy_id is not None:
+                updates["selected_strategy_editor_strategy_id"] = None
+        elif selected_strategy_detail_panel != "tracking":
+            if preferences.selected_strategy_tracking_kind is not None:
+                updates["selected_strategy_tracking_kind"] = None
+            if preferences.selected_strategy_tracking_summary:
+                updates["selected_strategy_tracking_summary"] = ""
+            if preferences.selected_strategy_tracking_detail:
+                updates["selected_strategy_tracking_detail"] = ""
+        elif preferences.selected_strategy_tracking_kind is None:
+            updates["selected_strategy_tracking_kind"] = "issue"
+
+        if preferences.active_section != "strategy":
+            if preferences.selected_strategy_editor_parameter_drafts:
+                updates["selected_strategy_editor_parameter_drafts"] = {}
+            if preferences.selected_strategy_editor_risk_budget_draft:
+                updates["selected_strategy_editor_risk_budget_draft"] = ""
+
+        selected_review_inspector_id = preferences.selected_review_inspector_id
+        selected_review_inspector = (
+            review_by_id.get(selected_review_inspector_id) if selected_review_inspector_id else None
+        )
+        if selected_review_inspector_id and selected_review_inspector is None:
+            updates["selected_review_inspector_id"] = None
+            updates["selected_review_inspector_strategy_id"] = None
+
+        selected_review_inspector_strategy_id = preferences.selected_review_inspector_strategy_id
+        if (
+            selected_review_inspector_strategy_id
+            and selected_review_inspector_strategy_id not in strategy_ids
+        ):
+            updates["selected_review_inspector_strategy_id"] = None
+
+        selected_review_id = preferences.selected_review_id
+        selected_review = review_by_id.get(selected_review_id) if selected_review_id else None
+        if selected_review_id and selected_review is None:
+            updates["selected_review_id"] = None
+
+        selected_proposal_id = preferences.selected_proposal_id
+        selected_proposal = proposal_by_id.get(selected_proposal_id) if selected_proposal_id else None
+        if selected_proposal_id and selected_proposal is None:
+            updates["selected_proposal_id"] = None
+
+        selected_change_request_id = preferences.selected_change_request_id
+        selected_change_request = next(
+            (request for request in self.state.change_requests if request.id == selected_change_request_id),
+            None,
+        )
+        if selected_change_request_id and selected_change_request is None:
+            updates["selected_change_request_id"] = None
+
+        selected_strategy_editor_strategy_id = preferences.selected_strategy_editor_strategy_id
+        if (
+            preferences.active_section == "strategy"
+            and not selected_strategy_editor_strategy_id
+        ):
+            if preferences.selected_strategy_editor_parameter_drafts:
+                updates["selected_strategy_editor_parameter_drafts"] = {}
+            if preferences.selected_strategy_editor_risk_budget_draft:
+                updates["selected_strategy_editor_risk_budget_draft"] = ""
+        if (
+            selected_strategy_editor_strategy_id
+            and selected_strategy_editor_strategy_id not in strategy_ids
+        ):
+            updates["selected_strategy_editor_strategy_id"] = None
+            if preferences.selected_strategy_editor_parameter_drafts:
+                updates["selected_strategy_editor_parameter_drafts"] = {}
+            if preferences.selected_strategy_editor_risk_budget_draft:
+                updates["selected_strategy_editor_risk_budget_draft"] = ""
+
+        next_selected_strategy_id = updates.get("selected_strategy_id", preferences.selected_strategy_id)
+        if preferences.active_section == "strategy" and selected_change_request is not None:
+            payload_strategy_id = selected_change_request.payload.get("strategy_id")
+            if (
+                isinstance(payload_strategy_id, str)
+                and payload_strategy_id in strategy_ids
+                and payload_strategy_id != next_selected_strategy_id
+            ):
+                updates["selected_strategy_id"] = payload_strategy_id
+                next_selected_strategy_id = payload_strategy_id
+        elif preferences.active_section == "strategy" and selected_proposal is not None:
+            if selected_proposal.strategy_id in strategy_ids and selected_proposal.strategy_id != next_selected_strategy_id:
+                updates["selected_strategy_id"] = selected_proposal.strategy_id
+                next_selected_strategy_id = selected_proposal.strategy_id
+        elif preferences.active_section == "backtest" and selected_backtest is not None:
+            if selected_backtest.strategy_id in strategy_ids and selected_backtest.strategy_id != next_selected_strategy_id:
+                updates["selected_strategy_id"] = selected_backtest.strategy_id
+                next_selected_strategy_id = selected_backtest.strategy_id
+        elif preferences.active_section == "replay" and selected_review is not None:
+            review_strategy_id = selected_review.strategy_id
+            if not review_strategy_id:
+                review_strategy_candidates = {
+                    proposal.strategy_id
+                    for proposal in selected_review.proposals
+                    if isinstance(proposal.strategy_id, str) and proposal.strategy_id in strategy_ids
+                }
+                if len(review_strategy_candidates) == 1:
+                    review_strategy_id = next(iter(review_strategy_candidates))
+            if review_strategy_id in strategy_ids and review_strategy_id != next_selected_strategy_id:
+                updates["selected_strategy_id"] = review_strategy_id
+                next_selected_strategy_id = review_strategy_id
+        elif preferences.active_section == "scheduler" and selected_scheduler_job is not None:
+            scheduler_strategy_id = selected_scheduler_job.strategy_id
+            if not scheduler_strategy_id:
+                context_strategy_id = selected_scheduler_job.context.get("strategy_id")
+                if isinstance(context_strategy_id, str) and context_strategy_id in strategy_ids:
+                    scheduler_strategy_id = context_strategy_id
+            if scheduler_strategy_id in strategy_ids and scheduler_strategy_id != next_selected_strategy_id:
+                updates["selected_strategy_id"] = scheduler_strategy_id
+                next_selected_strategy_id = scheduler_strategy_id
+
+        next_editor_strategy_id = updates.get(
+            "selected_strategy_editor_strategy_id",
+            preferences.selected_strategy_editor_strategy_id,
+        )
+        if (
+            preferences.active_section == "strategy"
+            and selected_strategy_detail_panel == "editor"
+            and selected_change_request is None
+            and selected_proposal is None
+            and next_editor_strategy_id in strategy_ids
+            and next_editor_strategy_id != next_selected_strategy_id
+        ):
+            updates["selected_strategy_id"] = next_editor_strategy_id
+            next_selected_strategy_id = next_editor_strategy_id
+        if (
+            preferences.active_section == "strategy"
+            and next_editor_strategy_id
+            and next_selected_strategy_id != next_editor_strategy_id
+        ):
+            updates["selected_strategy_editor_strategy_id"] = None
+            if preferences.selected_strategy_editor_parameter_drafts:
+                updates["selected_strategy_editor_parameter_drafts"] = {}
+            if preferences.selected_strategy_editor_risk_budget_draft:
+                updates["selected_strategy_editor_risk_budget_draft"] = ""
+
+        next_selected_symbol = updates.get("selected_symbol", preferences.selected_symbol)
+        if preferences.active_section in {"strategy", "replay", "scheduler"} and next_selected_strategy_id in strategy_symbols:
+            strategy_symbol = strategy_symbols[next_selected_strategy_id]
+            if strategy_symbol in watchlist_symbols and strategy_symbol != next_selected_symbol:
+                updates["selected_symbol"] = strategy_symbol
+        elif preferences.active_section == "backtest" and selected_backtest is not None:
+            backtest_symbol = next(
+                (
+                    symbol
+                    for symbol in selected_backtest.symbol_scope
+                    if isinstance(symbol, str) and symbol.strip() and symbol in watchlist_symbols
+                ),
+                None,
+            )
+            if backtest_symbol and backtest_symbol != next_selected_symbol:
+                updates["selected_symbol"] = backtest_symbol
+
+        if not updates:
+            return False
+        self.state.workspace_preferences = preferences.model_copy(update=updates)
+        return True
 
     def _recompute_alert_summary(self) -> None:
         summary = {"P0": 0, "P1": 0, "P2": 0}
@@ -170,6 +528,7 @@ class AppRepository:
         ]
 
     def _refresh_derived_state(self) -> None:
+        self._sanitize_workspace_preferences_locked()
         self._settle_open_paper_orders_locked()
         self._refresh_paper_state_locked()
         self._recompute_alert_summary()
@@ -472,7 +831,12 @@ class AppRepository:
             "sizing_available_balance_gap": preview.sizing_available_balance_gap,
         }
 
-    def _build_review_strategy_activity_context_locked(self, strategy_id: str) -> Optional[Dict[str, Any]]:
+    def _build_review_strategy_activity_context_locked(
+        self,
+        strategy_id: str,
+        proposal_status_overrides: Optional[Dict[str, str]] = None,
+        change_request_follow_up_overrides: Optional[Dict[str, Dict[str, Any]]] = None,
+    ) -> Optional[Dict[str, Any]]:
         strategy = next((item for item in self.state.strategies if item.id == strategy_id), None)
         if strategy is None:
             return None
@@ -528,22 +892,607 @@ class AppRepository:
             return f"{order.symbol} {order.side.value} {order.qty}@{order.price} · {order.status} · {order.source}"
 
         def summarize_trade(trade: TradeRecord) -> str:
-            return (
-                f"{trade.symbol} {trade.side.value} {trade.quantity}@{trade.price} · "
-                f"{trade.status} · pnl {trade.pnl}"
-            )
+            parts = [f"{trade.symbol} {trade.side.value} {trade.quantity}@{trade.price}", str(trade.status or "filled")]
+            pnl = str(trade.pnl or "").strip()
+            if pnl and pnl != "--":
+                parts.append(f"pnl {pnl}")
+            return " · ".join(parts)
 
         def summarize_alert(alert: AlertRecord) -> str:
             return f"{alert.severity} {alert.title} · {alert.description}"
 
         def summarize_event(event: ExecutionEvent) -> str:
-            return f"{event.event_type} · {event.source}"
+            return AppRepository._summarize_execution_event(event)
+
+        def summarize_backtest(backtest: BacktestRun) -> str:
+            parts = [
+                f"{backtest.id} · {backtest.timeframe} · {backtest.data_range}",
+                backtest.status,
+                backtest.decision_readiness,
+            ]
+            if backtest.history_source != "exchange_history":
+                parts.append(backtest.history_source)
+            if backtest.source_change_request_id:
+                parts.append(f"变更 {backtest.source_change_request_id}")
+            if backtest.source_backtest_id:
+                parts.append(f"来源回测 {backtest.source_backtest_id}")
+            if backtest.source_review_id:
+                parts.append(f"来源复盘 {backtest.source_review_id}")
+            if backtest.source_proposal_id:
+                parts.append(f"来源提案 {backtest.source_proposal_id}")
+            return " · ".join(parts)
+
+        def summarize_review(review: ReviewDocument) -> str:
+            parts = [f"{review.id} · {review.period}", review.title]
+            if review.source_job_type:
+                job_parts = [f"任务 {review.source_job_type}"]
+                if review.source_job_status:
+                    job_parts.append(review.source_job_status)
+                parts.append(" / ".join(job_parts))
+            if review.source_change_request_id:
+                parts.append(f"变更 {review.source_change_request_id}")
+            if review.backtest_id:
+                parts.append(f"回测 {review.backtest_id}")
+            if review.source_proposal_id:
+                parts.append(f"提案 {review.source_proposal_id}")
+            return " · ".join(parts)
+
+        def summarize_agent_job(job: AgentJob) -> str:
+            parts = [f"{job.id} · {job.job_type}", job.status.value]
+            backtest_id = str(job.context.get("backtest_id") or "").strip()
+            linked_review_title = str(job.linked_review_title or "").strip()
+            linked_review_id = str(job.linked_review_id or "").strip()
+            result_summary = str(job.result_summary or "").strip()
+            if backtest_id:
+                parts.append(f"回测 {backtest_id}")
+            if linked_review_title:
+                parts.append(f"结果 {linked_review_title}")
+            elif linked_review_id:
+                parts.append(f"复盘 {linked_review_id}")
+            elif result_summary:
+                parts.append(result_summary)
+            return " · ".join(parts)
+
+        def summarize_change_request(change_request: ChangeRequest) -> str:
+            parts = [f"{change_request.id} · {change_request.type}", change_request.status.value]
+            if change_request.manual_followup_required:
+                parts.append("需人工跟进")
+            if change_request.linked_backtest_id:
+                parts.append(f"回测 {change_request.linked_backtest_id}")
+            if change_request.linked_review_id:
+                parts.append(f"复盘 {change_request.linked_review_id}")
+            follow_up_override = (change_request_follow_up_overrides or {}).get(change_request.id, {})
+            follow_up_job_type = (
+                str(follow_up_override.get("follow_up_job_type") or "").strip()
+                or str(change_request.follow_up_job_type or "").strip()
+            )
+            follow_up_job_status = (
+                str(follow_up_override.get("follow_up_job_status") or "").strip()
+                or str(change_request.follow_up_job_status.value if change_request.follow_up_job_status else "")
+            )
+            if follow_up_job_type:
+                follow_up_parts = [f"跟踪 {follow_up_job_type}"]
+                if follow_up_job_status:
+                    follow_up_parts.append(follow_up_job_status)
+                parts.append(" / ".join(follow_up_parts))
+            return " · ".join(parts)
+
+        def get_change_request_source_proposal_id(change_request: ChangeRequest) -> Optional[str]:
+            source_proposal_id = str(change_request.source_proposal_id or "").strip()
+            if source_proposal_id:
+                return source_proposal_id
+            payload_proposal_id = str(change_request.payload.get("proposal_id") or "").strip()
+            return payload_proposal_id or None
+
+        def get_change_request_source_backtest_id(change_request: ChangeRequest) -> Optional[str]:
+            source_backtest_id = str(change_request.source_backtest_id or "").strip()
+            return source_backtest_id or None
+
+        def get_change_request_source_review_id(change_request: ChangeRequest) -> Optional[str]:
+            source_review_id = str(change_request.source_review_id or "").strip()
+            return source_review_id or None
+
+        def summarize_proposal(proposal: StrategyProposal) -> str:
+            proposal_status = str(
+                (proposal_status_overrides or {}).get(proposal.id, proposal.status)
+            )
+            parts = [
+                proposal.id,
+                proposal.proposal_type,
+                proposal_status,
+                proposal.title,
+                proposal.expected_impact,
+            ]
+            linked_change_request = get_linked_change_request_for_proposal(proposal)
+            linked_backtest = get_linked_backtest_for_proposal(proposal)
+            linked_review = get_linked_review_for_proposal(proposal)
+            linked_job = get_linked_job_for_proposal(proposal)
+            if linked_change_request:
+                follow_up_override = (change_request_follow_up_overrides or {}).get(linked_change_request.id, {})
+                parts.append(f"变更 {linked_change_request.id}")
+                if linked_change_request.manual_followup_required:
+                    parts.append("需人工跟进")
+                follow_up_job_type = (
+                    str(follow_up_override.get("follow_up_job_type") or "").strip()
+                    or str(linked_change_request.follow_up_job_type or "").strip()
+                )
+                follow_up_job_status = (
+                    str(follow_up_override.get("follow_up_job_status") or "").strip()
+                    or str(linked_change_request.follow_up_job_status.value if linked_change_request.follow_up_job_status else "")
+                )
+                linked_review_title = (
+                    str(follow_up_override.get("linked_review_title") or "").strip()
+                    or str(linked_change_request.linked_review_title or "").strip()
+                )
+                follow_up_result_summary = (
+                    str(follow_up_override.get("follow_up_result_summary") or "").strip()
+                    or str(linked_change_request.follow_up_result_summary or "").strip()
+                )
+                if follow_up_job_type:
+                    follow_up_parts = [f"跟踪 {follow_up_job_type}"]
+                    if follow_up_job_status:
+                        follow_up_parts.append(follow_up_job_status)
+                    if linked_review_title:
+                        follow_up_parts.append(f"结果 {linked_review_title}")
+                    elif follow_up_result_summary:
+                        follow_up_parts.append(follow_up_result_summary)
+                    parts.append(" / ".join(follow_up_parts))
+            elif linked_job:
+                follow_up_parts = [f"任务 {linked_job.job_type}"]
+                if linked_job.status:
+                    follow_up_parts.append(linked_job.status.value)
+                linked_review_title = read_text(linked_job.context.get("linked_review_title"))
+                if linked_review_title:
+                    follow_up_parts.append(f"结果 {linked_review_title}")
+                elif linked_job.result_summary:
+                    follow_up_parts.append(linked_job.result_summary)
+                parts.append(" / ".join(follow_up_parts))
+            elif proposal.proposal_type == "script_patch_proposal" and proposal_status in {"pending", "testing"}:
+                parts.append("接受后需人工跟进")
+            if linked_backtest:
+                parts.append(f"回测 {linked_backtest.id}")
+            if linked_review:
+                parts.append(f"复盘 {linked_review.id}")
+            return " · ".join(parts)
 
         active_orders = [item for item in self.state.paper_orders if matches_order(item)]
         recent_orders = [item for item in self.state.paper_order_history if matches_order(item)]
         recent_trades = [item for item in self.state.trades if matches_trade(item)]
         recent_alerts = [item for item in self.state.alerts if matches_alert(item)]
-        recent_audit_events = [item for item in self.state.audit_events if matches_event(item)]
+        recent_audit_events = [self._decorate_execution_event(item) for item in self.state.audit_events if matches_event(item)]
+        active_orders.sort(key=lambda item: parse_optional_iso_datetime(item.created_at), reverse=True)
+        recent_orders.sort(key=lambda item: parse_optional_iso_datetime(item.created_at), reverse=True)
+        recent_trades.sort(key=lambda item: parse_optional_iso_datetime(item.created_at), reverse=True)
+        recent_alerts.sort(key=lambda item: parse_optional_iso_datetime(item.triggered_at), reverse=True)
+        recent_audit_events.sort(key=lambda item: parse_optional_iso_datetime(item.occurred_at), reverse=True)
+        recent_proposals = [
+            proposal
+            for review in self.state.reviews
+            for proposal in review.proposals
+            if proposal.strategy_id == strategy_id
+        ]
+        recent_proposals.sort(key=lambda item: item.created_at, reverse=True)
+        recent_reviews = [
+            review
+            for review in self.state.reviews
+            if review.strategy_id == strategy_id
+            or any(proposal.strategy_id == strategy_id for proposal in review.proposals)
+        ]
+        recent_reviews.sort(key=lambda item: item.created_at, reverse=True)
+        recent_agent_jobs = [
+            item
+            for item in self.state.agent_jobs
+            if str(item.context.get("strategy_id") or "") == strategy_id
+        ]
+        recent_agent_jobs.sort(key=lambda item: item.updated_at or item.created_at, reverse=True)
+        recent_change_requests = [
+            item
+            for item in self.state.change_requests
+            if str(item.payload.get("strategy_id") or "") == strategy_id
+        ]
+        recent_change_requests.sort(key=lambda item: item.updated_at or item.created_at, reverse=True)
+        recent_backtests = [
+            item
+            for item in self.state.backtests
+            if item.strategy_id == strategy_id
+        ]
+        recent_backtests.sort(key=lambda item: item.finished_at or item.started_at, reverse=True)
+
+        def read_text(value: object) -> Optional[str]:
+            if not isinstance(value, str):
+                return None
+            text = value.strip()
+            return text or None
+
+        proposal_change_request_map: Dict[str, ChangeRequest] = {}
+        for change_request in recent_change_requests:
+            source_proposal_id = get_change_request_source_proposal_id(change_request)
+            if source_proposal_id and source_proposal_id not in proposal_change_request_map:
+                proposal_change_request_map[source_proposal_id] = change_request
+        proposal_backtest_map: Dict[str, BacktestRun] = {}
+        for backtest in recent_backtests:
+            source_proposal_id = str(backtest.source_proposal_id or "").strip()
+            if source_proposal_id and source_proposal_id not in proposal_backtest_map:
+                proposal_backtest_map[source_proposal_id] = backtest
+        proposal_review_map: Dict[str, ReviewDocument] = {}
+        for review in recent_reviews:
+            source_proposal_id = str(review.source_proposal_id or "").strip()
+            if source_proposal_id and source_proposal_id not in proposal_review_map:
+                proposal_review_map[source_proposal_id] = review
+        proposal_by_id = {item.id: item for item in recent_proposals}
+
+        def get_linked_change_request_for_proposal(proposal: Optional[StrategyProposal]) -> Optional[ChangeRequest]:
+            if proposal is None:
+                return None
+            return proposal_change_request_map.get(proposal.id)
+
+        def get_linked_backtest_for_proposal(proposal: Optional[StrategyProposal]) -> Optional[BacktestRun]:
+            if proposal is None:
+                return None
+            linked_backtest = proposal_backtest_map.get(proposal.id)
+            if linked_backtest is not None:
+                return linked_backtest
+            linked_change_request = proposal_change_request_map.get(proposal.id)
+            if linked_change_request and linked_change_request.linked_backtest_id:
+                return next(
+                    (item for item in recent_backtests if item.id == linked_change_request.linked_backtest_id),
+                    None,
+                )
+            linked_review = proposal_review_map.get(proposal.id)
+            if linked_review and linked_review.backtest_id:
+                return next((item for item in recent_backtests if item.id == linked_review.backtest_id), None)
+            return None
+
+        def get_linked_review_for_proposal(proposal: Optional[StrategyProposal]) -> Optional[ReviewDocument]:
+            if proposal is None:
+                return None
+            linked_review = proposal_review_map.get(proposal.id)
+            if linked_review is not None:
+                return linked_review
+            linked_change_request = proposal_change_request_map.get(proposal.id)
+            if linked_change_request and linked_change_request.linked_review_id:
+                return next((item for item in recent_reviews if item.id == linked_change_request.linked_review_id), None)
+            linked_backtest = get_linked_backtest_for_proposal(proposal)
+            if linked_backtest is not None:
+                return next((item for item in recent_reviews if item.backtest_id == linked_backtest.id), None)
+            return None
+
+        def get_linked_job_for_proposal(proposal: Optional[StrategyProposal]) -> Optional[AgentJob]:
+            if proposal is None:
+                return None
+            linked_change_request = proposal_change_request_map.get(proposal.id)
+            if linked_change_request and linked_change_request.follow_up_job_id:
+                linked_job = next(
+                    (item for item in recent_agent_jobs if item.id == linked_change_request.follow_up_job_id),
+                    None,
+                )
+                if linked_job is not None:
+                    return linked_job
+            linked_review = get_linked_review_for_proposal(proposal)
+            if linked_review and linked_review.source_job_id:
+                linked_job = next((item for item in recent_agent_jobs if item.id == linked_review.source_job_id), None)
+                if linked_job is not None:
+                    return linked_job
+            linked_backtest = get_linked_backtest_for_proposal(proposal)
+            if linked_backtest is not None:
+                return next(
+                    (
+                        item
+                        for item in recent_agent_jobs
+                        if str(item.context.get("backtest_id") or "") == linked_backtest.id
+                    ),
+                    None,
+                )
+            return None
+        latest_primary_review = next(
+            (item for item in recent_reviews if item.period not in {"strategy_issue", "strategy_change"}),
+            None,
+        )
+        latest_proposal = next(iter(recent_proposals), None)
+        latest_actionable_proposal = next(
+            (
+                item
+                for item in recent_proposals
+                if str((proposal_status_overrides or {}).get(item.id, item.status)) in {"pending", "testing"}
+            ),
+            None,
+        )
+        latest_proposal_change_request = get_linked_change_request_for_proposal(latest_proposal)
+        latest_proposal_backtest = get_linked_backtest_for_proposal(latest_proposal)
+        latest_proposal_review = get_linked_review_for_proposal(latest_proposal)
+        latest_proposal_job = get_linked_job_for_proposal(latest_proposal)
+        latest_actionable_proposal_change_request = get_linked_change_request_for_proposal(
+            latest_actionable_proposal
+        )
+        latest_actionable_proposal_backtest = get_linked_backtest_for_proposal(latest_actionable_proposal)
+        latest_actionable_proposal_review = get_linked_review_for_proposal(latest_actionable_proposal)
+        latest_actionable_proposal_job = get_linked_job_for_proposal(latest_actionable_proposal)
+        latest_backtest = next(iter(recent_backtests), None)
+        latest_backtest_review = (
+            next((item for item in recent_reviews if item.backtest_id == latest_backtest.id), None)
+            if latest_backtest
+            else None
+        )
+        latest_backtest_job = (
+            next(
+                (
+                    item
+                    for item in recent_agent_jobs
+                    if str(item.context.get("backtest_id") or "") == latest_backtest.id
+                ),
+                None,
+            )
+            if latest_backtest
+            else None
+        )
+        latest_tracking_review = next(
+            (item for item in recent_reviews if item.period in {"strategy_issue", "strategy_change"}),
+            None,
+        )
+        latest_tracking_job = next(
+            (item for item in recent_agent_jobs if item.job_type in {"review_strategy_issue", "review_strategy_change"}),
+            None,
+        )
+        latest_change_request = next(iter(recent_change_requests), None)
+        latest_change_request_backtest_record = (
+            next((item for item in recent_backtests if item.id == latest_change_request.linked_backtest_id), None)
+            if latest_change_request and latest_change_request.linked_backtest_id
+            else None
+        )
+        latest_change_request_review_record = (
+            next((item for item in recent_reviews if item.id == latest_change_request.linked_review_id), None)
+            if latest_change_request and latest_change_request.linked_review_id
+            else None
+        )
+        latest_change_request_job_record = (
+            next((item for item in recent_agent_jobs if item.id == latest_change_request.follow_up_job_id), None)
+            if latest_change_request and latest_change_request.follow_up_job_id
+            else None
+        )
+        latest_change_request_source_backtest_record = (
+            next((item for item in recent_backtests if item.id == get_change_request_source_backtest_id(latest_change_request)), None)
+            if latest_change_request
+            else None
+        )
+        latest_change_request_source_review_record = (
+            next((item for item in recent_reviews if item.id == get_change_request_source_review_id(latest_change_request)), None)
+            if latest_change_request
+            else None
+        )
+        latest_change_request_source_proposal_record = (
+            proposal_by_id.get(get_change_request_source_proposal_id(latest_change_request))
+            if latest_change_request
+            else None
+        )
+        def has_change_request_rerun_recommendation(change_request: ChangeRequest) -> bool:
+            linked_backtest = (
+                next((item for item in recent_backtests if item.id == change_request.linked_backtest_id), None)
+                if change_request.linked_backtest_id
+                else None
+            )
+            linked_history_source_reason = (
+                read_text(getattr(linked_backtest, "history_source_reason", None))
+                or read_text(change_request.linked_backtest_history_source_reason)
+                or "none"
+            )
+            decision_range = read_text(
+                getattr(linked_backtest, "decision_recommended_data_range", None)
+            ) or read_text(change_request.linked_backtest_decision_recommended_data_range)
+            decision_timeframe = read_text(
+                getattr(linked_backtest, "decision_recommended_timeframe", None)
+            ) or read_text(change_request.linked_backtest_decision_recommended_timeframe)
+            if linked_history_source_reason != "exchange_fetch_failed" and decision_range and decision_timeframe:
+                return True
+            full_window_range = read_text(
+                getattr(linked_backtest, "full_window_recommended_data_range", None)
+            ) or read_text(change_request.linked_backtest_full_window_recommended_data_range)
+            full_window_timeframe = read_text(
+                getattr(linked_backtest, "full_window_recommended_timeframe", None)
+            ) or read_text(change_request.linked_backtest_full_window_recommended_timeframe)
+            if full_window_range and full_window_timeframe:
+                return True
+            history_range = read_text(
+                getattr(linked_backtest, "history_source_recommended_data_range", None)
+            ) or read_text(change_request.linked_backtest_history_source_recommended_data_range)
+            history_timeframe = read_text(
+                getattr(linked_backtest, "history_source_recommended_timeframe", None)
+            ) or read_text(change_request.linked_backtest_history_source_recommended_timeframe)
+            return linked_history_source_reason != "exchange_fetch_failed" and bool(history_range and history_timeframe)
+
+        def has_backtest_rerun_recommendation(backtest: BacktestRun) -> bool:
+            history_source_reason = read_text(getattr(backtest, "history_source_reason", None)) or "none"
+            decision_range = read_text(getattr(backtest, "decision_recommended_data_range", None))
+            decision_timeframe = read_text(getattr(backtest, "decision_recommended_timeframe", None))
+            if history_source_reason != "exchange_fetch_failed" and decision_range and decision_timeframe:
+                return True
+            full_window_range = read_text(getattr(backtest, "full_window_recommended_data_range", None))
+            full_window_timeframe = read_text(getattr(backtest, "full_window_recommended_timeframe", None))
+            if full_window_range and full_window_timeframe:
+                return True
+            history_range = read_text(getattr(backtest, "history_source_recommended_data_range", None))
+            history_timeframe = read_text(getattr(backtest, "history_source_recommended_timeframe", None))
+            return history_source_reason != "exchange_fetch_failed" and bool(history_range and history_timeframe)
+
+        def has_review_rerun_recommendation(review: ReviewDocument) -> bool:
+            decision_range = read_text(getattr(review, "decision_recommended_data_range", None))
+            decision_timeframe = read_text(getattr(review, "decision_recommended_timeframe", None))
+            return bool(decision_range and decision_timeframe)
+
+        latest_actionable_change_request = next(
+            (
+                item
+                for item in recent_change_requests
+                if (
+                    item.follow_up_job_id
+                    and item.follow_up_job_status in {"failed", "cancelled"}
+                )
+                or has_change_request_rerun_recommendation(item)
+            ),
+            None,
+        )
+        latest_actionable_change_request_backtest_record = (
+            next(
+                (item for item in recent_backtests if item.id == latest_actionable_change_request.linked_backtest_id),
+                None,
+            )
+            if latest_actionable_change_request and latest_actionable_change_request.linked_backtest_id
+            else None
+        )
+        latest_actionable_change_request_review_record = (
+            next(
+                (item for item in recent_reviews if item.id == latest_actionable_change_request.linked_review_id),
+                None,
+            )
+            if latest_actionable_change_request and latest_actionable_change_request.linked_review_id
+            else None
+        )
+        latest_actionable_change_request_job_record = (
+            next((item for item in recent_agent_jobs if item.id == latest_actionable_change_request.follow_up_job_id), None)
+            if latest_actionable_change_request and latest_actionable_change_request.follow_up_job_id
+            else None
+        )
+        latest_actionable_change_request_source_backtest_record = (
+            next(
+                (item for item in recent_backtests if item.id == get_change_request_source_backtest_id(latest_actionable_change_request)),
+                None,
+            )
+            if latest_actionable_change_request
+            else None
+        )
+        latest_actionable_change_request_source_review_record = (
+            next(
+                (item for item in recent_reviews if item.id == get_change_request_source_review_id(latest_actionable_change_request)),
+                None,
+            )
+            if latest_actionable_change_request
+            else None
+        )
+        latest_actionable_change_request_source_proposal_record = (
+            proposal_by_id.get(get_change_request_source_proposal_id(latest_actionable_change_request))
+            if latest_actionable_change_request
+            else None
+        )
+        latest_actionable_backtest = next(
+            (
+                item
+                for item in recent_backtests
+                if has_backtest_rerun_recommendation(item)
+                or any(
+                    str(job.context.get("backtest_id") or "") == item.id
+                    and job.status in {"failed", "cancelled"}
+                    for job in recent_agent_jobs
+                )
+            ),
+            None,
+        )
+        latest_backtest_record = (
+            next((item for item in recent_backtests if latest_backtest is not None and item.id == latest_backtest.id), None)
+            if latest_backtest
+            else None
+        )
+        latest_actionable_backtest_record = (
+            next(
+                (
+                    item
+                    for item in recent_backtests
+                    if latest_actionable_backtest is not None and item.id == latest_actionable_backtest.id
+                ),
+                None,
+            )
+            if latest_actionable_backtest
+            else None
+        )
+        latest_actionable_backtest_review = next(
+            (
+                item
+                for item in recent_reviews
+                if latest_actionable_backtest is not None and item.backtest_id == latest_actionable_backtest.id
+            ),
+            None,
+        )
+        latest_actionable_backtest_job = next(
+            (
+                item
+                for item in recent_agent_jobs
+                if latest_actionable_backtest is not None
+                and str(item.context.get("backtest_id") or "") == latest_actionable_backtest.id
+            ),
+            None,
+        )
+        latest_actionable_primary_review = next(
+            (
+                item
+                for item in recent_reviews
+                if item.period not in {"strategy_issue", "strategy_change"} and has_review_rerun_recommendation(item)
+            ),
+            None,
+        )
+        latest_retryable_tracking_job = next(
+            (
+                item
+                for item in recent_agent_jobs
+                if item.job_type in {"review_strategy_issue", "review_strategy_change"}
+                and item.status in {"failed", "cancelled"}
+            ),
+            None,
+        )
+        latest_key_audit_event = AppRepository._pick_latest_key_execution_event(recent_audit_events)
+        latest_active_order_record = max(
+            active_orders,
+            key=lambda item: parse_optional_iso_datetime(item.created_at),
+            default=None,
+        )
+        latest_historical_order_record = max(
+            recent_orders,
+            key=lambda item: parse_optional_iso_datetime(item.created_at),
+            default=None,
+        )
+        latest_trade_record = max(
+            recent_trades,
+            key=lambda item: parse_optional_iso_datetime(item.created_at),
+            default=None,
+        )
+        latest_alert_record = max(
+            recent_alerts,
+            key=lambda item: parse_optional_iso_datetime(item.triggered_at),
+            default=None,
+        )
+        latest_pending_alert_record = max(
+            [item for item in recent_alerts if not item.acknowledged],
+            key=lambda item: parse_optional_iso_datetime(item.triggered_at),
+            default=None,
+        )
+        latest_order_record = max(
+            [item for item in [latest_active_order_record, latest_historical_order_record] if item is not None],
+            key=lambda item: parse_optional_iso_datetime(item.created_at),
+            default=None,
+        )
+        latest_ops = {
+            "latest_active_order": summarize_order(latest_active_order_record) if latest_active_order_record else None,
+            "latest_historical_order": (
+                summarize_order(latest_historical_order_record) if latest_historical_order_record else None
+            ),
+            "latest_order": summarize_order(latest_order_record) if latest_order_record else None,
+            "latest_pending_alert": summarize_alert(latest_pending_alert_record) if latest_pending_alert_record else None,
+            "latest_trade": summarize_trade(latest_trade_record) if latest_trade_record else None,
+            "latest_alert": summarize_alert(latest_alert_record) if latest_alert_record else None,
+            "latest_audit_event": summarize_event(latest_key_audit_event) if latest_key_audit_event else None,
+            "latest_active_order_record": latest_active_order_record.model_dump(mode="json")
+            if latest_active_order_record
+            else None,
+            "latest_historical_order_record": latest_historical_order_record.model_dump(mode="json")
+            if latest_historical_order_record
+            else None,
+            "latest_order_record": latest_order_record.model_dump(mode="json") if latest_order_record else None,
+            "latest_pending_alert_record": latest_pending_alert_record.model_dump(mode="json")
+            if latest_pending_alert_record
+            else None,
+            "latest_trade_record": latest_trade_record.model_dump(mode="json") if latest_trade_record else None,
+            "latest_alert_record": latest_alert_record.model_dump(mode="json") if latest_alert_record else None,
+            "latest_audit_event_record": latest_key_audit_event.model_dump(mode="json")
+            if latest_key_audit_event
+            else None,
+        }
 
         runtime = (
             {
@@ -560,6 +1509,7 @@ class AppRepository:
             if snapshot is not None
             else None
         )
+        latest_runtime = {"runtime": runtime, "latest_ops": latest_ops}
 
         return {
             "strategy_id": strategy.id,
@@ -568,13 +1518,248 @@ class AppRepository:
             "mode": strategy.mode.value,
             "generated_at": now_iso(),
             "runtime": runtime,
+            "latest_runtime": latest_runtime,
+            "latest_ops": latest_ops,
             "active_order_count": len(active_orders),
             "active_orders": [summarize_order(order) for order in active_orders[:3]],
+            "latest_active_order": latest_ops["latest_active_order"],
+            "latest_active_order_record": latest_ops["latest_active_order_record"],
+            "latest_historical_order": latest_ops["latest_historical_order"],
+            "latest_historical_order_record": latest_ops["latest_historical_order_record"],
+            "latest_order": latest_ops["latest_order"],
+            "latest_order_record": latest_ops["latest_order_record"],
             "recent_orders": [summarize_order(order) for order in recent_orders[:3]],
+            "latest_trade": latest_ops["latest_trade"],
+            "latest_trade_record": latest_ops["latest_trade_record"],
             "recent_trades": [summarize_trade(trade) for trade in recent_trades[:3]],
+            "latest_pending_alert": latest_ops["latest_pending_alert"],
+            "latest_pending_alert_record": latest_ops["latest_pending_alert_record"],
+            "latest_alert": latest_ops["latest_alert"],
+            "latest_alert_record": latest_ops["latest_alert_record"],
             "recent_alerts": [summarize_alert(alert) for alert in recent_alerts[:3]],
+            "latest_proposal": summarize_proposal(latest_proposal) if latest_proposal else None,
+            "latest_actionable_proposal": (
+                summarize_proposal(latest_actionable_proposal) if latest_actionable_proposal else None
+            ),
+            "latest_proposal_change_request": (
+                summarize_change_request(latest_proposal_change_request)
+                if latest_proposal_change_request
+                else None
+            ),
+            "latest_proposal_backtest": (
+                summarize_backtest(latest_proposal_backtest) if latest_proposal_backtest else None
+            ),
+            "latest_proposal_backtest_record": (
+                latest_proposal_backtest.model_dump(mode="json") if latest_proposal_backtest else None
+            ),
+            "latest_proposal_review": (
+                summarize_review(latest_proposal_review) if latest_proposal_review else None
+            ),
+            "latest_proposal_review_record": (
+                latest_proposal_review.model_dump(mode="json") if latest_proposal_review else None
+            ),
+            "latest_proposal_job": (
+                summarize_agent_job(latest_proposal_job) if latest_proposal_job else None
+            ),
+            "latest_proposal_job_record": (
+                latest_proposal_job.model_dump(mode="json") if latest_proposal_job else None
+            ),
+            "latest_actionable_proposal_change_request": (
+                summarize_change_request(latest_actionable_proposal_change_request)
+                if latest_actionable_proposal_change_request
+                else None
+            ),
+            "latest_actionable_proposal_backtest": (
+                summarize_backtest(latest_actionable_proposal_backtest)
+                if latest_actionable_proposal_backtest
+                else None
+            ),
+            "latest_actionable_proposal_backtest_record": (
+                latest_actionable_proposal_backtest.model_dump(mode="json")
+                if latest_actionable_proposal_backtest
+                else None
+            ),
+            "latest_actionable_proposal_review": (
+                summarize_review(latest_actionable_proposal_review)
+                if latest_actionable_proposal_review
+                else None
+            ),
+            "latest_actionable_proposal_review_record": (
+                latest_actionable_proposal_review.model_dump(mode="json")
+                if latest_actionable_proposal_review
+                else None
+            ),
+            "latest_actionable_proposal_job": (
+                summarize_agent_job(latest_actionable_proposal_job)
+                if latest_actionable_proposal_job
+                else None
+            ),
+            "latest_actionable_proposal_job_record": (
+                latest_actionable_proposal_job.model_dump(mode="json")
+                if latest_actionable_proposal_job
+                else None
+            ),
+            "recent_proposals": [summarize_proposal(proposal) for proposal in recent_proposals[:3]],
+            "latest_change_request": summarize_change_request(latest_change_request) if latest_change_request else None,
+            "latest_actionable_change_request": (
+                summarize_change_request(latest_actionable_change_request)
+                if latest_actionable_change_request
+                else None
+            ),
+            "latest_change_request_backtest_record": (
+                latest_change_request_backtest_record.model_dump(mode="json")
+                if latest_change_request_backtest_record
+                else None
+            ),
+            "latest_change_request_review_record": (
+                latest_change_request_review_record.model_dump(mode="json")
+                if latest_change_request_review_record
+                else None
+            ),
+            "latest_change_request_job_record": (
+                latest_change_request_job_record.model_dump(mode="json")
+                if latest_change_request_job_record
+                else None
+            ),
+            "latest_change_request_source_backtest_record": (
+                latest_change_request_source_backtest_record.model_dump(mode="json")
+                if latest_change_request_source_backtest_record
+                else None
+            ),
+            "latest_change_request_source_review_record": (
+                latest_change_request_source_review_record.model_dump(mode="json")
+                if latest_change_request_source_review_record
+                else None
+            ),
+            "latest_change_request_source_proposal_record": (
+                latest_change_request_source_proposal_record.model_dump(mode="json")
+                if latest_change_request_source_proposal_record
+                else None
+            ),
+            "latest_actionable_change_request_backtest_record": (
+                latest_actionable_change_request_backtest_record.model_dump(mode="json")
+                if latest_actionable_change_request_backtest_record
+                else None
+            ),
+            "latest_actionable_change_request_review_record": (
+                latest_actionable_change_request_review_record.model_dump(mode="json")
+                if latest_actionable_change_request_review_record
+                else None
+            ),
+            "latest_actionable_change_request_job_record": (
+                latest_actionable_change_request_job_record.model_dump(mode="json")
+                if latest_actionable_change_request_job_record
+                else None
+            ),
+            "latest_actionable_change_request_source_backtest_record": (
+                latest_actionable_change_request_source_backtest_record.model_dump(mode="json")
+                if latest_actionable_change_request_source_backtest_record
+                else None
+            ),
+            "latest_actionable_change_request_source_review_record": (
+                latest_actionable_change_request_source_review_record.model_dump(mode="json")
+                if latest_actionable_change_request_source_review_record
+                else None
+            ),
+            "latest_actionable_change_request_source_proposal_record": (
+                latest_actionable_change_request_source_proposal_record.model_dump(mode="json")
+                if latest_actionable_change_request_source_proposal_record
+                else None
+            ),
+            "recent_change_requests": [
+                summarize_change_request(change_request)
+                for change_request in recent_change_requests[:3]
+            ],
+            "latest_backtest": summarize_backtest(latest_backtest) if latest_backtest else None,
+            "latest_actionable_backtest": (
+                summarize_backtest(latest_actionable_backtest) if latest_actionable_backtest else None
+            ),
+            "latest_backtest_record": (
+                latest_backtest_record.model_dump(mode="json") if latest_backtest_record else None
+            ),
+            "latest_actionable_backtest_record": (
+                latest_actionable_backtest_record.model_dump(mode="json")
+                if latest_actionable_backtest_record
+                else None
+            ),
+            "latest_actionable_backtest_review": (
+                summarize_review(latest_actionable_backtest_review)
+                if latest_actionable_backtest_review
+                else None
+            ),
+            "latest_backtest_review_record": (
+                latest_backtest_review.model_dump(mode="json") if latest_backtest_review else None
+            ),
+            "latest_backtest_job_record": (
+                latest_backtest_job.model_dump(mode="json") if latest_backtest_job else None
+            ),
+            "latest_actionable_backtest_review_record": (
+                latest_actionable_backtest_review.model_dump(mode="json")
+                if latest_actionable_backtest_review
+                else None
+            ),
+            "latest_actionable_backtest_job_record": (
+                latest_actionable_backtest_job.model_dump(mode="json")
+                if latest_actionable_backtest_job
+                else None
+            ),
+            "latest_actionable_backtest_job": (
+                summarize_agent_job(latest_actionable_backtest_job)
+                if latest_actionable_backtest_job
+                else None
+            ),
+            "latest_backtest_review": summarize_review(latest_backtest_review) if latest_backtest_review else None,
+            "latest_backtest_job": summarize_agent_job(latest_backtest_job) if latest_backtest_job else None,
+            "recent_backtests": [summarize_backtest(backtest) for backtest in recent_backtests[:3]],
+            "latest_primary_review": summarize_review(latest_primary_review) if latest_primary_review else None,
+            "latest_actionable_primary_review": (
+                summarize_review(latest_actionable_primary_review) if latest_actionable_primary_review else None
+            ),
+            "latest_primary_review_record": (
+                latest_primary_review.model_dump(mode="json") if latest_primary_review else None
+            ),
+            "latest_actionable_primary_review_record": (
+                latest_actionable_primary_review.model_dump(mode="json")
+                if latest_actionable_primary_review
+                else None
+            ),
+            "latest_tracking_review": summarize_review(latest_tracking_review) if latest_tracking_review else None,
+            "latest_tracking_job": summarize_agent_job(latest_tracking_job) if latest_tracking_job else None,
+            "latest_tracking_review_record": (
+                latest_tracking_review.model_dump(mode="json") if latest_tracking_review else None
+            ),
+            "latest_tracking_job_record": (
+                latest_tracking_job.model_dump(mode="json") if latest_tracking_job else None
+            ),
+            "latest_retryable_tracking_job": (
+                summarize_agent_job(latest_retryable_tracking_job) if latest_retryable_tracking_job else None
+            ),
+            "latest_retryable_tracking_job_record": (
+                latest_retryable_tracking_job.model_dump(mode="json")
+                if latest_retryable_tracking_job
+                else None
+            ),
+            "latest_audit_event": latest_ops["latest_audit_event"],
+            "latest_audit_event_record": latest_ops["latest_audit_event_record"],
+            "recent_reviews": [summarize_review(review) for review in recent_reviews[:3]],
+            "recent_agent_jobs": [summarize_agent_job(job) for job in recent_agent_jobs[:4]],
             "recent_audit_events": [summarize_event(event) for event in recent_audit_events[:4]],
         }
+
+    def _refresh_agent_job_review_strategy_activity_locked(
+        self,
+        job: AgentJob,
+        proposal_status_overrides: Optional[Dict[str, str]] = None,
+        change_request_follow_up_overrides: Optional[Dict[str, Dict[str, Any]]] = None,
+    ) -> None:
+        strategy_id = str(job.context.get("strategy_id") or "").strip()
+        if not strategy_id:
+            return
+        job.context["review_strategy_activity"] = self._build_review_strategy_activity_context_locked(
+            strategy_id,
+            proposal_status_overrides=proposal_status_overrides,
+            change_request_follow_up_overrides=change_request_follow_up_overrides,
+        )
 
     def _resolve_mark_price_locked(self, symbol: str, fallback_price: float) -> float:
         watch_item = next((item for item in self.state.watchlist if item.symbol == symbol), None)
@@ -1302,10 +2487,25 @@ class AppRepository:
         suggested_action = self._market_alert_action(item)
 
         if existing is not None:
+            changed = (
+                existing.severity != severity
+                or existing.title != title
+                or existing.description != description
+                or existing.suggested_action != suggested_action
+                or existing.symbol != item.symbol
+                or existing.source_type != "rule"
+                or existing.rule_id != rule.id
+                or existing.rule_key != rule_key
+                or abs(float(existing.trigger_value or 0.0) - float(item.change_24h)) >= 0.1
+                or abs(float(existing.threshold_value or 0.0) - float(threshold)) >= 1e-9
+            )
+            if not changed:
+                return False
+            refreshed_at = now_iso()
             existing.severity = severity
             existing.title = title
             existing.description = description
-            existing.triggered_at = now_iso()
+            existing.triggered_at = refreshed_at
             existing.suggested_action = suggested_action
             existing.symbol = item.symbol
             existing.source_type = "rule"
@@ -1313,9 +2513,9 @@ class AppRepository:
             existing.rule_key = rule_key
             existing.trigger_value = item.change_24h
             existing.threshold_value = threshold
-            rule.last_triggered_at = existing.triggered_at
+            rule.last_triggered_at = refreshed_at
             rule.last_triggered_change_24h = item.change_24h
-            rule.updated_at = existing.triggered_at
+            rule.updated_at = refreshed_at
             return True
 
         if self._is_alert_rule_on_cooldown(rule):
@@ -1619,7 +2819,8 @@ class AppRepository:
         symbol: Optional[str] = None,
         strategy_id: Optional[str] = None,
     ) -> ExecutionEvent:
-        event = ExecutionEvent(
+        event = self._decorate_execution_event(
+            ExecutionEvent(
             id=f"evt-{uuid4().hex[:8]}",
             event_type=event_type,
             severity=severity,
@@ -1629,6 +2830,7 @@ class AppRepository:
             payload=payload,
             trace_id=f"trace-{uuid4().hex[:12]}",
             occurred_at=now_iso(),
+            )
         )
         self.state.audit_events.insert(0, event)
         return event
@@ -1644,6 +2846,8 @@ class AppRepository:
             source_review_id=payload.source_review_id,
             source_proposal_id=payload.source_proposal_id,
             trigger_reason=payload.trigger_reason or "manual_create",
+            manual_followup_required=payload.manual_followup_required,
+            manual_followup_detail=payload.manual_followup_detail,
             target_mode=payload.target_mode,
             priority=payload.priority,
             status=ChangeRequestStatus.QUEUED,
@@ -1858,6 +3062,17 @@ class AppRepository:
         return job
 
     def _queue_strategy_change_review_locked(self, record: ChangeRequest) -> AgentJob:
+        proposal_status_overrides = (
+            {str(record.source_proposal_id): "accepted"}
+            if record.trigger_reason == "proposal_accept" and record.source_proposal_id
+            else None
+        )
+        change_request_follow_up_overrides = {
+            record.id: {
+                "follow_up_job_type": "review_strategy_change",
+                "follow_up_job_status": JobStatus.QUEUED.value,
+            }
+        }
         job = self._create_agent_job_locked(
             AgentJobCreate(
                 job_type="review_strategy_change",
@@ -1881,6 +3096,11 @@ class AppRepository:
                 writeback_target="strategy_activity",
             ),
             source="mock-orchestrator",
+        )
+        self._refresh_agent_job_review_strategy_activity_locked(
+            job,
+            proposal_status_overrides=proposal_status_overrides,
+            change_request_follow_up_overrides=change_request_follow_up_overrides,
         )
         self._sync_change_request_follow_up_locked(record.id, job=job)
         return job
@@ -2162,14 +3382,31 @@ class AppRepository:
                 "trigger_reason": backtest.trigger_reason,
                 "execution_health": execution_health,
                 "execution_top_issue": execution_health.get("top_issue"),
-                "review_strategy_activity": self._build_review_strategy_activity_context_locked(backtest.strategy_id),
+                "review_strategy_activity": self._build_review_strategy_activity_context_locked(
+                    backtest.strategy_id,
+                    proposal_status_overrides=(
+                        {str(backtest.source_proposal_id): "accepted"}
+                        if backtest.trigger_reason == "proposal_accept" and backtest.source_proposal_id
+                        else None
+                    ),
+                ),
             },
             allowed_actions=["review_backtest", "propose_next_step"],
             timeout=90,
             idempotency_key=idempotency_key,
             writeback_target="reviews",
         )
-        return self._create_agent_job_locked(payload, source="quant-core")
+        job = self._create_agent_job_locked(payload, source="quant-core")
+        proposal_status_overrides = (
+            {str(backtest.source_proposal_id): "accepted"}
+            if backtest.trigger_reason == "proposal_accept" and backtest.source_proposal_id
+            else None
+        )
+        self._refresh_agent_job_review_strategy_activity_locked(
+            job,
+            proposal_status_overrides=proposal_status_overrides,
+        )
+        return job
 
     def _find_proposal(self, proposal_id: str) -> StrategyProposal:
         for review in self.state.reviews:
@@ -2457,6 +3694,8 @@ class AppRepository:
     def create_agent_job(self, payload: AgentJobCreate) -> AgentJob:
         with self._lock:
             record = self._create_agent_job_locked(payload)
+            if record.job_type in {"review_strategy_issue", "review_strategy_change", "generate_backtest_review"}:
+                self._refresh_agent_job_review_strategy_activity_locked(record)
             self._persist()
             return record
 
@@ -2486,6 +3725,8 @@ class AppRepository:
             )
             retried_job.retried_from_job_id = job.id
             retried_job.retry_count = retry_count
+            if retried_job.job_type in {"review_strategy_issue", "review_strategy_change", "generate_backtest_review"}:
+                self._refresh_agent_job_review_strategy_activity_locked(retried_job)
             self._sync_change_request_follow_up_locked(
                 str(retried_job.context.get("change_request_id") or "") or None,
                 job=retried_job,
@@ -2892,6 +4133,7 @@ class AppRepository:
                     ) if proposal.proposal_type in {"param_update", "pause_resume", "risk_update", "script_patch_proposal"} else None
 
                 if proposal.proposal_type == "script_patch_proposal":
+                    manual_followup_detail = "脚本补丁提案已转成待处理 ChangeRequest，需后续人工或编排链落实。"
                     created_change_request = self._create_change_request_locked(
                         ChangeRequestCreate(
                             type="proposal.script_patch_proposal",
@@ -2901,6 +4143,8 @@ class AppRepository:
                             source_review_id=parent_review.id,
                             source_proposal_id=proposal.id,
                             trigger_reason="proposal_accept",
+                            manual_followup_required=True,
+                            manual_followup_detail=manual_followup_detail,
                             target_mode=target_mode or AccountMode.PAPER,
                             priority="high",
                             summary=self._build_script_patch_change_summary(proposal, proposal_payload),
@@ -2915,7 +4159,7 @@ class AppRepository:
                             "proposal_id": proposal.id,
                             "proposal_type": proposal.proposal_type,
                             "requested_by": payload.requested_by,
-                            "detail": "脚本补丁提案已转成待处理 ChangeRequest，需后续人工或编排链落实。",
+                            "detail": manual_followup_detail,
                         },
                         strategy_id=strategy_id,
                     )
@@ -3099,6 +4343,13 @@ class AppRepository:
 
             collapsed_candidates = self._dedupe_strings(payload.overview_collapsed_cards)
             collapsed_cards = [card_id for card_id in card_order if card_id in collapsed_candidates]
+            editor_strategy_id = self._normalize_optional_string(payload.selected_strategy_editor_strategy_id)
+            if editor_strategy_id is None and (
+                payload.selected_strategy_detail_panel == "editor"
+                or payload.selected_strategy_editor_parameter_drafts
+                or payload.selected_strategy_editor_risk_budget_draft
+            ):
+                editor_strategy_id = self._normalize_optional_string(payload.selected_strategy_id)
 
             next_preferences = WorkspacePreferences(
                 active_section=payload.active_section,
@@ -3108,6 +4359,31 @@ class AppRepository:
                 selected_market_timeframe=payload.selected_market_timeframe,
                 selected_strategy_id=payload.selected_strategy_id,
                 selected_backtest_id=self._normalize_optional_string(payload.selected_backtest_id),
+                selected_scheduler_job_id=self._normalize_optional_string(payload.selected_scheduler_job_id),
+                selected_strategy_detail_panel=payload.selected_strategy_detail_panel,
+                selected_strategy_tracking_kind=payload.selected_strategy_tracking_kind,
+                selected_strategy_tracking_summary=(
+                    self._normalize_optional_string(payload.selected_strategy_tracking_summary) or ""
+                ),
+                selected_strategy_tracking_detail=(
+                    self._normalize_optional_string(payload.selected_strategy_tracking_detail) or ""
+                ),
+                selected_strategy_editor_strategy_id=editor_strategy_id,
+                selected_strategy_editor_parameter_drafts={
+                    str(key).strip(): str(value)
+                    for key, value in payload.selected_strategy_editor_parameter_drafts.items()
+                    if str(key).strip()
+                },
+                selected_strategy_editor_risk_budget_draft=(
+                    self._normalize_optional_string(payload.selected_strategy_editor_risk_budget_draft) or ""
+                ),
+                selected_review_inspector_id=self._normalize_optional_string(payload.selected_review_inspector_id),
+                selected_review_inspector_strategy_id=self._normalize_optional_string(
+                    payload.selected_review_inspector_strategy_id
+                ),
+                selected_review_id=self._normalize_optional_string(payload.selected_review_id),
+                selected_proposal_id=self._normalize_optional_string(payload.selected_proposal_id),
+                selected_change_request_id=self._normalize_optional_string(payload.selected_change_request_id),
                 backtest_filter=payload.backtest_filter,
                 replay_tracking_scope=payload.replay_tracking_scope,
                 alert_severity_filter=payload.alert_severity_filter,
@@ -3126,18 +4402,20 @@ class AppRepository:
                 updated_at=now_iso(),
             )
             self.state.workspace_preferences = next_preferences
-            self.state.control_snapshot.scheduler.current_mode = payload.selected_mode
+            self._sanitize_workspace_preferences_locked()
+            persisted_preferences = self.state.workspace_preferences
+            self.state.control_snapshot.scheduler.current_mode = persisted_preferences.selected_mode
             self._refresh_derived_state()
             self.add_event(
                 event_type="workspace.preferences.updated",
                 source="desktop",
                 severity=EventSeverity.INFO,
-                payload=next_preferences.model_dump(mode="json"),
-                symbol=payload.selected_symbol,
-                strategy_id=payload.selected_strategy_id,
+                payload=persisted_preferences.model_dump(mode="json"),
+                symbol=persisted_preferences.selected_symbol,
+                strategy_id=persisted_preferences.selected_strategy_id,
             )
             self._persist()
-            return next_preferences
+            return persisted_preferences
 
     def add_watchlist_item(
         self,

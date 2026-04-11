@@ -234,7 +234,7 @@ class MarketDetail(BaseModel):
     recent_public_trades: List[MarketRecentTrade] = Field(default_factory=list)
     headline: str
     stats: Dict[str, str]
-    source: Literal["mock", "bybit_rest", "bybit_ws"] = "mock"
+    source: Literal["mock", "fallback", "bybit_rest", "bybit_ws"] = "fallback"
     updated_at: Optional[str] = None
 
 
@@ -242,7 +242,23 @@ class MarketLiveSnapshot(BaseModel):
     selected_symbol: str
     watchlist: List[WatchlistInstrument]
     detail: MarketDetail
+    watchlist_details: List[MarketDetail] = Field(default_factory=list)
+    diagnostics: "MarketLiveDiagnostics"
     generated_at: str
+
+
+class MarketLiveDiagnostics(BaseModel):
+    requested_symbol: str
+    effective_symbol: str
+    timeframe: str
+    selection_corrected: bool = False
+    detail_source: Literal["mock", "fallback", "bybit_rest", "bybit_ws"] = "fallback"
+    detail_candle_count: int = 0
+    watchlist_symbol_count: int = 0
+    watchlist_real_detail_count: int = 0
+    watchlist_fallback_detail_count: int = 0
+    watchlist_source_breakdown: Dict[str, int] = Field(default_factory=dict)
+    generated_in_ms: int = 0
 
 
 class OpsLiveSummary(BaseModel):
@@ -333,6 +349,28 @@ class StrategyLiveSnapshot(BaseModel):
     generated_at: str
 
 
+class StrategyActivityLatestOpsSnapshot(BaseModel):
+    latest_active_order: Optional[str] = None
+    latest_historical_order: Optional[str] = None
+    latest_order: Optional[str] = None
+    latest_pending_alert: Optional[str] = None
+    latest_trade: Optional[str] = None
+    latest_alert: Optional[str] = None
+    latest_audit_event: Optional[str] = None
+    latest_active_order_record: Optional["OrderRecord"] = None
+    latest_historical_order_record: Optional["OrderRecord"] = None
+    latest_order_record: Optional["OrderRecord"] = None
+    latest_pending_alert_record: Optional["AlertRecord"] = None
+    latest_trade_record: Optional["TradeRecord"] = None
+    latest_alert_record: Optional["AlertRecord"] = None
+    latest_audit_event_record: Optional["ExecutionEvent"] = None
+
+
+class StrategyActivityLatestRuntimeSnapshot(BaseModel):
+    runtime: Optional["StrategyRuntimeSnapshot"] = None
+    latest_ops: Optional[StrategyActivityLatestOpsSnapshot] = None
+
+
 class StrategyActivitySnapshot(BaseModel):
     strategy_id: str
     strategy_name: str
@@ -340,9 +378,77 @@ class StrategyActivitySnapshot(BaseModel):
     market: Literal["spot", "perp"]
     mode: AccountMode
     runtime: Optional[StrategyRuntimeSnapshot] = None
+    latest_runtime: Optional[StrategyActivityLatestRuntimeSnapshot] = None
+    latest_ops: Optional[StrategyActivityLatestOpsSnapshot] = None
+    latest_backtest: Optional["StrategyActivityBacktestSummary"] = None
+    latest_actionable_backtest: Optional["StrategyActivityBacktestSummary"] = None
+    latest_backtest_record: Optional["BacktestRun"] = None
+    latest_actionable_backtest_record: Optional["BacktestRun"] = None
+    latest_backtest_review: Optional["StrategyActivityReviewSummary"] = None
+    latest_backtest_job: Optional["StrategyActivityJobSummary"] = None
+    latest_actionable_backtest_review: Optional["StrategyActivityReviewSummary"] = None
+    latest_actionable_backtest_job: Optional["StrategyActivityJobSummary"] = None
+    latest_backtest_review_record: Optional["ReviewDocument"] = None
+    latest_backtest_job_record: Optional["AgentJob"] = None
+    latest_actionable_backtest_review_record: Optional["ReviewDocument"] = None
+    latest_actionable_backtest_job_record: Optional["AgentJob"] = None
     latest_primary_review: Optional["StrategyActivityReviewSummary"] = None
+    latest_actionable_primary_review: Optional["StrategyActivityReviewSummary"] = None
+    latest_primary_review_record: Optional["ReviewDocument"] = None
+    latest_actionable_primary_review_record: Optional["ReviewDocument"] = None
     latest_tracking_review: Optional["StrategyActivityReviewSummary"] = None
     latest_tracking_job: Optional["StrategyActivityJobSummary"] = None
+    latest_tracking_review_record: Optional["ReviewDocument"] = None
+    latest_tracking_job_record: Optional["AgentJob"] = None
+    latest_proposal: Optional["StrategyProposal"] = None
+    latest_actionable_proposal: Optional["StrategyProposal"] = None
+    latest_proposal_change_request: Optional["ChangeRequest"] = None
+    latest_proposal_backtest: Optional["StrategyActivityBacktestSummary"] = None
+    latest_proposal_review: Optional["StrategyActivityReviewSummary"] = None
+    latest_proposal_job: Optional["StrategyActivityJobSummary"] = None
+    latest_proposal_backtest_record: Optional["BacktestRun"] = None
+    latest_proposal_review_record: Optional["ReviewDocument"] = None
+    latest_proposal_job_record: Optional["AgentJob"] = None
+    latest_actionable_proposal_change_request: Optional["ChangeRequest"] = None
+    latest_actionable_proposal_backtest: Optional["StrategyActivityBacktestSummary"] = None
+    latest_actionable_proposal_review: Optional["StrategyActivityReviewSummary"] = None
+    latest_actionable_proposal_job: Optional["StrategyActivityJobSummary"] = None
+    latest_actionable_proposal_backtest_record: Optional["BacktestRun"] = None
+    latest_actionable_proposal_review_record: Optional["ReviewDocument"] = None
+    latest_actionable_proposal_job_record: Optional["AgentJob"] = None
+    latest_change_request: Optional["ChangeRequest"] = None
+    latest_actionable_change_request: Optional["ChangeRequest"] = None
+    latest_change_request_backtest_record: Optional["BacktestRun"] = None
+    latest_change_request_review_record: Optional["ReviewDocument"] = None
+    latest_change_request_job_record: Optional["AgentJob"] = None
+    latest_change_request_source_backtest_record: Optional["BacktestRun"] = None
+    latest_change_request_source_review_record: Optional["ReviewDocument"] = None
+    latest_change_request_source_proposal_record: Optional["StrategyProposal"] = None
+    latest_actionable_change_request_backtest_record: Optional["BacktestRun"] = None
+    latest_actionable_change_request_review_record: Optional["ReviewDocument"] = None
+    latest_actionable_change_request_job_record: Optional["AgentJob"] = None
+    latest_actionable_change_request_source_backtest_record: Optional["BacktestRun"] = None
+    latest_actionable_change_request_source_review_record: Optional["ReviewDocument"] = None
+    latest_actionable_change_request_source_proposal_record: Optional["StrategyProposal"] = None
+    latest_retryable_tracking_job: Optional["StrategyActivityJobSummary"] = None
+    latest_retryable_tracking_job_record: Optional["AgentJob"] = None
+    latest_active_order: Optional[str] = None
+    latest_historical_order: Optional[str] = None
+    latest_order: Optional[str] = None
+    latest_pending_alert: Optional[str] = None
+    latest_trade: Optional[str] = None
+    latest_alert: Optional[str] = None
+    latest_active_order_record: Optional["OrderRecord"] = None
+    latest_historical_order_record: Optional["OrderRecord"] = None
+    latest_order_record: Optional["OrderRecord"] = None
+    latest_pending_alert_record: Optional["AlertRecord"] = None
+    latest_trade_record: Optional["TradeRecord"] = None
+    latest_alert_record: Optional["AlertRecord"] = None
+    latest_audit_event: Optional[str] = None
+    latest_audit_event_record: Optional["ExecutionEvent"] = None
+    recent_proposals: List["StrategyProposal"] = Field(default_factory=list)
+    recent_change_requests: List["ChangeRequest"] = Field(default_factory=list)
+    recent_backtests: List["StrategyActivityBacktestSummary"] = Field(default_factory=list)
     recent_reviews: List["StrategyActivityReviewSummary"] = Field(default_factory=list)
     active_orders: List["OrderRecord"] = Field(default_factory=list)
     recent_orders: List["OrderRecord"] = Field(default_factory=list)
@@ -371,11 +477,33 @@ class StrategyActivityReviewSummary(BaseModel):
     created_at: str
 
 
+class StrategyActivityBacktestSummary(BaseModel):
+    id: str
+    status: str
+    timeframe: BacktestTimeframe
+    data_range: str
+    sample_quality: BacktestSampleQuality
+    history_source: BacktestHistorySource
+    decision_readiness: BacktestDecisionReadiness
+    source_change_request_id: Optional[str] = None
+    source_backtest_id: Optional[str] = None
+    source_review_id: Optional[str] = None
+    source_proposal_id: Optional[str] = None
+    trigger_reason: Optional[str] = None
+    created_at: str
+    finished_at: Optional[str] = None
+
+
 class StrategyActivityJobSummary(BaseModel):
     id: str
     job_type: str
     status: JobStatus
     strategy_id: Optional[str] = None
+    backtest_id: Optional[str] = None
+    source_change_request_id: Optional[str] = None
+    source_backtest_id: Optional[str] = None
+    source_review_id: Optional[str] = None
+    source_proposal_id: Optional[str] = None
     requested_by: Optional[str] = None
     result_summary: Optional[str] = None
     linked_review_id: Optional[str] = None
@@ -465,6 +593,8 @@ class ChangeRequest(BaseModel):
     source_review_id: Optional[str] = None
     source_proposal_id: Optional[str] = None
     trigger_reason: Optional[str] = None
+    manual_followup_required: bool = False
+    manual_followup_detail: Optional[str] = None
     target_mode: AccountMode
     priority: PriorityLevel
     status: ChangeRequestStatus
@@ -521,6 +651,8 @@ class ChangeRequestCreate(BaseModel):
     source_review_id: Optional[str] = None
     source_proposal_id: Optional[str] = None
     trigger_reason: Optional[str] = "manual_create"
+    manual_followup_required: bool = False
+    manual_followup_detail: Optional[str] = None
     target_mode: AccountMode = AccountMode.PAPER
     priority: PriorityLevel = PriorityLevel.NORMAL
     summary: str
@@ -897,6 +1029,10 @@ class ExecutionEvent(BaseModel):
     symbol: Optional[str] = None
     strategy_id: Optional[str] = None
     payload: Dict[str, Any]
+    summary: Optional[str] = None
+    impact_detail: Optional[str] = None
+    priority: Optional[int] = None
+    is_key_event: Optional[bool] = None
     trace_id: str
     occurred_at: str
 
@@ -965,6 +1101,19 @@ class WorkspacePreferences(BaseModel):
     selected_market_timeframe: Literal["15m", "1h", "4h", "1d"] = "1h"
     selected_strategy_id: Optional[str] = None
     selected_backtest_id: Optional[str] = None
+    selected_scheduler_job_id: Optional[str] = None
+    selected_strategy_detail_panel: Optional[Literal["activity", "tracking", "editor"]] = None
+    selected_strategy_tracking_kind: Optional[Literal["issue", "change"]] = None
+    selected_strategy_tracking_summary: str = ""
+    selected_strategy_tracking_detail: str = ""
+    selected_strategy_editor_strategy_id: Optional[str] = None
+    selected_strategy_editor_parameter_drafts: Dict[str, str] = Field(default_factory=dict)
+    selected_strategy_editor_risk_budget_draft: str = ""
+    selected_review_inspector_id: Optional[str] = None
+    selected_review_inspector_strategy_id: Optional[str] = None
+    selected_review_id: Optional[str] = None
+    selected_proposal_id: Optional[str] = None
+    selected_change_request_id: Optional[str] = None
     backtest_filter: Literal["selected", "all"] = "selected"
     replay_tracking_scope: Literal["all", "selected"] = "all"
     alert_severity_filter: Literal["all", "P0", "P1", "P2"] = "all"
@@ -1003,6 +1152,19 @@ class WorkspacePreferencesUpdate(BaseModel):
     selected_market_timeframe: Literal["15m", "1h", "4h", "1d"] = "1h"
     selected_strategy_id: Optional[str] = None
     selected_backtest_id: Optional[str] = None
+    selected_scheduler_job_id: Optional[str] = None
+    selected_strategy_detail_panel: Optional[Literal["activity", "tracking", "editor"]] = None
+    selected_strategy_tracking_kind: Optional[Literal["issue", "change"]] = None
+    selected_strategy_tracking_summary: str = ""
+    selected_strategy_tracking_detail: str = ""
+    selected_strategy_editor_strategy_id: Optional[str] = None
+    selected_strategy_editor_parameter_drafts: Dict[str, str] = Field(default_factory=dict)
+    selected_strategy_editor_risk_budget_draft: str = ""
+    selected_review_inspector_id: Optional[str] = None
+    selected_review_inspector_strategy_id: Optional[str] = None
+    selected_review_id: Optional[str] = None
+    selected_proposal_id: Optional[str] = None
+    selected_change_request_id: Optional[str] = None
     backtest_filter: Literal["selected", "all"] = "selected"
     replay_tracking_scope: Literal["all", "selected"] = "all"
     alert_severity_filter: Literal["all", "P0", "P1", "P2"] = "all"

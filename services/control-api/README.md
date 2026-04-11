@@ -21,8 +21,16 @@ python3 services/control-api/main.py
 
 - 当前版本使用本地 JSON 持久化 mock 状态，文件位于 `services/control-api/.runtime/state.json`。
 - 桌面控制端的布局、默认页面、默认模式等工作台状态也通过本地服务持久化，方便后续会话恢复。
-- `WorkspacePreferences` 当前也会继续保存回测页聚焦回测、`仅当前策略/全策略` 回测筛选、复盘跟踪范围，以及提醒/成交/审计筛选器与审计搜索词，便于重启桌面端或切换会话后继续沿用原来的排障上下文。
+- `WorkspacePreferences` 当前也会继续保存回测页聚焦回测、当前聚焦的 replay review、当前聚焦的 AI 调度任务、当前打开的复盘结果详情小窗、策略页当前打开的活动/跟踪二级面板与跟踪草稿、当前定位的提案与 `ChangeRequest`、`仅当前策略/全策略` 回测筛选、复盘跟踪范围，以及提醒/成交/审计筛选器与审计搜索词，便于重启桌面端或切换会话后继续沿用原来的排障上下文；桌面端恢复这条定位项时，也会自动切回它所属的策略上下文。
+- 若策略编辑器当前已有未保存的参数或风险预算草稿，控制端当前也会继续保留 `selected_strategy_editor_strategy_id / selected_strategy_editor_*draft`；这样在同一策略页里切到活动/跟踪再回来时，编辑器草稿不会丢。若恢复时编辑器本身就是打开的，控制端也会优先按这条草稿所属策略恢复策略焦点。但若当前模块已经离开策略页，或草稿所属策略和当前策略焦点不再一致，控制端会在返回前自动清理这组字段，避免串到别的策略。
+- 其中复盘结果详情小窗当前除 `selected_review_inspector_id` 外，也会继续保留打开时的 `selected_review_inspector_strategy_id`；这样即使这条 review 自身没有明确 `strategy_id`，桌面端恢复小窗时也能保留原先的策略来源语境。
+- 控制端在返回 `WorkspacePreferences` 前，也会自动清理已经不存在的 `selected_symbol / selected_strategy_id / selected_backtest_id / selected_scheduler_job_id / selected_review_inspector_id / selected_review_id / selected_proposal_id / selected_change_request_id`，避免陈旧定位状态在服务端和桌面端之间反复恢复。
+- 若策略页当前打开的是活动或跟踪二级面板，控制端当前也会通过 `selected_strategy_detail_panel / selected_strategy_tracking_*` 保留这层近场上下文；但若当前模块已经不在策略页，会在返回前自动清理这些字段，避免恢复出越界的小窗状态。
+- 若当前恢复的是策略页上下文，控制端也会优先按 `selected_change_request_id` 对齐 `selected_strategy_id`；若没有定位变更但有有效的 `selected_proposal_id`，则会继续按提案对齐策略焦点；若当前恢复的是 `AI 调度` 页上下文，则会优先按 `selected_scheduler_job_id` 对齐策略与主品种；若当前恢复的是回放页上下文，则会优先按 `selected_review_id` 对齐策略与主品种；若当前恢复的是回测页上下文，则会优先按 `selected_backtest_id` 对齐策略焦点，避免跨模块恢复时上下文错位。
+- 上述两类恢复当前也会继续把 `selected_symbol` 对齐到对应策略或回测的主品种，避免桌面端已经恢复到正确对象，但行情盯盘仍停在旧 symbol。
 - 行情接口当前优先走 Bybit 公共 WebSocket + REST；WebSocket 负责近实时更新，REST 继续承担首帧与回退。
+- `GET /api/market/watchlist` 当前默认走本地快照快路径，避免桌面端切换品种或周期时被慢版全量刷新拖住；如需显式全量刷新，可带 `?refresh=true`。
+- `GET /api/market/live` 当前会优先复用 Bybit 公共 WebSocket 的 ticker / orderbook / recent trades / 15m|1h|4h|1d 最新 K 线快照；本地缓存缺失时才回退到 REST 历史行情。
 - 私有账户接口支持从环境变量或 `~/.bybit-control/private-api.json` 读取 Bybit API 配置。
 - 仓库内提供了示例文件 [private-api.example.json](/Users/leo/Desktop/Work/bybit/services/control-api/private-api.example.json)，请在本机自行复制到 `~/.bybit-control/private-api.json` 后再填写新的只读 Key，不要把真实密钥提交到仓库或发送到对话里。
 - `GET /api/integrations/bybit-private` 当前也会显式返回本机配置文件路径、文件是否存在，以及仓库内示例文件路径；设置页可直接复用这组字段提示本地配置入口。
@@ -112,11 +120,13 @@ python3 services/control-api/main.py
 - 当前 `/metrics` 还会额外输出 `bybit_control_paper_realized_pnl`、`bybit_control_paper_win_rate`、`bybit_control_paper_open_orders`、`bybit_control_paper_positions`、`bybit_control_paper_available_balance`，以及策略级的 `bybit_control_strategy_live_stop_loss_guard` / `bybit_control_strategy_live_stop_loss_cooldown_minutes` / `bybit_control_strategy_exchange_rejection_guard` / `bybit_control_strategy_exchange_rejection_cooldown_minutes` / `bybit_control_strategy_stale_order_guard`，便于后续 Grafana / Prometheus 看板接入。
 - 对 `live / demo` 策略执行而言，当前还会把 Bybit 私有 WS 的连通、鉴权与“最近是否仍在刷新”都当成真实执行门禁；若私有实时链路未连通、未鉴权或已失活，策略真实预检、手动策略执行与后台自动执行都会统一阻断。
 - `/metrics` 当前也会单独输出 `bybit_control_public_ws_stale{channel=...}` 与 `bybit_control_public_ws_stale_seconds{channel=...}`，便于后续 Grafana / Prometheus 直接监控公共实时行情链路。
+- `/metrics` 当前也会继续输出“当前工作台主图”这层诊断：`bybit_control_market_live_generation_ms`、`bybit_control_market_live_detail_candle_count`、`bybit_control_market_live_selection_corrected`、`bybit_control_market_live_watchlist_real_detail_count`、`bybit_control_market_live_watchlist_fallback_detail_count`、`bybit_control_market_live_watchlist_source_breakdown` 与 `bybit_control_market_live_snapshot_error`，便于直接看当前主图到底命中了 `Bybit 公共 WS / REST / fallback` 哪一层、有没有退回空图/回退图、以及控制端本次构建耗时。
 - 当前 `POST /api/integrations/bybit-private/probe-trade` 会向 Bybit 交易接口发送故意无效的下单参数，用来验证签名、认证和交易 POST 链路，不会直接发出可成交订单。
 - OpenClaw 集成当前已接通本机 worker，可自动执行日度复盘、回测复盘与变更落实补记；仍不修改 OpenClaw 源码，也不直接驱动 Bybit 交易。
 - 当前高影响策略变更在落地后会自动排一条 `review_strategy_change` 任务，补齐“变更 -> 落地 -> AI 跟踪摘要”的闭环；提醒规则等轻量变更仍沿用 `reconcile_change_request`。
 - `publish_recommendation` 当前除调度门禁外，也要求 payload 带有效 `recommendation`；若缺失结构化建议，后端会直接拒绝接受，不会提前改动提案状态。
 - `script_patch_proposal` 当前接受后会明确转成 `queued` 状态的 `ChangeRequest`，并补写 `change_request.manual_followup_required` 审计事件，表示这类脚本补丁仍需后续人工或编排链落实，不会直接走自动应用。
+- 这类 `script_patch_proposal -> ChangeRequest` 当前也会直接写回 `manual_followup_required / manual_followup_detail`，便于桌面端和后续审计直接显示“需人工跟进”，而不是只靠审计事件猜测。
 - `ChangeRequest` 当前也会显式返回 `source_backtest_id / source_review_id / source_proposal_id / trigger_reason`，把这次变更是“手动创建”还是“接受某条提案”，以及它是否来自某轮回测复盘，结构化保留下来，便于前端和后续审计直接追溯来源链路。
 - `ChangeRequest` 当前还会继续写回 `linked_backtest_id / linked_backtest_timeframe / linked_backtest_data_range`；对 `type=backtest.launch` 的变更，这组字段会直接指向它刚生成的那轮回测。
 - 对 `type=backtest.launch` 的变更，`follow_up_job_*` 当前也会优先指向 `generate_backtest_review`，让桌面端直接围绕这轮回测复盘展示排队中 / 执行中 / 失败 / 完成，而不是退回到泛化的 `reconcile_change_request`。
@@ -124,6 +134,8 @@ python3 services/control-api/main.py
 - 同一条 `ChangeRequest` 当前也会继续镜像这轮关联回测的 `history_source* / history_truncated / history_gap_reason / full_window_recommended_*`；即使桌面端暂时拿不到那轮回测详情，也能直接在变更卡片上展示“快照回退 / 样本截断”提示并复用结构化补样本建议。
 - 同一条 `ChangeRequest` 当前还会继续镜像这轮关联回测的 `requested_* / retrieved_* / used_*` 样本窗口覆盖字段，便于前端在没有 `BacktestRun` 详情的情况下也能保留“请求 / 取样 / 回测”窗口事实与覆盖率展示。
 - `ChangeRequest` 当前还会继续写回 `follow_up_job_id / follow_up_job_type / follow_up_job_status / follow_up_result_summary / linked_review_*`，让策略页和后续审计可直接看到这条变更后续排了哪条任务、当前跑到哪一步、有没有已经生成跟踪复盘；若这条变更后续又产出了 `generate_backtest_review`，这条回测复盘也会继续挂回同一条 `ChangeRequest.linked_review_*`。
+- `GET /api/strategies/{strategy_id}/activity` 当前也会继续返回 `recent_change_requests`，便于桌面端在策略活动二级窗里直接显示最近变更与 `manual_followup_required` 这类结构化状态，并复用现有 `ChangeRequest` 来源/回测/结果链做近场跳转。
+- 同一条策略活动接口当前也会继续返回 `recent_proposals`，便于桌面端在策略活动二级窗里直接显示最近提案、接受前的人工跟进提示，以及已生成的变更/回测/复盘，不必再从 `AI 复盘` 整页反查。
 - 若跟踪任务后续失败或被取消，再次重试时这组 `follow_up_job_*` 会自动切到新任务，并清空旧的失败摘要与旧结果引用，避免前端把“上一轮失败”误展示成当前状态。
 - 这组来源字段当前也会继续带进后续 `reconcile_change_request / review_strategy_change` 任务上下文，以及 `strategy.change.review.completed / failed` 审计事件，便于从提案、变更到跟踪结果保持同一条来源链。
 - 这类 `review_strategy_change` 任务在完成或失败后，当前也会额外写入 `strategy.change.review.completed / failed` 审计事件，方便策略活动与日志页直接复用。
@@ -142,7 +154,29 @@ python3 services/control-api/main.py
 - 上述复盘上下文当前还会带 `execution_top_issue_strategy_activity / review_strategy_activity`，把问题策略或当前复盘策略最近的运行态、提醒、委托、成交和审计事件压成紧凑摘要，便于 OpenClaw 直接引用。
 - 回测复盘任务当前会在入队时就固化 `review_strategy_activity`；后续生成 `generate_backtest_review` 提示词和写回 `ReviewDocument` 时会优先复用这份上下文，不再因稀疏上下文临时拉取 Bybit 实时链路。仅 `generate_daily_review` 仍保留最新执行健康兜底。
 - 这份紧凑策略活动摘要当前也会显式带 `runtime.next_action` 和结构化 `execution_preview` 关键信息，包括 `recommended_action` 与 `sizing_*` 资金门槛字段，后续复盘与排障无需再从提示文案里二次拆数。
+- 自动排队的 `review_strategy_change / generate_backtest_review` 当前也会在 `review_strategy_activity` 里固化最近提案与最近变更摘要；最近提案摘要会继续带上已生成的变更/回测/复盘落点，以及 `需人工跟进` 这类高价值状态。若任务由“接受提案”触发，入队时会先按 `accepted` 口径覆盖对应提案状态，避免队列快照仍停在旧的 `pending/testing`。
+- 同一份 `review_strategy_activity` 上下文当前也会继续带 `latest_primary_review / latest_tracking_review / latest_tracking_job / recent_reviews / recent_agent_jobs`；对手动发起的 `review_strategy_issue / review_strategy_change` 与自动排队的 `generate_backtest_review`，任务创建后还会立即回填一次，确保 queued 任务在自己的上下文里也能看到当前这条任务与最近 review/job 链。
+- 同一份 `review_strategy_activity` 上下文当前也会继续带 `latest_backtest / latest_backtest_review / latest_backtest_job / recent_backtests`；因此 `review_strategy_issue / review_strategy_change / generate_backtest_review` 在任务刚入队时，就能同时看到最近回测，以及最近回测已经落到复盘结果还是仍停在回测复盘任务里，不需要额外回拉活动接口。
+- 同一份 `review_strategy_activity` 上下文当前也会继续带 `latest_audit_event / recent_audit_events` 的高价值摘要，并补齐结构化的 `latest_audit_event_record`；不再只保留 `event_type · source`，而会优先写入 `summary / impact_detail / priority / is_key_event` 这类关键信息，便于 OpenClaw、桌面端和后端排障上下文直接引用。
+- 同一份 `review_strategy_activity` 上下文当前也会继续带 `latest_alert / latest_order / latest_trade`，并补齐结构化的 `latest_alert_record / latest_order_record / latest_trade_record`；同时还会继续固化 `latest_pending_alert / latest_pending_alert_record`、`latest_active_order / latest_active_order_record` 和 `latest_historical_order / latest_historical_order_record`，分别显式指出“当前仍待处理的提醒”“当前仍可操作的那张活动委托”和“历史委托里最新的一张”。其中 `recent_orders / recent_trades / recent_alerts / recent_audit_events` 当前都会先按时间倒序归一化，`latest_order*` 会优先在“最新活动委托”和“最新历史委托”之间选取创建时间更新的一条，而 `latest_active_order*` 会始终锁定活动态里最新的一条，`latest_historical_order*` 会始终锁定历史委托里最新的一条，`latest_alert*` 会按真实时间挑最新，`latest_pending_alert*` 会始终锁定未确认提醒里最新的一条，`latest_trade*` 也会按真实时间挑最新，不再依赖底层数组原始顺序。这样 OpenClaw 和后端排障上下文除了列表，还能直接同时看到最近一条提醒、当前待处理提醒、最近一条委托、当前仍可操作的活动委托和最近一条历史委托。
+- 同一份 `review_strategy_activity` 上下文当前也会继续带 `latest_runtime / latest_ops` 这组结构化分组：前者把当前 runtime 和最新运营摘要打包，后者把最新委托、成交、提醒和审计事件收拢成一组稳定字段；旧的平铺字段仍然保留，便于桌面端渐进迁移。
+- 同一份 `review_strategy_activity` 上下文当前也会继续带 `latest_proposal / latest_change_request`；这样 OpenClaw 和后端排障上下文除了最近列表，也能直接看到最近提案和最近变更的近场摘要。
+- 同一份 `review_strategy_activity` 上下文当前也会继续带 `latest_proposal_change_request / latest_proposal_backtest / latest_proposal_review / latest_proposal_job`，以及对应的 `latest_actionable_proposal_*`；这样最近提案和当前可处理提案已经落到哪一层，会由后端直接给出，不再只靠桌面端本地映射。
+- 同一份 `review_strategy_activity` 上下文当前也会继续带 `latest_proposal_backtest_record / latest_proposal_review_record / latest_proposal_job_record`，以及对应的 `latest_actionable_proposal_*_record`；这样最近提案和当前可处理提案如果已经落到完整 `BacktestRun / ReviewDocument / AgentJob`，后端会直接把正式对象固化进上下文，便于桌面端与 OpenClaw 沿结果链继续打开。
+- 同一份 `review_strategy_activity` 上下文当前也会继续带 `latest_actionable_proposal / latest_actionable_change_request / latest_actionable_backtest / latest_actionable_backtest_review / latest_actionable_backtest_job / latest_actionable_primary_review / latest_retryable_tracking_job`；这样 OpenClaw 和后端排障上下文不只知道“最近一条”是谁，也能直接知道当前仍可处理的提案、仍可重试/重跑的变更、当前仍可继续处理的回测/复盘，以及仍可重试的跟踪任务是谁。
+- 同一份 `review_strategy_activity` 上下文当前也会继续带 `latest_change_request_backtest_record / latest_change_request_review_record / latest_change_request_job_record`，以及对应的 `latest_actionable_change_request_*_record`；这样最近变更和当前可处理变更若已经落到完整 `BacktestRun / ReviewDocument / AgentJob`，后端会直接把正式对象固化进上下文，便于桌面端与 OpenClaw 沿结果链继续打开。
+- 同一份 `review_strategy_activity` 上下文当前也会继续带 `latest_change_request_source_backtest_record / latest_change_request_source_review_record / latest_change_request_source_proposal_record`，以及对应的 `latest_actionable_change_request_source_*_record`；这样最近变更和当前可处理变更若已经带来源回测、来源复盘或来源提案，后端会直接把这些正式来源对象固化进上下文，便于桌面端与 OpenClaw 继续沿来源链打开。
+- 若最近提案已经生成 `ChangeRequest` 并继续排了跟踪任务，这份摘要当前也会继续带上 `follow_up_job_type / follow_up_job_status / linked_review_title` 等结果线索，便于 AI 排障直接知道这条提案后续已经推进到哪一步。
 - 当前已提供 `GET /api/strategies/{strategy_id}/activity`，可按单条策略聚合最近运行态、委托、成交、提醒和审计事件，便于桌面端二级小窗或 AI 复盘直接复用。
+- 这条活动接口当前也会附带 `latest_backtest / latest_backtest_review / latest_backtest_job / recent_backtests`，便于桌面端和 AI 上下文直接看到最近回测的状态、周期、区间、来源链，以及当前这轮回测对应的结果/任务落点。
+- 这条活动接口当前也会附带 `latest_backtest_record / latest_actionable_backtest_record`，让桌面端和 AI 上下文直接拿到完整 `BacktestRun` 结构，不必再靠全量回测列表反查最近回测或当前可处理回测的门禁、窗口和来源链。
+- 这条活动接口当前也会附带 `latest_backtest_review_record / latest_backtest_job_record / latest_actionable_backtest_review_record / latest_actionable_backtest_job_record / latest_primary_review_record / latest_actionable_primary_review_record / latest_tracking_review_record / latest_tracking_job_record / latest_retryable_tracking_job_record`，让桌面端和 AI 上下文在最近复盘、跟踪结果或任务不在全局列表时，仍能直接复用完整 `ReviewDocument / AgentJob` 结构继续沿结果链、来源链与重试动作往下走。
+- 同一条活动接口当前也会附带 `latest_audit_event / latest_alert / latest_order / latest_trade`，并补齐结构化的 `latest_audit_event_record / latest_alert_record / latest_order_record / latest_trade_record`；同时还会继续附带 `latest_pending_alert / latest_pending_alert_record`、`latest_active_order / latest_active_order_record` 与 `latest_historical_order / latest_historical_order_record`，显式告诉桌面端“当前待处理提醒”“当前仍可改单/撤单的那张活动委托”和“历史委托里最新的一张”分别是谁。其中 `recent_orders / recent_trades / recent_alerts / recent_audit_events` 也会先按时间倒序归一化，`latest_order*` 同样会优先在“最新活动委托”和“最新历史委托”之间选取更新的一条，而 `latest_active_order*` 会始终锁定活动态里最新的一条，`latest_historical_order*` 会始终锁定历史委托里最新的一条，`latest_alert*` 会按真实时间挑最新，`latest_pending_alert*` 会始终锁定未确认提醒里最新的一条，`latest_trade*` 也会按真实时间挑最新，便于桌面端策略活动面板顶部同时复用最近一条提醒、当前待处理提醒、最近一条委托、当前活跃委托和当前最新历史委托，而不必再只靠最近列表第一条做本地推断。
+- 同一条活动接口当前也会附带 `latest_proposal / latest_change_request`，便于桌面端策略活动面板顶部直接显示最近提案与最近变更摘要，而不必再只靠最近列表第一条做本地推断。
+- 同一条活动接口当前也会附带 `latest_proposal_change_request / latest_proposal_backtest / latest_proposal_review / latest_proposal_job`，以及对应的 `latest_actionable_proposal_*`，便于桌面端顶部摘要、提案正文和直达按钮直接锁定“最近提案 / 当前可处理提案”已经落到的变更、回测、复盘或任务。
+- 同一条活动接口当前也会附带 `latest_proposal_backtest_record / latest_proposal_review_record / latest_proposal_job_record`，以及对应的 `latest_actionable_proposal_*_record`，便于桌面端在这些结果或任务暂时不在全局列表时，仍能直接复用完整对象继续打开结果、任务与来源链。
+- 同一条活动接口当前也会附带 `latest_actionable_proposal / latest_actionable_change_request / latest_actionable_backtest / latest_actionable_backtest_review / latest_actionable_backtest_job / latest_actionable_primary_review / latest_retryable_tracking_job`，便于桌面端直接复用“当前可处理提案 / 当前可处理变更 / 当前可处理回测 / 当前可处理复盘 / 当前可重试任务”这组近场动作，而不必长期只靠本地扫描最近列表。
+- 同一条活动接口当前也会附带 `latest_change_request_backtest_record / latest_change_request_review_record / latest_change_request_job_record`，以及对应的 `latest_actionable_change_request_*_record`，便于桌面端在这些结果或任务暂时不在全局列表时，仍能直接复用完整对象继续打开最近变更和当前可处理变更的结果链。
 - 即使工作台当前 `selected_mode` 与策略自身模式不一致，这条活动接口当前也会优先补齐按该策略自身模式生成的 `execution_preview`，便于直接查看真实阻断或当前建议。
 - 这条接口当前也会附带最近的策略相关 AI 任务摘要，便于直接查看 `review_strategy_change / generate_backtest_review` 等跟踪动作。
 - 这条接口当前也会附带最近的 `review_strategy_issue` 摘要，便于在同一处直接回看单策略最近一次异常跟踪。

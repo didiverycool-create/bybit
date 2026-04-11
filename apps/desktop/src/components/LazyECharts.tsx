@@ -11,8 +11,10 @@ type LazyChartProps = {
   option: object
   style?: CSSProperties
   notMerge?: boolean
+  lazyUpdate?: boolean
 }
 
 export default function LazyECharts(props: LazyChartProps) {
-  return <ReactEChartsCore echarts={echarts} {...props} />
+  const { lazyUpdate = true, ...rest } = props
+  return <ReactEChartsCore echarts={echarts} opts={{ renderer: 'canvas' }} lazyUpdate={lazyUpdate} {...rest} />
 }

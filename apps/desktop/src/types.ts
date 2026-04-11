@@ -227,7 +227,7 @@ export interface MarketDetail {
   recent_public_trades: MarketRecentTrade[]
   headline: string
   stats: Record<string, string>
-  source?: 'mock' | 'bybit_rest' | 'bybit_ws'
+  source?: 'mock' | 'fallback' | 'bybit_rest' | 'bybit_ws'
   updated_at?: string | null
 }
 
@@ -235,7 +235,23 @@ export interface MarketLiveSnapshot {
   selected_symbol: string
   watchlist: WatchlistInstrument[]
   detail: MarketDetail
+  watchlist_details?: MarketDetail[]
+  diagnostics: MarketLiveDiagnostics
   generated_at: string
+}
+
+export interface MarketLiveDiagnostics {
+  requested_symbol: string
+  effective_symbol: string
+  timeframe: string
+  selection_corrected: boolean
+  detail_source: 'mock' | 'fallback' | 'bybit_rest' | 'bybit_ws'
+  detail_candle_count: number
+  watchlist_symbol_count: number
+  watchlist_real_detail_count: number
+  watchlist_fallback_detail_count: number
+  watchlist_source_breakdown: Record<string, number>
+  generated_in_ms: number
 }
 
 export interface OpsLiveSummary {
@@ -326,6 +342,28 @@ export interface StrategyLiveSnapshot {
   generated_at: string
 }
 
+export interface StrategyActivityLatestOpsSnapshot {
+  latest_active_order?: string | null
+  latest_historical_order?: string | null
+  latest_order?: string | null
+  latest_pending_alert?: string | null
+  latest_trade?: string | null
+  latest_alert?: string | null
+  latest_audit_event?: string | null
+  latest_active_order_record?: OrderRecord | null
+  latest_historical_order_record?: OrderRecord | null
+  latest_order_record?: OrderRecord | null
+  latest_pending_alert_record?: AlertRecord | null
+  latest_trade_record?: TradeRecord | null
+  latest_alert_record?: AlertRecord | null
+  latest_audit_event_record?: ExecutionEvent | null
+}
+
+export interface StrategyActivityLatestRuntimeSnapshot {
+  runtime?: StrategyRuntimeSnapshot | null
+  latest_ops?: StrategyActivityLatestOpsSnapshot | null
+}
+
 export interface StrategyActivitySnapshot {
   strategy_id: string
   strategy_name: string
@@ -333,9 +371,77 @@ export interface StrategyActivitySnapshot {
   market: 'spot' | 'perp'
   mode: Mode
   runtime?: StrategyRuntimeSnapshot | null
+  latest_runtime?: StrategyActivityLatestRuntimeSnapshot | null
+  latest_ops?: StrategyActivityLatestOpsSnapshot | null
+  latest_backtest?: StrategyActivityBacktestSummary | null
+  latest_actionable_backtest?: StrategyActivityBacktestSummary | null
+  latest_backtest_record?: BacktestRun | null
+  latest_actionable_backtest_record?: BacktestRun | null
+  latest_backtest_review?: StrategyActivityReviewSummary | null
+  latest_backtest_job?: StrategyActivityJobSummary | null
+  latest_actionable_backtest_review?: StrategyActivityReviewSummary | null
+  latest_actionable_backtest_job?: StrategyActivityJobSummary | null
+  latest_backtest_review_record?: ReviewDocument | null
+  latest_backtest_job_record?: AgentJob | null
+  latest_actionable_backtest_review_record?: ReviewDocument | null
+  latest_actionable_backtest_job_record?: AgentJob | null
   latest_primary_review?: StrategyActivityReviewSummary | null
+  latest_actionable_primary_review?: StrategyActivityReviewSummary | null
+  latest_primary_review_record?: ReviewDocument | null
+  latest_actionable_primary_review_record?: ReviewDocument | null
   latest_tracking_review?: StrategyActivityReviewSummary | null
   latest_tracking_job?: StrategyActivityJobSummary | null
+  latest_tracking_review_record?: ReviewDocument | null
+  latest_tracking_job_record?: AgentJob | null
+  latest_proposal?: StrategyProposal | null
+  latest_actionable_proposal?: StrategyProposal | null
+  latest_proposal_change_request?: ChangeRequest | null
+  latest_proposal_backtest?: StrategyActivityBacktestSummary | null
+  latest_proposal_review?: StrategyActivityReviewSummary | null
+  latest_proposal_job?: StrategyActivityJobSummary | null
+  latest_proposal_backtest_record?: BacktestRun | null
+  latest_proposal_review_record?: ReviewDocument | null
+  latest_proposal_job_record?: AgentJob | null
+  latest_actionable_proposal_change_request?: ChangeRequest | null
+  latest_actionable_proposal_backtest?: StrategyActivityBacktestSummary | null
+  latest_actionable_proposal_review?: StrategyActivityReviewSummary | null
+  latest_actionable_proposal_job?: StrategyActivityJobSummary | null
+  latest_actionable_proposal_backtest_record?: BacktestRun | null
+  latest_actionable_proposal_review_record?: ReviewDocument | null
+  latest_actionable_proposal_job_record?: AgentJob | null
+  latest_change_request?: ChangeRequest | null
+  latest_actionable_change_request?: ChangeRequest | null
+  latest_change_request_backtest_record?: BacktestRun | null
+  latest_change_request_review_record?: ReviewDocument | null
+  latest_change_request_job_record?: AgentJob | null
+  latest_change_request_source_backtest_record?: BacktestRun | null
+  latest_change_request_source_review_record?: ReviewDocument | null
+  latest_change_request_source_proposal_record?: StrategyProposal | null
+  latest_actionable_change_request_backtest_record?: BacktestRun | null
+  latest_actionable_change_request_review_record?: ReviewDocument | null
+  latest_actionable_change_request_job_record?: AgentJob | null
+  latest_actionable_change_request_source_backtest_record?: BacktestRun | null
+  latest_actionable_change_request_source_review_record?: ReviewDocument | null
+  latest_actionable_change_request_source_proposal_record?: StrategyProposal | null
+  latest_retryable_tracking_job?: StrategyActivityJobSummary | null
+  latest_retryable_tracking_job_record?: AgentJob | null
+  latest_active_order?: string | null
+  latest_historical_order?: string | null
+  latest_order?: string | null
+  latest_pending_alert?: string | null
+  latest_trade?: string | null
+  latest_alert?: string | null
+  latest_active_order_record?: OrderRecord | null
+  latest_historical_order_record?: OrderRecord | null
+  latest_order_record?: OrderRecord | null
+  latest_pending_alert_record?: AlertRecord | null
+  latest_trade_record?: TradeRecord | null
+  latest_alert_record?: AlertRecord | null
+  latest_audit_event?: string | null
+  latest_audit_event_record?: ExecutionEvent | null
+  recent_proposals: StrategyProposal[]
+  recent_change_requests: ChangeRequest[]
+  recent_backtests: StrategyActivityBacktestSummary[]
   recent_reviews: StrategyActivityReviewSummary[]
   active_orders: OrderRecord[]
   recent_orders: OrderRecord[]
@@ -364,11 +470,36 @@ export interface StrategyActivityReviewSummary {
   created_at: string
 }
 
+export interface StrategyActivityBacktestSummary
+  extends Pick<
+    BacktestRun,
+    | 'id'
+    | 'status'
+    | 'timeframe'
+    | 'data_range'
+    | 'sample_quality'
+    | 'history_source'
+    | 'decision_readiness'
+    | 'source_change_request_id'
+    | 'source_backtest_id'
+    | 'source_review_id'
+    | 'source_proposal_id'
+    | 'trigger_reason'
+  > {
+  created_at: string
+  finished_at?: string | null
+}
+
 export interface StrategyActivityJobSummary {
   id: string
   job_type: string
   status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled' | 'waiting'
   strategy_id?: string | null
+  backtest_id?: string | null
+  source_change_request_id?: string | null
+  source_backtest_id?: string | null
+  source_review_id?: string | null
+  source_proposal_id?: string | null
   requested_by?: string | null
   result_summary?: string | null
   linked_review_id?: string | null
@@ -463,6 +594,8 @@ export interface ChangeRequest {
   source_review_id?: string | null
   source_proposal_id?: string | null
   trigger_reason?: string | null
+  manual_followup_required?: boolean
+  manual_followup_detail?: string | null
   target_mode: Mode
   priority: 'low' | 'normal' | 'high' | 'critical'
   status: ChangeRequestStatus
@@ -745,6 +878,10 @@ export interface ExecutionEvent {
   symbol?: string | null
   strategy_id?: string | null
   payload: Record<string, unknown>
+  summary?: string | null
+  impact_detail?: string | null
+  priority?: number | null
+  is_key_event?: boolean | null
   trace_id: string
   occurred_at: string
 }
@@ -786,6 +923,19 @@ export interface WorkspacePreferences {
   selected_market_timeframe: '15m' | '1h' | '4h' | '1d'
   selected_strategy_id?: string | null
   selected_backtest_id?: string | null
+  selected_scheduler_job_id?: string | null
+  selected_strategy_detail_panel?: 'activity' | 'tracking' | 'editor' | null
+  selected_strategy_tracking_kind?: 'issue' | 'change' | null
+  selected_strategy_tracking_summary?: string
+  selected_strategy_tracking_detail?: string
+  selected_strategy_editor_strategy_id?: string | null
+  selected_strategy_editor_parameter_drafts?: Record<string, string>
+  selected_strategy_editor_risk_budget_draft?: string
+  selected_review_inspector_id?: string | null
+  selected_review_inspector_strategy_id?: string | null
+  selected_review_id?: string | null
+  selected_proposal_id?: string | null
+  selected_change_request_id?: string | null
   backtest_filter: 'selected' | 'all'
   replay_tracking_scope: 'all' | 'selected'
   alert_severity_filter: 'all' | 'P0' | 'P1' | 'P2'

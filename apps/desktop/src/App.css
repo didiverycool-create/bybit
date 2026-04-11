@@ -2507,6 +2507,8 @@
 }
 
 .terminal-stage__chart {
+  position: relative;
+  height: 318px;
   min-height: 318px;
   border-radius: 14px;
   border: 1px solid rgba(148, 163, 184, 0.12);
@@ -2514,6 +2516,10 @@
     radial-gradient(circle at top, rgba(34, 211, 238, 0.06), transparent 50%),
     rgba(4, 8, 16, 0.92);
   overflow: hidden;
+}
+
+.terminal-stage__chart > div {
+  height: 100%;
 }
 
 .terminal-stage__metrics {
