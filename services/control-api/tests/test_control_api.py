@@ -20218,5 +20218,381 @@ class SignalConfidenceCalibrationUnitTests(unittest.TestCase):
         self.assertFalse(hint["confidence_multi_timeframe_alignment"])
 
 
+class NewStrategyKernelsUnitTests(unittest.TestCase):
+    """Round 47 — three additional strategy kernels.
+
+    Adds evaluate helpers and backtest runners for momentum (ROC + EMA),
+    Bollinger squeeze breakout and RSI reversal. Tests focus on the new
+    code paths: evaluate returns expected signal + confidence on synthetic
+    candles, each backtest runner produces at least one closed trade, and
+    Round 46 confidence calibration still threads through every new kernel.
+    """
+
+    def _build_detail(
+        self,
+        closes: List[float],
+        *,
+        bar_range_pct: float = 0.005,
+    ) -> Any:
+        from models import MarketDetail
+
+        candles = [
+            CandlePoint(
+                time=f"2026-04-{(idx % 28) + 1:02d}T{idx % 24:02d}:00:00+00:00",
+                open=close,
+                high=close * (1.0 + bar_range_pct),
+                low=close * (1.0 - bar_range_pct),
+                close=close,
+                volume=1_000.0,
+            )
+            for idx, close in enumerate(closes)
+        ]
+        return MarketDetail(
+            symbol="BTCUSDT",
+            market="perp",
+            timeframe="1h",
+            candles=candles,
+            bids=[],
+            asks=[],
+            headline="new-kernels test",
+            stats={},
+            source="fallback",
+        )
+
+    def _build_watch_item(self, last_price: float, change_24h: float = 1.2) -> Any:
+        return WatchlistInstrument(
+            symbol="BTCUSDT",
+            market="perp",
+            last_price=last_price,
+            change_24h=change_24h,
+            volume_24h=10_000.0,
+            signal="active",
+            position_side="flat",
+            risk_level="medium",
+        )
+
+    def _candles_from_closes(
+        self,
+        closes: List[float],
+        *,
+        bar_range_pct: float = 0.005,
+    ) -> List[Any]:
+        return [
+            backtest_engine.CandlePoint(
+                time=f"2026-04-{(idx % 28) + 1:02d}T{idx % 24:02d}:00:00+00:00",
+                open=close,
+                high=close * (1.0 + bar_range_pct),
+                low=close * (1.0 - bar_range_pct),
+                close=close,
+                volume=1_000.0,
+            )
+            for idx, close in enumerate(closes)
+        ]
+
+    def _strategy(
+        self,
+        *,
+        strategy_id: str,
+        kernel: Optional[str] = None,
+        parameters: Optional[List[Any]] = None,
+        enabled: bool = False,
+        regime_adjustments: Optional[Any] = None,
+        drift_penalty: Optional[float] = 0.0,
+        multi_tf: Optional[bool] = False,
+    ) -> Any:
+        from models import StrategySummary
+
+        return StrategySummary(
+            id=strategy_id,
+            name="新 Kernel 测试",
+            category="template",
+            status="running",
+            symbols=["BTCUSDT"],
+            mode=AccountMode.PAPER,
+            version="v1",
+            pnl_7d="+0.0%",
+            max_drawdown="-0.0%",
+            risk_budget="18%",
+            description="round 47 unit test",
+            parameters=parameters or [],
+            kernel=kernel,
+            confidence_calibration_enabled=enabled,
+            confidence_regime_adjustments=regime_adjustments,
+            confidence_parameter_drift_penalty=drift_penalty,
+            confidence_multi_timeframe_alignment=multi_tf,
+        )
+
+    # ------------------------------------------------------------------
+    # Kernel 4 — Momentum
+    # ------------------------------------------------------------------
+
+    def test_momentum_evaluate_emits_long_on_strong_roc(self) -> None:
+        """Rising price sequence should exceed the ROC threshold and land the
+        price above the EMA so the kernel emits ``long``.
+        """
+        import strategy_runtime
+
+        parameters = [
+            StrategyParameter(key="roc_window", label="roc", value=3),
+            StrategyParameter(key="ema_trend_window", label="ema", value=5),
+            StrategyParameter(key="momentum_threshold_pct", label="thr", value=1.0),
+        ]
+        strategy = self._strategy(
+            strategy_id="momentum-long-01",
+            kernel="momentum",
+            parameters=parameters,
+        )
+        closes = [100.0, 101.0, 102.0, 103.0, 104.0, 105.0, 108.0, 112.0]
+        snap = strategy_runtime.evaluate_strategy_runtime(
+            strategy, self._build_detail(closes), self._build_watch_item(112.0)
+        )
+        self.assertEqual(snap.signal, "long")
+        self.assertGreater(snap.confidence, 30.0)
+
+    def test_momentum_backtest_runner_produces_at_least_one_trade(self) -> None:
+        """Strong upward drift should let the momentum runner open + close at
+        least one trade over a short candle series.
+        """
+
+        parameters = [
+            StrategyParameter(key="roc_window", label="roc", value=3),
+            StrategyParameter(key="ema_trend_window", label="ema", value=5),
+            StrategyParameter(key="momentum_threshold_pct", label="thr", value=0.5),
+        ]
+        strategy = self._strategy(
+            strategy_id="momentum-bt-01",
+            kernel="momentum",
+            parameters=parameters,
+        )
+        # 15 bars: gentle uptrend then a pullback to fire both entry and exit.
+        closes = [
+            100.0, 101.0, 102.0, 103.0, 104.0, 106.0, 108.0, 110.0,
+            112.0, 113.0, 112.0, 110.0, 108.0, 107.0, 106.0,
+        ]
+        candles = self._candles_from_closes(closes)
+        result = backtest_engine.run_local_backtest(
+            strategy, candles, "1h", "2026-04-01 ~ 2026-04-02"
+        )
+        self.assertGreaterEqual(result.metrics.trades, 1)
+
+    def test_momentum_evaluate_responds_to_confidence_calibration(self) -> None:
+        """With calibration on and a regime multiplier of 0.5, the momentum
+        kernel's confidence must drop versus the opt-out baseline.
+        """
+        import strategy_runtime
+        from models import ConfidenceRegimeAdjustments, VolatilityRegimeThresholds
+
+        parameters = [
+            StrategyParameter(key="roc_window", label="roc", value=3),
+            StrategyParameter(key="ema_trend_window", label="ema", value=5),
+            StrategyParameter(key="momentum_threshold_pct", label="thr", value=1.0),
+        ]
+        closes = [100.0, 101.0, 102.0, 103.0, 104.0, 105.0, 108.0, 112.0]
+        detail = self._build_detail(closes)
+        watch = self._build_watch_item(112.0)
+
+        baseline = self._strategy(
+            strategy_id="momentum-calib-base",
+            kernel="momentum",
+            parameters=parameters,
+            enabled=False,
+        )
+        calibrated = self._strategy(
+            strategy_id="momentum-calib-on",
+            kernel="momentum",
+            parameters=parameters,
+            enabled=True,
+            regime_adjustments=ConfidenceRegimeAdjustments(low=0.5, normal=0.5, high=0.5),
+        )
+        calibrated.volatility_regime_thresholds = VolatilityRegimeThresholds(
+            low_pct=0.3, high_pct=1.5
+        )
+
+        base_snap = strategy_runtime.evaluate_strategy_runtime(baseline, detail, watch)
+        calib_snap = strategy_runtime.evaluate_strategy_runtime(calibrated, detail, watch)
+        self.assertGreater(base_snap.confidence, calib_snap.confidence)
+
+    # ------------------------------------------------------------------
+    # Kernel 5 — Bollinger squeeze
+    # ------------------------------------------------------------------
+
+    def test_bollinger_squeeze_evaluate_emits_long_on_breakout(self) -> None:
+        """After a compressed period the kernel must emit ``long`` when the
+        latest close breaks above the upper band.
+        """
+        import strategy_runtime
+
+        parameters = [
+            StrategyParameter(key="bollinger_window", label="bw", value=6),
+            StrategyParameter(key="bollinger_std", label="std", value=2.0),
+            StrategyParameter(key="squeeze_bandwidth_pct", label="sq", value=1.0),
+        ]
+        strategy = self._strategy(
+            strategy_id="bollinger-brk-01",
+            kernel="bollinger_squeeze",
+            parameters=parameters,
+        )
+        # Tight squeeze (closes near 100) followed by a sharp breakout.
+        closes = [100.0, 100.1, 100.0, 100.2, 100.1, 100.0, 100.2, 105.0]
+        snap = strategy_runtime.evaluate_strategy_runtime(
+            strategy, self._build_detail(closes), self._build_watch_item(105.0)
+        )
+        self.assertEqual(snap.signal, "long")
+        self.assertGreater(snap.confidence, 30.0)
+
+    def test_bollinger_squeeze_backtest_runner_produces_at_least_one_trade(self) -> None:
+        """Runner must enter on the squeeze-then-breakout fixture and close at
+        least one trade before the series ends.
+        """
+
+        parameters = [
+            StrategyParameter(key="bollinger_window", label="bw", value=5),
+            StrategyParameter(key="bollinger_std", label="std", value=2.0),
+            StrategyParameter(key="squeeze_bandwidth_pct", label="sq", value=1.0),
+        ]
+        strategy = self._strategy(
+            strategy_id="bollinger-bt-01",
+            kernel="bollinger_squeeze",
+            parameters=parameters,
+        )
+        closes = [
+            100.0, 100.1, 100.0, 100.2, 100.1, 100.05, 100.1,
+            103.0, 104.0, 105.0, 104.0, 102.0, 100.0,
+        ]
+        candles = self._candles_from_closes(closes, bar_range_pct=0.001)
+        result = backtest_engine.run_local_backtest(
+            strategy, candles, "1h", "2026-04-01 ~ 2026-04-02"
+        )
+        self.assertGreaterEqual(result.metrics.trades, 1)
+
+    def test_bollinger_squeeze_evaluate_responds_to_confidence_calibration(self) -> None:
+        """Calibration discounts the Bollinger kernel's long-breakout
+        confidence when the regime multiplier is below 1.
+        """
+        import strategy_runtime
+        from models import ConfidenceRegimeAdjustments, VolatilityRegimeThresholds
+
+        parameters = [
+            StrategyParameter(key="bollinger_window", label="bw", value=6),
+            StrategyParameter(key="bollinger_std", label="std", value=2.0),
+            StrategyParameter(key="squeeze_bandwidth_pct", label="sq", value=1.0),
+        ]
+        closes = [100.0, 100.1, 100.0, 100.2, 100.1, 100.0, 100.2, 105.0]
+        detail = self._build_detail(closes)
+        watch = self._build_watch_item(105.0)
+
+        baseline = self._strategy(
+            strategy_id="bollinger-calib-base",
+            kernel="bollinger_squeeze",
+            parameters=parameters,
+            enabled=False,
+        )
+        calibrated = self._strategy(
+            strategy_id="bollinger-calib-on",
+            kernel="bollinger_squeeze",
+            parameters=parameters,
+            enabled=True,
+            regime_adjustments=ConfidenceRegimeAdjustments(low=0.5, normal=0.5, high=0.5),
+        )
+        calibrated.volatility_regime_thresholds = VolatilityRegimeThresholds(
+            low_pct=0.3, high_pct=1.5
+        )
+
+        base_snap = strategy_runtime.evaluate_strategy_runtime(baseline, detail, watch)
+        calib_snap = strategy_runtime.evaluate_strategy_runtime(calibrated, detail, watch)
+        self.assertGreater(base_snap.confidence, calib_snap.confidence)
+
+    # ------------------------------------------------------------------
+    # Kernel 6 — RSI reversal
+    # ------------------------------------------------------------------
+
+    def test_rsi_reversal_evaluate_emits_long_on_oversold(self) -> None:
+        """A long consecutive decline should push RSI below the oversold
+        threshold and yield a ``long`` signal.
+        """
+        import strategy_runtime
+
+        parameters = [
+            StrategyParameter(key="rsi_window", label="rsi", value=3),
+            StrategyParameter(key="rsi_overbought", label="ob", value=70.0),
+            StrategyParameter(key="rsi_oversold", label="os", value=30.0),
+        ]
+        strategy = self._strategy(
+            strategy_id="rsi-long-01",
+            kernel="rsi_reversal",
+            parameters=parameters,
+        )
+        # Monotonic decline → RSI collapses well below 30.
+        closes = [120.0, 115.0, 110.0, 105.0, 100.0, 95.0, 90.0, 85.0]
+        snap = strategy_runtime.evaluate_strategy_runtime(
+            strategy, self._build_detail(closes), self._build_watch_item(85.0)
+        )
+        self.assertEqual(snap.signal, "long")
+        self.assertGreater(snap.confidence, 30.0)
+
+    def test_rsi_reversal_backtest_runner_produces_at_least_one_trade(self) -> None:
+        """Runner must enter when RSI collapses and exit when it recovers
+        above the midline.
+        """
+
+        parameters = [
+            StrategyParameter(key="rsi_window", label="rsi", value=3),
+            StrategyParameter(key="rsi_overbought", label="ob", value=70.0),
+            StrategyParameter(key="rsi_oversold", label="os", value=30.0),
+        ]
+        strategy = self._strategy(
+            strategy_id="rsi-bt-01",
+            kernel="rsi_reversal",
+            parameters=parameters,
+        )
+        # Decline into oversold then recover to trigger exit.
+        closes = [
+            120.0, 115.0, 110.0, 105.0, 100.0, 95.0, 90.0,
+            92.0, 95.0, 100.0, 104.0, 108.0, 112.0,
+        ]
+        candles = self._candles_from_closes(closes)
+        result = backtest_engine.run_local_backtest(
+            strategy, candles, "1h", "2026-04-01 ~ 2026-04-02"
+        )
+        self.assertGreaterEqual(result.metrics.trades, 1)
+
+    def test_rsi_reversal_evaluate_responds_to_confidence_calibration(self) -> None:
+        """Calibration must discount the RSI kernel's confidence when the
+        regime multiplier is below 1.
+        """
+        import strategy_runtime
+        from models import ConfidenceRegimeAdjustments, VolatilityRegimeThresholds
+
+        parameters = [
+            StrategyParameter(key="rsi_window", label="rsi", value=3),
+            StrategyParameter(key="rsi_overbought", label="ob", value=70.0),
+            StrategyParameter(key="rsi_oversold", label="os", value=30.0),
+        ]
+        closes = [120.0, 115.0, 110.0, 105.0, 100.0, 95.0, 90.0, 85.0]
+        detail = self._build_detail(closes)
+        watch = self._build_watch_item(85.0)
+
+        baseline = self._strategy(
+            strategy_id="rsi-calib-base",
+            kernel="rsi_reversal",
+            parameters=parameters,
+            enabled=False,
+        )
+        calibrated = self._strategy(
+            strategy_id="rsi-calib-on",
+            kernel="rsi_reversal",
+            parameters=parameters,
+            enabled=True,
+            regime_adjustments=ConfidenceRegimeAdjustments(low=0.5, normal=0.5, high=0.5),
+        )
+        calibrated.volatility_regime_thresholds = VolatilityRegimeThresholds(
+            low_pct=0.3, high_pct=1.5
+        )
+
+        base_snap = strategy_runtime.evaluate_strategy_runtime(baseline, detail, watch)
+        calib_snap = strategy_runtime.evaluate_strategy_runtime(calibrated, detail, watch)
+        self.assertGreater(base_snap.confidence, calib_snap.confidence)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

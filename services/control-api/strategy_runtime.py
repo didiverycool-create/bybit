@@ -54,6 +54,24 @@ _BREAKOUT_DEFAULT_PARAMS: Dict[str, float] = {
     "stop_loss_pct": 1.8,
     "take_profit_pct": 4.2,
 }
+# Round 47 — drift defaults for the three newly-added kernels. Each mirrors
+# the evaluator's built-in parameter defaults so a strategy that leaves every
+# tunable at its preset value produces a drift score of ``0.0`` (no penalty).
+_MOMENTUM_DEFAULT_PARAMS: Dict[str, float] = {
+    "roc_window": 10.0,
+    "ema_trend_window": 20.0,
+    "momentum_threshold_pct": 2.0,
+}
+_BOLLINGER_SQUEEZE_DEFAULT_PARAMS: Dict[str, float] = {
+    "bollinger_window": 20.0,
+    "bollinger_std": 2.0,
+    "squeeze_bandwidth_pct": 2.5,
+}
+_RSI_REVERSAL_DEFAULT_PARAMS: Dict[str, float] = {
+    "rsi_window": 14.0,
+    "rsi_overbought": 70.0,
+    "rsi_oversold": 30.0,
+}
 
 
 def _parameter_drift_score(strategy: StrategySummary, defaults: Dict[str, float]) -> float:
@@ -386,6 +404,287 @@ def _evaluate_breakout(
     )
 
 
+# ---------------------------------------------------------------------------
+# Round 47 — three additional kernels: momentum / bollinger squeeze / RSI
+# reversal. Each evaluate helper mirrors the shape of the Round 45 kernels
+# (``_evaluate_trend`` / ``_evaluate_mean_revert`` / ``_evaluate_breakout``):
+# it returns a ``(signal, reference_price, confidence, note, next_action)``
+# tuple and routes its raw confidence through ``apply_confidence_calibration``
+# so every Round 46 opt-in knob continues to work without any extra wiring.
+# ---------------------------------------------------------------------------
+
+
+def _ema_series(values: List[float], window: int) -> List[float]:
+    """Classic exponential moving average over ``values``. Returns a list of
+    the same length so callers can index by bar. The first element seeds the
+    EMA with the first close (avoids a warm-up NaN) and every subsequent
+    element uses the standard ``alpha = 2 / (window + 1)`` recursion.
+    """
+
+    if not values:
+        return []
+    span = max(int(window), 1)
+    alpha = 2.0 / (span + 1.0)
+    result: List[float] = []
+    prev = float(values[0])
+    result.append(prev)
+    for raw in values[1:]:
+        current = float(raw)
+        prev = (current - prev) * alpha + prev
+        result.append(prev)
+    return result
+
+
+def _rsi_value(values: List[float], window: int) -> float:
+    """Wilder-smoothed RSI at the last element of ``values``. Returns ``50.0``
+    (the neutral reading) when the sample is too short or every period is
+    flat — avoids injecting spurious signal fidelity when the input is
+    degenerate.
+    """
+
+    span = max(int(window), 2)
+    if len(values) <= span:
+        return 50.0
+    gains: List[float] = []
+    losses: List[float] = []
+    for previous, current in zip(values[:-1], values[1:]):
+        delta = float(current) - float(previous)
+        if delta >= 0.0:
+            gains.append(delta)
+            losses.append(0.0)
+        else:
+            gains.append(0.0)
+            losses.append(-delta)
+    # Wilder smoothing: seed with a simple mean of the first ``span`` deltas,
+    # then roll forward using ``avg = (prev_avg * (span - 1) + current) / span``.
+    avg_gain = sum(gains[:span]) / span
+    avg_loss = sum(losses[:span]) / span
+    for gain_value, loss_value in zip(gains[span:], losses[span:]):
+        avg_gain = (avg_gain * (span - 1) + gain_value) / span
+        avg_loss = (avg_loss * (span - 1) + loss_value) / span
+    if avg_loss <= 0.0:
+        # Strongest possible uptrend — every period closed higher. Clamp to
+        # ``100.0`` rather than returning infinity so downstream comparisons
+        # against the overbought threshold still behave.
+        return 100.0 if avg_gain > 0.0 else 50.0
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + rs))
+
+
+def _bollinger_bandwidth_pct(
+    sample: List[float], std_multiplier: float
+) -> tuple[float, float, float, float]:
+    """Return ``(mid, upper, lower, bandwidth_pct)`` for a single Bollinger
+    window. ``bandwidth_pct`` is ``(upper - lower) / mid * 100`` — a plain
+    percentage so callers can compare it with ``squeeze_bandwidth_pct``
+    without additional scaling.
+    """
+
+    if not sample:
+        return 0.0, 0.0, 0.0, 0.0
+    mid = mean(sample)
+    std = pstdev(sample) if len(sample) >= 2 else 0.0
+    upper = mid + std_multiplier * std
+    lower = mid - std_multiplier * std
+    bandwidth_pct = ((upper - lower) / mid * 100.0) if mid else 0.0
+    return mid, upper, lower, bandwidth_pct
+
+
+def _evaluate_momentum(
+    strategy: StrategySummary,
+    closes: List[float],
+    *,
+    regime: Optional[str] = None,
+    multi_timeframe_hint: Optional[bool] = None,
+) -> tuple[str, float, float, str, str]:
+    """Kernel 4 — ROC + EMA confirmation momentum kernel."""
+
+    roc_window = max(int(_param_value(strategy, "roc_window", 10)), 2)
+    ema_window = max(int(_param_value(strategy, "ema_trend_window", 20)), 2)
+    threshold = max(_param_value(strategy, "momentum_threshold_pct", 2.0), 0.1)
+    drift = _parameter_drift_score(strategy, _MOMENTUM_DEFAULT_PARAMS)
+
+    last_price = closes[-1]
+    # ROC uses the close ``roc_window`` bars ago; when the history is too
+    # short we fall back to the earliest close so the kernel still produces a
+    # well-defined but muted reading instead of raising.
+    reference_index = max(len(closes) - 1 - roc_window, 0)
+    reference_close = closes[reference_index] or 1e-9
+    roc_pct = (last_price - reference_close) / reference_close * 100.0
+    ema_values = _ema_series(closes, ema_window)
+    ema_last = ema_values[-1] if ema_values else last_price
+
+    def _calibrate(base: float) -> float:
+        return apply_confidence_calibration(
+            base,
+            strategy=strategy,
+            regime=regime,
+            parameter_drift_score=drift,
+            multi_timeframe_aligned=multi_timeframe_hint,
+        )
+
+    if roc_pct >= threshold and last_price > ema_last:
+        base = _clamp(abs(roc_pct / threshold) * 45.0 + 30.0)
+        return (
+            "long",
+            ema_last,
+            _calibrate(base),
+            f"ROC({roc_window}) {roc_pct:+.2f}% 超过阈值 {threshold:.2f}%，价格站上 EMA{ema_window} {ema_last:.2f}。",
+            "按动量策略跟踪；若要执行真实单，仍需走量化执行层风控。",
+        )
+    if roc_pct <= -threshold and last_price < ema_last:
+        base = _clamp(abs(roc_pct / threshold) * 45.0 + 30.0)
+        return (
+            "short",
+            ema_last,
+            _calibrate(base),
+            f"ROC({roc_window}) {roc_pct:+.2f}% 低于阈值 -{threshold:.2f}%，价格跌破 EMA{ema_window} {ema_last:.2f}。",
+            "按动量空头逻辑观察加速下行。",
+        )
+    base = _clamp(30.0 - abs(roc_pct) * 2.0, 12, 48)
+    return (
+        "watch",
+        ema_last,
+        _calibrate(base),
+        f"ROC({roc_window}) {roc_pct:+.2f}% 尚未突破动量阈值 ±{threshold:.2f}%。",
+        "等待更明确的动量信号，或在策略页调整 ROC 窗口。",
+    )
+
+
+def _evaluate_bollinger_squeeze(
+    strategy: StrategySummary,
+    closes: List[float],
+    *,
+    regime: Optional[str] = None,
+    multi_timeframe_hint: Optional[bool] = None,
+) -> tuple[str, float, float, str, str]:
+    """Kernel 5 — Bollinger squeeze breakout kernel."""
+
+    window = max(int(_param_value(strategy, "bollinger_window", 20)), 5)
+    std_multiplier = max(_param_value(strategy, "bollinger_std", 2.0), 0.5)
+    squeeze_pct = max(_param_value(strategy, "squeeze_bandwidth_pct", 2.5), 0.1)
+    drift = _parameter_drift_score(strategy, _BOLLINGER_SQUEEZE_DEFAULT_PARAMS)
+
+    usable_window = min(window, len(closes))
+    sample = closes[-usable_window:]
+    mid, upper, lower, bandwidth_pct = _bollinger_bandwidth_pct(sample, std_multiplier)
+    last_price = closes[-1]
+
+    # Check whether any of the last ``usable_window`` windows were in a
+    # squeeze. This gates the breakout branch — we only fire when the band
+    # was genuinely compressed beforehand, not on every random band touch.
+    squeeze_detected = False
+    history_span = min(usable_window, len(closes))
+    for anchor in range(max(len(closes) - history_span, 0), len(closes)):
+        anchor_sample = closes[max(anchor - usable_window + 1, 0) : anchor + 1]
+        if len(anchor_sample) < 2:
+            continue
+        _, _, _, anchor_bw = _bollinger_bandwidth_pct(anchor_sample, std_multiplier)
+        if anchor_bw < squeeze_pct:
+            squeeze_detected = True
+            break
+
+    def _calibrate(base: float) -> float:
+        return apply_confidence_calibration(
+            base,
+            strategy=strategy,
+            regime=regime,
+            parameter_drift_score=drift,
+            multi_timeframe_aligned=multi_timeframe_hint,
+        )
+
+    if squeeze_detected and last_price > upper and upper > 0:
+        breakout_pct = (last_price - upper) / upper * 100.0
+        base = _clamp(55.0 + breakout_pct * 25.0)
+        return (
+            "long",
+            mid,
+            _calibrate(base),
+            f"布林带压缩后突破上轨 {upper:.2f}，当前 {last_price:.2f}。",
+            "在压缩突破方向上跟踪；关注能否放量延续。",
+        )
+    if squeeze_detected and last_price < lower and lower > 0:
+        breakout_pct = (lower - last_price) / lower * 100.0
+        base = _clamp(55.0 + breakout_pct * 25.0)
+        return (
+            "short",
+            mid,
+            _calibrate(base),
+            f"布林带压缩后跌破下轨 {lower:.2f}，当前 {last_price:.2f}。",
+            "在压缩跌破方向上观察弱势延续。",
+        )
+    base = _clamp(40.0 - bandwidth_pct * 2.0, 15, 55)
+    return (
+        "watch",
+        mid,
+        _calibrate(base),
+        f"布林带带宽 {bandwidth_pct:.2f}%，尚未满足压缩突破条件。",
+        "继续观察带宽是否持续压缩至阈值以下。",
+    )
+
+
+def _evaluate_rsi_reversal(
+    strategy: StrategySummary,
+    closes: List[float],
+    *,
+    regime: Optional[str] = None,
+    multi_timeframe_hint: Optional[bool] = None,
+) -> tuple[str, float, float, str, str]:
+    """Kernel 6 — RSI overbought / oversold reversal kernel."""
+
+    window = max(int(_param_value(strategy, "rsi_window", 14)), 2)
+    overbought = _param_value(strategy, "rsi_overbought", 70.0)
+    oversold = _param_value(strategy, "rsi_oversold", 30.0)
+    # Defensive clamp: operators sometimes swap the two thresholds. The mean-
+    # revert logic below assumes ``oversold < overbought`` so we swap when
+    # inverted rather than silently producing inverted signals.
+    if oversold > overbought:
+        oversold, overbought = overbought, oversold
+    drift = _parameter_drift_score(strategy, _RSI_REVERSAL_DEFAULT_PARAMS)
+
+    rsi = _rsi_value(closes, window)
+    last_price = closes[-1]
+    # ``distance_from_midline`` is the gap from the 50 neutral reading — the
+    # deeper the RSI sits in the extreme zone, the higher the confidence.
+    distance_from_midline = abs(rsi - 50.0)
+
+    def _calibrate(base: float) -> float:
+        return apply_confidence_calibration(
+            base,
+            strategy=strategy,
+            regime=regime,
+            parameter_drift_score=drift,
+            multi_timeframe_aligned=multi_timeframe_hint,
+        )
+
+    if rsi <= oversold:
+        base = _clamp(distance_from_midline * 1.8 + 30.0)
+        return (
+            "long",
+            last_price,
+            _calibrate(base),
+            f"RSI({window}) {rsi:.1f} 低于超卖阈值 {oversold:.1f}，预期反弹。",
+            "按 RSI 反转逻辑观察多头回补；仍需走量化执行层风控。",
+        )
+    if rsi >= overbought:
+        base = _clamp(distance_from_midline * 1.8 + 30.0)
+        return (
+            "short",
+            last_price,
+            _calibrate(base),
+            f"RSI({window}) {rsi:.1f} 高于超买阈值 {overbought:.1f}，预期回调。",
+            "按 RSI 反转逻辑观察空头回落；仍需走量化执行层风控。",
+        )
+    base = _clamp(45.0 - distance_from_midline, 15, 55)
+    return (
+        "watch",
+        last_price,
+        _calibrate(base),
+        f"RSI({window}) {rsi:.1f} 处于中性区间 [{oversold:.1f}, {overbought:.1f}]。",
+        "等待 RSI 进入超买或超卖区间后再行动。",
+    )
+
+
 def _infer_volatility_regime(strategy: StrategySummary, detail: Any) -> Optional[str]:
     """Best-effort regime classifier used by the confidence calibration path.
 
@@ -523,14 +822,42 @@ def evaluate_strategy_runtime(
     # strategies.
     regime = _infer_volatility_regime(strategy, detail)
 
-    if "趋势" in strategy.name or strategy.id.startswith("trend"):
+    # Round 47 — kernel routing. ``strategy.kernel`` is an explicit opt-in
+    # override (None falls back to the legacy id / name heuristic so existing
+    # payloads route identically to pre-R47). The three new kernels never
+    # match the legacy heuristic so omitting ``strategy.kernel`` keeps
+    # ``_evaluate_trend`` / ``_evaluate_mean_revert`` / ``_evaluate_breakout``
+    # untouched for every strategy currently in production.
+    kernel_override = getattr(strategy, "kernel", None)
+    if kernel_override == "momentum" or strategy.id.startswith("momentum"):
+        signal, reference_price, confidence, note, next_action = _evaluate_momentum(
+            strategy,
+            closes,
+            regime=regime,
+            multi_timeframe_hint=multi_timeframe_hint,
+        )
+    elif kernel_override == "bollinger_squeeze" or strategy.id.startswith("bollinger"):
+        signal, reference_price, confidence, note, next_action = _evaluate_bollinger_squeeze(
+            strategy,
+            closes,
+            regime=regime,
+            multi_timeframe_hint=multi_timeframe_hint,
+        )
+    elif kernel_override == "rsi_reversal" or strategy.id.startswith("rsi"):
+        signal, reference_price, confidence, note, next_action = _evaluate_rsi_reversal(
+            strategy,
+            closes,
+            regime=regime,
+            multi_timeframe_hint=multi_timeframe_hint,
+        )
+    elif kernel_override == "trend" or "趋势" in strategy.name or strategy.id.startswith("trend"):
         signal, reference_price, confidence, note, next_action = _evaluate_trend(
             strategy,
             closes,
             regime=regime,
             multi_timeframe_hint=multi_timeframe_hint,
         )
-    elif "均值回归" in strategy.name or "revert" in strategy.id:
+    elif kernel_override == "mean_revert" or "均值回归" in strategy.name or "revert" in strategy.id:
         signal, reference_price, confidence, note, next_action = _evaluate_mean_revert(
             strategy,
             closes,
@@ -565,6 +892,19 @@ def evaluate_strategy_runtime(
 
 
 def _family_for_strategy(strategy: StrategySummary) -> str:
+    # Round 47 — the opt-in ``strategy.kernel`` override takes precedence so
+    # strategies that explicitly tag themselves route to the matching family.
+    # ``None`` falls through to the legacy heuristic, keeping pre-R47 payloads
+    # bit-exact.
+    kernel_override = getattr(strategy, "kernel", None)
+    if kernel_override in {"momentum", "bollinger_squeeze", "rsi_reversal", "trend", "mean_revert", "breakout"}:
+        return str(kernel_override)
+    if strategy.id.startswith("momentum"):
+        return "momentum"
+    if strategy.id.startswith("bollinger"):
+        return "bollinger_squeeze"
+    if strategy.id.startswith("rsi"):
+        return "rsi_reversal"
     if "趋势" in strategy.name or strategy.id.startswith("trend"):
         return "trend"
     if "均值回归" in strategy.name or "revert" in strategy.id:
@@ -916,9 +1256,14 @@ def compute_strategy_runtime_risk_hints(
         )
         return base
 
-    if family == "trend":
+    # Round 47 — three new kernels piggy-back on the existing risk-hint
+    # generators. Momentum uses the trend-style MA bands, Bollinger squeeze
+    # reuses the breakout stop/target framework, and RSI reversal is a
+    # mean-reversion-shaped exit ladder. This keeps the emitted schema stable
+    # for downstream panels.
+    if family in {"trend", "momentum"}:
         hint = _trend_risk_hint(strategy, closes)
-    elif family == "mean_revert":
+    elif family in {"mean_revert", "rsi_reversal"}:
         hint = _mean_revert_risk_hint(strategy, closes)
     else:
         hint = _breakout_risk_hint(strategy, closes)

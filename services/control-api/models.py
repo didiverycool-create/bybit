@@ -398,6 +398,36 @@ class StrategySummary(BaseModel):
     confidence_regime_adjustments: Optional[ConfidenceRegimeAdjustments] = None
     confidence_parameter_drift_penalty: Optional[float] = 0.0
     confidence_multi_timeframe_alignment: Optional[bool] = False
+    # Round 47 additive kernel selector + three new kernel parameter groups.
+    # ``kernel`` is an opt-in override for the routing logic — when unset the
+    # legacy ``strategy.id`` / ``strategy.name`` heuristic picks the kernel so
+    # historical payloads keep their current behavior. New values route the
+    # strategy to the momentum / bollinger-squeeze / RSI-reversal kernels. All
+    # downstream parameter fields default to ``None`` so unsetting them is
+    # exactly equivalent to pre-R47 behavior — the runners / evaluators fall
+    # back to their built-in defaults.
+    kernel: Optional[
+        Literal[
+            "trend",
+            "mean_revert",
+            "breakout",
+            "momentum",
+            "bollinger_squeeze",
+            "rsi_reversal",
+        ]
+    ] = None
+    # Momentum kernel parameters (ROC-over-window + EMA confirmation).
+    roc_window: Optional[int] = None
+    ema_trend_window: Optional[int] = None
+    momentum_threshold_pct: Optional[float] = None
+    # Bollinger squeeze kernel parameters.
+    bollinger_window: Optional[int] = None
+    bollinger_std: Optional[float] = None
+    squeeze_bandwidth_pct: Optional[float] = None
+    # RSI reversal kernel parameters.
+    rsi_window: Optional[int] = None
+    rsi_overbought: Optional[float] = None
+    rsi_oversold: Optional[float] = None
 
 
 class StrategyRuntimeSnapshot(BaseModel):

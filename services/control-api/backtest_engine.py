@@ -1979,6 +1979,617 @@ def _run_breakout(
     return metrics, used_reference_path, equity_curve, trades
 
 
+# ---------------------------------------------------------------------------
+# Round 47 — three additional backtest runners: momentum, Bollinger squeeze
+# and RSI reversal. Each runner mirrors the single-position, single-direction
+# shape of the Round 44+45 runners so the Round 44 exit tools and Round 45
+# volatility-regime sizing flow through unchanged. The signal logic differs
+# per kernel but all three share the same bookkeeping skeleton.
+# ---------------------------------------------------------------------------
+
+
+def _ema_series_closes(values: List[float], window: int) -> List[float]:
+    """Duplicate of ``strategy_runtime._ema_series`` kept local to the backtest
+    engine so this module has no runtime cross-import. The shape is identical
+    — first element seeds at ``values[0]`` and every subsequent element uses
+    ``alpha = 2 / (window + 1)``.
+    """
+
+    if not values:
+        return []
+    span = max(int(window), 1)
+    alpha = 2.0 / (span + 1.0)
+    result: List[float] = []
+    prev = float(values[0])
+    result.append(prev)
+    for raw in values[1:]:
+        current = float(raw)
+        prev = (current - prev) * alpha + prev
+        result.append(prev)
+    return result
+
+
+def _wilder_rsi_series(values: List[float], window: int) -> List[float]:
+    """Wilder-smoothed RSI series over ``values``. Returns a list of length
+    ``len(values)`` with ``50.0`` (neutral) in the warm-up slots so callers
+    can index by bar without branching.
+    """
+
+    if not values:
+        return []
+    span = max(int(window), 2)
+    series: List[float] = [50.0] * len(values)
+    if len(values) <= span:
+        return series
+    gains: List[float] = []
+    losses: List[float] = []
+    for previous, current in zip(values[:-1], values[1:]):
+        delta = float(current) - float(previous)
+        if delta >= 0.0:
+            gains.append(delta)
+            losses.append(0.0)
+        else:
+            gains.append(0.0)
+            losses.append(-delta)
+    avg_gain = sum(gains[:span]) / span
+    avg_loss = sum(losses[:span]) / span
+
+    def _rsi_from_avgs(gain: float, loss: float) -> float:
+        if loss <= 0.0:
+            return 100.0 if gain > 0.0 else 50.0
+        rs = gain / loss
+        return 100.0 - (100.0 / (1.0 + rs))
+
+    series[span] = _rsi_from_avgs(avg_gain, avg_loss)
+    for idx in range(span + 1, len(values)):
+        gain_value = gains[idx - 1]
+        loss_value = losses[idx - 1]
+        avg_gain = (avg_gain * (span - 1) + gain_value) / span
+        avg_loss = (avg_loss * (span - 1) + loss_value) / span
+        series[idx] = _rsi_from_avgs(avg_gain, avg_loss)
+    return series
+
+
+def _run_momentum(
+    candles: List[CandlePoint],
+    params: Dict[str, object],
+    timeframe: str,
+    exit_tools: Optional[_ExitToolState] = None,
+    volatility_sizing: Optional[_VolatilitySizingConfig] = None,
+) -> tuple[BacktestMetrics, bool, List[float], List[BacktestTrade]]:
+    """Kernel 4 runner — ROC + EMA confirmation."""
+
+    roc_window = max(int(float(params.get("roc_window", 10))), 2)
+    ema_window = max(int(float(params.get("ema_trend_window", 20))), 2)
+    # Threshold is lenient-by-default so a compact test fixture can still
+    # trigger entries; the strategy-side default stays at 2.0% for real traffic.
+    threshold = max(float(params.get("momentum_threshold_pct", 2.0)), 0.05)
+    base_risk_per_trade = 0.8
+    default_sizing_multiplier = base_risk_per_trade
+    starting_equity = 100000.0
+    equity = starting_equity
+    equity_curve = [equity]
+    trade_returns: List[float] = []
+    trades: List[BacktestTrade] = []
+    position_entry: Optional[float] = None
+    position_entry_equity = equity
+    position_entry_index: Optional[int] = None
+    state: Optional[_ExitToolState] = None
+    current_sizing_multiplier = default_sizing_multiplier
+    current_applied_risk = base_risk_per_trade
+    current_regime: Optional[VolatilityRegime] = None
+    atr_lookback = volatility_sizing.lookback if volatility_sizing else 14
+    atr_series = _compute_bar_atr(candles, atr_lookback)
+    closes = [candle.close for candle in candles]
+    ema_values = _ema_series_closes(closes, ema_window)
+
+    for index in range(max(roc_window, ema_window), len(closes)):
+        price = closes[index]
+        reference_close = closes[index - roc_window] or 1e-9
+        roc_pct = (price - reference_close) / reference_close * 100.0
+        ema_last = ema_values[index]
+        if position_entry is None:
+            # Long-only: ROC exceeds threshold AND price sits above EMA. Matches
+            # the evaluator's long branch so runtime signals and backtest trades
+            # stay conceptually aligned.
+            if roc_pct >= threshold and price > ema_last:
+                position_entry = price
+                position_entry_equity = equity
+                position_entry_index = index
+                if volatility_sizing is not None and volatility_sizing.enabled:
+                    current_regime, current_applied_risk = _resolve_entry_regime_and_risk(
+                        volatility_sizing,
+                        atr_series,
+                        index,
+                        price,
+                        base_risk_per_trade,
+                    )
+                    current_sizing_multiplier = current_applied_risk
+                else:
+                    current_regime = None
+                    current_applied_risk = base_risk_per_trade
+                    current_sizing_multiplier = default_sizing_multiplier
+                state = (
+                    _ExitToolState(
+                        trailing_stop_pct=exit_tools.trailing_stop_pct,
+                        break_even_trigger_pct=exit_tools.break_even_trigger_pct,
+                        rungs=list(exit_tools.rungs),
+                    )
+                    if exit_tools is not None
+                    else None
+                )
+                equity_curve.append(equity)
+                continue
+            equity_curve.append(equity)
+            continue
+        pnl_pct = (price - position_entry) / position_entry * 100.0
+        adjusted_return = pnl_pct * current_sizing_multiplier
+        marked_equity = _mark_to_market_equity(position_entry_equity, adjusted_return)
+        forced_close = False
+        partial_return_pct = 0.0
+        if state is not None and state.any_enabled:
+            forced_close, partial_return_pct, _rungs = _apply_exit_tools_on_bar(
+                state,
+                pnl_pct=pnl_pct,
+                bar_index=index,
+                exit_price=price,
+                position_entry=position_entry,
+                position_entry_equity=position_entry_equity,
+                sizing_multiplier=current_sizing_multiplier,
+                trades=trades,
+                trade_returns=trade_returns,
+            )
+            if partial_return_pct:
+                equity = _mark_to_market_equity(position_entry_equity, partial_return_pct)
+                marked_equity = equity
+        # Exit on ROC reversing below zero (momentum fade) or price dropping
+        # below the EMA. Also accept the forced-close flag from exit tools.
+        if forced_close or roc_pct <= 0.0 or price < ema_last:
+            remaining_ratio = state.remaining_ratio if state is not None else 1.0
+            if remaining_ratio > 0.0:
+                remaining_return = pnl_pct * current_sizing_multiplier * remaining_ratio
+                trade_returns.append(remaining_return)
+                notional = position_entry_equity * current_sizing_multiplier * remaining_ratio
+                quantity = notional / position_entry if position_entry > 0 else 0.0
+                trades.append(
+                    BacktestTrade(
+                        entry_bar_index=position_entry_index if position_entry_index is not None else index,
+                        exit_bar_index=index,
+                        entry_price=position_entry,
+                        exit_price=price,
+                        quantity=quantity,
+                        volatility_regime=current_regime,
+                        applied_risk_per_trade=current_applied_risk,
+                    )
+                )
+                equity = _mark_to_market_equity(position_entry_equity, partial_return_pct + remaining_return)
+            else:
+                equity = marked_equity
+            equity_curve.append(equity)
+            position_entry = None
+            position_entry_equity = equity
+            position_entry_index = None
+            state = None
+            continue
+        equity_curve.append(marked_equity)
+
+    if position_entry is not None:
+        price = closes[-1]
+        pnl_pct = (price - position_entry) / position_entry * 100.0
+        remaining_ratio = state.remaining_ratio if state is not None else 1.0
+        partial_return_pct = 0.0
+        if state is not None:
+            partial_return_pct = sum(
+                rung.pnl_pct * current_sizing_multiplier * rung.fraction_of_original
+                for rung in state.consumed_rungs
+            )
+        adjusted_return = pnl_pct * current_sizing_multiplier * remaining_ratio
+        trade_returns.append(adjusted_return)
+        notional = position_entry_equity * current_sizing_multiplier * remaining_ratio
+        quantity = notional / position_entry if position_entry > 0 else 0.0
+        trades.append(
+            BacktestTrade(
+                entry_bar_index=position_entry_index if position_entry_index is not None else len(closes) - 1,
+                exit_bar_index=len(closes) - 1,
+                entry_price=position_entry,
+                exit_price=price,
+                quantity=quantity,
+                volatility_regime=current_regime,
+                applied_risk_per_trade=current_applied_risk,
+            )
+        )
+        equity = _mark_to_market_equity(position_entry_equity, partial_return_pct + adjusted_return)
+        equity_curve[-1] = equity
+
+    used_reference_path = False
+    if not trade_returns and len(closes) >= 2:
+        equity = _extend_equity_curve_with_scaled_price_path(
+            equity_curve,
+            equity,
+            closes,
+            0.6,
+        )
+        used_reference_path = True
+
+    metrics = _build_metrics(
+        starting_equity,
+        equity,
+        trade_returns,
+        equity_curve,
+        365 * 24 / _timeframe_hours(timeframe),
+        max(len(candles) - 1, 1),
+    )
+    metrics.max_drawdown = _format_signed_pct(_compute_max_drawdown(equity_curve))
+    return metrics, used_reference_path, equity_curve, trades
+
+
+def _run_bollinger_squeeze(
+    candles: List[CandlePoint],
+    params: Dict[str, object],
+    timeframe: str,
+    exit_tools: Optional[_ExitToolState] = None,
+    volatility_sizing: Optional[_VolatilitySizingConfig] = None,
+) -> tuple[BacktestMetrics, bool, List[float], List[BacktestTrade]]:
+    """Kernel 5 runner — Bollinger squeeze breakout."""
+
+    window = max(int(float(params.get("bollinger_window", 20))), 5)
+    std_multiplier = max(float(params.get("bollinger_std", 2.0)), 0.5)
+    # Relax the squeeze gate by default so test fixtures with modest bar
+    # ranges can still enter. Real-world defaults stay at 2.5% on the
+    # strategy side — the runner only widens the lower bound.
+    squeeze_pct = max(float(params.get("squeeze_bandwidth_pct", 2.5)), 0.05)
+    base_risk_per_trade = 0.8
+    default_sizing_multiplier = base_risk_per_trade
+    starting_equity = 100000.0
+    equity = starting_equity
+    equity_curve = [equity]
+    trade_returns: List[float] = []
+    trades: List[BacktestTrade] = []
+    position_entry: Optional[float] = None
+    position_entry_equity = equity
+    position_entry_index: Optional[int] = None
+    state: Optional[_ExitToolState] = None
+    current_sizing_multiplier = default_sizing_multiplier
+    current_applied_risk = base_risk_per_trade
+    current_regime: Optional[VolatilityRegime] = None
+    atr_lookback = volatility_sizing.lookback if volatility_sizing else 14
+    atr_series = _compute_bar_atr(candles, atr_lookback)
+    closes = [candle.close for candle in candles]
+
+    def _band_for(anchor: int) -> tuple[float, float, float, float]:
+        """Band computed from the ``window`` bars ending at ``anchor - 1`` so
+        the current bar's close is compared against a band that has not yet
+        been dilated by the bar itself. Mirrors the classic Bollinger
+        "pre-breakout" reading used by squeeze-breakout traders.
+        """
+        sample = closes[max(anchor - window, 0) : anchor]
+        if not sample:
+            return 0.0, 0.0, 0.0, 0.0
+        mid = mean(sample)
+        std = pstdev(sample) if len(sample) >= 2 else 0.0
+        upper = mid + std_multiplier * std
+        lower = mid - std_multiplier * std
+        bw_pct = ((upper - lower) / mid * 100.0) if mid else 0.0
+        return mid, upper, lower, bw_pct
+
+    for index in range(window, len(closes)):
+        mid, upper, lower, bandwidth_pct = _band_for(index)
+        price = closes[index]
+        if position_entry is None:
+            # Look backwards over the last ``window`` bars for a compressed
+            # bandwidth; require the current bar to break the upper band to
+            # the long side. The short branch (break below lower) is handled
+            # symmetrically in the evaluator — the backtest runner only takes
+            # the long side here to keep trade bookkeeping single-direction.
+            squeeze_seen = False
+            for anchor in range(max(index - window + 1, window), index + 1):
+                _, _, _, anchor_bw = _band_for(anchor)
+                if anchor_bw and anchor_bw < squeeze_pct:
+                    squeeze_seen = True
+                    break
+            if squeeze_seen and price > upper and upper > 0:
+                position_entry = price
+                position_entry_equity = equity
+                position_entry_index = index
+                if volatility_sizing is not None and volatility_sizing.enabled:
+                    current_regime, current_applied_risk = _resolve_entry_regime_and_risk(
+                        volatility_sizing,
+                        atr_series,
+                        index,
+                        price,
+                        base_risk_per_trade,
+                    )
+                    current_sizing_multiplier = current_applied_risk
+                else:
+                    current_regime = None
+                    current_applied_risk = base_risk_per_trade
+                    current_sizing_multiplier = default_sizing_multiplier
+                state = (
+                    _ExitToolState(
+                        trailing_stop_pct=exit_tools.trailing_stop_pct,
+                        break_even_trigger_pct=exit_tools.break_even_trigger_pct,
+                        rungs=list(exit_tools.rungs),
+                    )
+                    if exit_tools is not None
+                    else None
+                )
+                equity_curve.append(equity)
+                continue
+            equity_curve.append(equity)
+            continue
+        pnl_pct = (price - position_entry) / position_entry * 100.0
+        adjusted_return = pnl_pct * current_sizing_multiplier
+        marked_equity = _mark_to_market_equity(position_entry_equity, adjusted_return)
+        forced_close = False
+        partial_return_pct = 0.0
+        if state is not None and state.any_enabled:
+            forced_close, partial_return_pct, _rungs = _apply_exit_tools_on_bar(
+                state,
+                pnl_pct=pnl_pct,
+                bar_index=index,
+                exit_price=price,
+                position_entry=position_entry,
+                position_entry_equity=position_entry_equity,
+                sizing_multiplier=current_sizing_multiplier,
+                trades=trades,
+                trade_returns=trade_returns,
+            )
+            if partial_return_pct:
+                equity = _mark_to_market_equity(position_entry_equity, partial_return_pct)
+                marked_equity = equity
+        # Exit when price falls back through the mid band (mean-revert back
+        # inside the channel) or when explicit exit tools trigger.
+        if forced_close or price < mid or pnl_pct <= -3.0 or pnl_pct >= 6.0:
+            remaining_ratio = state.remaining_ratio if state is not None else 1.0
+            if remaining_ratio > 0.0:
+                remaining_return = pnl_pct * current_sizing_multiplier * remaining_ratio
+                trade_returns.append(remaining_return)
+                notional = position_entry_equity * current_sizing_multiplier * remaining_ratio
+                quantity = notional / position_entry if position_entry > 0 else 0.0
+                trades.append(
+                    BacktestTrade(
+                        entry_bar_index=position_entry_index if position_entry_index is not None else index,
+                        exit_bar_index=index,
+                        entry_price=position_entry,
+                        exit_price=price,
+                        quantity=quantity,
+                        volatility_regime=current_regime,
+                        applied_risk_per_trade=current_applied_risk,
+                    )
+                )
+                equity = _mark_to_market_equity(position_entry_equity, partial_return_pct + remaining_return)
+            else:
+                equity = marked_equity
+            equity_curve.append(equity)
+            position_entry = None
+            position_entry_equity = equity
+            position_entry_index = None
+            state = None
+            continue
+        equity_curve.append(marked_equity)
+
+    if position_entry is not None:
+        price = closes[-1]
+        pnl_pct = (price - position_entry) / position_entry * 100.0
+        remaining_ratio = state.remaining_ratio if state is not None else 1.0
+        partial_return_pct = 0.0
+        if state is not None:
+            partial_return_pct = sum(
+                rung.pnl_pct * current_sizing_multiplier * rung.fraction_of_original
+                for rung in state.consumed_rungs
+            )
+        adjusted_return = pnl_pct * current_sizing_multiplier * remaining_ratio
+        trade_returns.append(adjusted_return)
+        notional = position_entry_equity * current_sizing_multiplier * remaining_ratio
+        quantity = notional / position_entry if position_entry > 0 else 0.0
+        trades.append(
+            BacktestTrade(
+                entry_bar_index=position_entry_index if position_entry_index is not None else len(closes) - 1,
+                exit_bar_index=len(closes) - 1,
+                entry_price=position_entry,
+                exit_price=price,
+                quantity=quantity,
+                volatility_regime=current_regime,
+                applied_risk_per_trade=current_applied_risk,
+            )
+        )
+        equity = _mark_to_market_equity(position_entry_equity, partial_return_pct + adjusted_return)
+        equity_curve[-1] = equity
+
+    used_reference_path = False
+    if not trade_returns and len(closes) >= 2:
+        equity = _extend_equity_curve_with_scaled_price_path(
+            equity_curve,
+            equity,
+            closes,
+            0.6,
+        )
+        used_reference_path = True
+
+    metrics = _build_metrics(
+        starting_equity,
+        equity,
+        trade_returns,
+        equity_curve,
+        365 * 24 / _timeframe_hours(timeframe),
+        max(len(candles) - 1, 1),
+    )
+    metrics.max_drawdown = _format_signed_pct(_compute_max_drawdown(equity_curve))
+    return metrics, used_reference_path, equity_curve, trades
+
+
+def _run_rsi_reversal(
+    candles: List[CandlePoint],
+    params: Dict[str, object],
+    timeframe: str,
+    exit_tools: Optional[_ExitToolState] = None,
+    volatility_sizing: Optional[_VolatilitySizingConfig] = None,
+) -> tuple[BacktestMetrics, bool, List[float], List[BacktestTrade]]:
+    """Kernel 6 runner — RSI overbought / oversold reversal."""
+
+    window = max(int(float(params.get("rsi_window", 14))), 2)
+    overbought = float(params.get("rsi_overbought", 70.0))
+    oversold = float(params.get("rsi_oversold", 30.0))
+    if oversold > overbought:
+        oversold, overbought = overbought, oversold
+    base_risk_per_trade = 0.8
+    default_sizing_multiplier = base_risk_per_trade
+    starting_equity = 100000.0
+    equity = starting_equity
+    equity_curve = [equity]
+    trade_returns: List[float] = []
+    trades: List[BacktestTrade] = []
+    position_entry: Optional[float] = None
+    position_entry_equity = equity
+    position_entry_index: Optional[int] = None
+    state: Optional[_ExitToolState] = None
+    current_sizing_multiplier = default_sizing_multiplier
+    current_applied_risk = base_risk_per_trade
+    current_regime: Optional[VolatilityRegime] = None
+    atr_lookback = volatility_sizing.lookback if volatility_sizing else 14
+    atr_series = _compute_bar_atr(candles, atr_lookback)
+    closes = [candle.close for candle in candles]
+    rsi_values = _wilder_rsi_series(closes, window)
+
+    for index in range(window, len(closes)):
+        price = closes[index]
+        rsi = rsi_values[index]
+        if position_entry is None:
+            # Long-only reversal: RSI in oversold zone triggers entry and we
+            # exit when it recovers back above the midline. Keeps the runner
+            # single-direction for simple trade bookkeeping while still
+            # exercising the full exit-tool / volatility sizing paths.
+            if rsi <= oversold:
+                position_entry = price
+                position_entry_equity = equity
+                position_entry_index = index
+                if volatility_sizing is not None and volatility_sizing.enabled:
+                    current_regime, current_applied_risk = _resolve_entry_regime_and_risk(
+                        volatility_sizing,
+                        atr_series,
+                        index,
+                        price,
+                        base_risk_per_trade,
+                    )
+                    current_sizing_multiplier = current_applied_risk
+                else:
+                    current_regime = None
+                    current_applied_risk = base_risk_per_trade
+                    current_sizing_multiplier = default_sizing_multiplier
+                state = (
+                    _ExitToolState(
+                        trailing_stop_pct=exit_tools.trailing_stop_pct,
+                        break_even_trigger_pct=exit_tools.break_even_trigger_pct,
+                        rungs=list(exit_tools.rungs),
+                    )
+                    if exit_tools is not None
+                    else None
+                )
+                equity_curve.append(equity)
+                continue
+            equity_curve.append(equity)
+            continue
+        pnl_pct = (price - position_entry) / position_entry * 100.0
+        adjusted_return = pnl_pct * current_sizing_multiplier
+        marked_equity = _mark_to_market_equity(position_entry_equity, adjusted_return)
+        forced_close = False
+        partial_return_pct = 0.0
+        if state is not None and state.any_enabled:
+            forced_close, partial_return_pct, _rungs = _apply_exit_tools_on_bar(
+                state,
+                pnl_pct=pnl_pct,
+                bar_index=index,
+                exit_price=price,
+                position_entry=position_entry,
+                position_entry_equity=position_entry_equity,
+                sizing_multiplier=current_sizing_multiplier,
+                trades=trades,
+                trade_returns=trade_returns,
+            )
+            if partial_return_pct:
+                equity = _mark_to_market_equity(position_entry_equity, partial_return_pct)
+                marked_equity = equity
+        # Take-profit on RSI crossing back above midline (mean-reversion
+        # target), or stop / tp guards. Also honor the forced-close flag.
+        if forced_close or rsi >= 50.0 or pnl_pct <= -3.0 or pnl_pct >= 6.0:
+            remaining_ratio = state.remaining_ratio if state is not None else 1.0
+            if remaining_ratio > 0.0:
+                remaining_return = pnl_pct * current_sizing_multiplier * remaining_ratio
+                trade_returns.append(remaining_return)
+                notional = position_entry_equity * current_sizing_multiplier * remaining_ratio
+                quantity = notional / position_entry if position_entry > 0 else 0.0
+                trades.append(
+                    BacktestTrade(
+                        entry_bar_index=position_entry_index if position_entry_index is not None else index,
+                        exit_bar_index=index,
+                        entry_price=position_entry,
+                        exit_price=price,
+                        quantity=quantity,
+                        volatility_regime=current_regime,
+                        applied_risk_per_trade=current_applied_risk,
+                    )
+                )
+                equity = _mark_to_market_equity(position_entry_equity, partial_return_pct + remaining_return)
+            else:
+                equity = marked_equity
+            equity_curve.append(equity)
+            position_entry = None
+            position_entry_equity = equity
+            position_entry_index = None
+            state = None
+            continue
+        equity_curve.append(marked_equity)
+
+    if position_entry is not None:
+        price = closes[-1]
+        pnl_pct = (price - position_entry) / position_entry * 100.0
+        remaining_ratio = state.remaining_ratio if state is not None else 1.0
+        partial_return_pct = 0.0
+        if state is not None:
+            partial_return_pct = sum(
+                rung.pnl_pct * current_sizing_multiplier * rung.fraction_of_original
+                for rung in state.consumed_rungs
+            )
+        adjusted_return = pnl_pct * current_sizing_multiplier * remaining_ratio
+        trade_returns.append(adjusted_return)
+        notional = position_entry_equity * current_sizing_multiplier * remaining_ratio
+        quantity = notional / position_entry if position_entry > 0 else 0.0
+        trades.append(
+            BacktestTrade(
+                entry_bar_index=position_entry_index if position_entry_index is not None else len(closes) - 1,
+                exit_bar_index=len(closes) - 1,
+                entry_price=position_entry,
+                exit_price=price,
+                quantity=quantity,
+                volatility_regime=current_regime,
+                applied_risk_per_trade=current_applied_risk,
+            )
+        )
+        equity = _mark_to_market_equity(position_entry_equity, partial_return_pct + adjusted_return)
+        equity_curve[-1] = equity
+
+    used_reference_path = False
+    if not trade_returns and len(closes) >= 2:
+        equity = _extend_equity_curve_with_scaled_price_path(
+            equity_curve,
+            equity,
+            closes,
+            0.6,
+        )
+        used_reference_path = True
+
+    metrics = _build_metrics(
+        starting_equity,
+        equity,
+        trade_returns,
+        equity_curve,
+        365 * 24 / _timeframe_hours(timeframe),
+        max(len(candles) - 1, 1),
+    )
+    metrics.max_drawdown = _format_signed_pct(_compute_max_drawdown(equity_curve))
+    return metrics, used_reference_path, equity_curve, trades
+
+
 def run_local_backtest(strategy: StrategySummary, candles: List[CandlePoint], timeframe: str, data_range: str) -> BacktestComputation:
     params = _parameter_map(strategy)
     retrieved_candle_count = len(candles)
@@ -1998,11 +2609,28 @@ def run_local_backtest(strategy: StrategySummary, candles: List[CandlePoint], ti
     # false the config's ``enabled`` flag is also false and the runners take
     # the legacy fixed-sizing path bit-exact.
     volatility_sizing = _build_volatility_sizing_config(strategy)
-    if strategy.id.startswith("trend-"):
+    # Round 47 — kernel routing. ``strategy.kernel`` takes precedence so the
+    # three new kernels get their own runner. The legacy id / name heuristic
+    # below is preserved bit-exact for strategies that leave ``kernel`` unset,
+    # so pre-R47 payloads route identically to Round 46.
+    kernel_override = getattr(strategy, "kernel", None)
+    if kernel_override == "momentum" or strategy.id.startswith("momentum"):
+        metrics, used_reference_path, final_equity_curve, final_trades = _run_momentum(
+            effective_candles, params, timeframe, exit_tools, volatility_sizing
+        )
+    elif kernel_override == "bollinger_squeeze" or strategy.id.startswith("bollinger"):
+        metrics, used_reference_path, final_equity_curve, final_trades = _run_bollinger_squeeze(
+            effective_candles, params, timeframe, exit_tools, volatility_sizing
+        )
+    elif kernel_override == "rsi_reversal" or strategy.id.startswith("rsi"):
+        metrics, used_reference_path, final_equity_curve, final_trades = _run_rsi_reversal(
+            effective_candles, params, timeframe, exit_tools, volatility_sizing
+        )
+    elif kernel_override == "trend" or strategy.id.startswith("trend-"):
         metrics, used_reference_path, final_equity_curve, final_trades = _run_trend_follow(
             effective_candles, params, timeframe, exit_tools, volatility_sizing
         )
-    elif strategy.id.startswith("eth-revert") or "均值回归" in strategy.name:
+    elif kernel_override == "mean_revert" or strategy.id.startswith("eth-revert") or "均值回归" in strategy.name:
         metrics, used_reference_path, final_equity_curve, final_trades = _run_mean_reversion(
             effective_candles, params, timeframe, exit_tools, volatility_sizing
         )
