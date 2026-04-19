@@ -1095,6 +1095,41 @@ export interface ExecutionEvent {
   occurred_at: string
 }
 
+export interface ExecutionImpactRecord {
+  id: string
+  strategy_id: string
+  strategy_name: string
+  window_start: string
+  window_end: string
+  summary: string
+  impact_level: 'negligible' | 'moderate' | 'significant'
+  direction: 'improved' | 'neutral' | 'worsened'
+  affected_orders: string[]
+  affected_positions: string[]
+  metrics_deltas: string[]
+  follow_up_checks: string[]
+  raw_text: string
+  agent_job_id?: string | null
+  source: string
+  created_at: string
+  updated_at: string
+}
+
+export interface ExecutionImpactSummarizeRequest {
+  strategy_id: string
+  strategy_name: string
+  window_start: string
+  window_end: string
+  order_count: number
+  fill_count: number
+  total_notional: number
+  slippage_bps: number
+  expected_pnl: number
+  realized_pnl: number
+  anomalies?: string[]
+  requested_by?: string
+}
+
 export interface SettingsPayload {
   bybit_web_entry: string
   api_base_url: string

@@ -8,6 +8,7 @@ import type {
   BybitPublicStatus,
   ControlSnapshot,
   ExecutionEvent,
+  ExecutionImpactRecord,
   ExecutionPreview,
   GrafanaIntegrationStatus,
   LatestSchedulerCommand,
@@ -646,6 +647,8 @@ const fallbackAccountLive: AccountLiveSnapshot = {
   generated_at: new Date().toISOString(),
 }
 
+const fallbackExecutionImpactRecords: ExecutionImpactRecord[] = []
+
 const fallbackRuntimeWorkerStatus: RuntimeWorkerStatus = {
   running: true,
   started_once: true,
@@ -687,4 +690,5 @@ export const apiFallbacks = {
   workspacePreferences: fallbackWorkspacePreferences,
   accountLive: fallbackAccountLive,
   runtimeWorkerStatus: fallbackRuntimeWorkerStatus,
+  executionImpactRecords: fallbackExecutionImpactRecords,
 }

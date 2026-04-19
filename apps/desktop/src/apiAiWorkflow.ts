@@ -2,6 +2,8 @@ import type {
   AgentJob,
   BacktestRun,
   ChangeRequest,
+  ExecutionImpactRecord,
+  ExecutionImpactSummarizeRequest,
   ReviewDocument,
   SchedulerCommandResult,
   SchedulerCommandType,
@@ -10,6 +12,19 @@ import type {
 import { apiFallbacks } from './apiFallbacks'
 import { fetchJson, postJson } from './apiHttp'
 import { normalizeReviewDocument } from './strategyActivitySnapshotNormalization'
+
+export async function fetchExecutionImpactRecords(): Promise<ExecutionImpactRecord[]> {
+  return fetchJson<ExecutionImpactRecord[]>(
+    '/api/execution-impact/records',
+    apiFallbacks.executionImpactRecords,
+  )
+}
+
+export async function queueExecutionImpactSummary(
+  request: ExecutionImpactSummarizeRequest,
+): Promise<{ job_id: string }> {
+  return postJson<{ job_id: string }>('/api/execution-impact/summarize', request)
+}
 
 function buildReviewQueryString(options?: {
   strategyId?: string | null
@@ -120,4 +135,6 @@ export const aiWorkflowApi = {
         requested_by: 'desktop_operator',
       },
     ),
+  fetchExecutionImpactRecords,
+  queueExecutionImpactSummary,
 }
