@@ -722,6 +722,13 @@ class BacktestExposureStatsModel(BaseModel):
     downside_deviation_pct: float = 0.0
 
 
+class BacktestTailRiskStatsModel(BaseModel):
+    var_95_pct: float = 0.0
+    cvar_95_pct: float = 0.0
+    tail_ratio: float = 0.0
+    gain_to_pain_ratio: float = 0.0
+
+
 class BacktestRun(BaseModel):
     id: str
     strategy_id: str
@@ -778,6 +785,7 @@ class BacktestRun(BaseModel):
     trade_rhythm_stats: Optional[BacktestTradeRhythmStatsModel] = None
     benchmark_stats: Optional[BacktestBenchmarkStatsModel] = None
     exposure_stats: Optional[BacktestExposureStatsModel] = None
+    tail_risk_stats: Optional[BacktestTailRiskStatsModel] = None
 
 
 class ChangeRequest(BaseModel):

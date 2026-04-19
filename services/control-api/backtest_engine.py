@@ -159,6 +159,42 @@ class BacktestExposureStats:
 
 
 @dataclass
+class BacktestTailRiskStats:
+    """Tail-risk descriptors of the simulated equity curve's period returns.
+
+    Complements ``BacktestExposureStats`` with historical Value-at-Risk /
+    Conditional-VaR style statistics that summarize the severity and balance
+    of the return distribution's extremes. Every field defaults to ``0.0`` so
+    degenerate inputs (empty series, no negative tail, small sample) still
+    yield a fully populated payload instead of raising — downstream consumers
+    should treat zero-fill as "unavailable" rather than "error".
+
+    - ``var_95_pct``: historical 5% Value-at-Risk of ``period_returns``,
+      expressed as a positive percentage denoting loss magnitude (the negated
+      5th percentile × 1). Returns ``0.0`` when the sample is empty or has no
+      negative return observations.
+    - ``cvar_95_pct``: historical Conditional VaR (expected shortfall) at the
+      95% confidence level. Computed by sorting ``period_returns`` ascending
+      and averaging the worst ``ceil(n * 0.05)`` observations (minimum of 1),
+      then negating so the figure reads as a positive loss magnitude. Returns
+      ``0.0`` when the sample is empty.
+    - ``tail_ratio``: ratio of the 95th percentile to the absolute value of
+      the 5th percentile of ``period_returns``. Signals whether upside tails
+      dominate downside tails. Returns ``0.0`` when the sample is smaller than
+      20 observations or the 5th-percentile denominator collapses to zero.
+    - ``gain_to_pain_ratio``: ``sum(positive returns) / abs(sum(negative
+      returns))``. A bar-level Sortino cousin that weights magnitudes rather
+      than deviations. Returns ``0.0`` when the negative-return denominator is
+      zero (no losses on record — ratio would otherwise diverge).
+    """
+
+    var_95_pct: float = 0.0
+    cvar_95_pct: float = 0.0
+    tail_ratio: float = 0.0
+    gain_to_pain_ratio: float = 0.0
+
+
+@dataclass
 class BacktestComputation:
     metrics: BacktestMetrics
     notes: str
@@ -179,6 +215,7 @@ class BacktestComputation:
     trade_rhythm_stats: Optional[BacktestTradeRhythmStats] = None
     benchmark_stats: Optional[BacktestBenchmarkStats] = None
     exposure_stats: Optional[BacktestExposureStats] = None
+    tail_risk_stats: Optional[BacktestTailRiskStats] = None
 
 
 def _parameter_map(strategy: StrategySummary) -> Dict[str, object]:
@@ -650,6 +687,101 @@ def _compute_exposure_stats(
     )
 
 
+def _linear_quantile(sorted_values: List[float], fraction: float) -> float:
+    """Linear-interpolation quantile helper used by the tail-risk pipeline.
+
+    Mirrors the ``statistics.quantiles(..., method="inclusive")`` behaviour at
+    an arbitrary fraction so ``p5`` / ``p95`` land on the same anchor points
+    regardless of sample length. Callers guarantee ``sorted_values`` is
+    non-empty and ``0.0 <= fraction <= 1.0``; degenerate samples (length 1)
+    short-circuit to the lone observation.
+    """
+
+    n = len(sorted_values)
+    if n == 1:
+        return sorted_values[0]
+    position = fraction * (n - 1)
+    lower_index = int(math.floor(position))
+    upper_index = int(math.ceil(position))
+    if lower_index == upper_index:
+        return sorted_values[lower_index]
+    lower_value = sorted_values[lower_index]
+    upper_value = sorted_values[upper_index]
+    weight = position - lower_index
+    return lower_value + (upper_value - lower_value) * weight
+
+
+def _compute_tail_risk_stats(period_returns: List[float]) -> BacktestTailRiskStats:
+    """Derive historical tail-risk descriptors from period returns.
+
+    Degenerate inputs (empty series, no negative tail, small sample) collapse
+    to the relevant default without raising so downstream consumers can treat
+    zero-fill as "unavailable" rather than "error". VaR / CVaR use the
+    historical method (sorted order statistics); ``tail_ratio`` only fires
+    once the sample is large enough (20+) for the 5th / 95th percentiles to
+    stabilize; ``gain_to_pain_ratio`` guards its denominator against a
+    loss-free sample to avoid divergence.
+    """
+
+    if not period_returns:
+        return BacktestTailRiskStats()
+
+    sorted_returns = sorted(period_returns)
+    n = len(sorted_returns)
+
+    # Historical VaR95 uses the discrete loss-threshold convention: the
+    # worst observation at the boundary of the bottom 5% tail. For a sample
+    # of size ``n`` the tail size is ``ceil(n * 0.05)`` (minimum of 1), and
+    # VaR95 reports the *last* (least-bad) observation inside that tail,
+    # negated and scaled to percent units so it reads as a positive loss
+    # magnitude. Only fires when the tail actually contains losses — a
+    # strictly non-negative sample has no meaningful VaR, so collapse to
+    # zero.
+    tail_count = max(1, math.ceil(n * 0.05))
+    var_95_pct = 0.0
+    negatives = [value for value in period_returns if value < 0]
+    if negatives:
+        tail_boundary = sorted_returns[min(tail_count - 1, n - 1)]
+        var_95_pct = -tail_boundary * 100.0
+
+    # Historical CVaR95: average of the worst ``ceil(n * 0.05)`` observations
+    # (minimum of 1), negated and scaled to percent units so the figure reads
+    # as a positive loss magnitude. Always safe so long as the sample is
+    # non-empty.
+    worst_slice = sorted_returns[:tail_count]
+    cvar_95_pct = -mean(worst_slice) * 100.0
+
+    # Tail ratio: stable only once the sample is large enough for p5 / p95 to
+    # reflect the distribution's extremes rather than noise. A zero
+    # denominator (strictly non-negative 5th percentile) would make the ratio
+    # diverge, so short-circuit to zero. The ratio is unitless — both legs
+    # share the same scale, so no percent conversion is applied.
+    tail_ratio = 0.0
+    if n >= 20:
+        p5_for_ratio = _linear_quantile(sorted_returns, 0.05)
+        p95_for_ratio = _linear_quantile(sorted_returns, 0.95)
+        if p5_for_ratio != 0:
+            tail_ratio = p95_for_ratio / abs(p5_for_ratio)
+
+    # Gain-to-pain: magnitude-weighted win/loss ratio. Zero denominator means
+    # no losses on record — ratio would otherwise diverge. Unitless, so no
+    # percent conversion is applied.
+    positives = [value for value in period_returns if value > 0]
+    sum_positive = sum(positives)
+    sum_negative_abs = abs(sum(negatives))
+    if sum_negative_abs > 0:
+        gain_to_pain_ratio = sum_positive / sum_negative_abs
+    else:
+        gain_to_pain_ratio = 0.0
+
+    return BacktestTailRiskStats(
+        var_95_pct=round(var_95_pct, 4),
+        cvar_95_pct=round(cvar_95_pct, 4),
+        tail_ratio=round(tail_ratio, 4),
+        gain_to_pain_ratio=round(gain_to_pain_ratio, 4),
+    )
+
+
 def _mark_to_market_equity(entry_equity: float, trade_return_pct: float) -> float:
     return entry_equity * (1.0 + trade_return_pct / 100.0)
 
@@ -979,6 +1111,10 @@ def run_local_backtest(strategy: StrategySummary, candles: List[CandlePoint], ti
         total_return_pct,
         max_drawdown_pct,
     )
+    # Tail-risk stats reuse the same period returns — historical VaR / CVaR
+    # and the gain-to-pain ratio are all purely distributional, so no
+    # additional equity-curve walking is required.
+    tail_risk_stats = _compute_tail_risk_stats(period_returns)
 
     notes = (
         f"由本地回测引擎基于 Bybit 历史 {timeframe} K 线生成，区间 {data_range}，"
@@ -1008,4 +1144,5 @@ def run_local_backtest(strategy: StrategySummary, candles: List[CandlePoint], ti
         trade_rhythm_stats=trade_rhythm_stats,
         benchmark_stats=benchmark_stats,
         exposure_stats=exposure_stats,
+        tail_risk_stats=tail_risk_stats,
     )

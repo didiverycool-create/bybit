@@ -3748,6 +3748,11 @@ def build_backtest_payload(strategy: Any, data_range: str, timeframe: str) -> Op
             if computation.exposure_stats is not None
             else None
         ),
+        "tail_risk_stats": (
+            dataclasses.asdict(computation.tail_risk_stats)
+            if computation.tail_risk_stats is not None
+            else None
+        ),
     }
 
 
@@ -4432,6 +4437,7 @@ def build_agent_job_prompt(job_type: str, context: Dict[str, Any]) -> str:
             f"节奏统计：{json.dumps(review_context.get('trade_rhythm_stats'), ensure_ascii=False)}\n"
             f"对比基准：{json.dumps(review_context.get('benchmark_stats'), ensure_ascii=False)}\n"
             f"敞口统计：{json.dumps(review_context.get('exposure_stats'), ensure_ascii=False)}\n"
+            f"尾部风险：{json.dumps(review_context.get('tail_risk_stats'), ensure_ascii=False)}\n"
             f"执行健康：{health_context}\n"
             f"策略最近活动：{review_strategy_activity}\n"
             "要求：聚焦收益质量、回撤、风险边界，并给出下一步验证建议。"

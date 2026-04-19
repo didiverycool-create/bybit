@@ -748,6 +748,53 @@ class BacktestEngineUnitTests(unittest.TestCase):
         )
         self.assertEqual(none_drawdown.recovery_factor, 0.0)
 
+    def test_compute_tail_risk_stats_returns_zero_defaults_for_empty_inputs(self) -> None:
+        # Degenerate inputs (empty series) must collapse to
+        # ``BacktestTailRiskStats()`` rather than raising so the downstream
+        # payload is always fully populated.
+        stats = backtest_engine._compute_tail_risk_stats([])
+        self.assertIsInstance(stats, backtest_engine.BacktestTailRiskStats)
+        self.assertEqual(stats.var_95_pct, 0.0)
+        self.assertEqual(stats.cvar_95_pct, 0.0)
+        self.assertEqual(stats.tail_ratio, 0.0)
+        self.assertEqual(stats.gain_to_pain_ratio, 0.0)
+
+        # A strictly non-negative sample has no meaningful VaR; the helper
+        # must short-circuit to zero rather than reading the upper tail.
+        positive_only = backtest_engine._compute_tail_risk_stats([0.0, 0.5, 1.0])
+        self.assertEqual(positive_only.var_95_pct, 0.0)
+        self.assertEqual(positive_only.gain_to_pain_ratio, 0.0)
+
+    def test_compute_tail_risk_stats_computes_historical_var_and_cvar(self) -> None:
+        # 20 returns with a single -0.05 outlier and a -0.02 cluster; the
+        # bottom-5% tail therefore contains exactly one observation (-0.05),
+        # so both historical VaR95 and CVaR95 land on 5.0% loss magnitude.
+        returns = [-0.05] + [-0.02] * 4 + [0.01] * 15
+        stats = backtest_engine._compute_tail_risk_stats(returns)
+
+        self.assertAlmostEqual(stats.var_95_pct, 5.0, places=4)
+        self.assertAlmostEqual(stats.cvar_95_pct, 5.0, places=4)
+
+    def test_compute_tail_risk_stats_gain_to_pain_ratio_from_signed_returns(self) -> None:
+        # Gain-to-pain weights magnitudes rather than counts: sum of positives
+        # is 2.0 + 1.0 + 0.5 = 3.5, absolute sum of negatives is
+        # 1.5 + 0.5 + 0.25 = 2.25, so the ratio is 3.5 / 2.25 = 1.5555…
+        returns = [2.0, -1.5, 1.0, -0.5, 0.5, -0.25]
+        stats = backtest_engine._compute_tail_risk_stats(returns)
+
+        expected = round(3.5 / 2.25, 4)
+        self.assertAlmostEqual(stats.gain_to_pain_ratio, expected, places=4)
+
+    def test_compute_tail_risk_stats_tail_ratio_guards_small_sample(self) -> None:
+        # Samples smaller than 20 observations cannot support a stable
+        # ``p5 / p95`` estimate, so the helper must short-circuit to zero
+        # rather than emitting noise. 19 alternating returns exercises the
+        # guard without triggering the 20-sample branch.
+        returns = [0.01 if index % 2 == 0 else -0.01 for index in range(19)]
+        stats = backtest_engine._compute_tail_risk_stats(returns)
+
+        self.assertEqual(stats.tail_ratio, 0.0)
+
     def test_run_local_backtest_attaches_benchmark_stats_to_computation(self) -> None:
         strategy = StrategySummary(
             id="trend-btc-01",
