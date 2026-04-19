@@ -12578,6 +12578,7 @@ class ControlApiIntegrationTests(unittest.TestCase):
             "benchmark_stats",
             "exposure_stats",
             "tail_risk_stats",
+            "order_flow_stats",
         ):
             self.assertIn(stat_key, payload, f"{stat_key} missing from backtest payload")
             self.assertIsInstance(payload[stat_key], dict, f"{stat_key} should be a dict")
@@ -12588,6 +12589,7 @@ class ControlApiIntegrationTests(unittest.TestCase):
         self.assertIn("correlation", payload["benchmark_stats"])
         self.assertIn("return_skew", payload["exposure_stats"])
         self.assertIn("var_95_pct", payload["tail_risk_stats"])
+        self.assertIn("avg_holding_bars", payload["order_flow_stats"])
 
     def test_change_request_backtest_and_agent_job_endpoints(self) -> None:
         scheduler_status, scheduler_before = self._get("/api/ai/scheduler")

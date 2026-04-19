@@ -729,6 +729,14 @@ class BacktestTailRiskStatsModel(BaseModel):
     gain_to_pain_ratio: float = 0.0
 
 
+class BacktestOrderFlowStatsModel(BaseModel):
+    avg_holding_bars: float = 0.0
+    trade_frequency_per_day: float = 0.0
+    turnover_rate_pct: float = 0.0
+    active_bar_ratio_pct: float = 0.0
+    avg_trade_notional: float = 0.0
+
+
 class BacktestRun(BaseModel):
     id: str
     strategy_id: str
@@ -786,6 +794,7 @@ class BacktestRun(BaseModel):
     benchmark_stats: Optional[BacktestBenchmarkStatsModel] = None
     exposure_stats: Optional[BacktestExposureStatsModel] = None
     tail_risk_stats: Optional[BacktestTailRiskStatsModel] = None
+    order_flow_stats: Optional[BacktestOrderFlowStatsModel] = None
 
 
 class ChangeRequest(BaseModel):

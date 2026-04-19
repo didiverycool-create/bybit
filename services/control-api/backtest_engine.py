@@ -195,6 +195,76 @@ class BacktestTailRiskStats:
 
 
 @dataclass
+class BacktestTrade:
+    """Single closed-position record emitted by the strategy runners.
+
+    Captures just enough information for the order-flow / holding-rhythm
+    pipeline to derive notional-level and cadence-level descriptors without
+    re-walking the equity curve. Fields are sized so a degenerate trade
+    (quantity == 0, entry_price <= 0) still materializes cleanly — the
+    downstream helpers individually guard their denominators.
+
+    - ``entry_bar_index`` / ``exit_bar_index``: zero-based bar indices
+      relative to the ``effective_candles`` sequence the runner consumed.
+      ``exit_bar_index >= entry_bar_index`` always; a trade that opens and
+      closes on the same bar reports ``entry == exit``.
+    - ``entry_price`` / ``exit_price``: the close prices used when the
+      position opened / closed, denominated in the candle's quote currency.
+    - ``quantity``: trade size in base-asset units, derived so that
+      ``entry_price * quantity`` equals the runner's effective notional
+      commitment on that trade (positional sizing factor applied).
+    - ``side``: ``"long"`` for directional runners (current implementation
+      only supports long-side strategies). Kept as a string literal so future
+      short-side runners can extend the field without breaking consumers.
+    """
+
+    entry_bar_index: int
+    exit_bar_index: int
+    entry_price: float
+    exit_price: float
+    quantity: float
+    side: str = "long"
+
+
+@dataclass
+class BacktestOrderFlowStats:
+    """Execution-side cadence descriptors derived from realized closed trades.
+
+    Companion to ``BacktestExposureStats`` / ``BacktestTailRiskStats`` —
+    focuses on the *rhythm* of order submission, the amount of time the
+    strategy actually holds exposure, and the capital turnover relative to
+    the starting equity. Every field defaults to ``0.0`` so degenerate
+    inputs (no trades, zero total bars, non-positive starting capital) still
+    yield a fully populated payload instead of raising, letting downstream
+    consumers treat zero-fill as "unavailable" rather than "error".
+
+    - ``avg_holding_bars``: mean of ``exit_bar_index - entry_bar_index`` over
+      all closed trades. Returns ``0.0`` when the trade list is empty.
+    - ``trade_frequency_per_day``: number of closed trades divided by the
+      number of elapsed natural days, inferred via
+      ``total_bars / bars_per_day``. Returns ``0.0`` when ``total_bars`` is
+      zero / negative so short-run simulations do not report artificially
+      high frequencies.
+    - ``turnover_rate_pct``: ``sum(entry_price * quantity) / start_capital``
+      for all closed trades, expressed as a percent (``1.0`` == 1%). Returns
+      ``0.0`` when ``start_capital`` is zero or negative — otherwise the
+      ratio would diverge / flip sign.
+    - ``active_bar_ratio_pct``: percentage of bars in which the strategy held
+      any exposure, measured via the union of per-trade bar intervals. A bar
+      counted in multiple trades still contributes once so overlapping
+      positions do not inflate the ratio past 100%.
+    - ``avg_trade_notional``: mean of ``entry_price * quantity`` over all
+      closed trades. Returns ``0.0`` when the trade list is empty.
+    """
+
+    avg_holding_bars: float = 0.0
+    trade_frequency_per_day: float = 0.0
+    turnover_rate_pct: float = 0.0
+    active_bar_ratio_pct: float = 0.0
+    avg_trade_notional: float = 0.0
+
+
+@dataclass
 class BacktestComputation:
     metrics: BacktestMetrics
     notes: str
@@ -216,6 +286,7 @@ class BacktestComputation:
     benchmark_stats: Optional[BacktestBenchmarkStats] = None
     exposure_stats: Optional[BacktestExposureStats] = None
     tail_risk_stats: Optional[BacktestTailRiskStats] = None
+    order_flow_stats: Optional[BacktestOrderFlowStats] = None
 
 
 def _parameter_map(strategy: StrategySummary) -> Dict[str, object]:
@@ -782,6 +853,76 @@ def _compute_tail_risk_stats(period_returns: List[float]) -> BacktestTailRiskSta
     )
 
 
+def _compute_order_flow_stats(
+    trades: List[BacktestTrade],
+    total_bars: int,
+    start_capital: float,
+    bars_per_day: int,
+) -> BacktestOrderFlowStats:
+    """Derive execution-side cadence statistics from closed trades.
+
+    Degenerate inputs (empty trade list, ``total_bars`` ≤ 0, non-positive
+    starting capital) short-circuit to the relevant defaults rather than
+    raising so downstream consumers can treat zero-fill as "unavailable"
+    rather than "error". The helper is intentionally O(n + bars) in the
+    worst case: the active-bar ratio walks each trade's ``entry..exit``
+    interval once, deduplicating via a set so overlapping positions cannot
+    inflate the covered bar count past ``total_bars``.
+    """
+
+    if not trades or total_bars <= 0:
+        return BacktestOrderFlowStats()
+
+    # Average holding length: inclusive bar span between entry and exit. The
+    # runners clamp ``exit_bar_index >= entry_bar_index`` so this subtraction
+    # is never negative; a single-bar trade reports ``0``.
+    holding_bars = [
+        max(trade.exit_bar_index - trade.entry_bar_index, 0) for trade in trades
+    ]
+    avg_holding_bars = sum(holding_bars) / len(trades)
+
+    # Trade frequency normalized to natural days via ``bars_per_day``. The
+    # lookup in ``run_local_backtest`` falls back to 1440 (1-minute bars) for
+    # unknown granularities so this denominator is always strictly positive.
+    effective_bars_per_day = max(int(bars_per_day), 1)
+    days_spanned = total_bars / effective_bars_per_day
+    if days_spanned > 0:
+        trade_frequency_per_day = len(trades) / days_spanned
+    else:
+        trade_frequency_per_day = 0.0
+
+    # Turnover: gross notional committed vs. the initial equity stake. The
+    # ``start_capital`` guard keeps the ratio from diverging / flipping sign
+    # when the strategy runner reports a non-positive starting capital.
+    notionals = [trade.entry_price * trade.quantity for trade in trades]
+    if start_capital > 0:
+        turnover_rate_pct = sum(notionals) / start_capital * 100.0
+    else:
+        turnover_rate_pct = 0.0
+
+    # Active-bar ratio: union of per-trade ``entry..exit`` intervals divided
+    # by the total bar count. A set-based union keeps overlapping positions
+    # from inflating the covered count past ``total_bars``, which could
+    # otherwise push the ratio past 100%.
+    active_bars: set[int] = set()
+    for trade in trades:
+        low = max(int(trade.entry_bar_index), 0)
+        high = max(int(trade.exit_bar_index), low)
+        for bar_index in range(low, high + 1):
+            active_bars.add(bar_index)
+    active_bar_ratio_pct = len(active_bars) / total_bars * 100.0
+
+    avg_trade_notional = sum(notionals) / len(trades) if notionals else 0.0
+
+    return BacktestOrderFlowStats(
+        avg_holding_bars=round(avg_holding_bars, 4),
+        trade_frequency_per_day=round(trade_frequency_per_day, 4),
+        turnover_rate_pct=round(turnover_rate_pct, 4),
+        active_bar_ratio_pct=round(active_bar_ratio_pct, 4),
+        avg_trade_notional=round(avg_trade_notional, 4),
+    )
+
+
 def _mark_to_market_equity(entry_equity: float, trade_return_pct: float) -> float:
     return entry_equity * (1.0 + trade_return_pct / 100.0)
 
@@ -841,7 +982,7 @@ def _run_trend_follow(
     candles: List[CandlePoint],
     params: Dict[str, object],
     timeframe: str,
-) -> tuple[BacktestMetrics, bool, List[float]]:
+) -> tuple[BacktestMetrics, bool, List[float], List[BacktestTrade]]:
     fast = max(int(float(params.get("fast_ma", 21))), 2)
     slow = max(int(float(params.get("slow_ma", 55))), fast + 1)
     risk_per_trade = max(float(params.get("risk_per_trade", 1.0)), 0.2) / 100.0
@@ -849,8 +990,10 @@ def _run_trend_follow(
     equity = starting_equity
     equity_curve = [equity]
     trade_returns: List[float] = []
+    trades: List[BacktestTrade] = []
     position_entry: Optional[float] = None
     position_entry_equity = equity
+    position_entry_index: Optional[int] = None
 
     closes = [candle.close for candle in candles]
     for index in range(slow, len(closes)):
@@ -860,6 +1003,7 @@ def _run_trend_follow(
         if position_entry is None and fast_ma > slow_ma:
             position_entry = price
             position_entry_equity = equity
+            position_entry_index = index
             equity_curve.append(equity)
             continue
         if position_entry is not None:
@@ -867,10 +1011,27 @@ def _run_trend_follow(
             marked_equity = _mark_to_market_equity(position_entry_equity, trade_return)
             if fast_ma < slow_ma:
                 trade_returns.append(trade_return)
+                # Effective notional stake: ``risk_per_trade * 10`` is the
+                # sizing multiplier the runner applies to the price move, so
+                # the committed exposure equals ``position_entry_equity *
+                # risk_per_trade * 10``. Deriving ``quantity`` from the
+                # notional keeps ``entry_price * quantity == notional``.
+                notional = position_entry_equity * risk_per_trade * 10.0
+                quantity = notional / position_entry if position_entry > 0 else 0.0
+                trades.append(
+                    BacktestTrade(
+                        entry_bar_index=position_entry_index if position_entry_index is not None else index,
+                        exit_bar_index=index,
+                        entry_price=position_entry,
+                        exit_price=price,
+                        quantity=quantity,
+                    )
+                )
                 equity = marked_equity
                 equity_curve.append(equity)
                 position_entry = None
                 position_entry_equity = equity
+                position_entry_index = None
                 continue
             equity_curve.append(marked_equity)
             continue
@@ -880,6 +1041,17 @@ def _run_trend_follow(
         price = closes[-1]
         trade_return = ((price - position_entry) / position_entry) * (risk_per_trade * 10.0) * 100.0
         trade_returns.append(trade_return)
+        notional = position_entry_equity * risk_per_trade * 10.0
+        quantity = notional / position_entry if position_entry > 0 else 0.0
+        trades.append(
+            BacktestTrade(
+                entry_bar_index=position_entry_index if position_entry_index is not None else len(closes) - 1,
+                exit_bar_index=len(closes) - 1,
+                entry_price=position_entry,
+                exit_price=price,
+                quantity=quantity,
+            )
+        )
         equity = _mark_to_market_equity(position_entry_equity, trade_return)
         equity_curve[-1] = equity
 
@@ -902,14 +1074,14 @@ def _run_trend_follow(
         max(len(candles) - 1, 1),
     )
     metrics.max_drawdown = _format_signed_pct(_compute_max_drawdown(equity_curve))
-    return metrics, used_reference_path, equity_curve
+    return metrics, used_reference_path, equity_curve, trades
 
 
 def _run_mean_reversion(
     candles: List[CandlePoint],
     params: Dict[str, object],
     timeframe: str,
-) -> tuple[BacktestMetrics, bool, List[float]]:
+) -> tuple[BacktestMetrics, bool, List[float], List[BacktestTrade]]:
     entry = max(float(params.get("zscore_entry", 2.0)), 0.5)
     exit_value = max(float(params.get("zscore_exit", 0.5)), 0.1)
     stop_loss_pct = max(float(params.get("stop_loss_pct", 1.0)), 0.2)
@@ -918,8 +1090,10 @@ def _run_mean_reversion(
     equity = starting_equity
     equity_curve = [equity]
     trade_returns: List[float] = []
+    trades: List[BacktestTrade] = []
     position_entry: Optional[float] = None
     position_entry_equity = equity
+    position_entry_index: Optional[int] = None
 
     closes = [candle.close for candle in candles]
     for index in range(lookback, len(closes)):
@@ -931,6 +1105,7 @@ def _run_mean_reversion(
         if position_entry is None and zscore <= -entry:
             position_entry = price
             position_entry_equity = equity
+            position_entry_index = index
             equity_curve.append(equity)
             continue
         if position_entry is not None:
@@ -939,10 +1114,24 @@ def _run_mean_reversion(
             marked_equity = _mark_to_market_equity(position_entry_equity, adjusted_return)
             if zscore >= -exit_value or pnl_pct <= -stop_loss_pct:
                 trade_returns.append(adjusted_return)
+                # Effective notional stake: runner scales raw pnl_pct by 0.9
+                # so the committed exposure is 90% of the entry equity.
+                notional = position_entry_equity * 0.9
+                quantity = notional / position_entry if position_entry > 0 else 0.0
+                trades.append(
+                    BacktestTrade(
+                        entry_bar_index=position_entry_index if position_entry_index is not None else index,
+                        exit_bar_index=index,
+                        entry_price=position_entry,
+                        exit_price=price,
+                        quantity=quantity,
+                    )
+                )
                 equity = marked_equity
                 equity_curve.append(equity)
                 position_entry = None
                 position_entry_equity = equity
+                position_entry_index = None
                 continue
             equity_curve.append(marked_equity)
             continue
@@ -952,6 +1141,17 @@ def _run_mean_reversion(
         pnl_pct = (closes[-1] - position_entry) / position_entry * 100.0
         adjusted_return = pnl_pct * 0.9
         trade_returns.append(adjusted_return)
+        notional = position_entry_equity * 0.9
+        quantity = notional / position_entry if position_entry > 0 else 0.0
+        trades.append(
+            BacktestTrade(
+                entry_bar_index=position_entry_index if position_entry_index is not None else len(closes) - 1,
+                exit_bar_index=len(closes) - 1,
+                entry_price=position_entry,
+                exit_price=closes[-1],
+                quantity=quantity,
+            )
+        )
         equity = _mark_to_market_equity(position_entry_equity, adjusted_return)
         equity_curve[-1] = equity
 
@@ -974,14 +1174,14 @@ def _run_mean_reversion(
         max(len(candles) - 1, 1),
     )
     metrics.max_drawdown = _format_signed_pct(_compute_max_drawdown(equity_curve))
-    return metrics, used_reference_path, equity_curve
+    return metrics, used_reference_path, equity_curve, trades
 
 
 def _run_breakout(
     candles: List[CandlePoint],
     params: Dict[str, object],
     timeframe: str,
-) -> tuple[BacktestMetrics, bool, List[float]]:
+) -> tuple[BacktestMetrics, bool, List[float], List[BacktestTrade]]:
     breakout_window = max(int(float(params.get("breakout_window", 18))), 5)
     volume_ratio = max(float(params.get("volume_ratio", 1.2)), 1.0)
     max_hold_hours = max(float(params.get("max_hold_hours", 6)), 1.0)
@@ -990,8 +1190,10 @@ def _run_breakout(
     equity = starting_equity
     equity_curve = [equity]
     trade_returns: List[float] = []
+    trades: List[BacktestTrade] = []
     position_entry: Optional[float] = None
     position_entry_equity = equity
+    position_entry_index: Optional[int] = None
     hold_bars = 0
 
     for index in range(breakout_window, len(candles)):
@@ -1003,6 +1205,7 @@ def _run_breakout(
             if candle.close > highest_high and candle.volume >= avg_volume * volume_ratio:
                 position_entry = candle.close
                 position_entry_equity = equity
+                position_entry_index = index
                 hold_bars = 0
                 equity_curve.append(equity)
                 continue
@@ -1015,10 +1218,25 @@ def _run_breakout(
         marked_equity = _mark_to_market_equity(position_entry_equity, adjusted)
         if hold_bars >= max_hold_bars or pnl_pct <= -1.8 or pnl_pct >= 4.2:
             trade_returns.append(adjusted)
+            # Runner scales raw pnl_pct by 0.85, so committed exposure is
+            # 85% of the entry equity. Deriving ``quantity`` from the
+            # notional keeps ``entry_price * quantity == notional``.
+            notional = position_entry_equity * 0.85
+            quantity = notional / position_entry if position_entry > 0 else 0.0
+            trades.append(
+                BacktestTrade(
+                    entry_bar_index=position_entry_index if position_entry_index is not None else index,
+                    exit_bar_index=index,
+                    entry_price=position_entry,
+                    exit_price=candle.close,
+                    quantity=quantity,
+                )
+            )
             equity = marked_equity
             equity_curve.append(equity)
             position_entry = None
             position_entry_equity = equity
+            position_entry_index = None
             hold_bars = 0
             continue
         equity_curve.append(marked_equity)
@@ -1027,6 +1245,17 @@ def _run_breakout(
         pnl_pct = (candles[-1].close - position_entry) / position_entry * 100.0
         adjusted = pnl_pct * 0.85
         trade_returns.append(adjusted)
+        notional = position_entry_equity * 0.85
+        quantity = notional / position_entry if position_entry > 0 else 0.0
+        trades.append(
+            BacktestTrade(
+                entry_bar_index=position_entry_index if position_entry_index is not None else len(candles) - 1,
+                exit_bar_index=len(candles) - 1,
+                entry_price=position_entry,
+                exit_price=candles[-1].close,
+                quantity=quantity,
+            )
+        )
         equity = _mark_to_market_equity(position_entry_equity, adjusted)
         equity_curve[-1] = equity
 
@@ -1050,7 +1279,7 @@ def _run_breakout(
         max(len(candles) - 1, 1),
     )
     metrics.max_drawdown = _format_signed_pct(_compute_max_drawdown(equity_curve))
-    return metrics, used_reference_path, equity_curve
+    return metrics, used_reference_path, equity_curve, trades
 
 
 def run_local_backtest(strategy: StrategySummary, candles: List[CandlePoint], timeframe: str, data_range: str) -> BacktestComputation:
@@ -1062,11 +1291,11 @@ def run_local_backtest(strategy: StrategySummary, candles: List[CandlePoint], ti
     retrieved_range_start, retrieved_range_end = _candle_time_bounds(candles)
     used_range_start, used_range_end = _candle_time_bounds(effective_candles)
     if strategy.id.startswith("trend-"):
-        metrics, used_reference_path, final_equity_curve = _run_trend_follow(effective_candles, params, timeframe)
+        metrics, used_reference_path, final_equity_curve, final_trades = _run_trend_follow(effective_candles, params, timeframe)
     elif strategy.id.startswith("eth-revert") or "均值回归" in strategy.name:
-        metrics, used_reference_path, final_equity_curve = _run_mean_reversion(effective_candles, params, timeframe)
+        metrics, used_reference_path, final_equity_curve, final_trades = _run_mean_reversion(effective_candles, params, timeframe)
     else:
-        metrics, used_reference_path, final_equity_curve = _run_breakout(effective_candles, params, timeframe)
+        metrics, used_reference_path, final_equity_curve, final_trades = _run_breakout(effective_candles, params, timeframe)
     bars_per_year = 365 * 24 / _timeframe_hours(timeframe)
     volatility_stats = _compute_volatility_stats(
         final_equity_curve,
@@ -1115,6 +1344,29 @@ def run_local_backtest(strategy: StrategySummary, candles: List[CandlePoint], ti
     # and the gain-to-pain ratio are all purely distributional, so no
     # additional equity-curve walking is required.
     tail_risk_stats = _compute_tail_risk_stats(period_returns)
+    # Order-flow stats derive from the closed trades the runners exported
+    # above. ``total_bars`` is the elapsed bar count (equity curve length
+    # minus one; the runners always seed the curve with the starting equity
+    # so the first entry is an anchor rather than a bar). ``bars_per_day``
+    # falls back to 1440 (1-minute granularity) whenever the timeframe
+    # lookup misses — the helper guards division by zero internally.
+    total_bars = max(len(final_equity_curve) - 1, 0)
+    bars_per_day_lookup = {
+        "1m": 1440,
+        "5m": 288,
+        "15m": 96,
+        "1h": 24,
+        "4h": 6,
+        "1d": 1,
+    }
+    bars_per_day = bars_per_day_lookup.get(str(timeframe).lower(), 1440)
+    start_capital = final_equity_curve[0] if final_equity_curve else 0.0
+    order_flow_stats = _compute_order_flow_stats(
+        final_trades,
+        total_bars,
+        start_capital,
+        bars_per_day,
+    )
 
     notes = (
         f"由本地回测引擎基于 Bybit 历史 {timeframe} K 线生成，区间 {data_range}，"
@@ -1145,4 +1397,5 @@ def run_local_backtest(strategy: StrategySummary, candles: List[CandlePoint], ti
         benchmark_stats=benchmark_stats,
         exposure_stats=exposure_stats,
         tail_risk_stats=tail_risk_stats,
+        order_flow_stats=order_flow_stats,
     )

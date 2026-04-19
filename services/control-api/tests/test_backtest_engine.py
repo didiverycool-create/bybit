@@ -66,7 +66,7 @@ class BacktestEngineUnitTests(unittest.TestCase):
             for index, price in enumerate([100.0, 101.0, 102.0, 103.0, 90.0, 106.0])
         ]
 
-        metrics, used_reference_path, _equity_curve = backtest_engine._run_trend_follow(
+        metrics, used_reference_path, _equity_curve, _trades = backtest_engine._run_trend_follow(
             candles,
             {"fast_ma": 2, "slow_ma": 3, "risk_per_trade": 1.0},
             "1h",
@@ -82,7 +82,7 @@ class BacktestEngineUnitTests(unittest.TestCase):
             for index, price in enumerate([100.0, 110.0, 80.0, 120.0])
         ]
 
-        metrics, used_reference_path, _equity_curve = backtest_engine._run_trend_follow(
+        metrics, used_reference_path, _equity_curve, _trades = backtest_engine._run_trend_follow(
             candles,
             {"fast_ma": 2, "slow_ma": 3, "risk_per_trade": 1.0},
             "1h",
@@ -832,6 +832,126 @@ class BacktestEngineUnitTests(unittest.TestCase):
         self.assertIsInstance(benchmark.buy_hold_return_pct, float)
         self.assertIsInstance(benchmark.strategy_over_buy_hold_pct, float)
         self.assertIsInstance(benchmark.tracking_error_pct, float)
+
+    def test_compute_order_flow_stats_returns_defaults_for_no_trades(self) -> None:
+        # Empty trade list must collapse to the all-zero default payload
+        # regardless of how many bars / how much starting capital the caller
+        # reports — the helper treats "no trades" as a single canonical
+        # degenerate case rather than branching on the other inputs.
+        empty_stats = backtest_engine._compute_order_flow_stats(
+            trades=[],
+            total_bars=1_000,
+            start_capital=100_000.0,
+            bars_per_day=24,
+        )
+        self.assertIsInstance(empty_stats, backtest_engine.BacktestOrderFlowStats)
+        self.assertEqual(empty_stats.avg_holding_bars, 0.0)
+        self.assertEqual(empty_stats.trade_frequency_per_day, 0.0)
+        self.assertEqual(empty_stats.turnover_rate_pct, 0.0)
+        self.assertEqual(empty_stats.active_bar_ratio_pct, 0.0)
+        self.assertEqual(empty_stats.avg_trade_notional, 0.0)
+
+        # Non-empty trades but zero total bars must likewise collapse — the
+        # helper cannot infer frequency / coverage without a time axis.
+        zero_bar_stats = backtest_engine._compute_order_flow_stats(
+            trades=[
+                backtest_engine.BacktestTrade(
+                    entry_bar_index=0,
+                    exit_bar_index=0,
+                    entry_price=100.0,
+                    exit_price=100.0,
+                    quantity=1.0,
+                )
+            ],
+            total_bars=0,
+            start_capital=100_000.0,
+            bars_per_day=24,
+        )
+        self.assertEqual(zero_bar_stats.avg_holding_bars, 0.0)
+        self.assertEqual(zero_bar_stats.active_bar_ratio_pct, 0.0)
+
+    def test_compute_order_flow_stats_avg_holding_and_active_ratio(self) -> None:
+        # Two trades with well-defined holding spans: 0→10 (span 10) and
+        # 20→25 (span 5). Average holding is (10 + 5) / 2 = 7.5 bars. The
+        # active-bar union covers 11 bars (0..10 inclusive) plus 6 bars
+        # (20..25 inclusive) = 17 of 30 total bars → 56.67%.
+        trades = [
+            backtest_engine.BacktestTrade(
+                entry_bar_index=0,
+                exit_bar_index=10,
+                entry_price=100.0,
+                exit_price=110.0,
+                quantity=1.0,
+            ),
+            backtest_engine.BacktestTrade(
+                entry_bar_index=20,
+                exit_bar_index=25,
+                entry_price=105.0,
+                exit_price=108.0,
+                quantity=1.0,
+            ),
+        ]
+        stats = backtest_engine._compute_order_flow_stats(
+            trades=trades,
+            total_bars=30,
+            start_capital=100_000.0,
+            bars_per_day=24,
+        )
+
+        self.assertAlmostEqual(stats.avg_holding_bars, 7.5, places=2)
+        self.assertAlmostEqual(stats.active_bar_ratio_pct, 17 / 30 * 100.0, places=2)
+
+    def test_compute_order_flow_stats_turnover_and_avg_notional(self) -> None:
+        # Hand-picked notionals (100 * 100 = 10_000, 150 * 100 = 15_000)
+        # against a 50_000 starting capital give turnover 25_000 / 50_000 ×
+        # 100 = 50.0% and average notional (10_000 + 15_000) / 2 = 12_500.
+        trades = [
+            backtest_engine.BacktestTrade(
+                entry_bar_index=0,
+                exit_bar_index=5,
+                entry_price=100.0,
+                exit_price=105.0,
+                quantity=100.0,
+            ),
+            backtest_engine.BacktestTrade(
+                entry_bar_index=10,
+                exit_bar_index=15,
+                entry_price=150.0,
+                exit_price=155.0,
+                quantity=100.0,
+            ),
+        ]
+        stats = backtest_engine._compute_order_flow_stats(
+            trades=trades,
+            total_bars=100,
+            start_capital=50_000.0,
+            bars_per_day=24,
+        )
+
+        self.assertAlmostEqual(stats.turnover_rate_pct, 50.0, places=4)
+        self.assertAlmostEqual(stats.avg_trade_notional, 12_500.0, places=4)
+
+    def test_compute_order_flow_stats_trade_frequency_per_day(self) -> None:
+        # 2880 bars at 1440 bars per day spans exactly 2 natural days; 4
+        # trades over that window → frequency 4 / 2 = 2.0 per day.
+        trades = [
+            backtest_engine.BacktestTrade(
+                entry_bar_index=index * 500,
+                exit_bar_index=index * 500 + 10,
+                entry_price=100.0,
+                exit_price=101.0,
+                quantity=1.0,
+            )
+            for index in range(4)
+        ]
+        stats = backtest_engine._compute_order_flow_stats(
+            trades=trades,
+            total_bars=2880,
+            start_capital=100_000.0,
+            bars_per_day=1440,
+        )
+
+        self.assertAlmostEqual(stats.trade_frequency_per_day, 2.0, places=4)
 
 
 if __name__ == "__main__":

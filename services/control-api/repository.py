@@ -3356,6 +3356,7 @@ class AppRepository:
             benchmark_stats=computed.get("benchmark_stats") if computed else None,
             exposure_stats=computed.get("exposure_stats") if computed else None,
             tail_risk_stats=computed.get("tail_risk_stats") if computed else None,
+            order_flow_stats=computed.get("order_flow_stats") if computed else None,
         )
         self.state.backtests.insert(0, record)
         self.add_event(
@@ -3423,6 +3424,7 @@ class AppRepository:
                 "benchmark_stats": backtest.benchmark_stats.model_dump(mode="json") if backtest.benchmark_stats else None,
                 "exposure_stats": backtest.exposure_stats.model_dump(mode="json") if backtest.exposure_stats else None,
                 "tail_risk_stats": backtest.tail_risk_stats.model_dump(mode="json") if backtest.tail_risk_stats else None,
+                "order_flow_stats": backtest.order_flow_stats.model_dump(mode="json") if backtest.order_flow_stats else None,
                 "requested_by": requested_by,
                 "mode": strategy.mode.value,
                 "backtest_id": backtest.id,
