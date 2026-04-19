@@ -24,20 +24,25 @@ f'bybit_control_market_live_generation_ms{{requested_symbol="{diagnostics.reques
 
 ---
 
-### 2. App.tsx 单文件 16,763 行 — 不可维护的 God Component
+### 2. App.tsx 主文件仍偏重，但已明显收敛（已部分覆盖）
 
 **文件**: `apps/desktop/src/App.tsx`
 
-所有业务逻辑（~60+ `useState`、~20 `useEffect`、~15 `useQuery`）集中在一个函数组件内。任何一个状态变更都会触发整棵 16,000+ 行 JSX 树的重新渲染。`useDeferredValue` 已被移除（改为直接使用 `selectedSymbol`），进一步降低了切换时的响应性优化。
+最初审计时，`App.tsx` 还是一个超大体量的 God Component；但沿着当前主线持续拆分后，桌面端主文件已经明显压薄，最新主线约为 **782 行**，并且新增了 `AppWorkspaceShell`、`buildAppPresentationModels`、`useAppCompositionModel`、`useAppInteractionModels`、`useAppLifecycleEffects` 等分层，说明“所有逻辑都堆在单文件里”的情况已经不再成立。
+
+当前剩余问题主要变成：
+
+- `App.tsx` 虽然已经不再直接承载大块 JSX，但仍然是桌面端的顶层编排入口
+- 组合层参数面仍然较宽，后续继续拆时仍可能出现“主文件变薄，但 builder / model 继续膨胀”的风险
+- 主线已收敛到“容器 + hook + 展示组件 + 纯 builder”模式，但还没完全拆到最终稳态
 
 具体影响：
 
-- 每次修改都面临巨大的合并冲突风险
-- React 热更新变慢
-- 无法有效地做 code splitting 和 tree shaking
-- 新开发者无法快速理解代码结构
+- 顶层编排改动仍然容易触发较大范围的联动修改
+- 如果继续只做“把长对象搬去别的文件”，复杂度可能只是转移位置，没有真正下降
+- 新接手者仍需同时理解 bootstrap、query、interaction、composition、presentation 这几层关系
 
-**修复建议**: 将 ~40 个纯函数（`summarizeAuditEvent`、`auditImpactMeta`、`proposalStatusLabel` 等）抽出为独立模块；将各 section 面板（策略活动、行情、回测等）拆分为独立组件。
+**后续建议**: 继续把 `App.tsx` 保持为编排入口，优先收窄剩余顶层组合层的参数面，避免再回到“新的 mega-builder / mega-hook”；展示层拆分已明显推进，这条问题当前应视为“已明显缓解，但未彻底完成”。
 
 ---
 
@@ -88,7 +93,7 @@ def snapshot(self) -> AppState:
 
 ---
 
-### 6. `StrategyActivitySnapshot` 模型字段爆炸
+### 6. `StrategyActivitySnapshot` 模型字段爆炸（已部分覆盖）
 
 **文件**: `services/control-api/models.py`
 
@@ -98,7 +103,9 @@ def snapshot(self) -> AppState:
 - 前后端数据契约脆弱，每次新增实体都要添加 6-8 个字段
 - 序列化/反序列化开销显著，对 SSE 流带宽和前端解析性能都有压力
 
-**修复建议**: 使用嵌套结构（如 `latest: { backtest: {...}, proposal: {...} }` 和 `latest_actionable: {...}`），或改为按需加载子资源的 API 设计。
+当前仓库已引入 `activity_sections`、`latest_ops`、`latest_runtime`、`decision_context` 等分层结构，前端也已通过 selector / hook 分层优先消费嵌套字段，再 fallback 到旧的 flat 字段。本轮又进一步把 proposal / change request / backtest / review / tracking / ops 的 sources 与 `recent_*` collections 收口到 `strategyActivitySelectors.ts` 的统一快照视图模型，并让 `Decision / Progress / Ops` 三个活动模型复用同一入口，说明这条问题已明显收敛；但为了兼容 fallback 数据和历史脏数据，前端仍保留了大量旧字段兜底，后端 schema 也依然偏宽，尚未彻底完成模型瘦身。
+
+**后续建议**: 继续以前述嵌套结构作为主消费通道，逐步减少新的 flat 字段扩张；中长期再评估是否收敛旧 flat 字段，或拆成按需加载的子资源 API。
 
 ---
 
@@ -124,42 +131,49 @@ def snapshot(self) -> AppState:
 
 ## Medium（中等）
 
-### 9. 缓存无容量上限
+### 9. 缓存无容量上限（已修复）
 
 **文件**: `services/control-api/bybit_public_client.py`
 
-所有缓存字典（`_ticker_cache`、`_candle_cache`、`_orderbook_cache` 等）只有 TTL 过期策略，没有容量限制。如果 watchlist 持续变化，缓存会无限增长。
+当前实现已经为 `_ticker_cache`、`_candle_cache`、`_orderbook_cache`、`_recent_trade_cache`、`_announcement_cache`、`_instrument_cache`、`_candle_history_cache` 增加 `max_entries` 上限，并在写入时主动 prune 旧条目，原审计结论已不再成立。
 
-**修复建议**: 添加 `maxsize` 限制或使用 `functools.lru_cache` / 定期清理过期条目。
+**当前状态**: 已通过容量上限与写入时裁剪完成修复，后续只需按业务规模继续校准各缓存桶的上限参数。
 
 ---
 
-### 10. K 线缓存 TTL 从 20s 大幅增加到 180s
+### 10. K 线缓存 TTL 从 20s 大幅增加到 180s（已修复）
 
 **文件**: `services/control-api/bybit_public_client.py`
 
-`_candle_cache_ttl` 和 `_candle_history_cache_ttl` 均从 20 秒改为 180 秒（3 分钟）。对于交易系统，3 分钟的陈旧 K 线数据可能导致决策延迟。
+当前实现已经改为按周期分层的 TTL，而不是统一 180 秒；并且后续又进一步收紧为：
 
-**修复建议**: 确认是否为预期行为；如果是为了减少 API 调用频率，考虑结合 WebSocket 实时推送来保持数据新鲜度。
+- 实时 K 线缓存：`15m/1h/4h/1d = 4/5/8/12s`
+- 历史 K 线缓存：`15m/1h/4h/1d = 5/6/10/14s`
+
+这说明原审计里“统一放大到 180 秒”的结论已经过时，风险明显低于最初判断。
+
+**当前状态**: 已通过按周期细化并再次收紧 TTL 完成修复；当前最长实时 K 线缓存窗口已收紧到 `12s`，历史分页缓存最长也已收紧到 `14s`，不再保留跨多轮桌面刷新仍滞留的明显偏长窗口。
 
 ---
 
-### 11. 前后端逻辑重复
+### 11. 前后端逻辑重复（已部分覆盖）
 
 **文件**: `apps/desktop/src/App.tsx` 与 `services/control-api/repository.py` / `main.py`
 
 以下函数在前后端几乎完全相同的实现：
 
-| 前端 (App.tsx) | 后端 (repository.py / main.py) |
+| 前端消费层 | 后端快照/装饰层 |
 |---|---|
 | `auditImpactMeta()` | `_build_audit_event_impact_detail()` |
 | `auditEventPriority()` | `_execution_event_priority()` |
 | `pickLatestKeyAuditEvent()` | `_pick_latest_key_execution_event()` |
 | `summarizeAuditEvent()` | `_build_audit_event_summary()` |
 
-双重维护容易导致逻辑分叉。
+后端已经在 `repository.py` 的执行事件装饰链路里补充 `summary / impact_detail / priority / is_key_event`，前端 `app-helpers.ts` 也已经收敛为“优先读后端字段，缺失时再兜底”的统一消费层，因此这条问题不再是完全裸露的双重实现。
 
-**修复建议**: 让后端返回计算好的 `impact_detail`、`priority`、`summary`，前端直接使用。
+当前剩余问题主要是 fallback 数据和历史脏数据路径仍要求前端保留兜底逻辑，因此前后端之间仍有一部分重复维护成本。
+
+**修复建议**: 后续如要继续收敛，优先补齐 fallback / 本地快照数据结构，再评估是否进一步减少前端兜底逻辑；本轮不建议为该条目额外引入前后端联动改造。
 
 ---
 
@@ -205,13 +219,17 @@ refetchInterval: liveMarketEnabled ? 12000 : 12000
 
 ---
 
-### 16. `build_strategy_activity_payload` 线性遍历的 O(n*m) 复杂度
+### 16. `build_strategy_activity_payload` 仍存在多轮线性遍历（已部分缓解）
 
 **文件**: `services/control-api/main.py`
 
-该函数对 `state.backtests`、`state.reviews`、`state.change_requests`、`state.agent_jobs`、`state.audit_events` 做全量遍历和排序，然后又在内嵌的 `get_linked_*_for_proposal` 等函数中对 `recent_backtests`、`recent_reviews`、`recent_agent_jobs` 做重复 `next(... for ... in ...)` 线性查找。策略和数据量增长后，性能会显著退化。
+该函数仍会对 `state.backtests`、`state.reviews`、`state.change_requests`、`state.agent_jobs`、`state.audit_events` 做多轮过滤、排序和筛选；不过当前已通过 `StrategyActivityLineageMaps` 预建 `proposal_*_map`、`*_summary_by_id` 等索引字典，把原先最明显的重复关联查找从线性扫描收敛到了字典命中，因此问题不再是完全裸露的 O(n*m) 形态。
 
-**修复建议**: 预先构建 `{id: record}` 的索引字典，O(1) 查找替代线性扫描。
+最新几轮已继续收敛顶部聚合阶段：`build_strategy_activity_payload` 现在不再重复调用 `repo.snapshot()` 取 `trades`，并把 `reviews / proposals` 的两轮收集合并成了一次遍历；对已排序列表的“最新项”提取也改成了直接取首项，`tracking jobs / proposals / change requests` 的“最新项 + 可行动项”筛选也开始复用单次顺序扫描，减少了几轮无必要的再次遍历。本轮又进一步把 `agent_jobs -> tracking jobs` 的额外过滤收进 summary 构建过程，并把 `recent_backtest_records -> recent_actionable_backtest_records` 的中间列表改成直接顺序扫描首个可行动回测，继续削掉了两段额外的全量遍历。
+
+当前剩余风险主要在于顶部聚合阶段仍有多轮全量遍历；如果后续数据规模继续增长，仍可能出现构建快照时延缓慢上升的问题。
+
+**修复建议**: 保留现有索引层，后续如出现真实性能压力，再基于 profile 评估是否将前置索引继续上移、或把部分子资源改为按需构建。
 
 ---
 
@@ -275,7 +293,7 @@ refetchInterval: liveMarketEnabled ? 12000 : 12000
 
 ---
 
-### 23. `did-finish-load` 回调中 early return 阻断后续扩展
+### 23. `did-finish-load` 回调中 early return 阻断后续扩展（已修复）
 
 **文件**: `apps/desktop/src/main/main.ts`
 
@@ -288,17 +306,17 @@ win.webContents.on("did-finish-load", async () => {
 });
 ```
 
-如果后续需要在 `did-finish-load` 添加正常功能逻辑（如窗口 ready 后的初始化），此 early return 会阻断它们。
+当前实现已改成“仅在需要时执行 smoke 分支”，不再通过 normal path 上的 early return 直接退出整个 `did-finish-load` 回调；后续若继续在同一回调里追加正常初始化逻辑，不会再被 smoke guard 提前截断。
 
 ---
 
-### 24. docs/ 与 README 内容重复
+### 24. docs/ 与 README 内容重复（已修复）
 
 **文件**: `README.md` 与 `docs/实施路线与接手清单.md`
 
 工作台状态恢复逻辑（`selected_change_request_id` 对齐策略、自动清理旧定位等）在两处都有描述，措辞略有不同，后续维护容易分叉。
 
-**修复建议**: 以 `docs/` 为唯一信源，README 只做引用链接。
+当前 README 已收敛为“仓库入口 + 高层概览 + 常用命令”，详细功能清单、实施进度与验证口径统一回收到 `docs/实施路线与接手清单.md`，避免两处继续并行维护同一批细节描述。
 
 ---
 
@@ -318,11 +336,10 @@ win.webContents.on("did-finish-load", async () => {
 | **P0** | `snapshot()` 读写分离 + 返回不可变快照 | 中 | #4 |
 | **P0** | 缓存线程安全 | 小 | #5 |
 | **P1** | App.tsx 拆分 | 大 | #2 |
-| **P1** | StrategyActivitySnapshot 模型重构 | 中 | #6 |
+| **P1** | StrategyActivitySnapshot 模型继续收敛（已明显收敛，但仍未完成） | 中 | #6 |
 | **P1** | watchlist strict 模式错误处理 | 小 | #7 |
 | **P1** | SSE 断连兜底 | 小 | #8 |
-| **P2** | 前后端逻辑去重 | 中 | #11 |
+| **P2** | 前后端逻辑继续收敛（已部分覆盖） | 中 | #11 |
 | **P2** | ECharts lazy 加载恢复 | 小 | #12 |
-| **P2** | 缓存容量上限 | 小 | #9 |
-| **P2** | 策略活动查询性能优化 | 中 | #16 |
+| **P2** | 策略活动查询性能持续收敛（已部分缓解） | 中 | #16 |
 | **P3** | 其余 Low 级别问题 | 小 | #17-#25 |

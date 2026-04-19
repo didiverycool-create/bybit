@@ -14,7 +14,7 @@ import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from bybit_private_client import BybitPrivateClient
 from bybit_public_client import BybitPublicMarketClient
@@ -141,6 +141,7 @@ from models import (
     PaperOrderBulkCancelResult,
     PaperOrderReplacePayload,
     PaperPositionBulkCloseResult,
+    ReconcileChangeRequestOutcome,
     ReviewDocument,
     RuntimeWorkerActionPayload,
     RuntimeWorkerActionResult,
@@ -171,6 +172,46 @@ from models import (
     WorkspacePreferences,
     WorkspacePreferencesUpdate,
     normalize_backtest_timeframe,
+)
+from strategy_activity_review import (
+    build_strategy_activity_review_context_indexes,
+    summarize_strategy_activity_alert as summarize_alert,
+    summarize_strategy_activity_backtest as summarize_backtest,
+    summarize_strategy_activity_change_request as summarize_change_request,
+    summarize_strategy_activity_event as summarize_event,
+    summarize_strategy_activity_job as summarize_agent_job,
+    summarize_strategy_activity_order as summarize_order,
+    summarize_strategy_activity_proposal,
+    summarize_strategy_activity_review as summarize_review,
+    summarize_strategy_activity_trade as summarize_trade,
+)
+from strategy_activity_snapshot import (
+    build_strategy_activity_latest_runtime_snapshot as _build_strategy_activity_latest_runtime_snapshot,
+    build_strategy_activity_snapshot_from_sections as _build_strategy_activity_snapshot_model,
+)
+from strategy_activity_latest_ops import (
+    build_strategy_activity_latest_ops_snapshot as _build_strategy_activity_latest_ops_snapshot,
+)
+from strategy_activity_payload import (
+    build_strategy_activity_recent_data as _build_strategy_activity_recent_data_model,
+    StrategyActivityRecentData,
+)
+from strategy_activity_lineage import (
+    StrategyActivityBacktestLinkage,
+    StrategyActivityChangeRequestLinkage,
+    StrategyActivityLineageContext,
+    StrategyActivityLineageMaps,
+    StrategyActivityProposalLinkage,
+    StrategyActivityReviewLinkage,
+    StrategyActivityReviewTailLinkage,
+)
+from strategy_activity_payload import (
+    build_strategy_activity_payload_assemblies as _build_strategy_activity_payload_assemblies,
+)
+from strategy_activity_summary import (
+    build_strategy_activity_summary_collections as _build_strategy_activity_summary_collections,
+    has_strategy_activity_backtest_rerun_recommendation as _has_strategy_activity_backtest_rerun_recommendation,
+    has_strategy_activity_change_request_rerun_recommendation as _has_strategy_activity_change_request_rerun_recommendation,
 )
 from openclaw_client import OpenClawGatewayClient
 from repository import AppRepository
@@ -930,6 +971,21 @@ def parse_metric_number(value: Any) -> float:
         return 0.0
 
 
+def prometheus_label_value(value: object) -> str:
+    return (
+        str(value if value is not None else "")
+        .replace("\\", "\\\\")
+        .replace("\n", "\\n")
+        .replace('"', '\\"')
+    )
+
+
+def prometheus_labels(**labels: object) -> str:
+    return ",".join(
+        f'{key}="{prometheus_label_value(raw_value)}"' for key, raw_value in labels.items()
+    )
+
+
 def resolve_private_mode_access(mode: AccountMode) -> tuple[BybitPrivateStatus, Optional[str]]:
     status = private_data.get_status()
     if mode == AccountMode.PAPER:
@@ -1241,18 +1297,6 @@ def load_private_positions_snapshot() -> tuple[BybitPrivateStatus, List[Dict[str
         private_realtime.seed_positions_snapshot(positions)
     updated_at = get_private_runtime_updated_at(status)
     return status, positions, updated_at
-    normalized = (
-        str(value)
-        .replace("USDT", "")
-        .replace("%", "")
-        .replace(",", "")
-        .replace("+", "")
-        .strip()
-    )
-    try:
-        return float(normalized)
-    except ValueError:
-        return 0.0
 
 
 def ensure_private_realtime_started() -> None:
@@ -2564,12 +2608,6 @@ def build_prometheus_metrics() -> str:
             metric_headers_written.add(metric_name)
         lines.append(value_line)
 
-    def prometheus_label_value(value: object) -> str:
-        return str(value if value is not None else "").replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"')
-
-    def prometheus_labels(**labels: object) -> str:
-        return ",".join(f'{key}="{prometheus_label_value(raw_value)}"' for key, raw_value in labels.items())
-
     workspace_symbol = state.workspace_preferences.selected_symbol
     workspace_timeframe = state.workspace_preferences.selected_market_timeframe
     try:
@@ -2817,7 +2855,7 @@ def build_prometheus_metrics() -> str:
         add_metric_line(
             "bybit_control_alerts_total",
             "Unacknowledged alerts by severity",
-            f'bybit_control_alerts_total{{severity="{severity}"}} {count}',
+            f"bybit_control_alerts_total{{{prometheus_labels(severity=severity)}}} {count}",
         )
     for issue_name, count in (
         ("runtime_worker_issue", 1 if execution_health.runtime_worker_issue else 0),
@@ -2833,7 +2871,7 @@ def build_prometheus_metrics() -> str:
         add_metric_line(
             "bybit_control_strategy_issue_total",
             "Current strategy execution health issues by issue type",
-            f'bybit_control_strategy_issue_total{{issue="{issue_name}"}} {count}',
+            f"bybit_control_strategy_issue_total{{{prometheus_labels(issue=issue_name)}}} {count}",
         )
 
     for strategy in state.strategies:
@@ -2862,18 +2900,26 @@ def build_prometheus_metrics() -> str:
         add_metric_line(
             "bybit_control_strategy_pnl_7d",
             "Seven day strategy pnl percentage",
-            f'bybit_control_strategy_pnl_7d{{strategy_id="{strategy.id}",mode="{strategy.mode.value}",status="{strategy.status}"}} {parse_metric_number(strategy.pnl_7d)}',
+            (
+                f"bybit_control_strategy_pnl_7d"
+                f"{{{prometheus_labels(strategy_id=strategy.id, mode=strategy.mode.value, status=strategy.status)}}} "
+                f"{parse_metric_number(strategy.pnl_7d)}"
+            ),
         )
         add_metric_line(
             "bybit_control_strategy_drawdown",
             "Seven day max drawdown percentage",
-            f'bybit_control_strategy_drawdown{{strategy_id="{strategy.id}"}} {parse_metric_number(strategy.max_drawdown)}',
+            (
+                f"bybit_control_strategy_drawdown"
+                f"{{{prometheus_labels(strategy_id=strategy.id)}}} {parse_metric_number(strategy.max_drawdown)}"
+            ),
         )
         add_metric_line(
             "bybit_control_strategy_live_stop_loss_guard",
             "Whether a live or demo strategy is currently blocked by active real stop loss protection",
             (
-                f'bybit_control_strategy_live_stop_loss_guard{{strategy_id="{strategy.id}",mode="{strategy.mode.value}",status="{strategy.status}"}} '
+                f"bybit_control_strategy_live_stop_loss_guard"
+                f"{{{prometheus_labels(strategy_id=strategy.id, mode=strategy.mode.value, status=strategy.status)}}} "
                 f"{1 if _has_active_strategy_live_stop_loss_alert(strategy.id) else 0}"
             ),
         )
@@ -2881,7 +2927,8 @@ def build_prometheus_metrics() -> str:
             "bybit_control_strategy_live_stop_loss_cooldown_minutes",
             "Remaining cooldown minutes after a live or demo strategy stop loss guard event",
             (
-                f'bybit_control_strategy_live_stop_loss_cooldown_minutes{{strategy_id="{strategy.id}",mode="{strategy.mode.value}",status="{strategy.status}"}} '
+                f"bybit_control_strategy_live_stop_loss_cooldown_minutes"
+                f"{{{prometheus_labels(strategy_id=strategy.id, mode=strategy.mode.value, status=strategy.status)}}} "
                 f"{_strategy_live_stop_loss_cooldown_remaining_minutes(strategy) or 0}"
             ),
         )
@@ -2889,7 +2936,8 @@ def build_prometheus_metrics() -> str:
             "bybit_control_strategy_auto_dispatch_blocked",
             "Whether a strategy currently has an active or dynamically detected auto dispatch blocking condition",
             (
-                f'bybit_control_strategy_auto_dispatch_blocked{{strategy_id="{strategy.id}",mode="{strategy.mode.value}",status="{strategy.status}"}} '
+                f"bybit_control_strategy_auto_dispatch_blocked"
+                f"{{{prometheus_labels(strategy_id=strategy.id, mode=strategy.mode.value, status=strategy.status)}}} "
                 f"{1 if _has_active_strategy_auto_dispatch_alert(strategy.id) or strategy.id in dynamic_auto_dispatch_blocked_strategy_ids else 0}"
             ),
         )
@@ -2897,7 +2945,8 @@ def build_prometheus_metrics() -> str:
             "bybit_control_strategy_exchange_rejection_guard",
             "Whether a strategy is currently in cooldown after repeated rejected live or demo orders",
             (
-                f'bybit_control_strategy_exchange_rejection_guard{{strategy_id="{strategy.id}",mode="{strategy.mode.value}",status="{strategy.status}"}} '
+                f"bybit_control_strategy_exchange_rejection_guard"
+                f"{{{prometheus_labels(strategy_id=strategy.id, mode=strategy.mode.value, status=strategy.status)}}} "
                 f"{1 if _strategy_exchange_rejection_guard_remaining_minutes(strategy) is not None else 0}"
             ),
         )
@@ -2905,7 +2954,8 @@ def build_prometheus_metrics() -> str:
             "bybit_control_strategy_exchange_rejection_cooldown_minutes",
             "Remaining cooldown minutes after repeated rejected live or demo strategy orders",
             (
-                f'bybit_control_strategy_exchange_rejection_cooldown_minutes{{strategy_id="{strategy.id}",mode="{strategy.mode.value}",status="{strategy.status}"}} '
+                f"bybit_control_strategy_exchange_rejection_cooldown_minutes"
+                f"{{{prometheus_labels(strategy_id=strategy.id, mode=strategy.mode.value, status=strategy.status)}}} "
                 f"{_strategy_exchange_rejection_guard_remaining_minutes(strategy) or 0}"
             ),
         )
@@ -2913,7 +2963,8 @@ def build_prometheus_metrics() -> str:
             "bybit_control_strategy_stale_order_guard",
             "Whether a strategy currently has a stale real exchange order alert",
             (
-                f'bybit_control_strategy_stale_order_guard{{strategy_id="{strategy.id}",mode="{strategy.mode.value}",status="{strategy.status}"}} '
+                f"bybit_control_strategy_stale_order_guard"
+                f"{{{prometheus_labels(strategy_id=strategy.id, mode=strategy.mode.value, status=strategy.status)}}} "
                 f"{1 if _has_active_strategy_stale_order_alert(strategy.id) else 0}"
             ),
         )
@@ -2921,7 +2972,8 @@ def build_prometheus_metrics() -> str:
             "bybit_control_strategy_position_alignment_state",
             "Current position alignment state for the strategy target position",
             (
-                f'bybit_control_strategy_position_alignment_state{{strategy_id="{strategy.id}",mode="{strategy.mode.value}",status="{strategy.status}",alignment="{position_alignment}"}} '
+                f"bybit_control_strategy_position_alignment_state"
+                f"{{{prometheus_labels(strategy_id=strategy.id, mode=strategy.mode.value, status=strategy.status, alignment=position_alignment)}}} "
                 f"{alignment_map.get(position_alignment, 0)}"
             ),
         )
@@ -2930,17 +2982,26 @@ def build_prometheus_metrics() -> str:
         add_metric_line(
             "bybit_control_watchlist_change_24h",
             "24h percentage change of watched symbol",
-            f'bybit_control_watchlist_change_24h{{symbol="{item.symbol}",market="{item.market}"}} {item.change_24h}',
+            (
+                f"bybit_control_watchlist_change_24h"
+                f"{{{prometheus_labels(symbol=item.symbol, market=item.market)}}} {item.change_24h}"
+            ),
         )
         add_metric_line(
             "bybit_control_watchlist_risk_level",
             "Risk score of watched symbol",
-            f'bybit_control_watchlist_risk_level{{symbol="{item.symbol}"}} {risk_map.get(item.risk_level, 0)}',
+            (
+                f"bybit_control_watchlist_risk_level"
+                f"{{{prometheus_labels(symbol=item.symbol)}}} {risk_map.get(item.risk_level, 0)}"
+            ),
         )
         add_metric_line(
             "bybit_control_watchlist_signal_state",
             "Signal score of watched symbol",
-            f'bybit_control_watchlist_signal_state{{symbol="{item.symbol}"}} {signal_map.get(item.signal, 0)}',
+            (
+                f"bybit_control_watchlist_signal_state"
+                f"{{{prometheus_labels(symbol=item.symbol)}}} {signal_map.get(item.signal, 0)}"
+            ),
         )
 
     return "\n".join(lines) + "\n"
@@ -3839,3282 +3900,6 @@ def _strategy_matches_audit_event(event: ExecutionEvent, strategy_id: str, symbo
     return event.event_type.startswith("strategy.") or event.event_type.startswith("exchange_order.")
 
 
-def _build_strategy_activity_latest_ops_snapshot(
-    *,
-    latest_active_order_summary: Optional[str],
-    latest_historical_order_summary: Optional[str],
-    latest_order_summary: Optional[str],
-    latest_pending_alert_summary: Optional[str],
-    latest_trade_summary: Optional[str],
-    latest_alert_summary: Optional[str],
-    latest_audit_event_summary: Optional[str],
-    latest_active_order_record: Optional[OrderRecord],
-    latest_historical_order_record: Optional[OrderRecord],
-    latest_order_record: Optional[OrderRecord],
-    latest_pending_alert_record: Optional[AlertRecord],
-    latest_trade_record: Optional[TradeRecord],
-    latest_alert_record: Optional[AlertRecord],
-    latest_audit_event_record: Optional[ExecutionEvent],
-) -> StrategyActivityLatestOpsSnapshot:
-    return StrategyActivityLatestOpsSnapshot(
-        latest_active_order=latest_active_order_summary,
-        latest_historical_order=latest_historical_order_summary,
-        latest_order=latest_order_summary,
-        latest_pending_alert=latest_pending_alert_summary,
-        latest_trade=latest_trade_summary,
-        latest_alert=latest_alert_summary,
-        latest_audit_event=latest_audit_event_summary,
-        latest_active_order_record=latest_active_order_record,
-        latest_historical_order_record=latest_historical_order_record,
-        latest_order_record=latest_order_record,
-        latest_pending_alert_record=latest_pending_alert_record,
-        latest_trade_record=latest_trade_record,
-        latest_alert_record=latest_alert_record,
-        latest_audit_event_record=latest_audit_event_record,
-    )
-
-
-def _build_strategy_activity_latest_runtime_snapshot(
-    *,
-    runtime: Optional[StrategyRuntimeSnapshot],
-    latest_ops: StrategyActivityLatestOpsSnapshot,
-) -> StrategyActivityLatestRuntimeSnapshot:
-    return StrategyActivityLatestRuntimeSnapshot(runtime=runtime, latest_ops=latest_ops)
-
-
-def build_strategy_activity_payload(strategy_id: str) -> StrategyActivitySnapshot:
-    state = repo.snapshot()
-    strategy = next((item for item in state.strategies if item.id == strategy_id), None)
-    if strategy is None:
-        raise KeyError(strategy_id)
-    symbol = strategy.symbols[0] if strategy.symbols else "--"
-    market = next((item.market for item in state.watchlist if item.symbol == symbol), "perp")
-    runtime = _build_lightweight_strategy_activity_runtime_snapshot(state, strategy)
-    if runtime is not None:
-        runtime = _decorate_strategy_runtime_item(runtime)
-    if runtime is not None and runtime.runtime_status != "paused":
-        strategy_mode_preview: Optional[ExecutionPreview]
-        if strategy.mode != AccountMode.PAPER:
-            runtime_block_reason = _runtime_worker_execution_block_reason(_build_strategy_runtime_worker_health())
-            if runtime_block_reason is not None:
-                strategy_mode_preview = _build_blocked_strategy_execution_preview(runtime, strategy.mode, runtime_block_reason)
-            else:
-                try:
-                    strategy_mode_preview = _build_strategy_execution_preview_from_state(
-                        strategy_id,
-                        strategy.mode,
-                        runtime_snapshot_override=runtime,
-                    )
-                except RuntimeError as exc:
-                    strategy_mode_preview = _build_blocked_strategy_execution_preview(runtime, strategy.mode, str(exc))
-                except ValueError as exc:
-                    strategy_mode_preview = _build_blocked_strategy_execution_preview(runtime, strategy.mode, str(exc))
-        else:
-            try:
-                strategy_mode_preview = _build_strategy_execution_preview_from_state(
-                    strategy_id,
-                    strategy.mode,
-                    runtime_snapshot_override=runtime,
-                )
-            except RuntimeError:
-                strategy_mode_preview = None
-        if strategy_mode_preview is not None:
-            runtime = _apply_runtime_blocked_preview_context(runtime, strategy_mode_preview).model_copy(
-                update={"execution_preview": strategy_mode_preview}
-            )
-    orders_source = repo.get_paper_orders() if strategy.mode == AccountMode.PAPER else parse_open_orders(use_private_only=True)
-    history_source = repo.get_paper_order_history() if strategy.mode == AccountMode.PAPER else parse_order_history(use_private_only=True)
-    trades_source = repo.snapshot().trades if strategy.mode == AccountMode.PAPER else parse_trades(use_private_only=True)
-    active_orders = [item for item in orders_source if _strategy_matches_order(item, strategy_id, symbol, market)]
-    recent_orders = [item for item in history_source if _strategy_matches_order(item, strategy_id, symbol, market)]
-    recent_trades = [item for item in trades_source if _strategy_matches_trade(item, strategy_id, symbol, market)]
-    recent_alerts = [item for item in state.alerts if _strategy_matches_alert(item, strategy_id, symbol)]
-    recent_audit_events = [
-        AppRepository._decorate_execution_event(item)
-        for item in state.audit_events
-        if _strategy_matches_audit_event(item, strategy_id, symbol)
-    ]
-    recent_review_records = [
-        review
-        for review in state.reviews
-        if review.strategy_id == strategy_id or any(proposal.strategy_id == strategy_id for proposal in review.proposals)
-    ]
-    recent_review_records.sort(key=lambda item: item.created_at, reverse=True)
-    recent_reviews = [
-        StrategyActivityReviewSummary(
-            id=review.id,
-            period=review.period,
-            backtest_id=review.backtest_id,
-            source_job_id=review.source_job_id,
-            source_job_type=review.source_job_type,
-            source_job_status=review.source_job_status,
-            source_change_request_id=review.source_change_request_id,
-            source_backtest_id=review.source_backtest_id,
-            source_review_id=review.source_review_id,
-            source_proposal_id=review.source_proposal_id,
-            trigger_reason=review.trigger_reason,
-            title=review.title,
-            summary=review.summary,
-            proposal_count=sum(1 for proposal in review.proposals if proposal.strategy_id == strategy_id),
-            created_at=review.created_at,
-        )
-        for review in recent_review_records
-    ]
-    recent_proposals = [
-        proposal
-        for review in state.reviews
-        for proposal in review.proposals
-        if proposal.strategy_id == strategy_id
-    ]
-    recent_proposals.sort(key=lambda item: item.created_at, reverse=True)
-    recent_change_requests = [
-        item
-        for item in state.change_requests
-        if (str(item.payload.get("strategy_id") or "") == strategy_id)
-    ]
-    recent_change_requests.sort(key=lambda item: item.updated_at or item.created_at, reverse=True)
-    recent_backtest_records = [item for item in state.backtests if item.strategy_id == strategy_id]
-    recent_backtest_records.sort(key=lambda item: item.finished_at or item.started_at, reverse=True)
-    recent_backtests = [
-        StrategyActivityBacktestSummary(
-            id=item.id,
-            status=item.status,
-            timeframe=item.timeframe,
-            data_range=item.data_range,
-            sample_quality=item.sample_quality,
-            history_source=item.history_source,
-            decision_readiness=item.decision_readiness,
-            source_change_request_id=item.source_change_request_id,
-            source_backtest_id=item.source_backtest_id,
-            source_review_id=item.source_review_id,
-            source_proposal_id=item.source_proposal_id,
-            trigger_reason=item.trigger_reason,
-            created_at=item.started_at,
-            finished_at=item.finished_at,
-        )
-        for item in recent_backtest_records
-    ]
-    recent_agent_job_records = [
-        item
-        for item in state.agent_jobs
-        if str(item.context.get("strategy_id") or "") == strategy_id
-    ]
-    recent_agent_job_records.sort(key=lambda item: item.updated_at or item.created_at, reverse=True)
-    recent_agent_jobs = [
-        StrategyActivityJobSummary(
-            id=item.id,
-            job_type=item.job_type,
-            status=item.status,
-            strategy_id=str(item.context.get("strategy_id") or "") or None,
-            backtest_id=str(item.context.get("backtest_id") or "") or None,
-            source_change_request_id=str(item.context.get("source_change_request_id") or "") or None,
-            source_backtest_id=str(item.context.get("source_backtest_id") or "") or None,
-            source_review_id=str(item.context.get("source_review_id") or "") or None,
-            source_proposal_id=str(item.context.get("source_proposal_id") or "") or None,
-            requested_by=str(item.context.get("requested_by") or "") or None,
-            result_summary=item.result_summary,
-            linked_review_id=str(item.context.get("linked_review_id") or "") or None,
-            linked_review_title=str(item.context.get("linked_review_title") or "") or None,
-            linked_review_period=str(item.context.get("linked_review_period") or "") or None,
-            writeback_target=item.writeback_target,
-            created_at=item.created_at,
-            updated_at=item.updated_at,
-            retry_count=int(item.context.get("retry_count") or 0),
-            retried_from_job_id=str(item.context.get("retried_from_job_id") or "") or None,
-        )
-        for item in recent_agent_job_records
-    ]
-
-    def get_change_request_source_proposal_id(change_request: ChangeRequest) -> Optional[str]:
-        source_proposal_id = str(change_request.source_proposal_id or "").strip()
-        if source_proposal_id:
-            return source_proposal_id
-        payload_proposal_id = str(change_request.payload.get("proposal_id") or "").strip()
-        return payload_proposal_id or None
-
-    def get_change_request_source_backtest_id(change_request: ChangeRequest) -> Optional[str]:
-        source_backtest_id = str(change_request.source_backtest_id or "").strip()
-        return source_backtest_id or None
-
-    def get_change_request_source_review_id(change_request: ChangeRequest) -> Optional[str]:
-        source_review_id = str(change_request.source_review_id or "").strip()
-        return source_review_id or None
-
-    proposal_change_request_map: Dict[str, ChangeRequest] = {}
-    for change_request in recent_change_requests:
-        source_proposal_id = get_change_request_source_proposal_id(change_request)
-        if source_proposal_id and source_proposal_id not in proposal_change_request_map:
-            proposal_change_request_map[source_proposal_id] = change_request
-
-    proposal_backtest_map: Dict[str, StrategyActivityBacktestSummary] = {}
-    for backtest in recent_backtests:
-        source_proposal_id = str(backtest.source_proposal_id or "").strip()
-        if source_proposal_id and source_proposal_id not in proposal_backtest_map:
-            proposal_backtest_map[source_proposal_id] = backtest
-
-    proposal_review_map: Dict[str, StrategyActivityReviewSummary] = {}
-    for review in recent_reviews:
-        source_proposal_id = str(review.source_proposal_id or "").strip()
-        if source_proposal_id and source_proposal_id not in proposal_review_map:
-            proposal_review_map[source_proposal_id] = review
-
-    proposal_by_id = {item.id: item for item in recent_proposals}
-    backtest_summary_by_id = {item.id: item for item in recent_backtests}
-    backtest_record_by_id = {item.id: item for item in recent_backtest_records}
-    review_summary_by_id = {item.id: item for item in recent_reviews}
-    review_record_by_id = {item.id: item for item in recent_review_records}
-    agent_job_summary_by_id = {item.id: item for item in recent_agent_jobs}
-    agent_job_record_by_id = {item.id: item for item in recent_agent_job_records}
-
-    review_summary_by_backtest_id: Dict[str, StrategyActivityReviewSummary] = {}
-    for review in recent_reviews:
-        backtest_id = str(review.backtest_id or "").strip()
-        if backtest_id and backtest_id not in review_summary_by_backtest_id:
-            review_summary_by_backtest_id[backtest_id] = review
-
-    agent_job_summary_by_backtest_id: Dict[str, StrategyActivityJobSummary] = {}
-    retryable_agent_job_summary_by_backtest_id: Dict[str, StrategyActivityJobSummary] = {}
-    for job in recent_agent_jobs:
-        backtest_id = str(job.backtest_id or "").strip()
-        if backtest_id and backtest_id not in agent_job_summary_by_backtest_id:
-            agent_job_summary_by_backtest_id[backtest_id] = job
-        if (
-            backtest_id
-            and job.status in {"failed", "cancelled"}
-            and backtest_id not in retryable_agent_job_summary_by_backtest_id
-        ):
-            retryable_agent_job_summary_by_backtest_id[backtest_id] = job
-
-    def get_linked_backtest_for_proposal(proposal: Optional[StrategyProposal]) -> Optional[StrategyActivityBacktestSummary]:
-        if proposal is None:
-            return None
-        linked_backtest = proposal_backtest_map.get(proposal.id)
-        if linked_backtest is not None:
-            return linked_backtest
-        linked_change_request = proposal_change_request_map.get(proposal.id)
-        if linked_change_request and linked_change_request.linked_backtest_id:
-            return backtest_summary_by_id.get(linked_change_request.linked_backtest_id)
-        linked_review = proposal_review_map.get(proposal.id)
-        if linked_review and linked_review.backtest_id:
-            return backtest_summary_by_id.get(linked_review.backtest_id)
-        return None
-
-    def get_linked_review_for_proposal(proposal: Optional[StrategyProposal]) -> Optional[StrategyActivityReviewSummary]:
-        if proposal is None:
-            return None
-        linked_review = proposal_review_map.get(proposal.id)
-        if linked_review is not None:
-            return linked_review
-        linked_change_request = proposal_change_request_map.get(proposal.id)
-        if linked_change_request and linked_change_request.linked_review_id:
-            return review_summary_by_id.get(linked_change_request.linked_review_id)
-        linked_backtest = get_linked_backtest_for_proposal(proposal)
-        if linked_backtest is not None:
-            return review_summary_by_backtest_id.get(linked_backtest.id)
-        return None
-
-    def get_linked_job_for_proposal(proposal: Optional[StrategyProposal]) -> Optional[StrategyActivityJobSummary]:
-        if proposal is None:
-            return None
-        linked_change_request = proposal_change_request_map.get(proposal.id)
-        if linked_change_request and linked_change_request.follow_up_job_id:
-            linked_job = agent_job_summary_by_id.get(linked_change_request.follow_up_job_id)
-            if linked_job is not None:
-                return linked_job
-        linked_review = get_linked_review_for_proposal(proposal)
-        if linked_review and linked_review.source_job_id:
-            linked_job = agent_job_summary_by_id.get(linked_review.source_job_id)
-            if linked_job is not None:
-                return linked_job
-        linked_backtest = get_linked_backtest_for_proposal(proposal)
-        if linked_backtest is not None:
-            return agent_job_summary_by_backtest_id.get(linked_backtest.id)
-        return None
-
-    def summarize_order(order: OrderRecord) -> str:
-        side = "买" if order.side == "buy" else "卖"
-        return f"{order.symbol} {side} {order.qty}@{order.price} · {order.status}"
-
-    def summarize_trade(trade: TradeRecord) -> str:
-        side = "买" if trade.side == "buy" else "卖"
-        parts = [f"{trade.symbol} {side} {trade.quantity}@{trade.price}", str(trade.status or "filled")]
-        pnl = str(trade.pnl or "").strip()
-        if pnl and pnl != "--":
-            parts.append(f"pnl {pnl}")
-        return " · ".join(parts)
-
-    def summarize_alert(alert: AlertRecord) -> str:
-        detail = alert.description.strip()
-        action = str(alert.suggested_action or "").strip()
-        if action:
-            detail = f"{detail} · {action}" if detail else action
-        return f"{alert.severity} {alert.title}{f' · {detail}' if detail else ''}"
-
-    active_orders.sort(key=lambda item: parse_optional_iso_datetime(item.created_at), reverse=True)
-    recent_orders.sort(key=lambda item: parse_optional_iso_datetime(item.created_at), reverse=True)
-    recent_trades.sort(key=lambda item: parse_optional_iso_datetime(item.created_at), reverse=True)
-    recent_alerts.sort(key=lambda item: parse_optional_iso_datetime(item.triggered_at), reverse=True)
-    recent_audit_events.sort(key=lambda item: parse_optional_iso_datetime(item.occurred_at), reverse=True)
-
-    def _read_text(value: object) -> Optional[str]:
-        if not isinstance(value, str):
-            return None
-        text = value.strip()
-        return text or None
-
-    def _has_change_request_rerun_recommendation(change_request: ChangeRequest) -> bool:
-        linked_backtest = (
-            backtest_summary_by_id.get(change_request.linked_backtest_id)
-            if change_request.linked_backtest_id
-            else None
-        )
-        linked_history_source_reason = (
-            _read_text(getattr(linked_backtest, "history_source_reason", None))
-            or _read_text(change_request.linked_backtest_history_source_reason)
-            or "none"
-        )
-        decision_range = _read_text(getattr(linked_backtest, "decision_recommended_data_range", None)) or _read_text(
-            change_request.linked_backtest_decision_recommended_data_range
-        )
-        decision_timeframe = _read_text(
-            getattr(linked_backtest, "decision_recommended_timeframe", None)
-        ) or _read_text(change_request.linked_backtest_decision_recommended_timeframe)
-        if linked_history_source_reason != "exchange_fetch_failed" and decision_range and decision_timeframe:
-            return True
-        full_window_range = _read_text(
-            getattr(linked_backtest, "full_window_recommended_data_range", None)
-        ) or _read_text(change_request.linked_backtest_full_window_recommended_data_range)
-        full_window_timeframe = _read_text(
-            getattr(linked_backtest, "full_window_recommended_timeframe", None)
-        ) or _read_text(change_request.linked_backtest_full_window_recommended_timeframe)
-        if full_window_range and full_window_timeframe:
-            return True
-        history_range = _read_text(
-            getattr(linked_backtest, "history_source_recommended_data_range", None)
-        ) or _read_text(change_request.linked_backtest_history_source_recommended_data_range)
-        history_timeframe = _read_text(
-            getattr(linked_backtest, "history_source_recommended_timeframe", None)
-        ) or _read_text(change_request.linked_backtest_history_source_recommended_timeframe)
-        return linked_history_source_reason != "exchange_fetch_failed" and bool(history_range and history_timeframe)
-
-    def _has_backtest_rerun_recommendation(backtest: BacktestRun) -> bool:
-        history_source_reason = _read_text(getattr(backtest, "history_source_reason", None)) or "none"
-        decision_range = _read_text(getattr(backtest, "decision_recommended_data_range", None))
-        decision_timeframe = _read_text(getattr(backtest, "decision_recommended_timeframe", None))
-        if history_source_reason != "exchange_fetch_failed" and decision_range and decision_timeframe:
-            return True
-        full_window_range = _read_text(getattr(backtest, "full_window_recommended_data_range", None))
-        full_window_timeframe = _read_text(getattr(backtest, "full_window_recommended_timeframe", None))
-        if full_window_range and full_window_timeframe:
-            return True
-        history_range = _read_text(getattr(backtest, "history_source_recommended_data_range", None))
-        history_timeframe = _read_text(getattr(backtest, "history_source_recommended_timeframe", None))
-        return history_source_reason != "exchange_fetch_failed" and bool(history_range and history_timeframe)
-
-    def _has_review_rerun_recommendation(review: ReviewDocument) -> bool:
-        decision_range = _read_text(getattr(review, "decision_recommended_data_range", None))
-        decision_timeframe = _read_text(getattr(review, "decision_recommended_timeframe", None))
-        return bool(decision_range and decision_timeframe)
-
-    recent_primary_review_records = [item for item in recent_review_records if item.period not in {"strategy_issue", "strategy_change"}]
-    recent_primary_review_summaries = [item for item in recent_reviews if item.period not in {"strategy_issue", "strategy_change"}]
-    recent_tracking_review_records = [item for item in recent_reviews if item.period in {"strategy_issue", "strategy_change"}]
-    recent_tracking_job_records = [
-        item
-        for item in recent_agent_jobs
-        if item.job_type in {"review_strategy_issue", "review_strategy_change"}
-    ]
-    recent_actionable_proposal_records = [item for item in recent_proposals if item.status in {"pending", "testing"}]
-    recent_actionable_backtest_records = [
-        item
-        for item in recent_backtest_records
-        if _has_backtest_rerun_recommendation(item)
-        or item.id in retryable_agent_job_summary_by_backtest_id
-    ]
-
-    latest_backtest_record = next(iter(recent_backtest_records), None)
-    latest_backtest = next(iter(recent_backtests), None)
-    latest_actionable_backtest_record = next(iter(recent_actionable_backtest_records), None)
-    latest_actionable_backtest = (
-        backtest_summary_by_id[latest_actionable_backtest_record.id]
-        if latest_actionable_backtest_record is not None
-        else None
-    )
-    latest_backtest_review = (
-        review_summary_by_backtest_id.get(latest_backtest.id)
-        if latest_backtest
-        else None
-    )
-    latest_backtest_job = (
-        agent_job_summary_by_backtest_id.get(latest_backtest.id)
-        if latest_backtest
-        else None
-    )
-    latest_backtest_review_record = (
-        review_record_by_id.get(latest_backtest_review.id) if latest_backtest_review is not None else None
-    )
-    latest_backtest_job_record = (
-        agent_job_record_by_id.get(latest_backtest_job.id) if latest_backtest_job is not None else None
-    )
-    latest_actionable_backtest_review = (
-        review_summary_by_backtest_id.get(latest_actionable_backtest.id)
-        if latest_actionable_backtest
-        else None
-    )
-    latest_actionable_backtest_job = (
-        agent_job_summary_by_backtest_id.get(latest_actionable_backtest.id)
-        if latest_actionable_backtest
-        else None
-    )
-    latest_actionable_backtest_review_record = (
-        review_record_by_id.get(latest_actionable_backtest_review.id)
-        if latest_actionable_backtest_review is not None
-        else None
-    )
-    latest_actionable_backtest_job_record = (
-        agent_job_record_by_id.get(latest_actionable_backtest_job.id)
-        if latest_actionable_backtest_job is not None
-        else None
-    )
-    latest_primary_review = next(iter(recent_primary_review_summaries), None)
-    latest_primary_review_record = (
-        review_record_by_id.get(latest_primary_review.id) if latest_primary_review is not None else None
-    )
-    latest_actionable_primary_review = next(
-        (
-            review_summary_by_id[item.id]
-            for item in recent_primary_review_records
-            if _has_review_rerun_recommendation(item)
-        ),
-        None,
-    )
-    latest_actionable_primary_review_record = (
-        review_record_by_id.get(latest_actionable_primary_review.id)
-        if latest_actionable_primary_review is not None
-        else None
-    )
-    latest_tracking_review = next(iter(recent_tracking_review_records), None)
-    latest_tracking_review_record = (
-        review_record_by_id.get(latest_tracking_review.id) if latest_tracking_review is not None else None
-    )
-    latest_tracking_job = next(iter(recent_tracking_job_records), None)
-    latest_tracking_job_record = (
-        agent_job_record_by_id.get(latest_tracking_job.id) if latest_tracking_job is not None else None
-    )
-    latest_proposal = next(iter(recent_proposals), None)
-    latest_actionable_proposal = next(iter(recent_actionable_proposal_records), None)
-    latest_proposal_change_request = (
-        proposal_change_request_map.get(latest_proposal.id) if latest_proposal is not None else None
-    )
-    latest_proposal_backtest = get_linked_backtest_for_proposal(latest_proposal)
-    latest_proposal_review = get_linked_review_for_proposal(latest_proposal)
-    latest_proposal_job = get_linked_job_for_proposal(latest_proposal)
-    latest_proposal_backtest_record = (
-        backtest_record_by_id.get(latest_proposal_backtest.id)
-        if latest_proposal_backtest is not None
-        else None
-    )
-    latest_proposal_review_record = (
-        review_record_by_id.get(latest_proposal_review.id)
-        if latest_proposal_review is not None
-        else None
-    )
-    latest_proposal_job_record = (
-        agent_job_record_by_id.get(latest_proposal_job.id)
-        if latest_proposal_job is not None
-        else None
-    )
-    latest_actionable_proposal_change_request = (
-        proposal_change_request_map.get(latest_actionable_proposal.id)
-        if latest_actionable_proposal is not None
-        else None
-    )
-    latest_actionable_proposal_backtest = get_linked_backtest_for_proposal(latest_actionable_proposal)
-    latest_actionable_proposal_review = get_linked_review_for_proposal(latest_actionable_proposal)
-    latest_actionable_proposal_job = get_linked_job_for_proposal(latest_actionable_proposal)
-    latest_actionable_proposal_backtest_record = (
-        backtest_record_by_id.get(latest_actionable_proposal_backtest.id)
-        if latest_actionable_proposal_backtest is not None
-        else None
-    )
-    latest_actionable_proposal_review_record = (
-        review_record_by_id.get(latest_actionable_proposal_review.id)
-        if latest_actionable_proposal_review is not None
-        else None
-    )
-    latest_actionable_proposal_job_record = (
-        agent_job_record_by_id.get(latest_actionable_proposal_job.id)
-        if latest_actionable_proposal_job is not None
-        else None
-    )
-    latest_change_request = next(iter(recent_change_requests), None)
-    latest_change_request_backtest_record = (
-        backtest_record_by_id.get(latest_change_request.linked_backtest_id)
-        if latest_change_request and latest_change_request.linked_backtest_id
-        else None
-    )
-    latest_change_request_review_record = (
-        review_record_by_id.get(latest_change_request.linked_review_id)
-        if latest_change_request and latest_change_request.linked_review_id
-        else None
-    )
-    latest_change_request_job_record = (
-        agent_job_record_by_id.get(latest_change_request.follow_up_job_id)
-        if latest_change_request and latest_change_request.follow_up_job_id
-        else None
-    )
-    latest_change_request_source_backtest_record = (
-        backtest_record_by_id.get(get_change_request_source_backtest_id(latest_change_request))
-        if latest_change_request
-        else None
-    )
-    latest_change_request_source_review_record = (
-        review_record_by_id.get(get_change_request_source_review_id(latest_change_request))
-        if latest_change_request
-        else None
-    )
-    latest_change_request_source_proposal_record = (
-        proposal_by_id.get(get_change_request_source_proposal_id(latest_change_request))
-        if latest_change_request
-        else None
-    )
-    latest_actionable_change_request = next(
-        (
-            item
-            for item in recent_change_requests
-            if (
-                item.follow_up_job_id
-                and item.follow_up_job_status in {"failed", "cancelled"}
-            )
-            or _has_change_request_rerun_recommendation(item)
-        ),
-        None,
-    )
-    latest_actionable_change_request_backtest_record = (
-        backtest_record_by_id.get(latest_actionable_change_request.linked_backtest_id)
-        if latest_actionable_change_request and latest_actionable_change_request.linked_backtest_id
-        else None
-    )
-    latest_actionable_change_request_review_record = (
-        review_record_by_id.get(latest_actionable_change_request.linked_review_id)
-        if latest_actionable_change_request and latest_actionable_change_request.linked_review_id
-        else None
-    )
-    latest_actionable_change_request_job_record = (
-        agent_job_record_by_id.get(latest_actionable_change_request.follow_up_job_id)
-        if latest_actionable_change_request and latest_actionable_change_request.follow_up_job_id
-        else None
-    )
-    latest_actionable_change_request_source_backtest_record = (
-        backtest_record_by_id.get(get_change_request_source_backtest_id(latest_actionable_change_request))
-        if latest_actionable_change_request
-        else None
-    )
-    latest_actionable_change_request_source_review_record = (
-        review_record_by_id.get(get_change_request_source_review_id(latest_actionable_change_request))
-        if latest_actionable_change_request
-        else None
-    )
-    latest_actionable_change_request_source_proposal_record = (
-        proposal_by_id.get(get_change_request_source_proposal_id(latest_actionable_change_request))
-        if latest_actionable_change_request
-        else None
-    )
-    latest_retryable_tracking_job = next(
-        (
-            item
-            for item in recent_agent_jobs
-            if item.job_type in {"review_strategy_issue", "review_strategy_change"}
-            and item.status in {"failed", "cancelled"}
-        ),
-        None,
-    )
-    latest_retryable_tracking_job_record = (
-        agent_job_record_by_id.get(latest_retryable_tracking_job.id)
-        if latest_retryable_tracking_job is not None
-        else None
-    )
-    latest_key_audit_event = AppRepository._pick_latest_key_execution_event(recent_audit_events)
-    latest_active_order_record = max(
-        active_orders,
-        key=lambda item: parse_optional_iso_datetime(item.created_at),
-        default=None,
-    )
-    latest_historical_order_record = max(
-        recent_orders,
-        key=lambda item: parse_optional_iso_datetime(item.created_at),
-        default=None,
-    )
-    latest_trade_record = max(
-        recent_trades,
-        key=lambda item: parse_optional_iso_datetime(item.created_at),
-        default=None,
-    )
-    latest_alert_record = max(
-        recent_alerts,
-        key=lambda item: parse_optional_iso_datetime(item.triggered_at),
-        default=None,
-    )
-    latest_pending_alert_record = max(
-        [item for item in recent_alerts if not item.acknowledged],
-        key=lambda item: parse_optional_iso_datetime(item.triggered_at),
-        default=None,
-    )
-    latest_order_record = max(
-        [item for item in [latest_active_order_record, latest_historical_order_record] if item is not None],
-        key=lambda item: parse_optional_iso_datetime(item.created_at),
-        default=None,
-    )
-    latest_ops = _build_strategy_activity_latest_ops_snapshot(
-        latest_active_order_summary=summarize_order(latest_active_order_record) if latest_active_order_record else None,
-        latest_historical_order_summary=(
-            summarize_order(latest_historical_order_record) if latest_historical_order_record else None
-        ),
-        latest_order_summary=summarize_order(latest_order_record) if latest_order_record else None,
-        latest_pending_alert_summary=summarize_alert(latest_pending_alert_record) if latest_pending_alert_record else None,
-        latest_trade_summary=summarize_trade(latest_trade_record) if latest_trade_record else None,
-        latest_alert_summary=summarize_alert(latest_alert_record) if latest_alert_record else None,
-        latest_audit_event_summary=AppRepository._summarize_execution_event(latest_key_audit_event)
-        if latest_key_audit_event
-        else None,
-        latest_active_order_record=latest_active_order_record,
-        latest_historical_order_record=latest_historical_order_record,
-        latest_order_record=latest_order_record,
-        latest_pending_alert_record=latest_pending_alert_record,
-        latest_trade_record=latest_trade_record,
-        latest_alert_record=latest_alert_record,
-        latest_audit_event_record=latest_key_audit_event,
-    )
-    return StrategyActivitySnapshot(
-        strategy_id=strategy.id,
-        strategy_name=strategy.name,
-        symbol=symbol,
-        market=market,
-        mode=strategy.mode,
-        runtime=runtime,
-        latest_runtime=_build_strategy_activity_latest_runtime_snapshot(runtime=runtime, latest_ops=latest_ops),
-        latest_ops=latest_ops,
-        latest_backtest=latest_backtest,
-        latest_actionable_backtest=latest_actionable_backtest,
-        latest_backtest_record=latest_backtest_record,
-        latest_actionable_backtest_record=latest_actionable_backtest_record,
-        latest_backtest_review=latest_backtest_review,
-        latest_backtest_job=latest_backtest_job,
-        latest_actionable_backtest_review=latest_actionable_backtest_review,
-        latest_actionable_backtest_job=latest_actionable_backtest_job,
-        latest_backtest_review_record=latest_backtest_review_record,
-        latest_backtest_job_record=latest_backtest_job_record,
-        latest_actionable_backtest_review_record=latest_actionable_backtest_review_record,
-        latest_actionable_backtest_job_record=latest_actionable_backtest_job_record,
-        latest_primary_review=latest_primary_review,
-        latest_actionable_primary_review=latest_actionable_primary_review,
-        latest_primary_review_record=latest_primary_review_record,
-        latest_actionable_primary_review_record=latest_actionable_primary_review_record,
-        latest_tracking_review=latest_tracking_review,
-        latest_tracking_job=latest_tracking_job,
-        latest_tracking_review_record=latest_tracking_review_record,
-        latest_tracking_job_record=latest_tracking_job_record,
-        latest_proposal=latest_proposal,
-        latest_actionable_proposal=latest_actionable_proposal,
-        latest_proposal_change_request=latest_proposal_change_request,
-        latest_proposal_backtest=latest_proposal_backtest,
-        latest_proposal_review=latest_proposal_review,
-        latest_proposal_job=latest_proposal_job,
-        latest_proposal_backtest_record=latest_proposal_backtest_record,
-        latest_proposal_review_record=latest_proposal_review_record,
-        latest_proposal_job_record=latest_proposal_job_record,
-        latest_actionable_proposal_change_request=latest_actionable_proposal_change_request,
-        latest_actionable_proposal_backtest=latest_actionable_proposal_backtest,
-        latest_actionable_proposal_review=latest_actionable_proposal_review,
-        latest_actionable_proposal_job=latest_actionable_proposal_job,
-        latest_actionable_proposal_backtest_record=latest_actionable_proposal_backtest_record,
-        latest_actionable_proposal_review_record=latest_actionable_proposal_review_record,
-        latest_actionable_proposal_job_record=latest_actionable_proposal_job_record,
-        latest_change_request=latest_change_request,
-        latest_actionable_change_request=latest_actionable_change_request,
-        latest_change_request_backtest_record=latest_change_request_backtest_record,
-        latest_change_request_review_record=latest_change_request_review_record,
-        latest_change_request_job_record=latest_change_request_job_record,
-        latest_change_request_source_backtest_record=latest_change_request_source_backtest_record,
-        latest_change_request_source_review_record=latest_change_request_source_review_record,
-        latest_change_request_source_proposal_record=latest_change_request_source_proposal_record,
-        latest_actionable_change_request_backtest_record=latest_actionable_change_request_backtest_record,
-        latest_actionable_change_request_review_record=latest_actionable_change_request_review_record,
-        latest_actionable_change_request_job_record=latest_actionable_change_request_job_record,
-        latest_actionable_change_request_source_backtest_record=latest_actionable_change_request_source_backtest_record,
-        latest_actionable_change_request_source_review_record=latest_actionable_change_request_source_review_record,
-        latest_actionable_change_request_source_proposal_record=latest_actionable_change_request_source_proposal_record,
-        latest_retryable_tracking_job=latest_retryable_tracking_job,
-        latest_retryable_tracking_job_record=latest_retryable_tracking_job_record,
-        latest_active_order=latest_ops.latest_active_order,
-        latest_active_order_record=(
-            latest_ops.latest_active_order_record.model_dump(mode="json") if latest_ops.latest_active_order_record else None
-        ),
-        latest_historical_order=latest_ops.latest_historical_order,
-        latest_historical_order_record=(
-            latest_ops.latest_historical_order_record.model_dump(mode="json")
-            if latest_ops.latest_historical_order_record
-            else None
-        ),
-        latest_order=latest_ops.latest_order,
-        latest_order_record=latest_ops.latest_order_record.model_dump(mode="json") if latest_ops.latest_order_record else None,
-        recent_orders=recent_orders[:20],
-        latest_trade=latest_ops.latest_trade,
-        latest_trade_record=latest_ops.latest_trade_record.model_dump(mode="json") if latest_ops.latest_trade_record else None,
-        recent_trades=recent_trades[:20],
-        latest_pending_alert=latest_ops.latest_pending_alert,
-        latest_pending_alert_record=(
-            latest_ops.latest_pending_alert_record.model_dump(mode="json")
-            if latest_ops.latest_pending_alert_record
-            else None
-        ),
-        latest_alert=latest_ops.latest_alert,
-        latest_alert_record=latest_ops.latest_alert_record.model_dump(mode="json") if latest_ops.latest_alert_record else None,
-        recent_alerts=recent_alerts[:12],
-        latest_audit_event=latest_ops.latest_audit_event,
-        latest_audit_event_record=(
-            latest_ops.latest_audit_event_record.model_dump(mode="json")
-            if latest_ops.latest_audit_event_record
-            else None
-        ),
-        recent_proposals=recent_proposals[:8],
-        recent_change_requests=recent_change_requests[:8],
-        recent_backtests=recent_backtests[:8],
-        recent_reviews=recent_reviews[:8],
-        active_orders=active_orders[:20],
-        recent_audit_events=recent_audit_events[:30],
-        recent_agent_jobs=recent_agent_jobs[:12],
-        generated_at=datetime.now(timezone.utc).astimezone().isoformat(),
-    )
-
-
-def build_manual_strategy_review_job(strategy_id: str, payload: StrategyTrackingReviewRequest) -> AgentJobCreate:
-    state = repo.snapshot()
-    strategy = next((item for item in state.strategies if item.id == strategy_id), None)
-    if strategy is None:
-        raise KeyError(strategy_id)
-
-    summary = payload.summary.strip()
-    if not summary:
-        raise ValueError("跟踪摘要不能为空。")
-
-    detail = (payload.detail or "").strip() or None
-    symbol = strategy.symbols[0] if strategy.symbols else "--"
-    request_key = (payload.request_key or "").strip() or uuid4().hex[:12]
-    base_context = enrich_review_job_context({
-        "strategy_id": strategy.id,
-        "strategy_name": strategy.name,
-        "symbol": symbol,
-        "mode": strategy.mode.value,
-        "summary": summary,
-        "detail": detail,
-        "requested_by": payload.requested_by,
-        "requested_at": datetime.now(timezone.utc).astimezone().isoformat(),
-        "review_strategy_activity": _build_strategy_activity_review_context(strategy.id),
-    })
-    if payload.review_kind == "issue":
-        return AgentJobCreate(
-            job_type="review_strategy_issue",
-            context={
-                **base_context,
-                "issue_type": "manual_issue_review",
-            },
-            allowed_actions=["review_strategy_issue", "summarize_execution_impact"],
-            timeout=75,
-            idempotency_key=f"strategy-manual-review:{strategy.id}:issue:{request_key}",
-            writeback_target="strategy_activity",
-        )
-
-    return AgentJobCreate(
-        job_type="review_strategy_change",
-        context={
-            **base_context,
-            "change_type": "manual_change_review",
-        },
-        allowed_actions=["review_strategy_change", "summarize_execution_impact"],
-        timeout=75,
-        idempotency_key=f"strategy-manual-review:{strategy.id}:change:{request_key}",
-        writeback_target="strategy_activity",
-    )
-
-
-def build_private_execution_preview(payload: ExecutionPreviewRequest) -> ExecutionPreview:
-    notional = payload.quantity * payload.price
-    base_preview = {
-        "symbol": payload.symbol.upper(),
-        "market": payload.market,
-        "mode": payload.mode,
-        "side": payload.side,
-        "origin": payload.origin,
-        "strategy_id": payload.strategy_id,
-        "quantity": payload.quantity,
-        "price": payload.price,
-        "notional": format_usdt(notional),
-        "generated_at": datetime.now(timezone.utc).astimezone().isoformat(),
-    }
-    status, access_error = resolve_private_mode_access(payload.mode)
-    if access_error is not None:
-        return ExecutionPreview(
-            **base_preview,
-            action="等待真实执行引擎",
-            allowed=False,
-            blocked_reason=access_error,
-            recommended_action=_build_execution_preview_recommended_action(access_error),
-            warnings=["当前结果仅适用于已配置且模式一致的 Demo / Live 私有 API。"],
-            current_position_size="--",
-            current_avg_price="--",
-            projected_position_size="--",
-            projected_avg_price="--",
-            available_balance_before="--",
-            available_balance_after="--",
-            estimated_realized_pnl="--",
-        )
-
-    try:
-        _wallet_status, wallet_snapshot, _wallet_updated_at = load_private_wallet_snapshot()
-        positions_status, position_items, positions_updated_at = load_private_positions_snapshot()
-    except RuntimeError as exc:
-        return ExecutionPreview(
-            **base_preview,
-            action="等待真实执行引擎",
-            allowed=False,
-            blocked_reason=str(exc),
-            recommended_action="请先恢复 Bybit 私有账户链路，再重试真实交易预检。",
-            warnings=["当前结果仅适用于已配置且链路可用的 Demo / Live 私有 API。"],
-            current_position_size="--",
-            current_avg_price="--",
-            projected_position_size="--",
-            projected_avg_price="--",
-            available_balance_before="--",
-            available_balance_after="--",
-            estimated_realized_pnl="--",
-        )
-
-    positions = build_position_records(position_items, positions_status, positions_updated_at)
-    position = next(
-        (
-            item
-            for item in positions
-            if item.symbol == payload.symbol.upper() and item.market == payload.market
-        ),
-        None,
-    )
-    current_qty = 0.0
-    current_avg = 0.0
-    if position is not None:
-        current_qty = parse_metric_number(position.size) * (1 if position.side == "long" else -1)
-        current_avg = parse_metric_number(position.avg_price)
-
-    signed_qty = payload.quantity if payload.side == Direction.BUY else -payload.quantity
-    next_qty = current_qty + signed_qty
-    close_qty = 0.0
-    realized_on_fill = 0.0
-
-    if current_qty != 0 and current_qty * signed_qty < 0:
-        close_qty = min(abs(current_qty), abs(signed_qty))
-        realized_on_fill = close_qty * (payload.price - current_avg) * (1 if current_qty > 0 else -1)
-
-    if current_qty == 0 or current_qty * signed_qty > 0:
-        total_size = abs(current_qty) + abs(signed_qty)
-        projected_avg = (
-            ((abs(current_qty) * current_avg) + (abs(signed_qty) * payload.price)) / total_size
-            if total_size > 0
-            else 0.0
-        )
-    elif abs(next_qty) <= 1e-9:
-        projected_avg = 0.0
-    elif current_qty * next_qty > 0:
-        projected_avg = current_avg
-    else:
-        projected_avg = payload.price
-
-    perp_balance_delta_notional = 0.0
-    perp_additional_required_notional = 0.0
-    if payload.market == "perp":
-        perp_balance_delta_notional = _calculate_private_perp_balance_delta_notional(
-            current_qty=current_qty,
-            next_qty=next_qty,
-            price=payload.price,
-        )
-        perp_additional_required_notional = max(perp_balance_delta_notional, 0.0)
-
-    available_before = float(wallet_snapshot.get("totalAvailableBalance") or 0)
-    preview_open_orders: List[OrderRecord] = []
-    if payload.exclude_order_id or payload.release_order_ids or (payload.market == "spot" and payload.side == Direction.SELL):
-        preview_open_orders = _load_private_open_order_records_for_preview()
-    available_before += _private_released_order_reservation(
-        preview_open_orders,
-        symbol=payload.symbol,
-        market=payload.market,
-        exclude_order_id=payload.exclude_order_id,
-        release_order_ids=payload.release_order_ids,
-    )
-    reserved_spot_sell_qty = 0.0
-    released_spot_sell_qty = 0.0
-    wallet_available_spot_qty: Optional[float] = None
-    if payload.market == "spot" and payload.side == Direction.SELL:
-        wallet_available_spot_qty = _private_wallet_available_spot_quantity(
-            wallet_snapshot,
-            symbol=payload.symbol,
-        )
-        reserved_spot_sell_qty = _private_reserved_spot_sell_quantity(
-            preview_open_orders,
-            symbol=payload.symbol,
-            exclude_order_id=payload.exclude_order_id,
-        )
-        released_spot_sell_qty = _private_released_spot_sell_reservation(
-            preview_open_orders,
-            symbol=payload.symbol,
-            exclude_order_id=payload.exclude_order_id,
-        )
-    blocked_reason = _validate_exchange_order_constraints(
-        symbol=payload.symbol,
-        market=payload.market,
-        quantity=payload.quantity,
-        price=payload.price,
-    )
-    recommended_action = _build_exchange_constraint_recommended_action(blocked_reason)
-    if blocked_reason is None and payload.market == "spot" and payload.side == Direction.BUY and available_before + 1e-9 < notional:
-        blocked_reason = _build_private_insufficient_balance_reason(
-            available_balance=available_before,
-            required_notional=notional,
-            buy_order=True,
-        )
-        recommended_action = _build_private_insufficient_balance_recommended_action(
-            account_type=status.account_type,
-            available_balance=available_before,
-            required_notional=notional,
-            buy_order=True,
-        )
-    elif blocked_reason is None and payload.market == "spot" and payload.side == Direction.SELL:
-        if wallet_available_spot_qty is not None:
-            available_spot_qty = max(wallet_available_spot_qty + released_spot_sell_qty, 0.0)
-        else:
-            available_spot_qty = max(current_qty - reserved_spot_sell_qty, 0.0)
-        if available_spot_qty + 1e-9 < payload.quantity:
-            blocked_reason = (
-                "当前 Bybit 现货可卖数量不足，"
-                f"扣除未成交卖单占用后最多可卖 {repo._format_quantity(available_spot_qty, 6)}。"
-            )
-            recommended_action = _build_private_spot_inventory_recommended_action(payload.symbol)
-    elif blocked_reason is None and payload.market == "perp" and available_before + 1e-9 < perp_additional_required_notional:
-        blocked_reason = _build_private_insufficient_balance_reason(
-            available_balance=available_before,
-            required_notional=perp_additional_required_notional,
-            buy_order=False,
-        )
-        recommended_action = _build_private_insufficient_balance_recommended_action(
-            account_type=status.account_type,
-            available_balance=available_before,
-            required_notional=perp_additional_required_notional,
-            buy_order=False,
-        )
-
-    warnings = [
-        "当前为真实交易顾问式预检，最终风控、最小下单单位和精度仍以 Bybit 返回为准。",
-    ]
-    if wallet_available_spot_qty is not None:
-        warnings.append(
-            f"当前 {payload.symbol.upper()} 钱包可用数量为 {repo._format_quantity(wallet_available_spot_qty, 6)}。"
-        )
-    if reserved_spot_sell_qty > 1e-9:
-        warnings.append(
-            f"当前已扣除 {payload.symbol.upper()} 未成交卖单占用 {repo._format_quantity(reserved_spot_sell_qty, 6)}。"
-        )
-    if close_qty > 0:
-        warnings.append("本次委托若成交，会先结算一部分已实现盈亏。")
-    if current_qty != 0 and current_qty * next_qty < 0:
-        warnings.append("本次委托若成交，会让当前仓位发生反手。")
-
-    if payload.market == "perp":
-        available_after = available_before - perp_balance_delta_notional
-    else:
-        available_after = available_before - (notional if payload.side == Direction.BUY else -notional)
-
-    return ExecutionPreview(
-        **base_preview,
-        action=repo._describe_execution_action_locked(payload.market, payload.side, current_qty, next_qty),  # type: ignore[attr-defined]
-        allowed=blocked_reason is None,
-        blocked_reason=blocked_reason,
-        recommended_action=recommended_action,
-        warnings=warnings,
-        current_position_side=repo._classify_position_side(current_qty),  # type: ignore[attr-defined]
-        current_position_size=repo._format_quantity(abs(current_qty), 6),  # type: ignore[attr-defined]
-        current_avg_price=repo._format_ratio(current_avg) if abs(current_qty) > 1e-9 else "--",  # type: ignore[attr-defined]
-        projected_position_side=repo._classify_position_side(next_qty),  # type: ignore[attr-defined]
-        projected_position_size=repo._format_quantity(abs(next_qty), 6),  # type: ignore[attr-defined]
-        projected_avg_price=repo._format_ratio(projected_avg) if abs(next_qty) > 1e-9 else "--",  # type: ignore[attr-defined]
-        available_balance_before=format_usdt(available_before),
-        available_balance_after=format_usdt(available_after),
-        estimated_realized_pnl=repo._format_usdt_delta(realized_on_fill) if close_qty > 0 else "--",  # type: ignore[attr-defined]
-    )
-
-
-def submit_exchange_order(
-    payload: ManualOrderRequest,
-    *,
-    origin: str = "manual",
-    strategy_id: Optional[str] = None,
-    requested_by: str = "desktop_operator",
-) -> OrderRecord:
-    status, access_error = resolve_private_mode_access(payload.mode)
-    if access_error is not None:
-        raise RuntimeError(access_error)
-
-    preview = build_private_execution_preview(
-        ExecutionPreviewRequest(
-            symbol=payload.symbol,
-            market=payload.market,
-            mode=payload.mode,
-            side=payload.side,
-            quantity=payload.quantity,
-            price=payload.price,
-            origin="manual",
-            note=payload.note,
-        )
-    )
-    if not preview.allowed:
-        raise RuntimeError(preview.blocked_reason or "当前真实交易预检未通过。")
-
-    reduce_only = _execution_preview_requires_reduce_only(preview)
-    if origin == "strategy" and strategy_id:
-        order_link_id = f"strategy-{payload.mode.value}-{strategy_id}-{uuid4().hex[:8]}"
-    else:
-        order_link_id = f"{origin}-{payload.mode.value}-{uuid4().hex[:12]}"
-    created_at = datetime.now(timezone.utc).astimezone().isoformat()
-    created_time_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-    body = {
-        "category": "spot" if payload.market == "spot" else "linear",
-        "symbol": payload.symbol.upper(),
-        "side": "Buy" if payload.side == Direction.BUY else "Sell",
-        "orderType": "Limit",
-        "qty": serialize_decimal(payload.quantity),
-        "price": serialize_decimal(payload.price),
-        "timeInForce": "GTC",
-        "orderLinkId": order_link_id,
-    }
-    if payload.market == "perp":
-        body["reduceOnly"] = reduce_only
-    result = private_data.create_order(body)
-    order_id = str(result.get("orderId") or order_link_id)
-    order_status = str(result.get("orderStatus") or "New")
-
-    if hasattr(private_realtime, "get_open_orders_snapshot") and hasattr(private_realtime, "seed_open_orders_snapshot"):
-        current_orders = private_realtime.get_open_orders_snapshot() or []
-        next_orders = [
-            item
-            for item in current_orders
-            if str(item.get("orderId") or "") != order_id
-        ]
-        next_orders.insert(
-            0,
-            {
-                "orderId": order_id,
-                "orderLinkId": order_link_id,
-                "symbol": payload.symbol.upper(),
-                "category": body["category"],
-                "side": body["side"],
-                "orderType": body["orderType"],
-                "qty": body["qty"],
-                "price": body["price"],
-                "orderStatus": order_status,
-                "createdTime": str(created_time_ms),
-                "reduceOnly": body.get("reduceOnly"),
-            },
-        )
-        private_realtime.seed_open_orders_snapshot(next_orders)
-
-    upsert_private_order_history_cache(
-        status,
-        [
-            {
-                "orderId": order_id,
-                "orderLinkId": order_link_id,
-                "symbol": payload.symbol.upper(),
-                "category": body["category"],
-                "side": body["side"],
-                "orderType": body["orderType"],
-                "qty": body["qty"],
-                "price": body["price"],
-                "orderStatus": order_status,
-                "createdTime": str(created_time_ms),
-            }
-        ],
-    )
-    remember_private_order_metadata(
-        order_id,
-        origin=origin,
-        strategy_id=strategy_id,
-        requested_by=requested_by,
-        note=payload.note,
-    )
-
-    repo.add_event(
-        event_type="exchange_order.created",
-        source="quant-core",
-        severity=EventSeverity.INFO,
-        payload={
-            "origin": origin,
-            "strategy_id": strategy_id,
-            "mode": payload.mode.value,
-            "symbol": payload.symbol.upper(),
-            "market": payload.market,
-            "side": payload.side.value,
-            "quantity": payload.quantity,
-            "price": payload.price,
-            "order_id": order_id,
-            "order_link_id": order_link_id,
-            "account_mode": status.mode.value,
-            "note": payload.note,
-        },
-        symbol=payload.symbol.upper(),
-    )
-    repo._persist()  # type: ignore[attr-defined]
-
-    return OrderRecord(
-        source="bybit_private",
-        origin=origin,
-        strategy_id=strategy_id,
-        order_id=order_id,
-        symbol=payload.symbol.upper(),
-        market=payload.market,
-        side=payload.side,
-        order_type="Limit",
-        qty=serialize_decimal(payload.quantity),
-        price=serialize_decimal(payload.price),
-        status=order_status,
-        created_at=created_at,
-    )
-
-
-def cancel_exchange_order(order_id: str, requested_by: str, mode: Optional[AccountMode] = None) -> OrderRecord:
-    selected_mode = mode or repo.snapshot().workspace_preferences.selected_mode
-    status, access_error = resolve_private_mode_access(selected_mode)
-    if selected_mode == AccountMode.PAPER:
-        raise RuntimeError("当前工作台处于 Paper 模式，请使用本地 Paper 撤单接口。")
-    if access_error is not None:
-        raise RuntimeError(access_error)
-
-    orders = parse_open_orders(use_private_only=True)
-    target = next((item for item in orders if item.order_id == order_id), None)
-    if target is None:
-        raise KeyError(order_id)
-
-    body = {
-        "category": "spot" if target.market == "spot" else "linear",
-        "symbol": target.symbol,
-        "orderId": target.order_id,
-    }
-    result = private_data.cancel_order(body)
-    cancelled_order_id = str(result.get("orderId") or target.order_id)
-    remember_private_order_metadata(
-        cancelled_order_id,
-        origin=target.origin,
-        strategy_id=target.strategy_id,
-        requested_by=requested_by,
-    )
-
-    if hasattr(private_realtime, "get_open_orders_snapshot") and hasattr(private_realtime, "seed_open_orders_snapshot"):
-        next_orders = [
-            item
-            for item in (private_realtime.get_open_orders_snapshot() or [])
-            if str(item.get("orderId") or "") != cancelled_order_id
-        ]
-        private_realtime.seed_open_orders_snapshot(next_orders)
-
-    upsert_private_order_history_cache(
-        status,
-        [
-            {
-                "orderId": cancelled_order_id,
-                "symbol": target.symbol,
-                "category": "spot" if target.market == "spot" else "linear",
-                "side": "Buy" if target.side == Direction.BUY else "Sell",
-                "orderType": target.order_type,
-                "qty": target.qty.replace(",", ""),
-                "price": target.price.replace(",", ""),
-                "orderStatus": "Cancelled",
-                "createdTime": str(
-                    int(datetime.fromisoformat(target.created_at).astimezone(timezone.utc).timestamp() * 1000)
-                ),
-            }
-        ],
-    )
-
-    repo.add_event(
-        event_type="exchange_order.cancelled",
-        source="desktop",
-        severity=EventSeverity.WARNING,
-        payload={
-            "mode": status.mode.value,
-            "order_id": cancelled_order_id,
-            "symbol": target.symbol,
-            "market": target.market,
-            "origin": target.origin,
-            "strategy_id": target.strategy_id,
-            "requested_by": requested_by,
-        },
-        symbol=target.symbol,
-    )
-    repo._persist()  # type: ignore[attr-defined]
-
-    return target.model_copy(update={"status": "Cancelled"})
-
-
-def cancel_all_exchange_orders(requested_by: str) -> PaperOrderBulkCancelResult:
-    selected_mode = repo.snapshot().workspace_preferences.selected_mode
-    status, access_error = resolve_private_mode_access(selected_mode)
-    if selected_mode == AccountMode.PAPER:
-        raise RuntimeError("当前工作台处于 Paper 模式，请使用本地 Paper 全撤接口。")
-    if access_error is not None:
-        raise RuntimeError(access_error)
-
-    orders = parse_open_orders(use_private_only=True)
-    if not orders:
-        return PaperOrderBulkCancelResult(
-            cancelled_count=0,
-            cancelled_order_ids=[],
-            requested_by=requested_by,
-            updated_at=datetime.now(timezone.utc).astimezone().isoformat(),
-        )
-
-    grouped_requests: Dict[tuple[str, str], Dict[str, str]] = {}
-    for order in orders:
-        key = (order.market, order.symbol)
-        grouped_requests[key] = {
-            "category": "spot" if order.market == "spot" else "linear",
-            "symbol": order.symbol,
-        }
-
-    for body in grouped_requests.values():
-        private_data.cancel_all_orders(body)
-
-    for order in orders:
-        remember_private_order_metadata(
-            order.order_id,
-            origin=order.origin,
-            strategy_id=order.strategy_id,
-            requested_by=requested_by,
-        )
-
-    cancelled_order_ids = [order.order_id for order in orders]
-    if hasattr(private_realtime, "seed_open_orders_snapshot"):
-        private_realtime.seed_open_orders_snapshot([])
-
-    upsert_private_order_history_cache(
-        status,
-        [
-            {
-                "orderId": order.order_id,
-                "symbol": order.symbol,
-                "category": "spot" if order.market == "spot" else "linear",
-                "side": "Buy" if order.side == Direction.BUY else "Sell",
-                "orderType": order.order_type,
-                "qty": order.qty.replace(",", ""),
-                "price": order.price.replace(",", ""),
-                "orderStatus": "Cancelled",
-                "createdTime": str(
-                    int(datetime.fromisoformat(order.created_at).astimezone(timezone.utc).timestamp() * 1000)
-                ),
-            }
-            for order in orders
-        ],
-    )
-
-    repo.add_event(
-        event_type="exchange_order.cancelled_all",
-        source="desktop",
-        severity=EventSeverity.WARNING,
-        payload={
-            "mode": status.mode.value,
-            "requested_by": requested_by,
-            "cancelled_count": len(cancelled_order_ids),
-            "cancelled_order_ids": cancelled_order_ids,
-            "origins": [order.origin for order in orders],
-            "strategy_ids": [order.strategy_id for order in orders if order.strategy_id],
-        },
-    )
-    repo._persist()  # type: ignore[attr-defined]
-    return PaperOrderBulkCancelResult(
-        cancelled_count=len(cancelled_order_ids),
-        cancelled_order_ids=cancelled_order_ids,
-        requested_by=requested_by,
-        updated_at=datetime.now(timezone.utc).astimezone().isoformat(),
-    )
-
-
-def _market_reference_price(symbol: str, market: str) -> float:
-    ticker = market_data.get_ticker(symbol.upper(), market)
-    price = coerce_float(ticker.get("lastPrice"), 0.0)
-    if price <= 0:
-        raise RuntimeError(f"{symbol.upper()} 当前缺少可用行情，无法生成平仓委托。")
-    return price
-
-
-def _resolve_spot_close_quantity(symbol: str, position_qty: float) -> float:
-    upper_symbol = symbol.upper()
-    available_qty: Optional[float] = None
-    wallet_snapshot: Optional[Dict[str, Any]] = None
-    try:
-        _wallet_status, wallet_snapshot, _wallet_updated_at = load_private_wallet_snapshot()
-    except RuntimeError:
-        wallet_snapshot = None
-
-    if wallet_snapshot is not None:
-        available_qty = _private_wallet_available_spot_quantity(wallet_snapshot, symbol=upper_symbol)
-
-    if available_qty is None:
-        open_orders = _load_private_open_order_records_for_preview()
-        reserved_qty = _private_reserved_spot_sell_quantity(open_orders, symbol=upper_symbol)
-        available_qty = max(position_qty - reserved_qty, 0.0)
-
-    if available_qty <= 1e-9:
-        raise RuntimeError(
-            f"{upper_symbol} 当前现货可用数量为 0，可能已被未成交卖单占用或其他冻结量占用，请先撤销相关挂单后再平仓。"
-        )
-    if available_qty + 1e-9 < position_qty:
-        raise RuntimeError(
-            f"{upper_symbol} 当前现货仅有 {repo._format_quantity(available_qty, 6)} 可用于平仓，"
-            f"低于持仓数量 {repo._format_quantity(position_qty, 6)}；请先撤销相关挂单后再平仓。"
-        )
-    return position_qty
-
-
-def _prepare_exchange_close_order(target: PositionRecord) -> Dict[str, Any]:
-    quantity = coerce_float(str(target.size).replace(",", ""), 0.0)
-    if quantity <= 0:
-        raise RuntimeError(f"{target.symbol.upper()} 当前没有可平的真实持仓。")
-    if target.market == "spot":
-        quantity = _resolve_spot_close_quantity(target.symbol, quantity)
-    price = _market_reference_price(target.symbol, target.market)
-    side = Direction.SELL if target.side == "long" else Direction.BUY
-    return {
-        "quantity": quantity,
-        "price": price,
-        "side": side,
-    }
-
-
-def _submit_exchange_close_order(
-    *,
-    target: PositionRecord,
-    quantity: float,
-    price: float,
-    side: Direction,
-    status: BybitPrivateStatus,
-    requested_by: str,
-) -> OrderRecord:
-    selected_mode = repo.snapshot().workspace_preferences.selected_mode
-    order_link_id = f"close-{selected_mode.value}-{uuid4().hex[:12]}"
-    created_at = datetime.now(timezone.utc).astimezone().isoformat()
-    created_time_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-    body = {
-        "category": "spot" if target.market == "spot" else "linear",
-        "symbol": target.symbol,
-        "side": "Buy" if side == Direction.BUY else "Sell",
-        "orderType": "Limit",
-        "qty": serialize_decimal(quantity),
-        "price": serialize_decimal(price),
-        "timeInForce": "GTC",
-        "orderLinkId": order_link_id,
-    }
-    if target.market == "perp":
-        body["reduceOnly"] = True
-
-    result = private_data.create_order(body)
-    order_id = str(result.get("orderId") or order_link_id)
-    order_status = str(result.get("orderStatus") or "New")
-    remember_private_order_metadata(
-        order_id,
-        origin="manual",
-        requested_by=requested_by,
-    )
-
-    if hasattr(private_realtime, "get_open_orders_snapshot") and hasattr(private_realtime, "seed_open_orders_snapshot"):
-        current_orders = private_realtime.get_open_orders_snapshot() or []
-        next_orders = [item for item in current_orders if str(item.get("orderId") or "") != order_id]
-        next_orders.insert(
-            0,
-            {
-                "orderId": order_id,
-                "orderLinkId": order_link_id,
-                "symbol": target.symbol,
-                "category": body["category"],
-                "side": body["side"],
-                "orderType": body["orderType"],
-                "qty": body["qty"],
-                "price": body["price"],
-                "orderStatus": order_status,
-                "createdTime": str(created_time_ms),
-            },
-        )
-        private_realtime.seed_open_orders_snapshot(next_orders)
-
-    upsert_private_order_history_cache(
-        status,
-        [
-            {
-                "orderId": order_id,
-                "orderLinkId": order_link_id,
-                "symbol": target.symbol,
-                "category": body["category"],
-                "side": body["side"],
-                "orderType": body["orderType"],
-                "qty": body["qty"],
-                "price": body["price"],
-                "orderStatus": order_status,
-                "createdTime": str(created_time_ms),
-            }
-        ],
-    )
-
-    repo.add_event(
-        event_type="exchange_position.close_submitted",
-        source="desktop",
-        severity=EventSeverity.INFO,
-        payload={
-            "mode": status.mode.value,
-            "requested_by": requested_by,
-            "symbol": target.symbol,
-            "market": target.market,
-            "position_side": target.side,
-            "origin": "manual",
-            "quantity": quantity,
-            "price": price,
-            "order_id": order_id,
-            "order_link_id": order_link_id,
-        },
-        symbol=target.symbol,
-    )
-    repo._persist()  # type: ignore[attr-defined]
-    return OrderRecord(
-        source="bybit_private",
-        origin="manual",
-        order_id=order_id,
-        symbol=target.symbol,
-        market=target.market,
-        side=side,
-        order_type="Limit",
-        qty=serialize_decimal(quantity),
-        price=serialize_decimal(price),
-        status=order_status,
-        created_at=created_at,
-    )
-
-
-def close_exchange_position(symbol: str, requested_by: str) -> OrderRecord:
-    selected_mode = repo.snapshot().workspace_preferences.selected_mode
-    status, access_error = resolve_private_mode_access(selected_mode)
-    if selected_mode == AccountMode.PAPER:
-        raise RuntimeError("当前工作台处于 Paper 模式，请使用本地 Paper 平仓接口。")
-    if access_error is not None:
-        raise RuntimeError(access_error)
-
-    positions = parse_positions(use_private_only=True)
-    matched_positions = [item for item in positions if item.symbol == symbol.upper()]
-    if not matched_positions:
-        raise KeyError(symbol.upper())
-    if len(matched_positions) > 1:
-        markets = " / ".join(sorted({item.market for item in matched_positions}))
-        raise RuntimeError(
-            f"{symbol.upper()} 当前同时存在多个市场持仓（{markets}），单笔平仓接口无法安全判定目标市场，请改用批量全平或先收敛到单一市场持仓后再操作。"
-        )
-    target = matched_positions[0]
-
-    prepared = _prepare_exchange_close_order(target)
-    return _submit_exchange_close_order(
-        target=target,
-        quantity=float(prepared["quantity"]),
-        price=float(prepared["price"]),
-        side=prepared["side"],
-        status=status,
-        requested_by=requested_by,
-    )
-
-
-def close_all_exchange_positions(requested_by: str) -> ExchangePositionBulkCloseResult:
-    selected_mode = repo.snapshot().workspace_preferences.selected_mode
-    status, access_error = resolve_private_mode_access(selected_mode)
-    if selected_mode == AccountMode.PAPER:
-        raise RuntimeError("当前工作台处于 Paper 模式，请使用本地 Paper 全平接口。")
-    if access_error is not None:
-        raise RuntimeError(access_error)
-
-    positions = parse_positions(use_private_only=True)
-    if not positions:
-        return ExchangePositionBulkCloseResult(
-            submitted_count=0,
-            order_ids=[],
-            requested_by=requested_by,
-            updated_at=datetime.now(timezone.utc).astimezone().isoformat(),
-        )
-
-    prepared_positions = [
-        (
-            position,
-            _prepare_exchange_close_order(position),
-        )
-        for position in positions
-    ]
-
-    submitted_orders: List[OrderRecord] = []
-    for position, prepared in prepared_positions:
-        submitted_orders.append(
-            _submit_exchange_close_order(
-                target=position,
-                quantity=float(prepared["quantity"]),
-                price=float(prepared["price"]),
-                side=prepared["side"],
-                status=status,
-                requested_by=requested_by,
-            )
-        )
-
-    repo.add_event(
-        event_type="exchange_position.close_all_submitted",
-        source="desktop",
-        severity=EventSeverity.INFO,
-        payload={
-            "mode": status.mode.value,
-            "requested_by": requested_by,
-            "submitted_count": len(submitted_orders),
-            "order_ids": [item.order_id for item in submitted_orders],
-            "symbols": [item.symbol for item in submitted_orders],
-        },
-    )
-    repo._persist()  # type: ignore[attr-defined]
-    return ExchangePositionBulkCloseResult(
-        submitted_count=len(submitted_orders),
-        order_ids=[item.order_id for item in submitted_orders],
-        requested_by=requested_by,
-        updated_at=datetime.now(timezone.utc).astimezone().isoformat(),
-    )
-
-
-def replace_exchange_order(
-    order_id: str,
-    quantity: float,
-    price: float,
-    requested_by: str,
-    mode: Optional[AccountMode] = None,
-) -> OrderRecord:
-    selected_mode = mode or repo.snapshot().workspace_preferences.selected_mode
-    status, access_error = resolve_private_mode_access(selected_mode)
-    if selected_mode == AccountMode.PAPER:
-        raise RuntimeError("当前工作台处于 Paper 模式，请使用本地 Paper 改单接口。")
-    if access_error is not None:
-        raise RuntimeError(access_error)
-
-    ensure_private_realtime_started()
-    raw_orders = private_realtime.get_open_orders_snapshot() if hasattr(private_realtime, "get_open_orders_snapshot") else []
-    if not raw_orders:
-        raw_orders = private_data.fetch_open_orders()
-        if hasattr(private_realtime, "seed_open_orders_snapshot"):
-            private_realtime.seed_open_orders_snapshot(raw_orders)
-
-    raw_target = next(
-        (
-            item
-            for item in raw_orders
-            if str(item.get("orderId") or "") == order_id
-        ),
-        None,
-    )
-    if raw_target is None:
-        raise KeyError(order_id)
-
-    target = build_order_records([raw_target])[0]
-    preview = build_private_execution_preview(
-        ExecutionPreviewRequest(
-            symbol=target.symbol,
-            market=target.market,
-            mode=selected_mode,
-            side=target.side,
-            quantity=quantity,
-            price=price,
-            origin="manual",
-            exclude_order_id=order_id,
-        )
-    )
-    if not preview.allowed:
-        raise RuntimeError(preview.blocked_reason or "当前真实委托改单预检未通过。")
-    desired_reduce_only = _execution_preview_requires_reduce_only(preview)
-    if _exchange_order_matches_requested_target(
-        target,
-        quantity,
-        price,
-        require_reduce_only=desired_reduce_only,
-    ):
-        repo.add_event(
-            event_type="exchange_order.replace_noop",
-            source="desktop",
-            severity=EventSeverity.INFO,
-            payload={
-                "mode": status.mode.value,
-                "requested_by": requested_by,
-                "order_id": order_id,
-                "symbol": target.symbol,
-                "market": target.market,
-                "origin": target.origin,
-                "strategy_id": target.strategy_id,
-                "side": target.side.value,
-                "quantity": quantity,
-                "price": price,
-            },
-            symbol=target.symbol,
-        )
-        repo._persist()  # type: ignore[attr-defined]
-        return target
-
-    body = {
-        "category": "spot" if target.market == "spot" else "linear",
-        "symbol": target.symbol,
-        "orderId": order_id,
-        "qty": serialize_decimal(quantity),
-        "price": serialize_decimal(price),
-    }
-    if target.market == "perp":
-        body["reduceOnly"] = desired_reduce_only
-    result = private_data.amend_order(body)
-    amended_order_id = str(result.get("orderId") or order_id)
-    order_status = str(result.get("orderStatus") or raw_target.get("orderStatus") or target.status or "New")
-    remember_private_order_metadata(
-        amended_order_id,
-        origin=target.origin,
-        strategy_id=target.strategy_id,
-        requested_by=requested_by,
-    )
-    next_order = {
-        **raw_target,
-        "orderId": amended_order_id,
-        "qty": body["qty"],
-        "price": body["price"],
-        "orderStatus": order_status,
-        "reduceOnly": body.get("reduceOnly"),
-    }
-
-    if hasattr(private_realtime, "seed_open_orders_snapshot"):
-        next_orders = []
-        for item in raw_orders:
-            if str(item.get("orderId") or "") == order_id:
-                next_orders.append(next_order)
-            else:
-                next_orders.append(item)
-        private_realtime.seed_open_orders_snapshot(next_orders)
-
-    upsert_private_order_history_cache(
-        status,
-        [
-            {
-                "orderId": amended_order_id,
-                "symbol": target.symbol,
-                "category": "spot" if target.market == "spot" else "linear",
-                "side": "Buy" if target.side == Direction.BUY else "Sell",
-                "orderType": target.order_type,
-                "qty": body["qty"],
-                "price": body["price"],
-                "orderStatus": order_status,
-                "createdTime": str(
-                    int(datetime.fromisoformat(target.created_at).astimezone(timezone.utc).timestamp() * 1000)
-                ),
-            }
-        ],
-    )
-
-    repo.add_event(
-        event_type="exchange_order.replaced",
-        source="desktop",
-        severity=EventSeverity.INFO,
-        payload={
-            "mode": status.mode.value,
-            "requested_by": requested_by,
-            "order_id": amended_order_id,
-            "symbol": target.symbol,
-            "market": target.market,
-            "origin": target.origin,
-            "strategy_id": target.strategy_id,
-            "side": target.side.value,
-            "previous_quantity": target.qty,
-            "previous_price": target.price,
-            "quantity": quantity,
-            "price": price,
-        },
-        symbol=target.symbol,
-    )
-    repo._persist()  # type: ignore[attr-defined]
-    return target.model_copy(
-        update={
-            "qty": serialize_decimal(quantity),
-            "price": serialize_decimal(price),
-            "status": order_status,
-        }
-    )
-
-
-def _announcement_symbols(title: str, summary: str) -> List[str]:
-    content = f"{title} {summary}".upper()
-    matched: List[str] = []
-    for item in repo.snapshot().watchlist:
-        base_symbol = item.symbol.replace("USDT", "")
-        if base_symbol and base_symbol in content and item.symbol not in matched:
-            matched.append(item.symbol)
-    return matched
-
-
-def _announcement_impact_score(title: str, tags: List[str]) -> int:
-    normalized_title = title.lower()
-    normalized_tags = {str(tag).strip().lower() for tag in tags}
-    if any(keyword in normalized_title for keyword in ("delist", "suspend", "maintenance", "incident", "下架", "暂停", "维护", "异常")):
-        return 88
-    if {"listing", "launchpad", "pre-market"} & normalized_tags:
-        return 82
-    if {"earn", "campaign", "product"} & normalized_tags:
-        return 68
-    return 58
-
-
-def build_news_feed(limit: int = 10) -> List[NewsEvent]:
-    seeded_news = list(repo.snapshot().news_events)
-    announcement_events: List[NewsEvent] = []
-    try:
-        announcements = market_data.get_announcements(locale="zh-TW", limit=limit)
-        for item in announcements:
-            title = str(item.get("title") or "Bybit 公告")
-            summary = str(item.get("description") or item.get("subtitle") or "请前往 Bybit 公告页查看详情。").strip()
-            tags = item.get("tags") or item.get("tag") or []
-            if isinstance(tags, str):
-                tag_list = [tags]
-            else:
-                tag_list = [str(tag) for tag in tags if str(tag).strip()]
-            announcement_events.append(
-                NewsEvent(
-                    id=str(item.get("id") or f"bybit-ann-{uuid4().hex[:10]}"),
-                    source="Bybit 公告",
-                    title=title,
-                    summary=summary,
-                    url=str(item.get("url") or "").strip() or None,
-                    symbols=_announcement_symbols(title, summary),
-                    impact_score=_announcement_impact_score(title, tag_list),
-                    published_at=timestamp_ms_to_iso(item.get("publishTime") or item.get("dateTimestamp")),
-                    category="announcement",
-                    related_alert_ids=[],
-                )
-            )
-    except RuntimeError:
-        announcement_events = []
-
-    merged = announcement_events + seeded_news
-    deduped: Dict[str, NewsEvent] = {}
-    for item in merged:
-        dedupe_key = f"{item.source}|{item.title}"
-        if dedupe_key not in deduped:
-            deduped[dedupe_key] = item
-    return sorted(deduped.values(), key=lambda item: item.published_at, reverse=True)[: max(limit, 10)]
-
-
-def probe_private_trade_route() -> BybitTradeProbeResult:
-    status = private_data.get_status()
-    if not status.can_query_private:
-        return BybitTradeProbeResult(
-            configured=False,
-            authenticated=False,
-            trade_permission=None,
-            outcome="not_configured",
-            detail="未检测到 Bybit 私有 API 配置，无法探测真实下单链路。",
-            tested_at=status.updated_at,
-        )
-
-    try:
-        result = private_data.probe_trade_route()
-    except RuntimeError as exc:
-        return BybitTradeProbeResult(
-            configured=True,
-            authenticated=False,
-            trade_permission=None,
-            outcome="network_error",
-            detail=str(exc),
-            tested_at=status.updated_at,
-        )
-
-    return BybitTradeProbeResult(
-        configured=True,
-        authenticated=result["outcome"] != "permission_denied",
-        trade_permission=result.get("trade_permission"),
-        outcome=result["outcome"],
-        detail=result["ret_msg"] or "Bybit 交易链路探测已完成。",
-        ret_code=result.get("ret_code"),
-        order_link_id=result.get("order_link_id"),
-        tested_at=result["tested_at"],
-    )
-
-
-def build_health_payload() -> dict:
-    state = repo.snapshot()
-    return {
-        "ok": True,
-        "service": "control-api",
-        "watchlist_count": len(state.watchlist),
-        "strategy_count": len(state.strategies),
-        "openclaw_connected": state.control_snapshot.scheduler.openclaw_connected,
-    }
-
-
-def format_sse(data: Dict[str, Any], event: str = "snapshot") -> str:
-    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
-
-
-def build_market_live_snapshot_payload(symbol: str, timeframe: str = "1h") -> MarketLiveSnapshot:
-    started_at = time.perf_counter()
-    state = repo.snapshot()
-    uppercase_symbol = symbol.upper()
-    try:
-        normalized_timeframe = market_data.normalize_timeframe(timeframe)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    watchlist = market_data.enrich_watchlist_fast(state.watchlist)
-    if not watchlist:
-        raise HTTPException(status_code=404, detail="当前还没有可用自选品种。")
-    watch_item = next((item for item in watchlist if item.symbol == uppercase_symbol), None)
-    effective_symbol = uppercase_symbol
-    selection_corrected = False
-    if watch_item is None:
-        watch_item = watchlist[0]
-        effective_symbol = watch_item.symbol
-        selection_corrected = True
-
-    watchlist_details: List[MarketDetail] = []
-    detail_map: Dict[str, MarketDetail] = {}
-    live_detail: Optional[MarketDetail] = None
-
-    for item in watchlist:
-        seed_detail = state.market_details.get(item.symbol)
-        fallback_detail = build_runtime_market_fallback_detail(
-            symbol=item.symbol,
-            market=item.market,
-            timeframe=normalized_timeframe,
-            watch_item=item,
-            base_detail=seed_detail,
-        )
-        try:
-            detail = market_data.enrich_market_detail(
-                symbol=item.symbol,
-                market=item.market,
-                fallback_detail=fallback_detail,
-                watch_item=item,
-                timeframe=normalized_timeframe,
-                allow_rest_refresh=False,
-            )
-            if item.symbol == effective_symbol and len(detail.candles) == 0:
-                detail = market_data.enrich_market_detail(
-                    symbol=item.symbol,
-                    market=item.market,
-                    fallback_detail=fallback_detail,
-                    watch_item=item,
-                    timeframe=normalized_timeframe,
-                    allow_rest_refresh=True,
-                )
-        except RuntimeError as exc:
-            detail = build_runtime_market_fallback_detail(
-                symbol=item.symbol,
-                market=item.market,
-                timeframe=normalized_timeframe,
-                watch_item=item,
-                base_detail=seed_detail,
-                failure_reason=str(exc),
-            )
-        detail_map[item.symbol] = detail
-        watchlist_details.append(detail)
-        if item.symbol == effective_symbol:
-            live_detail = detail
-
-    if live_detail is None:
-        raise HTTPException(status_code=404, detail="当前自选中找不到该品种")
-
-    repo.sync_market_watchlist(watchlist, detail_map)
-
-    source_breakdown: Dict[str, int] = {}
-    for item in watchlist_details:
-        source_breakdown[item.source] = source_breakdown.get(item.source, 0) + 1
-    watchlist_real_detail_count = sum(1 for item in watchlist_details if item.source in {"bybit_ws", "bybit_rest"})
-    generated_in_ms = int((time.perf_counter() - started_at) * 1000)
-
-    return MarketLiveSnapshot(
-        selected_symbol=effective_symbol,
-        watchlist=watchlist,
-        detail=live_detail,
-        watchlist_details=watchlist_details,
-        diagnostics=MarketLiveDiagnostics(
-            requested_symbol=uppercase_symbol,
-            effective_symbol=effective_symbol,
-            timeframe=normalized_timeframe,
-            selection_corrected=selection_corrected,
-            detail_source=live_detail.source,
-            detail_candle_count=len(live_detail.candles),
-            watchlist_symbol_count=len(watchlist_details),
-            watchlist_real_detail_count=watchlist_real_detail_count,
-            watchlist_fallback_detail_count=max(len(watchlist_details) - watchlist_real_detail_count, 0),
-            watchlist_source_breakdown=source_breakdown,
-            generated_in_ms=generated_in_ms,
-        ),
-        generated_at=datetime.now(timezone.utc).astimezone().isoformat(),
-    )
-
-
-def _clear_strategy_auto_dispatch_alerts(strategy_id: str) -> bool:
-    changed = False
-    prefix = f"strategy-auto-dispatch:{strategy_id}:"
-    with repo._lock:  # type: ignore[attr-defined]
-        for alert in repo.state.alerts:  # type: ignore[attr-defined]
-            if alert.source_type != "system" or alert.acknowledged:
-                continue
-            rule_key = getattr(alert, "rule_key", None) or ""
-            if not rule_key.startswith(prefix):
-                continue
-            alert.acknowledged = True
-            changed = True
-        if changed:
-            repo._refresh_derived_state()  # type: ignore[attr-defined]
-            repo._persist()  # type: ignore[attr-defined]
-    return changed
-
-
-def _has_active_strategy_auto_dispatch_alert(strategy_id: str) -> bool:
-    prefix = f"strategy-auto-dispatch:{strategy_id}:"
-    with repo._lock:  # type: ignore[attr-defined]
-        return any(
-            alert.source_type == "system"
-            and not alert.acknowledged
-            and str(getattr(alert, "rule_key", None) or "").startswith(prefix)
-            for alert in repo.state.alerts  # type: ignore[attr-defined]
-        )
-
-
-def _clear_strategy_live_stop_loss_alerts(strategy_id: str) -> bool:
-    changed = False
-    prefix = f"strategy-live-stop-loss:{strategy_id}:"
-    with repo._lock:  # type: ignore[attr-defined]
-        for alert in repo.state.alerts:  # type: ignore[attr-defined]
-            if alert.source_type != "system" or alert.acknowledged:
-                continue
-            rule_key = getattr(alert, "rule_key", None) or ""
-            if not rule_key.startswith(prefix):
-                continue
-            alert.acknowledged = True
-            changed = True
-        if changed:
-            repo._refresh_derived_state()  # type: ignore[attr-defined]
-            repo._persist()  # type: ignore[attr-defined]
-    return changed
-
-
-def _has_active_strategy_live_stop_loss_alert(strategy_id: str) -> bool:
-    prefix = f"strategy-live-stop-loss:{strategy_id}:"
-    with repo._lock:  # type: ignore[attr-defined]
-        return any(
-            alert.source_type == "system"
-            and not alert.acknowledged
-            and str(getattr(alert, "rule_key", None) or "").startswith(prefix)
-            for alert in repo.state.alerts  # type: ignore[attr-defined]
-        )
-
-
-def _clear_strategy_position_drift_alerts(
-    strategy_id: str,
-    *,
-    resolution_detail: Optional[str] = None,
-) -> bool:
-    changed = False
-    prefix = f"strategy-position-drift:{strategy_id}:"
-    with repo._lock:  # type: ignore[attr-defined]
-        for alert in repo.state.alerts:  # type: ignore[attr-defined]
-            if alert.source_type != "system" or alert.acknowledged:
-                continue
-            rule_key = getattr(alert, "rule_key", None) or ""
-            if not rule_key.startswith(prefix):
-                continue
-            alert.acknowledged = True
-            changed = True
-        if changed:
-            repo.add_event(
-                event_type="strategy.position_drift.resolved",
-                source="quant-core",
-                severity=EventSeverity.INFO,
-                payload={
-                    "strategy_id": strategy_id,
-                    "detail": resolution_detail or "当前实际仓位已重新与策略目标对齐，偏离提醒已收起。",
-                },
-                strategy_id=strategy_id,
-            )
-            repo._refresh_derived_state()  # type: ignore[attr-defined]
-            repo._persist()  # type: ignore[attr-defined]
-    return changed
-
-
-def _has_active_strategy_position_drift_alert(strategy_id: str) -> bool:
-    prefix = f"strategy-position-drift:{strategy_id}:"
-    with repo._lock:  # type: ignore[attr-defined]
-        return any(
-            alert.source_type == "system"
-            and not alert.acknowledged
-            and str(getattr(alert, "rule_key", None) or "").startswith(prefix)
-            for alert in repo.state.alerts  # type: ignore[attr-defined]
-        )
-
-
-def _clear_strategy_exchange_rejected_alerts(
-    strategy_id: str,
-    *,
-    resolution_detail: Optional[str] = None,
-) -> bool:
-    changed = False
-    prefix = f"strategy-exchange-rejected:{strategy_id}:"
-    with repo._lock:  # type: ignore[attr-defined]
-        for alert in repo.state.alerts:  # type: ignore[attr-defined]
-            if alert.source_type != "system" or alert.acknowledged:
-                continue
-            rule_key = getattr(alert, "rule_key", None) or ""
-            if not rule_key.startswith(prefix):
-                continue
-            alert.acknowledged = True
-            changed = True
-        if changed:
-            repo.add_event(
-                event_type="strategy.exchange_order.rejection_resolved",
-                source="quant-core",
-                severity=EventSeverity.INFO,
-                payload={
-                    "strategy_id": strategy_id,
-                    "detail": resolution_detail or "真实策略委托已恢复正常，拒单提醒已收起。",
-                },
-                strategy_id=strategy_id,
-            )
-            repo._refresh_derived_state()  # type: ignore[attr-defined]
-            repo._persist()  # type: ignore[attr-defined]
-    return changed
-
-
-def _clear_strategy_exchange_rejection_guard_alerts(
-    strategy_id: str,
-    *,
-    resolution_detail: Optional[str] = None,
-) -> bool:
-    changed = False
-    prefix = f"strategy-exchange-rejection-guard:{strategy_id}:"
-    with repo._lock:  # type: ignore[attr-defined]
-        for alert in repo.state.alerts:  # type: ignore[attr-defined]
-            if alert.source_type != "system" or alert.acknowledged:
-                continue
-            rule_key = getattr(alert, "rule_key", None) or ""
-            if not rule_key.startswith(prefix):
-                continue
-            alert.acknowledged = True
-            changed = True
-        if changed:
-            repo.add_event(
-                event_type="strategy.exchange_order.rejection_guard.resolved",
-                source="quant-core",
-                severity=EventSeverity.INFO,
-                payload={
-                    "strategy_id": strategy_id,
-                    "detail": resolution_detail or "连续拒单熔断已解除，真实策略自动执行可继续人工复核后恢复。",
-                },
-                strategy_id=strategy_id,
-            )
-            repo._refresh_derived_state()  # type: ignore[attr-defined]
-            repo._persist()  # type: ignore[attr-defined]
-    return changed
-
-
-def _has_active_strategy_exchange_rejection_guard_alert(strategy_id: str) -> bool:
-    prefix = f"strategy-exchange-rejection-guard:{strategy_id}:"
-    with repo._lock:  # type: ignore[attr-defined]
-        return any(
-            alert.source_type == "system"
-            and not alert.acknowledged
-            and str(getattr(alert, "rule_key", None) or "").startswith(prefix)
-            for alert in repo.state.alerts  # type: ignore[attr-defined]
-        )
-
-
-def _clear_strategy_stale_order_alerts(
-    strategy_id: str,
-    *,
-    resolution_detail: Optional[str] = None,
-) -> bool:
-    changed = False
-    prefix = f"strategy-stale-order:{strategy_id}:"
-    with repo._lock:  # type: ignore[attr-defined]
-        for alert in repo.state.alerts:  # type: ignore[attr-defined]
-            if alert.source_type != "system" or alert.acknowledged:
-                continue
-            rule_key = getattr(alert, "rule_key", None) or ""
-            if not rule_key.startswith(prefix):
-                continue
-            alert.acknowledged = True
-            changed = True
-        if changed:
-            repo.add_event(
-                event_type="strategy.exchange_order.stale_resolved",
-                source="quant-core",
-                severity=EventSeverity.INFO,
-                payload={
-                    "strategy_id": strategy_id,
-                    "detail": resolution_detail or "停滞挂单异常已解除，旧提醒已收起。",
-                },
-                strategy_id=strategy_id,
-            )
-            repo._refresh_derived_state()  # type: ignore[attr-defined]
-            repo._persist()  # type: ignore[attr-defined]
-    return changed
-
-
-def _has_active_strategy_stale_order_alert(strategy_id: str) -> bool:
-    prefix = f"strategy-stale-order:{strategy_id}:"
-    with repo._lock:  # type: ignore[attr-defined]
-        return any(
-            alert.source_type == "system"
-            and not alert.acknowledged
-            and str(getattr(alert, "rule_key", None) or "").startswith(prefix)
-            for alert in repo.state.alerts  # type: ignore[attr-defined]
-        )
-
-
-def _queue_strategy_issue_review_locked(
-    *,
-    strategy_id: str,
-    strategy_name: str,
-    symbol: str,
-    mode: AccountMode,
-    issue_type: str,
-    summary: str,
-    detail: str,
-    rule_key: str,
-    severity: str = "P1",
-) -> None:
-    timestamp = datetime.now(timezone.utc).astimezone().isoformat()
-    repo._create_agent_job_locked(  # type: ignore[attr-defined]
-        AgentJobCreate(
-            job_type="review_strategy_issue",
-            context={
-                "issue_type": issue_type,
-                "summary": summary,
-                "detail": detail,
-                "severity": severity,
-                "strategy_id": strategy_id,
-                "strategy_name": strategy_name,
-                "symbol": symbol,
-                "mode": mode.value,
-                "rule_key": rule_key,
-                "triggered_at": timestamp,
-            },
-            allowed_actions=["review_strategy_issue", "summarize_execution_impact"],
-            timeout=60,
-            idempotency_key=f"strategy-issue-review:{rule_key}:{timestamp}",
-            writeback_target="strategy_activity",
-        ),
-        source="mock-orchestrator",
-    )
-
-
-def _record_strategy_auto_dispatch_issue(
-    strategy_id: str,
-    strategy_name: str,
-    symbol: str,
-    signal: str,
-    mode: AccountMode,
-    detail: str,
-    recommended_action: Optional[str] = None,
-) -> None:
-    rule_key = f"strategy-auto-dispatch:{strategy_id}:{signal}:{mode.value}"
-    suggested_action = recommended_action or _build_auto_dispatch_recommended_action(detail)
-    with repo._lock:  # type: ignore[attr-defined]
-        changed = repo._upsert_system_alert_locked(  # type: ignore[attr-defined]
-            rule_key=rule_key,
-            severity="P1",
-            symbol=symbol,
-            title=f"{symbol} 自动执行被拦截",
-            description=f"{strategy_name} 在 {mode.value.upper()} 自动执行时被阻断。{detail}",
-            suggested_action=suggested_action,
-            strategy_id=strategy_id,
-        )
-        if changed:
-            _queue_strategy_issue_review_locked(
-                strategy_id=strategy_id,
-                strategy_name=strategy_name,
-                symbol=symbol,
-                mode=mode,
-                issue_type="auto_dispatch_blocked",
-                summary=f"{symbol} 自动执行被拦截",
-                detail=detail,
-                rule_key=rule_key,
-            )
-            repo.add_event(
-                event_type="strategy.exchange_order.auto_blocked",
-                source="quant-core",
-                severity=EventSeverity.WARNING,
-                payload={
-                    "strategy_id": strategy_id,
-                    "strategy_name": strategy_name,
-                    "symbol": symbol,
-                    "signal": signal,
-                    "mode": mode.value,
-                    "detail": detail,
-                    "recommended_action": suggested_action,
-                },
-                symbol=symbol,
-                strategy_id=strategy_id,
-            )
-        repo._refresh_derived_state()  # type: ignore[attr-defined]
-        repo._persist()  # type: ignore[attr-defined]
-
-
-def _record_strategy_manual_execution_issue(
-    strategy_id: str,
-    strategy_name: str,
-    symbol: str,
-    mode: AccountMode,
-    detail: str,
-    recommended_action: Optional[str] = None,
-) -> None:
-    rule_key = f"strategy-blocked-execution:{strategy_id}:{mode.value}"
-    suggested_action = recommended_action or _build_manual_execution_recommended_action(detail)
-    with repo._lock:  # type: ignore[attr-defined]
-        changed = repo._upsert_system_alert_locked(  # type: ignore[attr-defined]
-            rule_key=rule_key,
-            severity="P1",
-            symbol=symbol,
-            title=f"{symbol} 手动策略执行被拦截",
-            description=f"{strategy_name} 在 {mode.value.upper()} 手动执行时被阻断。{detail}",
-            suggested_action=suggested_action,
-            strategy_id=strategy_id,
-        )
-        repo.add_event(
-            event_type="strategy.execution.blocked",
-            source="desktop-control",
-            severity=EventSeverity.WARNING,
-            payload={
-                "strategy_id": strategy_id,
-                "strategy_name": strategy_name,
-                "symbol": symbol,
-                "mode": mode.value,
-                "detail": detail,
-                "recommended_action": suggested_action,
-            },
-            symbol=symbol,
-            strategy_id=strategy_id,
-        )
-        if changed:
-            _queue_strategy_issue_review_locked(
-                strategy_id=strategy_id,
-                strategy_name=strategy_name,
-                symbol=symbol,
-                mode=mode,
-                issue_type="manual_execution_blocked",
-                summary=f"{symbol} 手动策略执行被拦截",
-                detail=detail,
-                rule_key=rule_key,
-            )
-            repo.add_event(
-                event_type="strategy.execution.blocked_alerted",
-                source="quant-core",
-                severity=EventSeverity.WARNING,
-                payload={
-                    "strategy_id": strategy_id,
-                    "strategy_name": strategy_name,
-                    "symbol": symbol,
-                    "mode": mode.value,
-                    "detail": detail,
-                    "recommended_action": suggested_action,
-                },
-                symbol=symbol,
-                strategy_id=strategy_id,
-            )
-        repo._refresh_derived_state()  # type: ignore[attr-defined]
-        repo._persist()  # type: ignore[attr-defined]
-
-
-def _clear_strategy_manual_execution_alerts(
-    strategy_id: str,
-    mode: AccountMode,
-    *,
-    resolution_detail: Optional[str] = None,
-) -> bool:
-    changed = False
-    rule_keys = {
-        f"strategy-blocked-execution:{strategy_id}:{mode.value}",
-        f"strategy-manual-execution:{strategy_id}:{mode.value}",
-    }
-    with repo._lock:  # type: ignore[attr-defined]
-        for alert in repo.state.alerts:  # type: ignore[attr-defined]
-            if alert.source_type != "system" or alert.acknowledged:
-                continue
-            if str(getattr(alert, "rule_key", None) or "") not in rule_keys:
-                continue
-            alert.acknowledged = True
-            changed = True
-        if changed:
-            repo.add_event(
-                event_type="strategy.execution.blocked_resolved",
-                source="quant-core",
-                severity=EventSeverity.INFO,
-                payload={
-                    "strategy_id": strategy_id,
-                    "mode": mode.value,
-                    "detail": resolution_detail or "后续手动策略执行已恢复成功，旧的拦截提醒已收起。",
-                },
-                strategy_id=strategy_id,
-            )
-            repo._refresh_derived_state()  # type: ignore[attr-defined]
-            repo._persist()  # type: ignore[attr-defined]
-    return changed
-
-
-def _sync_strategy_position_drift_issue(
-    snapshot: StrategyRuntimeSnapshot,
-    *,
-    active_order_count: int,
-) -> None:
-    if snapshot.mode == AccountMode.PAPER or snapshot.runtime_status != "running":
-        _clear_strategy_position_drift_alerts(snapshot.strategy_id)
-        return
-    if snapshot.position_alignment != "drifted":
-        detail = snapshot.position_alignment_detail or "当前仓位已经回到策略目标附近，偏离提醒已收起。"
-        _clear_strategy_position_drift_alerts(snapshot.strategy_id, resolution_detail=detail)
-        return
-
-    detail = snapshot.position_alignment_detail or "当前实际仓位与策略目标仍有偏差，尚未完全对齐。"
-    with repo._lock:  # type: ignore[attr-defined]
-        changed = repo._upsert_system_alert_locked(  # type: ignore[attr-defined]
-            rule_key=f"strategy-position-drift:{snapshot.strategy_id}:{snapshot.mode.value}",
-            severity="P1",
-            symbol=snapshot.symbol,
-            title=f"{snapshot.symbol} 策略仓位偏离目标",
-            description=(
-                f"{snapshot.strategy_name} 当前目标仓位 {snapshot.target_position_side} "
-                f"{snapshot.target_position_size or '--'}，但实际仓位仍未对齐。{detail}"
-            ),
-            suggested_action="切到策略页和账户页核对持仓、关联委托和执行预检，必要时人工补单或接管。",
-            strategy_id=snapshot.strategy_id,
-        )
-        if changed:
-            _queue_strategy_issue_review_locked(
-                strategy_id=snapshot.strategy_id,
-                strategy_name=snapshot.strategy_name,
-                symbol=snapshot.symbol,
-                mode=snapshot.mode,
-                issue_type="position_drift",
-                summary=f"{snapshot.symbol} 策略仓位偏离目标",
-                detail=detail,
-                rule_key=f"strategy-position-drift:{snapshot.strategy_id}:{snapshot.mode.value}",
-            )
-            repo.add_event(
-                event_type="strategy.position_drift.alerted",
-                source="quant-core",
-                severity=EventSeverity.WARNING,
-                payload={
-                    "strategy_id": snapshot.strategy_id,
-                    "strategy_name": snapshot.strategy_name,
-                    "symbol": snapshot.symbol,
-                    "mode": snapshot.mode.value,
-                    "target_position_side": snapshot.target_position_side,
-                    "target_position_size": snapshot.target_position_size,
-                    "detail": detail,
-                    "active_order_count": active_order_count,
-                },
-                symbol=snapshot.symbol,
-                strategy_id=snapshot.strategy_id,
-            )
-        repo._refresh_derived_state()  # type: ignore[attr-defined]
-        repo._persist()  # type: ignore[attr-defined]
-
-
-def _strategy_auto_dispatch_gate_reason(strategy: Optional[StrategySummary] = None) -> Optional[str]:
-    scheduler = repo.snapshot().control_snapshot.scheduler
-    if scheduler.status == "manual_override":
-        return "当前 AI 调度处于人工接管，后台自动执行已暂停。"
-    if scheduler.status == "paused":
-        return "当前 AI 调度已暂停，后台自动执行已暂停。"
-    if scheduler.freeze_publish:
-        return "当前已冻结自动发布，后台自动执行暂不继续提交新委托。"
-    if strategy is not None and strategy.mode in {AccountMode.DEMO, AccountMode.LIVE}:
-        state = repo.snapshot()
-        market = _resolve_strategy_primary_market(state, strategy)
-        symbol = strategy.symbols[0] if strategy.symbols else ""
-        if symbol:
-            public_channel_issue = get_public_execution_channel_issue(market, symbol)
-            if public_channel_issue is not None:
-                return public_channel_issue
-        private_channel_issue = get_private_execution_channel_issue(strategy.mode)
-        if private_channel_issue is not None:
-            return private_channel_issue
-    return None
-
-
-def _strategy_parameter_float(strategy: StrategySummary, key: str) -> Optional[float]:
-    for parameter in strategy.parameters:
-        if parameter.key != key:
-            continue
-        try:
-            return float(parameter.value)
-        except (TypeError, ValueError):
-            return None
-    return None
-
-
-def _strategy_parameter_int(strategy: StrategySummary, key: str) -> Optional[int]:
-    value = _strategy_parameter_float(strategy, key)
-    if value is None:
-        return None
-    return int(round(value))
-
-
-def _strategy_live_stop_loss_cooldown_remaining_minutes(strategy: StrategySummary) -> Optional[int]:
-    cooldown_minutes = _strategy_parameter_float(strategy, "cooldown_minutes") or 0.0
-    if cooldown_minutes <= 0:
-        return None
-    latest_guard_event = next(
-        (
-            event
-            for event in repo.snapshot().audit_events
-            if event.event_type == "strategy.exchange_stop_loss.alerted"
-            and event.strategy_id == strategy.id
-        ),
-        None,
-    )
-    if latest_guard_event is None:
-        return None
-    try:
-        occurred_at = datetime.fromisoformat(latest_guard_event.occurred_at)
-    except ValueError:
-        return None
-    elapsed_minutes = (datetime.now(timezone.utc).astimezone() - occurred_at).total_seconds() / 60
-    remaining = int(round(cooldown_minutes - elapsed_minutes))
-    return remaining if remaining > 0 else None
-
-
-def _strategy_exchange_rejection_guard_threshold(strategy: StrategySummary) -> int:
-    return max(_strategy_parameter_int(strategy, "rejection_guard_count") or 2, 1)
-
-
-def _strategy_exchange_rejection_guard_window_minutes(strategy: StrategySummary) -> int:
-    return max(_strategy_parameter_int(strategy, "rejection_guard_window_minutes") or 15, 1)
-
-
-def _strategy_exchange_rejection_guard_cooldown_minutes(strategy: StrategySummary) -> int:
-    return max(_strategy_parameter_int(strategy, "rejection_cooldown_minutes") or 20, 1)
-
-
-def _strategy_exchange_rejection_event_time(event: ExecutionEvent) -> datetime:
-    raw_value = event.payload.get("order_created_at") or event.occurred_at
-    try:
-        return datetime.fromisoformat(str(raw_value))
-    except (TypeError, ValueError):
-        return datetime.fromtimestamp(0, tz=timezone.utc)
-
-
-def _strategy_exchange_rejection_recent_count(strategy: StrategySummary) -> int:
-    threshold_window = _strategy_exchange_rejection_guard_window_minutes(strategy)
-    cutoff = datetime.now(timezone.utc).astimezone() - timedelta(minutes=threshold_window)
-    return sum(
-        1
-        for event in repo.snapshot().audit_events
-        if event.strategy_id == strategy.id
-        and event.event_type == "exchange_order.rejected"
-        and _strategy_exchange_rejection_event_time(event) >= cutoff
-    )
-
-
-def _strategy_exchange_rejection_guard_remaining_minutes(strategy: StrategySummary) -> Optional[int]:
-    if strategy.mode == AccountMode.PAPER or strategy.status in {"paper_only", "paused", "shadow"}:
-        return None
-    threshold = _strategy_exchange_rejection_guard_threshold(strategy)
-    cooldown_minutes = _strategy_exchange_rejection_guard_cooldown_minutes(strategy)
-    threshold_window = _strategy_exchange_rejection_guard_window_minutes(strategy)
-    if threshold <= 0 or cooldown_minutes <= 0 or threshold_window <= 0:
-        return None
-
-    cutoff = datetime.now(timezone.utc).astimezone() - timedelta(minutes=threshold_window)
-    recent_events = [
-        event
-        for event in repo.snapshot().audit_events
-        if event.strategy_id == strategy.id
-        and event.event_type == "exchange_order.rejected"
-        and _strategy_exchange_rejection_event_time(event) >= cutoff
-    ]
-    if len(recent_events) < threshold:
-        return None
-    latest_event = max(recent_events, key=_strategy_exchange_rejection_event_time)
-    latest_at = _strategy_exchange_rejection_event_time(latest_event)
-    elapsed_minutes = (datetime.now(timezone.utc).astimezone() - latest_at).total_seconds() / 60
-    remaining = int(round(cooldown_minutes - elapsed_minutes))
-    return remaining if remaining > 0 else None
-
-
-def _strategy_exchange_order_stale_minutes(strategy: StrategySummary) -> int:
-    return max(_strategy_parameter_int(strategy, "stale_order_minutes") or 20, 1)
-
-
-def _parse_order_created_at(value: Optional[str]) -> datetime:
-    if not value:
-        return datetime.fromtimestamp(0, tz=timezone.utc)
-    try:
-        return datetime.fromisoformat(str(value))
-    except (TypeError, ValueError):
-        return datetime.fromtimestamp(0, tz=timezone.utc)
-
-
-def _strategy_active_order_stale_age_minutes(order: OrderRecord) -> int:
-    created_at = _parse_order_created_at(order.created_at)
-    elapsed_minutes = (datetime.now(timezone.utc).astimezone() - created_at).total_seconds() / 60
-    return max(int(round(elapsed_minutes)), 0)
-
-
-def _is_strategy_active_order_stale(strategy: StrategySummary, order: Optional[OrderRecord]) -> bool:
-    if order is None or strategy.mode == AccountMode.PAPER:
-        return False
-    return _strategy_active_order_stale_age_minutes(order) >= _strategy_exchange_order_stale_minutes(strategy)
-
-
-def _record_strategy_live_stop_loss_issue(
-    strategy: StrategySummary,
-    snapshot: StrategyRuntimeSnapshot,
-    position: PositionRecord,
-    *,
-    stop_loss_pct: float,
-    cancelled_count: int,
-) -> None:
-    detail = (
-        f"{snapshot.symbol} 当前参考价 {snapshot.last_price:.4f} 已触发 {stop_loss_pct:.2f}% 真实模式止损保护；"
-        "后台自动执行已暂停，请先人工复核真实仓位。"
-    )
-    with repo._lock:  # type: ignore[attr-defined]
-        changed = repo._upsert_system_alert_locked(  # type: ignore[attr-defined]
-            rule_key=f"strategy-live-stop-loss:{strategy.id}:{strategy.mode.value}",
-            severity="P0",
-            symbol=snapshot.symbol,
-            title=f"{strategy.name} 触发真实模式止损保护",
-            description=detail,
-            suggested_action="打开策略页和账户页复核真实持仓、止损参数与当前委托，确认后再决定是否恢复自动执行。",
-            strategy_id=strategy.id,
-        )
-        if changed:
-            repo.add_event(
-                event_type="strategy.exchange_stop_loss.alerted",
-                source="quant-core",
-                severity=EventSeverity.CRITICAL,
-                payload={
-                    "strategy_id": strategy.id,
-                    "strategy_name": strategy.name,
-                    "symbol": snapshot.symbol,
-                    "market": snapshot.market,
-                    "mode": strategy.mode.value,
-                    "stop_loss_pct": stop_loss_pct,
-                    "last_price": snapshot.last_price,
-                    "position_size": position.size,
-                    "avg_price": position.avg_price,
-                    "cancelled_orders": cancelled_count,
-                },
-                symbol=snapshot.symbol,
-                strategy_id=strategy.id,
-            )
-        repo._refresh_derived_state()  # type: ignore[attr-defined]
-        repo._persist()  # type: ignore[attr-defined]
-
-
-def _cancel_strategy_exchange_orders(
-    strategy_id: str,
-    symbol: str,
-    market: str,
-    mode: AccountMode,
-    requested_by: str,
-    reason: str,
-) -> int:
-    existing_orders = [
-        item
-        for item in parse_open_orders(use_private_only=True)
-        if item.source == "bybit_private"
-        and item.origin == "strategy"
-        and (item.strategy_id == strategy_id or item.strategy_id is None)
-        and item.symbol == symbol
-        and item.market == market
-    ]
-    cancelled_count = 0
-    for order in existing_orders:
-        cancel_exchange_order(order.order_id, requested_by, mode)
-        cancelled_count += 1
-        repo.add_event(
-            event_type="strategy.exchange_order.cancelled_inactive",
-            source="quant-core",
-            severity=EventSeverity.INFO,
-            payload={
-                "strategy_id": strategy_id,
-                "symbol": symbol,
-                "market": market,
-                "mode": mode.value,
-                "order_id": order.order_id,
-                "reason": reason,
-                "requested_by": requested_by,
-            },
-            symbol=symbol,
-            strategy_id=strategy_id,
-        )
-    if cancelled_count:
-        repo._persist()  # type: ignore[attr-defined]
-    return cancelled_count
-
-
-def _exchange_order_matches_requested_target(
-    order: OrderRecord,
-    quantity: float,
-    price: float,
-    *,
-    require_reduce_only: bool = False,
-) -> bool:
-    matches = (
-        abs(parse_metric_number(order.qty) - float(quantity)) <= 1e-9
-        and abs(parse_metric_number(order.price) - float(price)) <= 1e-9
-    )
-    if not matches:
-        return False
-    if not require_reduce_only:
-        return True
-    return _raw_private_order_reduce_only_enabled(_find_private_raw_open_order(order.order_id))
-
-
-def _apply_live_strategy_stop_loss_guards(current_items: List[StrategyRuntimeSnapshot]) -> None:
-    state = repo.snapshot()
-    strategies_by_id = {item.id: item for item in state.strategies}
-    positions = parse_positions(use_private_only=True)
-    positions_by_key = {(item.symbol, item.market): item for item in positions}
-
-    for snapshot in current_items:
-        strategy = strategies_by_id.get(snapshot.strategy_id)
-        if strategy is None:
-            continue
-        if strategy.mode not in {AccountMode.LIVE, AccountMode.DEMO}:
-            _clear_strategy_live_stop_loss_alerts(snapshot.strategy_id)
-            continue
-        if strategy.status in {"paper_only", "paused", "shadow"} or snapshot.runtime_status != "running":
-            _clear_strategy_live_stop_loss_alerts(snapshot.strategy_id)
-            continue
-
-        stop_loss_pct = _strategy_parameter_float(strategy, "stop_loss_pct")
-        cooldown_remaining = _strategy_live_stop_loss_cooldown_remaining_minutes(strategy)
-        if stop_loss_pct is None or stop_loss_pct <= 0:
-            if cooldown_remaining is not None:
-                continue
-            _clear_strategy_live_stop_loss_alerts(snapshot.strategy_id)
-            continue
-
-        position = positions_by_key.get((snapshot.symbol, snapshot.market))
-        if position is None:
-            if cooldown_remaining is not None:
-                continue
-            _clear_strategy_live_stop_loss_alerts(snapshot.strategy_id)
-            continue
-
-        current_qty = parse_metric_number(position.size) * (1 if position.side == "long" else -1)
-        current_avg = parse_metric_number(position.avg_price)
-        if abs(current_qty) <= 1e-9 or current_avg <= 0:
-            if cooldown_remaining is not None:
-                continue
-            _clear_strategy_live_stop_loss_alerts(snapshot.strategy_id)
-            continue
-
-        stop_triggered = False
-        if current_qty > 0 and snapshot.last_price <= current_avg * (1 - stop_loss_pct / 100):
-            stop_triggered = True
-        elif current_qty < 0 and snapshot.last_price >= current_avg * (1 + stop_loss_pct / 100):
-            stop_triggered = True
-
-        if not stop_triggered:
-            if _has_active_strategy_live_stop_loss_alert(snapshot.strategy_id) or cooldown_remaining is not None:
-                continue
-            _clear_strategy_live_stop_loss_alerts(snapshot.strategy_id)
-            continue
-
-        cancelled_count = _cancel_strategy_exchange_orders(
-            snapshot.strategy_id,
-            snapshot.symbol,
-            snapshot.market,
-            strategy.mode,
-            "strategy_runtime_worker",
-            "当前参考价已触发真实模式止损保护，自动撤销旧策略委托并暂停后台自动执行。",
-        )
-        _record_strategy_live_stop_loss_issue(
-            strategy,
-            snapshot,
-            position,
-            stop_loss_pct=stop_loss_pct,
-            cancelled_count=cancelled_count,
-        )
-
-
-def _dispatch_strategy_signal_from_state(strategy_id: str, payload: StrategyExecutionRequest) -> StrategyExecutionResult:
-    preview = _build_strategy_execution_preview_from_state(strategy_id, payload.mode)
-    state = repo.snapshot()
-    resolved_mode = payload.mode or state.workspace_preferences.selected_mode
-    strategy = next((item for item in state.strategies if item.id == strategy_id), None)
-    if strategy is None:
-        raise KeyError(strategy_id)
-    snapshot = next((item for item in state.strategy_runtime_snapshots if item.strategy_id == strategy_id), None)
-    if snapshot is None:
-        raise RuntimeError("当前策略运行态尚未准备好，请先刷新策略页后再试。")
-
-    def _record_manual_execution_blocked(detail: str, recommended_action: Optional[str] = None) -> None:
-        _record_strategy_manual_execution_issue(
-            strategy_id,
-            strategy.name,
-            snapshot.symbol,
-            resolved_mode,
-            detail,
-            recommended_action=recommended_action,
-        )
-
-    if resolved_mode == AccountMode.PAPER:
-        if not preview.allowed:
-            detail = preview.blocked_reason or "当前策略 Paper 执行预检未通过。"
-            _record_manual_execution_blocked(detail, preview.recommended_action)
-            raise StrategyExecutionBlockedError(detail, preview.recommended_action)
-        trade = repo.execute_strategy_signal(
-            strategy_id,
-            payload.requested_by,
-            payload.note,
-        )
-        _clear_strategy_manual_execution_alerts(
-            strategy_id,
-            resolved_mode,
-            resolution_detail="后续 Paper 手动策略执行已恢复成功，旧的拦截提醒已收起。",
-        )
-        return StrategyExecutionResult(
-            kind="paper_trade",
-            strategy_id=strategy_id,
-            mode=resolved_mode,
-            preview=preview,
-            trade=trade,
-            message=f"{strategy.name} 已按当前策略信号写入 Paper 成交。",
-            generated_at=datetime.now(timezone.utc).astimezone().isoformat(),
-        )
-
-    if not preview.allowed:
-        detail = preview.blocked_reason or "当前策略真实模式执行预检未通过。"
-        _record_manual_execution_blocked(detail, preview.recommended_action)
-        raise StrategyExecutionBlockedError(detail, preview.recommended_action)
-
-    side = preview.side
-    quantity = preview.quantity
-    price = preview.price
-    existing_strategy_orders = [
-        item
-        for item in parse_open_orders(use_private_only=True)
-        if item.source == "bybit_private"
-        and item.origin == "strategy"
-        and item.strategy_id == strategy_id
-        and item.symbol == snapshot.symbol
-        and item.market == snapshot.market
-    ]
-    matching_order = next((item for item in existing_strategy_orders if item.side == side), None)
-    stale_orders = [
-        item
-        for item in existing_strategy_orders
-        if matching_order is None or item.order_id != matching_order.order_id
-    ]
-
-    for stale_order in stale_orders:
-        cancel_exchange_order(stale_order.order_id, payload.requested_by, resolved_mode)
-        repo.add_event(
-            event_type="strategy.exchange_order.cancelled_stale",
-            source="quant-core",
-            severity=EventSeverity.WARNING,
-            payload={
-                "strategy_id": strategy_id,
-                "strategy_name": strategy.name,
-                "symbol": stale_order.symbol,
-                "order_id": stale_order.order_id,
-                "mode": resolved_mode.value,
-                "requested_by": payload.requested_by,
-            },
-            symbol=stale_order.symbol,
-            strategy_id=strategy_id,
-        )
-
-    preview_requires_reduce_only = _execution_preview_requires_reduce_only(preview)
-    if matching_order is not None:
-        if _exchange_order_matches_requested_target(
-            matching_order,
-            quantity,
-            price,
-            require_reduce_only=preview_requires_reduce_only,
-        ):
-            _clear_strategy_manual_execution_alerts(
-                strategy_id,
-                resolved_mode,
-                resolution_detail="后续真实手动策略执行已恢复成功，旧的拦截提醒已收起。",
-            )
-            _clear_strategy_exchange_rejected_alerts(
-                strategy_id,
-                resolution_detail="当前真实策略委托已重新进入有效状态，拒单提醒已收起。",
-            )
-            _clear_strategy_exchange_rejection_guard_alerts(
-                strategy_id,
-                resolution_detail="当前真实策略委托已重新进入有效状态，连续拒单熔断已收起。",
-            )
-            _clear_strategy_stale_order_alerts(
-                strategy_id,
-                resolution_detail="当前真实策略委托已重新进入有效状态，停滞挂单提醒已收起。",
-            )
-            repo.add_event(
-                event_type="strategy.exchange_order.reused_existing",
-                source="quant-core",
-                severity=EventSeverity.INFO,
-                payload={
-                    "strategy_id": strategy_id,
-                    "strategy_name": strategy.name,
-                    "symbol": snapshot.symbol,
-                    "mode": resolved_mode.value,
-                    "order_id": matching_order.order_id,
-                    "quantity": quantity,
-                    "price": price,
-                    "requested_by": payload.requested_by,
-                },
-                symbol=snapshot.symbol,
-                strategy_id=strategy_id,
-            )
-            repo._persist()  # type: ignore[attr-defined]
-            return StrategyExecutionResult(
-                kind="exchange_order",
-                strategy_id=strategy_id,
-                mode=resolved_mode,
-                preview=preview,
-                order=matching_order,
-                message=f"{strategy.name} 当前真实策略委托已经与最新信号一致，无需改单。",
-                generated_at=datetime.now(timezone.utc).astimezone().isoformat(),
-            )
-        order = replace_exchange_order(
-            matching_order.order_id,
-            quantity,
-            price,
-            payload.requested_by,
-            resolved_mode,
-        )
-        _clear_strategy_manual_execution_alerts(
-            strategy_id,
-            resolved_mode,
-            resolution_detail="后续真实手动策略执行已恢复成功，旧的拦截提醒已收起。",
-        )
-        _clear_strategy_exchange_rejected_alerts(
-            strategy_id,
-            resolution_detail="最新真实策略委托已成功改单，拒单提醒已收起。",
-        )
-        _clear_strategy_exchange_rejection_guard_alerts(
-            strategy_id,
-            resolution_detail="最新真实策略委托已成功改单，连续拒单熔断已收起。",
-        )
-        _clear_strategy_stale_order_alerts(
-            strategy_id,
-            resolution_detail="最新真实策略委托已成功改单，停滞挂单提醒已收起。",
-        )
-        repo.add_event(
-            event_type="strategy.exchange_order.replaced_existing",
-            source="quant-core",
-            severity=EventSeverity.INFO,
-            payload={
-                "strategy_id": strategy_id,
-                "strategy_name": strategy.name,
-                "symbol": snapshot.symbol,
-                "mode": resolved_mode.value,
-                "order_id": order.order_id,
-                "quantity": quantity,
-                "price": price,
-                "requested_by": payload.requested_by,
-            },
-            symbol=snapshot.symbol,
-            strategy_id=strategy_id,
-        )
-        repo._persist()  # type: ignore[attr-defined]
-        return StrategyExecutionResult(
-            kind="exchange_order",
-            strategy_id=strategy_id,
-            mode=resolved_mode,
-            preview=preview,
-            order=order,
-            message=f"{strategy.name} 已复用当前策略委托并更新为最新信号参数。",
-            generated_at=datetime.now(timezone.utc).astimezone().isoformat(),
-        )
-
-    order = submit_exchange_order(
-        ManualOrderRequest(
-            symbol=snapshot.symbol,
-            market=snapshot.market,
-            mode=resolved_mode,
-            side=side,
-            quantity=quantity,
-            price=price,
-            note=payload.note or f"{strategy.name} 按当前策略信号提交真实委托。",
-        ),
-        origin="strategy",
-        strategy_id=strategy_id,
-        requested_by=payload.requested_by,
-    )
-    _clear_strategy_manual_execution_alerts(
-        strategy_id,
-        resolved_mode,
-        resolution_detail="后续真实手动策略执行已恢复成功，旧的拦截提醒已收起。",
-    )
-    _clear_strategy_exchange_rejected_alerts(
-        strategy_id,
-        resolution_detail="最新真实策略委托已成功提交，拒单提醒已收起。",
-    )
-    _clear_strategy_exchange_rejection_guard_alerts(
-        strategy_id,
-        resolution_detail="最新真实策略委托已成功提交，连续拒单熔断已收起。",
-    )
-    _clear_strategy_stale_order_alerts(
-        strategy_id,
-        resolution_detail="最新真实策略委托已成功提交，停滞挂单提醒已收起。",
-    )
-    repo.add_event(
-        event_type="strategy.exchange_order.submitted",
-        source="quant-core",
-        severity=EventSeverity.INFO,
-        payload={
-            "strategy_id": strategy_id,
-            "strategy_name": strategy.name,
-            "symbol": snapshot.symbol,
-            "market": snapshot.market,
-            "mode": resolved_mode.value,
-            "signal": snapshot.signal,
-            "side": side.value,
-            "quantity": quantity,
-            "price": price,
-            "order_id": order.order_id,
-            "requested_by": payload.requested_by,
-        },
-        symbol=snapshot.symbol,
-        strategy_id=strategy_id,
-    )
-    repo._persist()  # type: ignore[attr-defined]
-    return StrategyExecutionResult(
-        kind="exchange_order",
-        strategy_id=strategy_id,
-        mode=resolved_mode,
-        preview=preview,
-        order=order,
-        message=f"{strategy.name} 已按当前策略信号向 Bybit 提交真实委托。",
-        generated_at=datetime.now(timezone.utc).astimezone().isoformat(),
-    )
-
-
-def _auto_dispatch_strategy_signal_changes(
-    previous_by_id: Dict[str, StrategyRuntimeSnapshot],
-    current_items: List[StrategyRuntimeSnapshot],
-) -> None:
-    state = repo.snapshot()
-    strategies_by_id = {item.id: item for item in state.strategies}
-    for snapshot in current_items:
-        previous = previous_by_id.get(snapshot.strategy_id)
-        strategy = strategies_by_id.get(snapshot.strategy_id)
-        if strategy is None:
-            continue
-        pending_reconcile = _has_active_strategy_auto_dispatch_alert(snapshot.strategy_id)
-        gate_reason = _strategy_auto_dispatch_gate_reason(strategy)
-        if strategy.mode == AccountMode.PAPER or strategy.status in {"paper_only", "paused", "shadow"}:
-            _cancel_strategy_exchange_orders(
-                snapshot.strategy_id,
-                snapshot.symbol,
-                snapshot.market,
-                strategy.mode,
-                "strategy_runtime_worker",
-                "策略已暂停或切入影子/仅模拟模式，自动撤销旧策略委托。",
-            )
-            _clear_strategy_auto_dispatch_alerts(snapshot.strategy_id)
-            continue
-        cooldown_remaining = _strategy_live_stop_loss_cooldown_remaining_minutes(strategy)
-        if cooldown_remaining is not None:
-            _cancel_strategy_exchange_orders(
-                snapshot.strategy_id,
-                snapshot.symbol,
-                snapshot.market,
-                strategy.mode,
-                "strategy_runtime_worker",
-                f"当前处于真实模式止损后冷却期，剩余约 {cooldown_remaining} 分钟，后台自动执行继续保持暂停。",
-            )
-            continue
-        if _has_active_strategy_live_stop_loss_alert(snapshot.strategy_id):
-            _cancel_strategy_exchange_orders(
-                snapshot.strategy_id,
-                snapshot.symbol,
-                snapshot.market,
-                strategy.mode,
-                "strategy_runtime_worker",
-                "当前参考价已触发真实模式止损保护，后台自动执行继续保持暂停。",
-            )
-            continue
-        rejection_guard_remaining = _strategy_exchange_rejection_guard_remaining_minutes(strategy)
-        if rejection_guard_remaining is not None:
-            _cancel_strategy_exchange_orders(
-                snapshot.strategy_id,
-                snapshot.symbol,
-                snapshot.market,
-                strategy.mode,
-                "strategy_runtime_worker",
-                f"最近真实策略委托连续拒绝，冷却剩余约 {rejection_guard_remaining} 分钟，后台自动执行继续保持暂停。",
-            )
-            continue
-        if gate_reason is not None:
-            scheduler_status = repo.snapshot().control_snapshot.scheduler.status
-            if (
-                scheduler_status in {"paused", "manual_override"}
-                or "公共 WS" in gate_reason
-                or "私有 WS" in gate_reason
-            ):
-                _cancel_strategy_exchange_orders(
-                    snapshot.strategy_id,
-                    snapshot.symbol,
-                    snapshot.market,
-                    strategy.mode,
-                    "strategy_runtime_worker",
-                    gate_reason,
-                )
-            _record_strategy_auto_dispatch_issue(
-                snapshot.strategy_id,
-                snapshot.strategy_name,
-                snapshot.symbol,
-                snapshot.signal,
-                strategy.mode,
-                gate_reason,
-            )
-            continue
-        if snapshot.runtime_status != "running":
-            _cancel_strategy_exchange_orders(
-                snapshot.strategy_id,
-                snapshot.symbol,
-                snapshot.market,
-                strategy.mode,
-                "strategy_runtime_worker",
-                "策略运行态不再处于 running，自动撤销旧策略委托。",
-            )
-            _clear_strategy_auto_dispatch_alerts(snapshot.strategy_id)
-            continue
-        active_order_count, active_order = _build_strategy_active_order_summary(
-            snapshot.strategy_id,
-            strategy.mode,
-            snapshot.symbol,
-            snapshot.market,
-        )
-        if strategy.mode != AccountMode.PAPER and active_order_count > 1:
-            active_orders = _list_strategy_active_orders(
-                snapshot.strategy_id,
-                strategy.mode,
-                snapshot.symbol,
-                snapshot.market,
-            )
-            for stale_order in active_orders[1:]:
-                cancel_exchange_order(stale_order.order_id, "strategy_runtime_worker", strategy.mode)
-                repo.add_event(
-                    event_type="strategy.exchange_order.cancelled_surplus",
-                    source="quant-core",
-                    severity=EventSeverity.WARNING,
-                    payload={
-                        "strategy_id": snapshot.strategy_id,
-                        "strategy_name": snapshot.strategy_name,
-                        "symbol": snapshot.symbol,
-                        "mode": strategy.mode.value,
-                        "kept_order_id": active_orders[0].order_id if active_orders else None,
-                        "cancelled_order_id": stale_order.order_id,
-                    },
-                    symbol=snapshot.symbol,
-                    strategy_id=snapshot.strategy_id,
-                )
-            repo._persist()  # type: ignore[attr-defined]
-            active_order_count, active_order = _build_strategy_active_order_summary(
-                snapshot.strategy_id,
-                strategy.mode,
-                snapshot.symbol,
-                snapshot.market,
-            )
-        if active_order is not None and _is_strategy_active_order_stale(strategy, active_order):
-            stale_age_minutes = _strategy_active_order_stale_age_minutes(active_order)
-            cancel_exchange_order(active_order.order_id, "strategy_runtime_worker", strategy.mode)
-            repo.add_event(
-                event_type="strategy.exchange_order.cancelled_stale_timeout",
-                source="quant-core",
-                severity=EventSeverity.WARNING,
-                payload={
-                    "strategy_id": snapshot.strategy_id,
-                    "strategy_name": snapshot.strategy_name,
-                    "symbol": snapshot.symbol,
-                    "order_id": active_order.order_id,
-                    "mode": strategy.mode.value,
-                    "stale_age_minutes": stale_age_minutes,
-                    "threshold_minutes": _strategy_exchange_order_stale_minutes(strategy),
-                },
-                symbol=snapshot.symbol,
-                strategy_id=snapshot.strategy_id,
-            )
-            repo._persist()  # type: ignore[attr-defined]
-            active_order_count = 0
-            active_order = None
-        if previous is None:
-            continue
-        if (
-            previous.signal == snapshot.signal
-            and previous.runtime_status == snapshot.runtime_status
-            and not pending_reconcile
-        ):
-            if (
-                strategy.mode != AccountMode.PAPER
-                and snapshot.runtime_status == "running"
-                and snapshot.signal != "watch"
-                and active_order_count == 0
-            ):
-                try:
-                    reconcile_preview = _build_strategy_execution_preview_from_state(snapshot.strategy_id, strategy.mode)
-                except RuntimeError:
-                    continue
-                if reconcile_preview.allowed and reconcile_preview.quantity > 0:
-                    repo.add_event(
-                        event_type="strategy.exchange_order.reconcile_missing_order",
-                        source="quant-core",
-                        severity=EventSeverity.WARNING,
-                        payload={
-                            "strategy_id": snapshot.strategy_id,
-                            "strategy_name": snapshot.strategy_name,
-                            "symbol": snapshot.symbol,
-                            "signal": snapshot.signal,
-                            "mode": strategy.mode.value,
-                            "quantity": reconcile_preview.quantity,
-                            "price": reconcile_preview.price,
-                        },
-                        symbol=snapshot.symbol,
-                        strategy_id=snapshot.strategy_id,
-                    )
-                    repo._persist()  # type: ignore[attr-defined]
-                else:
-                    continue
-            else:
-                continue
-        if snapshot.signal == "watch":
-            _cancel_strategy_exchange_orders(
-                snapshot.strategy_id,
-                snapshot.symbol,
-                snapshot.market,
-                strategy.mode,
-                "strategy_runtime_worker",
-                "策略信号回到 watch，自动撤销旧策略委托。",
-            )
-            _clear_strategy_auto_dispatch_alerts(snapshot.strategy_id)
-            continue
-        try:
-            _dispatch_strategy_signal_from_state(
-                snapshot.strategy_id,
-                StrategyExecutionRequest(
-                    requested_by="strategy_runtime_worker",
-                    note=f"{snapshot.strategy_name} 自动执行最新策略信号。",
-                    mode=strategy.mode,
-                ),
-            )
-            _clear_strategy_auto_dispatch_alerts(snapshot.strategy_id)
-        except RuntimeError as exc:
-            detail = str(exc)
-            if "无需再次提交委托" in detail:
-                _clear_strategy_auto_dispatch_alerts(snapshot.strategy_id)
-                repo.add_event(
-                    event_type="strategy.exchange_order.auto_noop",
-                    source="quant-core",
-                    severity=EventSeverity.INFO,
-                    payload={
-                        "strategy_id": snapshot.strategy_id,
-                        "strategy_name": snapshot.strategy_name,
-                        "symbol": snapshot.symbol,
-                        "signal": snapshot.signal,
-                        "mode": strategy.mode.value,
-                        "detail": detail,
-                    },
-                    symbol=snapshot.symbol,
-                    strategy_id=snapshot.strategy_id,
-                )
-                repo._persist()  # type: ignore[attr-defined]
-                continue
-            recommended_action = exc.recommended_action if isinstance(exc, StrategyExecutionBlockedError) else None
-            _record_strategy_auto_dispatch_issue(
-                snapshot.strategy_id,
-                snapshot.strategy_name,
-                snapshot.symbol,
-                snapshot.signal,
-                strategy.mode,
-                detail,
-                recommended_action=recommended_action,
-            )
-        except Exception as exc:  # pragma: no cover - defensive guard for background worker
-            _record_strategy_auto_dispatch_issue(
-                snapshot.strategy_id,
-                snapshot.strategy_name,
-                snapshot.symbol,
-                snapshot.signal,
-                strategy.mode,
-                f"后台自动执行异常：{exc}",
-            )
-
-
-def refresh_strategy_runtime_once(auto_dispatch: bool = False) -> List[StrategyRuntimeSnapshot]:
-    state = repo.snapshot()
-    previous_by_id = {item.strategy_id: item for item in state.strategy_runtime_snapshots}
-    evaluated_at = datetime.now(timezone.utc).astimezone().isoformat()
-    try:
-        watchlist = market_data.enrich_watchlist(state.watchlist)
-    except RuntimeError:
-        watchlist = list(state.watchlist)
-
-    watchlist_by_symbol = {item.symbol: item for item in watchlist}
-    detail_overrides: Dict[str, MarketDetail] = {}
-    snapshots: List[StrategyRuntimeSnapshot] = []
-
-    for strategy in state.strategies:
-        if not strategy.symbols:
-            continue
-        symbol = strategy.symbols[0]
-        watch_item = watchlist_by_symbol.get(symbol)
-        if watch_item is None:
-            continue
-        fallback_detail = state.market_details.get(symbol) or build_market_detail_for_watchlist(watch_item)
-        try:
-            detail = market_data.enrich_market_detail(
-                symbol=symbol,
-                market=watch_item.market,
-                fallback_detail=fallback_detail.model_copy(update={"timeframe": "1h"}),
-                watch_item=watch_item,
-                timeframe="1h",
-            )
-        except RuntimeError:
-            detail = fallback_detail.model_copy(update={"timeframe": "1h"})
-        detail_overrides[symbol] = detail
-        snapshots.append(
-            evaluate_strategy_runtime(
-                strategy=strategy,
-                detail=detail,
-                watch_item=watch_item,
-                evaluated_at=evaluated_at,
-            )
-        )
-
-    repo.sync_market_watchlist(watchlist, detail_overrides if detail_overrides else None)
-    strategy_runtime_state["last_refresh_at"] = evaluated_at
-    strategy_runtime_state["last_error"] = None
-    updated = repo.update_strategy_runtime_snapshots(snapshots)
-    _apply_live_strategy_stop_loss_guards(updated)
-    if auto_dispatch:
-        _auto_dispatch_strategy_signal_changes(previous_by_id, updated)
-    private_order_history = parse_order_history(use_private_only=True, force_refresh=True)
-    _sync_strategy_exchange_order_history_events(private_order_history)
-    _sync_strategy_exchange_order_history_alerts(private_order_history)
-    _sync_strategy_stale_order_issues(updated)
-    _sync_strategy_exchange_rejection_guards(updated)
-    _sync_strategy_position_drift_issues(updated)
-    return updated
-
-
 def _build_lightweight_strategy_activity_runtime_snapshot(
     state: Any,
     strategy: Any,
@@ -7150,1917 +3935,147 @@ def _build_lightweight_strategy_activity_runtime_snapshot(
     except Exception:
         return cached_snapshot
 
-
-def _build_blocked_strategy_execution_preview(
-    snapshot: StrategyRuntimeSnapshot,
-    mode: AccountMode,
-    detail: str,
-) -> ExecutionPreview:
-    fallback_side = Direction.BUY if snapshot.signal != "short" else Direction.SELL
-    return ExecutionPreview(
-        symbol=snapshot.symbol,
-        market=snapshot.market,
-        mode=mode,
-        side=fallback_side,
-        origin="strategy",
-        strategy_id=snapshot.strategy_id,
-        quantity=0.0,
-        price=round(snapshot.reference_price or snapshot.last_price, 6),
-        notional="--",
-        action=snapshot.next_action,
-        allowed=False,
-        blocked_reason=detail,
-        recommended_action=_build_execution_preview_recommended_action(detail),
-        warnings=[detail],
-        current_position_side="flat",
-        current_position_size="--",
-        current_avg_price="--",
-        projected_position_side="flat",
-        projected_position_size="--",
-        projected_avg_price="--",
-        available_balance_before="--",
-        available_balance_after="--",
-        estimated_realized_pnl="--",
-        generated_at=datetime.now(timezone.utc).astimezone().isoformat(),
-    )
-
-
-def _decorate_strategy_runtime_item(item: StrategyRuntimeSnapshot) -> StrategyRuntimeSnapshot:
-    if _has_active_strategy_live_stop_loss_alert(item.strategy_id):
-        detail = "当前已触发真实模式止损保护，后台自动执行已暂停。"
-        return item.model_copy(
-            update={
-                "note": detail,
-                "next_action": "请先复核真实仓位、止损参数和遗留委托，再决定是否恢复自动执行。",
-                "guard_state": "live_stop_loss",
-                "guard_detail": detail,
-            }
-        )
-    state = repo.snapshot()
-    strategy = next((entry for entry in state.strategies if entry.id == item.strategy_id), None)
-    if strategy is not None:
-        public_channel_issue = (
-            get_public_execution_channel_issue(item.market, item.symbol)
-            if strategy.mode in {AccountMode.DEMO, AccountMode.LIVE} and strategy.status == "running"
-            else None
-        )
-        if public_channel_issue is not None:
-            return item.model_copy(
-                update={
-                    "note": public_channel_issue,
-                    "next_action": _build_public_execution_channel_recommended_action(public_channel_issue),
-                    "guard_state": "auto_dispatch_blocked",
-                    "guard_detail": public_channel_issue,
-                }
-            )
-        private_channel_issue = (
-            get_private_execution_channel_issue(strategy.mode)
-            if strategy.mode in {AccountMode.DEMO, AccountMode.LIVE} and strategy.status == "running"
-            else None
-        )
-        if private_channel_issue is not None:
-            return item.model_copy(
-                update={
-                    "note": private_channel_issue,
-                    "next_action": _build_private_execution_channel_recommended_action(
-                        private_channel_issue,
-                        last_error=str(private_realtime.get_status().get("last_error") or "").strip() or None,
-                    ),
-                    "guard_state": "auto_dispatch_blocked",
-                    "guard_detail": private_channel_issue,
-                }
-            )
-        cooldown_remaining = _strategy_live_stop_loss_cooldown_remaining_minutes(strategy)
-        if cooldown_remaining is not None:
-            detail = f"当前处于真实模式止损后冷却期，剩余约 {cooldown_remaining} 分钟。"
-            return item.model_copy(
-                update={
-                    "note": detail,
-                    "next_action": "冷却结束前不再恢复自动执行；请先人工复核真实仓位和策略参数。",
-                    "guard_state": "cooldown",
-                    "guard_detail": detail,
-                }
-            )
-        if _has_active_strategy_stale_order_alert(item.strategy_id):
-            detail = "当前存在长时间未处理的真实策略挂单，请先复核并决定是否人工处理或等待后台重发。"
-            return item.model_copy(
-                update={
-                    "note": detail,
-                    "next_action": "优先检查当前挂单价格与市场偏离，再决定是否人工改单、撤单或切入人工接管。",
-                    "guard_state": "auto_dispatch_blocked",
-                    "guard_detail": detail,
-                }
-            )
-        rejection_guard_remaining = _strategy_exchange_rejection_guard_remaining_minutes(strategy)
-        if rejection_guard_remaining is not None:
-            detail = f"最近真实策略委托连续拒绝，自动执行冷却剩余约 {rejection_guard_remaining} 分钟。"
-            return item.model_copy(
-                update={
-                    "note": detail,
-                    "next_action": "请先核对真实仓位、最小下单限制和委托参数，确认无误后再恢复自动执行。",
-                    "guard_state": "auto_dispatch_blocked",
-                    "guard_detail": detail,
-                }
-            )
-    if _has_active_strategy_auto_dispatch_alert(item.strategy_id):
-        state = repo.snapshot()
-        alert = _find_latest_active_system_alert_by_prefix(state, f"strategy-auto-dispatch:{item.strategy_id}:")
-        detail = "当前自动执行被系统拦截，请先查看执行预检和当前委托。"
-        next_action = "必要时进入人工接管，确认处理完成后再恢复自动执行。"
-        if alert is not None and "私有 WS" in alert.description:
-            detail = alert.description
-            next_action = alert.suggested_action or _build_private_execution_channel_recommended_action(alert.description)
-        elif alert is not None and ("公共 WS" in alert.description or "公共实时链路" in alert.description):
-            detail = alert.description
-            next_action = alert.suggested_action or _build_public_execution_channel_recommended_action(alert.description)
-        return item.model_copy(
-            update={
-                "note": detail,
-                "next_action": next_action,
-                "guard_state": "auto_dispatch_blocked",
-                "guard_detail": detail,
-            }
-        )
-    return item.model_copy(update={"guard_state": "none", "guard_detail": None})
-
-
-def _list_strategy_active_orders(
+def _build_strategy_activity_runtime_snapshot(
+    *,
     strategy_id: str,
-    mode: AccountMode,
-    symbol: str,
-    market: str,
-) -> List[OrderRecord]:
-    if mode == AccountMode.PAPER:
-        orders = repo.get_paper_orders()
-    else:
-        orders = parse_open_orders(use_private_only=True)
-    matching = [
-        item
-        for item in orders
-        if item.origin == "strategy"
-        and item.symbol == symbol
-        and item.market == market
-        and (item.strategy_id == strategy_id or (item.strategy_id is None and mode != AccountMode.PAPER))
-    ]
-    matching.sort(key=lambda item: item.created_at, reverse=True)
-    return matching
-
-
-def _build_strategy_active_order_summary(
-    strategy_id: str,
-    mode: AccountMode,
-    symbol: str,
-    market: str,
-) -> tuple[int, Optional[OrderRecord]]:
-    matching = _list_strategy_active_orders(strategy_id, mode, symbol, market)
-    return len(matching), matching[0] if matching else None
-
-
-def _build_strategy_position_alignment_summary(
-    strategy_id: str,
-    mode: AccountMode,
-    symbol: str,
-    market: str,
-    active_order_count: int,
-) -> tuple[str, Optional[str], str, Optional[str]]:
-    if mode == AccountMode.PAPER:
-        positions = repo.get_paper_positions()
-    else:
-        positions = parse_positions(use_private_only=True)
-    position = next((item for item in positions if item.symbol == symbol and item.market == market), None)
-    current_signed_qty = 0.0
-    if position is not None:
-        current_signed_qty = parse_metric_number(position.size) * (1 if position.side == "long" else -1)
-
-    try:
-        hint = repo.get_strategy_signal_order_hint(strategy_id)
-        target_signed_qty = float(hint["target_signed_qty"])
-        if mode != AccountMode.PAPER:
-            existing_strategy_orders = _list_strategy_private_open_orders(strategy_id, symbol, market)
-            _release_order_ids, released_buy_reservation = _strategy_order_release_context(existing_strategy_orders)
-            reusable_open_order_abs = _strategy_reusable_open_order_abs(
-                existing_strategy_orders,
-                raw_target_signed_qty=target_signed_qty,
-            )
-            target_resolution = _resolve_balance_linked_strategy_target_signed_qty(
-                symbol=symbol,
-                market=market,
-                mode=mode,
-                price=float(hint["price"]),
-                raw_target_signed_qty=target_signed_qty,
-                current_signed_qty=current_signed_qty,
-                risk_budget=hint.get("risk_budget"),
-                released_buy_reservation=released_buy_reservation,
-                reusable_open_order_abs=reusable_open_order_abs,
-            )
-            target_signed_qty = float(target_resolution["display_target_signed_qty"])
-            if target_resolution["blocked_reason"]:
-                return (
-                    repo._classify_position_side(target_signed_qty),  # type: ignore[attr-defined]
-                    normalize_number(abs(target_signed_qty), 6),
-                    "unknown",
-                    str(target_resolution["blocked_reason"]),
+    strategy: Any,
+    runtime: Optional[StrategyRuntimeSnapshot],
+) -> Optional[StrategyRuntimeSnapshot]:
+    if runtime is None:
+        return None
+    runtime = _decorate_strategy_runtime_item(runtime)
+    if runtime.runtime_status == "paused":
+        return runtime
+    strategy_mode_preview: Optional[ExecutionPreview] = None
+    if strategy.mode != AccountMode.PAPER:
+        runtime_block_reason = _runtime_worker_execution_block_reason(_build_strategy_runtime_worker_health())
+        if runtime_block_reason is not None:
+            strategy_mode_preview = _build_blocked_strategy_execution_preview(runtime, strategy.mode, runtime_block_reason)
+        else:
+            try:
+                strategy_mode_preview = _build_strategy_execution_preview_from_state(
+                    strategy_id,
+                    strategy.mode,
+                    runtime_snapshot_override=runtime,
                 )
-    except Exception:
-        return "flat", None, "unknown", "当前策略信号仍在观察或目标仓位暂不可用。"
-
-    delta_signed_qty = round(target_signed_qty - current_signed_qty, 12)
-    target_position_side = repo._classify_position_side(target_signed_qty)  # type: ignore[attr-defined]
-    target_position_size = normalize_number(abs(target_signed_qty), 6)
-
-    if abs(delta_signed_qty) <= 1e-9:
-        return (
-            target_position_side,
-            target_position_size,
-            "aligned",
-            "当前实际仓位已与策略目标仓位对齐。",
-        )
-    if active_order_count > 0:
-        return (
-            target_position_side,
-            target_position_size,
-            "reconciling",
-            "当前存在策略关联委托，正在向目标仓位对齐。",
-        )
-    return (
-        target_position_side,
-        target_position_size,
-        "drifted",
-        "当前实际仓位与策略目标仍有偏差，尚未完全对齐。",
-    )
-
-
-def _build_strategy_current_position_summary(
-    mode: AccountMode,
-    symbol: str,
-    market: str,
-) -> tuple[str, Optional[str], Optional[str]]:
-    if mode == AccountMode.PAPER:
-        positions = repo.get_paper_positions()
+            except RuntimeError as exc:
+                strategy_mode_preview = _build_blocked_strategy_execution_preview(runtime, strategy.mode, str(exc))
+            except ValueError as exc:
+                strategy_mode_preview = _build_blocked_strategy_execution_preview(runtime, strategy.mode, str(exc))
     else:
-        positions = parse_positions(use_private_only=True)
-    position = next((item for item in positions if item.symbol == symbol and item.market == market), None)
-    if position is None:
-        return "flat", None, None
-    avg_price = position.avg_price if position.avg_price not in {"", "--"} else None
-    return position.side, position.size, avg_price
-
-
-def _sync_strategy_exchange_order_history_events(history_items: List[OrderRecord]) -> None:
-    def _event_payload_matches(item: ExecutionEvent, event_type: str, order_id: str) -> bool:
-        return item.event_type == event_type and str(item.payload.get("order_id") or "") == order_id
-
-    changed = False
-    with repo._lock:  # type: ignore[attr-defined]
-        for order in history_items:
-            if order.origin != "strategy" or not order.strategy_id:
-                continue
-            status_normalized = order.status.lower()
-            if "fill" in status_normalized:
-                event_type = "exchange_order.filled"
-                severity = EventSeverity.INFO
-                detail = f"真实策略委托已成交 {order.qty}@{order.price} ({order.status})"
-            elif "cancel" in status_normalized:
-                event_type = "exchange_order.cancelled"
-                severity = EventSeverity.WARNING
-                detail = f"真实策略委托已撤销 {order.qty}@{order.price} ({order.status})"
-            elif "reject" in status_normalized:
-                event_type = "exchange_order.rejected"
-                severity = EventSeverity.ERROR
-                detail = f"真实策略委托被拒绝 {order.qty}@{order.price} ({order.status})"
-            else:
-                continue
-            if any(_event_payload_matches(event, event_type, order.order_id) for event in repo.state.audit_events):  # type: ignore[attr-defined]
-                continue
-            repo.add_event(
-                event_type=event_type,
-                source="quant-core",
-                severity=severity,
-                payload={
-                    "order_id": order.order_id,
-                    "order_created_at": order.created_at,
-                    "strategy_id": order.strategy_id,
-                    "symbol": order.symbol,
-                    "market": order.market,
-                    "status": order.status,
-                    "qty": order.qty,
-                    "price": order.price,
-                    "detail": detail,
-                },
-                symbol=order.symbol,
-                strategy_id=order.strategy_id,
-            )
-            changed = True
-        if changed:
-            repo._persist()  # type: ignore[attr-defined]
-
-
-def _sync_strategy_exchange_order_history_alerts(history_items: List[OrderRecord]) -> None:
-    snapshot_state = repo.snapshot()
-    strategies_by_id = {item.id: item for item in snapshot_state.strategies}
-    fallback_mode = snapshot_state.workspace_preferences.selected_mode
-
-    def _parse_order_time(value: Optional[str]) -> datetime:
-        if not value:
-            return datetime.fromtimestamp(0, tz=timezone.utc)
         try:
-            return datetime.fromisoformat(value)
-        except ValueError:
-            return datetime.fromtimestamp(0, tz=timezone.utc)
-
-    latest_by_strategy: Dict[str, OrderRecord] = {}
-    for order in history_items:
-        if order.origin != "strategy" or not order.strategy_id:
-            continue
-        current = latest_by_strategy.get(order.strategy_id)
-        if current is None or _parse_order_time(order.created_at) >= _parse_order_time(current.created_at):
-            latest_by_strategy[order.strategy_id] = order
-
-    for strategy_id, order in latest_by_strategy.items():
-        if "reject" not in order.status.lower():
-            _clear_strategy_exchange_rejected_alerts(
+            strategy_mode_preview = _build_strategy_execution_preview_from_state(
                 strategy_id,
-                resolution_detail="最新真实策略委托已不再处于拒单状态，异常提醒已收起。",
+                strategy.mode,
+                runtime_snapshot_override=runtime,
             )
-            continue
-        strategy = strategies_by_id.get(strategy_id)
-        strategy_name = strategy.name if strategy is not None else strategy_id
-        issue_mode = strategy.mode if strategy is not None else fallback_mode
-        changed = False
-        with repo._lock:  # type: ignore[attr-defined]
-            changed = repo._upsert_system_alert_locked(  # type: ignore[attr-defined]
-                rule_key=f"strategy-exchange-rejected:{strategy_id}:{order.order_id}",
-                severity="P1",
-                symbol=order.symbol,
-                title=f"{order.symbol} 策略真实委托被拒绝",
-                description=(
-                    f"{strategy_name} 最近一笔真实策略委托被交易所拒绝。"
-                    f"委托参数 {order.qty}@{order.price}，状态 {order.status}。"
-                ),
-                suggested_action="打开策略页、交易记录和账户页复核真实仓位、委托参数与模式配置。",
-                strategy_id=strategy_id,
-            )
-            if changed:
-                _queue_strategy_issue_review_locked(
-                    strategy_id=strategy_id,
-                    strategy_name=strategy_name,
-                    symbol=order.symbol,
-                    mode=issue_mode,
-                    issue_type="exchange_order_rejected",
-                    summary=f"{order.symbol} 策略真实委托被拒绝",
-                    detail=f"委托参数 {order.qty}@{order.price}，状态 {order.status}。",
-                    rule_key=f"strategy-exchange-rejected:{strategy_id}:{order.order_id}",
-                )
-                repo._refresh_derived_state()  # type: ignore[attr-defined]
-                repo._persist()  # type: ignore[attr-defined]
-
-
-def _sync_strategy_exchange_rejection_guards(current_items: List[StrategyRuntimeSnapshot]) -> None:
-    state = repo.snapshot()
-    strategies_by_id = {item.id: item for item in state.strategies}
-    for snapshot in current_items:
-        strategy = strategies_by_id.get(snapshot.strategy_id)
-        if strategy is None:
-            continue
-        remaining = _strategy_exchange_rejection_guard_remaining_minutes(strategy)
-        if remaining is None:
-            _clear_strategy_exchange_rejection_guard_alerts(
-                snapshot.strategy_id,
-                resolution_detail="连续拒单熔断已结束，真实策略自动执行可在人工确认后恢复。",
-            )
-            continue
-        rejection_count = _strategy_exchange_rejection_recent_count(strategy)
-        detail = (
-            f"最近 {_strategy_exchange_rejection_guard_window_minutes(strategy)} 分钟真实策略委托已连续拒绝 "
-            f"{rejection_count} 次，自动执行冷却剩余约 {remaining} 分钟。"
+        except RuntimeError:
+            strategy_mode_preview = None
+    if strategy_mode_preview is not None:
+        runtime = _apply_runtime_blocked_preview_context(runtime, strategy_mode_preview).model_copy(
+            update={"execution_preview": strategy_mode_preview}
         )
-        with repo._lock:  # type: ignore[attr-defined]
-            changed = repo._upsert_system_alert_locked(  # type: ignore[attr-defined]
-                rule_key=f"strategy-exchange-rejection-guard:{snapshot.strategy_id}:{snapshot.mode.value}",
-                severity="P1",
-                symbol=snapshot.symbol,
-                title=f"{snapshot.symbol} 策略连续拒单已熔断",
-                description=f"{snapshot.strategy_name} 当前已进入连续拒单冷却期。{detail}",
-                suggested_action="先复核交易所模式、仓位、委托参数和最小下单约束，确认后再恢复自动执行。",
-                strategy_id=snapshot.strategy_id,
-            )
-            if changed:
-                _queue_strategy_issue_review_locked(
-                    strategy_id=snapshot.strategy_id,
-                    strategy_name=snapshot.strategy_name,
-                    symbol=snapshot.symbol,
-                    mode=snapshot.mode,
-                    issue_type="exchange_rejection_guard",
-                    summary=f"{snapshot.symbol} 策略连续拒单已熔断",
-                    detail=detail,
-                    rule_key=f"strategy-exchange-rejection-guard:{snapshot.strategy_id}:{snapshot.mode.value}",
-                )
-                repo.add_event(
-                    event_type="strategy.exchange_order.rejection_guard.alerted",
-                    source="quant-core",
-                    severity=EventSeverity.WARNING,
-                    payload={
-                        "strategy_id": snapshot.strategy_id,
-                        "strategy_name": snapshot.strategy_name,
-                        "symbol": snapshot.symbol,
-                        "mode": snapshot.mode.value,
-                        "rejection_count": rejection_count,
-                        "window_minutes": _strategy_exchange_rejection_guard_window_minutes(strategy),
-                        "cooldown_remaining_minutes": remaining,
-                        "detail": detail,
-                    },
-                    symbol=snapshot.symbol,
-                    strategy_id=snapshot.strategy_id,
-                )
-                repo._refresh_derived_state()  # type: ignore[attr-defined]
-                repo._persist()  # type: ignore[attr-defined]
+    return runtime
 
 
-def _sync_strategy_stale_order_issues(current_items: List[StrategyRuntimeSnapshot]) -> None:
-    state = repo.snapshot()
-    strategies_by_id = {item.id: item for item in state.strategies}
-    for snapshot in current_items:
-        strategy = strategies_by_id.get(snapshot.strategy_id)
-        if strategy is None:
-            continue
-        active_order_count, active_order = _build_strategy_active_order_summary(
-            snapshot.strategy_id,
-            snapshot.mode,
-            snapshot.symbol,
-            snapshot.market,
-        )
-        if (
-            snapshot.mode == AccountMode.PAPER
-            or snapshot.runtime_status != "running"
-            or active_order_count == 0
-            or active_order is None
-            or not _is_strategy_active_order_stale(strategy, active_order)
-        ):
-            _clear_strategy_stale_order_alerts(
-                snapshot.strategy_id,
-                resolution_detail="当前已不再存在长时间未处理的策略挂单，停滞提醒已收起。",
-            )
-            continue
-
-        stale_age_minutes = _strategy_active_order_stale_age_minutes(active_order)
-        detail = (
-            f"当前真实策略委托已挂单约 {stale_age_minutes} 分钟仍未成交或撤单，"
-            f"超过 { _strategy_exchange_order_stale_minutes(strategy) } 分钟阈值。"
-        )
-        with repo._lock:  # type: ignore[attr-defined]
-            changed = repo._upsert_system_alert_locked(  # type: ignore[attr-defined]
-                rule_key=f"strategy-stale-order:{snapshot.strategy_id}:{active_order.order_id}",
-                severity="P1",
-                symbol=snapshot.symbol,
-                title=f"{snapshot.symbol} 策略挂单停滞",
-                description=f"{snapshot.strategy_name} 当前存在长时间未处理的真实策略委托。{detail}",
-                suggested_action="先复核委托价格是否偏离、交易所限制与市场状态；必要时改价、撤单或人工接管。",
-                strategy_id=snapshot.strategy_id,
-            )
-            if changed:
-                _queue_strategy_issue_review_locked(
-                    strategy_id=snapshot.strategy_id,
-                    strategy_name=snapshot.strategy_name,
-                    symbol=snapshot.symbol,
-                    mode=snapshot.mode,
-                    issue_type="stale_order",
-                    summary=f"{snapshot.symbol} 策略挂单停滞",
-                    detail=detail,
-                    rule_key=f"strategy-stale-order:{snapshot.strategy_id}:{active_order.order_id}",
-                )
-                repo.add_event(
-                    event_type="strategy.exchange_order.stale_alerted",
-                    source="quant-core",
-                    severity=EventSeverity.WARNING,
-                    payload={
-                        "strategy_id": snapshot.strategy_id,
-                        "strategy_name": snapshot.strategy_name,
-                        "symbol": snapshot.symbol,
-                        "mode": snapshot.mode.value,
-                        "order_id": active_order.order_id,
-                        "stale_age_minutes": stale_age_minutes,
-                        "threshold_minutes": _strategy_exchange_order_stale_minutes(strategy),
-                        "detail": detail,
-                    },
-                    symbol=snapshot.symbol,
-                    strategy_id=snapshot.strategy_id,
-                )
-                repo._refresh_derived_state()  # type: ignore[attr-defined]
-                repo._persist()  # type: ignore[attr-defined]
-
-
-def _build_strategy_last_execution_summary(
+def _build_strategy_activity_recent_data(
+    *,
+    state: Any,
     strategy_id: str,
+    strategy: Any,
     symbol: str,
     market: str,
-    mode: AccountMode,
-    recent_order_history: Optional[List[OrderRecord]] = None,
-) -> tuple[Optional[str], Optional[str], Optional[EventSeverity], Optional[str], Optional[str]]:
-    strategy_execution_events = {
-        "strategy.exchange_order.cancelled_inactive",
-        "strategy.exchange_order.cancelled_stale",
-        "strategy.exchange_order.cancelled_stale_timeout",
-        "strategy.exchange_order.reused_existing",
-        "strategy.exchange_order.replaced_existing",
-        "strategy.exchange_order.submitted",
-        "strategy.exchange_order.reconcile_missing_order",
-        "strategy.exchange_order.auto_blocked",
-        "strategy.exchange_order.auto_noop",
-        "strategy.execution.blocked",
-    }
-
-    def _parse_iso(value: Optional[str]) -> datetime:
-        if not value:
-            return datetime.fromtimestamp(0, tz=timezone.utc)
-        try:
-            return datetime.fromisoformat(value)
-        except ValueError:
-            return datetime.fromtimestamp(0, tz=timezone.utc)
-
-    best_event_type: Optional[str] = None
-    best_occurred_at: Optional[str] = None
-    best_severity: Optional[EventSeverity] = None
-    best_detail: Optional[str] = None
-    best_recommended_action: Optional[str] = None
-    best_at = datetime.fromtimestamp(0, tz=timezone.utc)
-
-    for event in repo.snapshot().audit_events:
-        if event.strategy_id != strategy_id:
-            continue
-        if not (
-            event.event_type in strategy_execution_events
-            or event.event_type.startswith("strategy.paper_trade.")
-            or event.event_type == "strategy.paper_stop_loss.executed"
-            or event.event_type.startswith("exchange_order.")
-        ):
-            continue
-        detail = (
-            str(event.payload.get("detail") or "").strip()
-            or str(event.payload.get("message") or "").strip()
-            or (
-                f'order_id={event.payload.get("order_id")}'
-                if event.payload.get("order_id")
-                else event.event_type
-            )
-        )
-        event_sort_key = event.payload.get("order_created_at") if event.event_type.startswith("exchange_order.") else event.occurred_at
-        occurred_at = _parse_iso(event_sort_key)
-        if occurred_at >= best_at:
-            best_event_type = event.event_type
-            best_occurred_at = event.occurred_at
-            best_severity = event.severity
-            best_detail = detail
-            best_recommended_action = str(event.payload.get("recommended_action") or "").strip() or None
-            best_at = occurred_at
-
-    if mode != AccountMode.PAPER:
-        history_items = recent_order_history if recent_order_history is not None else parse_order_history(use_private_only=True)
-        for order in history_items:
-            if order.origin != "strategy":
-                continue
-            if order.symbol != symbol or order.market != market:
-                continue
-            if order.strategy_id not in {strategy_id, None}:
-                continue
-            order_at = _parse_iso(order.created_at)
-            if order_at < best_at:
-                continue
-            status_normalized = order.status.lower()
-            if "fill" in status_normalized:
-                event_type = "exchange_order.filled"
-                severity = EventSeverity.INFO
-                detail = f"最近真实策略委托已成交 {order.qty}@{order.price} ({order.status})"
-            elif "cancel" in status_normalized:
-                event_type = "exchange_order.cancelled"
-                severity = EventSeverity.WARNING
-                detail = f"最近真实策略委托已撤销 {order.qty}@{order.price} ({order.status})"
-            elif "reject" in status_normalized:
-                event_type = "exchange_order.rejected"
-                severity = EventSeverity.ERROR
-                detail = f"最近真实策略委托被拒绝 {order.qty}@{order.price} ({order.status})"
-            else:
-                event_type = "exchange_order.updated"
-                severity = EventSeverity.INFO
-                detail = f"最近真实策略委托状态 {order.status} {order.qty}@{order.price}"
-            best_event_type = event_type
-            best_occurred_at = order.created_at
-            best_severity = severity
-            best_detail = detail
-            best_recommended_action = None
-            best_at = order_at
-
-    return best_event_type, best_occurred_at, best_severity, best_detail, best_recommended_action
+) -> StrategyActivityRecentData:
+    orders_source = repo.get_paper_orders() if strategy.mode == AccountMode.PAPER else parse_open_orders(use_private_only=True)
+    history_source = (
+        repo.get_paper_order_history() if strategy.mode == AccountMode.PAPER else parse_order_history(use_private_only=True)
+    )
+    trades_source = state.trades if strategy.mode == AccountMode.PAPER else parse_trades(use_private_only=True)
+    active_orders = [item for item in orders_source if _strategy_matches_order(item, strategy_id, symbol, market)]
+    recent_orders = [item for item in history_source if _strategy_matches_order(item, strategy_id, symbol, market)]
+    recent_trades = [item for item in trades_source if _strategy_matches_trade(item, strategy_id, symbol, market)]
+    recent_alerts = [item for item in state.alerts if _strategy_matches_alert(item, strategy_id, symbol)]
+    recent_audit_events = [
+        AppRepository._decorate_execution_event(item)
+        for item in state.audit_events
+        if _strategy_matches_audit_event(item, strategy_id, symbol)
+    ]
+    return _build_strategy_activity_recent_data_model(
+        strategy_id=strategy_id,
+        active_orders=active_orders,
+        recent_orders=recent_orders,
+        recent_trades=recent_trades,
+        recent_alerts=recent_alerts,
+        recent_audit_events=recent_audit_events,
+        reviews=state.reviews,
+        change_requests=state.change_requests,
+        backtests=state.backtests,
+        agent_jobs=state.agent_jobs,
+    )
 
 
-def _sync_strategy_position_drift_issues(current_items: List[StrategyRuntimeSnapshot]) -> None:
-    for snapshot in current_items:
-        active_order_count, _active_order = _build_strategy_active_order_summary(
-            snapshot.strategy_id,
-            snapshot.mode,
-            snapshot.symbol,
-            snapshot.market,
-        )
-        (
-            target_position_side,
-            target_position_size,
-            position_alignment,
-            position_alignment_detail,
-        ) = _build_strategy_position_alignment_summary(
-            snapshot.strategy_id,
-            snapshot.mode,
-            snapshot.symbol,
-            snapshot.market,
-            active_order_count,
-        )
-        enriched = snapshot.model_copy(
-            update={
-                "target_position_side": target_position_side,
-                "target_position_size": target_position_size,
-                "position_alignment": position_alignment,
-                "position_alignment_detail": position_alignment_detail,
-            }
-        )
-        _sync_strategy_position_drift_issue(enriched, active_order_count=active_order_count)
-
-
-def _get_strategy_signal_order_hint_for_runtime_snapshot(
-    strategy_id: str,
-    runtime_snapshot: StrategyRuntimeSnapshot,
-) -> Dict[str, Any]:
-    current_getter = repo.get_strategy_signal_order_hint
-    if getattr(current_getter, "__func__", None) is AppRepository.get_strategy_signal_order_hint:
-        with repo._lock:  # type: ignore[attr-defined]
-            strategy = repo._find_strategy(strategy_id)  # type: ignore[attr-defined]
-            target_signed_qty = repo._resolve_strategy_target_signed_qty_locked(  # type: ignore[attr-defined]
-                strategy,
-                runtime_snapshot,
-            )
-        if target_signed_qty is None:
-            raise ValueError("当前策略仍处于 watch 观察状态，暂时没有可提交的委托方向。")
-        price = round(runtime_snapshot.reference_price or runtime_snapshot.last_price, 6)
-        return {
-            "strategy_id": strategy.id,
-            "strategy_name": strategy.name,
-            "symbol": runtime_snapshot.symbol,
-            "market": runtime_snapshot.market,
-            "signal": runtime_snapshot.signal,
-            "risk_budget": strategy.risk_budget,
-            "target_signed_qty": target_signed_qty,
-            "price": price,
-            "note": runtime_snapshot.next_action,
-        }
-
-    with repo._lock:  # type: ignore[attr-defined]
-        original_snapshots = list(repo.state.strategy_runtime_snapshots)
-        next_snapshots = [
-            runtime_snapshot if item.strategy_id == strategy_id else item
-            for item in repo.state.strategy_runtime_snapshots
-        ]
-        if not any(item.strategy_id == strategy_id for item in repo.state.strategy_runtime_snapshots):
-            next_snapshots.append(runtime_snapshot)
-        repo.state.strategy_runtime_snapshots = next_snapshots
-    try:
-        return current_getter(strategy_id)
-    finally:
-        with repo._lock:  # type: ignore[attr-defined]
-            repo.state.strategy_runtime_snapshots = original_snapshots
-
-
-def _build_strategy_execution_preview_from_state(
-    strategy_id: str,
-    mode: Optional[AccountMode] = None,
-    runtime_snapshot_override: Optional[StrategyRuntimeSnapshot] = None,
-) -> ExecutionPreview:
+def build_strategy_activity_payload(strategy_id: str) -> StrategyActivitySnapshot:
     state = repo.snapshot()
-    resolved_mode = mode or state.workspace_preferences.selected_mode
-    runtime_health = _build_strategy_runtime_worker_health()
     strategy = next((item for item in state.strategies if item.id == strategy_id), None)
     if strategy is None:
         raise KeyError(strategy_id)
-
-    snapshot = runtime_snapshot_override or next(
-        (item for item in state.strategy_runtime_snapshots if item.strategy_id == strategy_id),
-        None,
+    symbol = strategy.symbols[0] if strategy.symbols else "--"
+    market = next((item.market for item in state.watchlist if item.symbol == symbol), "perp")
+    runtime = _build_lightweight_strategy_activity_runtime_snapshot(state, strategy)
+    runtime = _build_strategy_activity_runtime_snapshot(strategy_id=strategy_id, strategy=strategy, runtime=runtime)
+    recent_data = _build_strategy_activity_recent_data(
+        state=state,
+        strategy_id=strategy_id,
+        strategy=strategy,
+        symbol=symbol,
+        market=market,
     )
-    if snapshot is None:
-        raise RuntimeError("当前策略运行态尚未准备好，请先刷新策略页后再试。")
-    if snapshot.runtime_status == "paused":
-        raise RuntimeError("当前策略已暂停，不能生成执行预检。")
-    if resolved_mode == AccountMode.PAPER:
-        if not (strategy.mode == AccountMode.PAPER or strategy.status == "paper_only"):
-            raise RuntimeError("当前策略并未运行在 Paper 模式，不能生成 Paper 执行预检。")
-    elif strategy.mode != resolved_mode:
-        raise RuntimeError(f"当前策略并未运行在 {resolved_mode.value.upper()} 模式，不能直接按该模式执行。")
-
-    if resolved_mode == AccountMode.PAPER:
-        preview = snapshot.execution_preview
-        if preview is None:
-            raise RuntimeError("当前策略没有可执行的 Paper 预检结果。")
-        return preview
-
-    public_channel_issue = get_public_execution_channel_issue(snapshot.market, snapshot.symbol)
-    if public_channel_issue is not None:
-        raise RuntimeError(public_channel_issue)
-
-    private_channel_issue = get_private_execution_channel_issue(resolved_mode)
-    if private_channel_issue is not None:
-        raise RuntimeError(private_channel_issue)
-
-    if runtime_health["runtime_last_error"]:
-        raise RuntimeError("当前策略运行线程存在异常，请先在设置页恢复运行线程后再执行真实策略。")
-    if runtime_health["runtime_worker_stale"]:
-        raise RuntimeError("当前策略运行线程已停滞，请先在设置页恢复运行线程并确认最新信号后再执行真实策略。")
-
-    cooldown_remaining = _strategy_live_stop_loss_cooldown_remaining_minutes(strategy)
-    if cooldown_remaining is not None:
-        raise RuntimeError(f"当前处于真实模式止损后冷却期，剩余约 {cooldown_remaining} 分钟，请先人工复核后再恢复策略执行。")
-    rejection_guard_remaining = _strategy_exchange_rejection_guard_remaining_minutes(strategy)
-    if rejection_guard_remaining is not None:
-        raise RuntimeError(
-            f"最近真实策略委托连续拒绝，自动执行冷却剩余约 {rejection_guard_remaining} 分钟，请先人工复核交易所约束和委托参数。"
-        )
-
-    if runtime_snapshot_override is not None:
-        hint = _get_strategy_signal_order_hint_for_runtime_snapshot(strategy_id, snapshot)
-    else:
-        hint = repo.get_strategy_signal_order_hint(strategy_id)
-    positions = parse_positions(use_private_only=True)
-    position = next(
-        (
-            item
-            for item in positions
-            if item.symbol == hint["symbol"] and item.market == hint["market"]
-        ),
-        None,
+    summary_collections = _build_strategy_activity_summary_collections(
+        recent_review_records=recent_data.recent_review_records,
+        strategy_proposal_count_by_review_id=recent_data.strategy_proposal_count_by_review_id,
+        recent_backtest_records=recent_data.recent_backtest_records,
+        recent_agent_job_records=recent_data.recent_agent_job_records,
     )
-    current_signed_qty = 0.0
-    if position is not None:
-        current_signed_qty = parse_metric_number(position.size) * (1 if position.side == "long" else -1)
-    existing_strategy_orders = _list_strategy_private_open_orders(strategy_id, hint["symbol"], hint["market"])
-    release_order_ids, released_buy_reservation = _strategy_order_release_context(existing_strategy_orders)
-    reusable_open_order_abs = _strategy_reusable_open_order_abs(
-        existing_strategy_orders,
-        raw_target_signed_qty=float(hint["target_signed_qty"]),
+    payload_assemblies = _build_strategy_activity_payload_assemblies(
+        recent_data=recent_data,
+        summary_collections=summary_collections,
+        has_backtest_rerun_recommendation=_has_strategy_activity_backtest_rerun_recommendation,
+        has_change_request_rerun_recommendation=_has_strategy_activity_change_request_rerun_recommendation,
     )
-    target_resolution = _resolve_balance_linked_strategy_target_signed_qty(
-        symbol=hint["symbol"],
-        market=hint["market"],
-        mode=resolved_mode,
-        price=float(hint["price"]),
-        raw_target_signed_qty=float(hint["target_signed_qty"]),
-        current_signed_qty=current_signed_qty,
-        risk_budget=hint.get("risk_budget"),
-        released_buy_reservation=released_buy_reservation,
-        reusable_open_order_abs=reusable_open_order_abs,
-    )
-    target_signed_qty = float(target_resolution["target_signed_qty"])
-    preview_target_signed_qty = float(target_resolution["preview_target_signed_qty"])
-    strategy_adjustment_warnings = list(target_resolution["warnings"])
-    delta_signed_qty = round(preview_target_signed_qty - current_signed_qty, 12)
-    if abs(delta_signed_qty) <= 1e-9 and target_resolution["blocked_reason"] is not None:
-        current_position_side = repo._classify_position_side(current_signed_qty)  # type: ignore[attr-defined]
-        current_position_size = repo._format_quantity(abs(current_signed_qty), 6)  # type: ignore[attr-defined]
-        current_avg_price = position.avg_price if position is not None and abs(current_signed_qty) > 1e-9 else "--"
-        return ExecutionPreview(
-            symbol=hint["symbol"],
-            market=hint["market"],
-            mode=resolved_mode,
-            side=Direction.BUY if float(hint["target_signed_qty"]) > current_signed_qty else Direction.SELL,
-            origin="strategy",
-            strategy_id=strategy_id,
-            quantity=0.0,
-            price=round(float(hint["price"]), 6),
-            notional=format_usdt(0.0),
-            action=hint["note"] or "等待真实执行引擎",
-            allowed=False,
-            blocked_reason=str(target_resolution["blocked_reason"]),
-            recommended_action=target_resolution["recommended_action"],
-            sizing_risk_budget=target_resolution["sizing_risk_budget"],
-            sizing_budget_notional=target_resolution["sizing_budget_notional"],
-            sizing_minimum_required_notional=target_resolution["sizing_minimum_required_notional"],
-            sizing_available_balance_gap=target_resolution["sizing_available_balance_gap"],
-            warnings=strategy_adjustment_warnings,
-            current_position_side=current_position_side,
-            current_position_size=current_position_size,
-            current_avg_price=current_avg_price,
-            projected_position_side=current_position_side,
-            projected_position_size=current_position_size,
-            projected_avg_price=current_avg_price,
-            available_balance_before="--",
-            available_balance_after="--",
-            estimated_realized_pnl="--",
-            generated_at=datetime.now(timezone.utc).astimezone().isoformat(),
-        )
-    if abs(delta_signed_qty) <= 1e-9:
-        raise RuntimeError("当前真实持仓已经与策略目标一致，无需再次提交委托。")
-    side = Direction.BUY if delta_signed_qty > 0 else Direction.SELL
-    price, price_adjustment_warning = _align_strategy_limit_price_to_exchange_constraints(
-        hint["symbol"],
-        hint["market"],
-        side,
-        float(hint["price"]),
-    )
-    preview = build_private_execution_preview(
-        ExecutionPreviewRequest(
-            symbol=hint["symbol"],
-            market=hint["market"],
-            mode=resolved_mode,
-            side=side,
-            quantity=abs(delta_signed_qty),
-            price=price,
-            origin="strategy",
-            strategy_id=strategy_id,
-            note=hint["note"],
-            release_order_ids=release_order_ids,
-        )
-    )
-    if price_adjustment_warning is not None:
-        strategy_adjustment_warnings.append(price_adjustment_warning)
-    warnings = strategy_adjustment_warnings + list(preview.warnings)
-    if target_resolution["blocked_reason"] is not None:
-        return preview.model_copy(
-            update={
-                "allowed": False,
-                "blocked_reason": target_resolution["blocked_reason"],
-                "recommended_action": target_resolution["recommended_action"],
-                "sizing_risk_budget": target_resolution["sizing_risk_budget"],
-                "sizing_budget_notional": target_resolution["sizing_budget_notional"],
-                "sizing_minimum_required_notional": target_resolution["sizing_minimum_required_notional"],
-                "sizing_available_balance_gap": target_resolution["sizing_available_balance_gap"],
-                "warnings": warnings,
-            }
-        )
-    matching_order = next((item for item in existing_strategy_orders if item.side == side), None)
-    stale_orders = [
-        item
-        for item in existing_strategy_orders
-        if matching_order is None or item.order_id != matching_order.order_id
-    ]
-    if matching_order is not None:
-        if _exchange_order_matches_requested_target(
-            matching_order,
-            preview.quantity,
-            preview.price,
-            require_reduce_only=_execution_preview_requires_reduce_only(preview),
-        ):
-            warnings.append("当前已有同参数策略委托，若继续执行会直接复用旧委托。")
-        else:
-            warnings.append("当前已有策略委托，若继续执行会按最新信号参数改单。")
-    if stale_orders:
-        warnings.append("当前还存在旧策略委托，若继续执行会先自动撤掉旧委托。")
-    if _has_active_strategy_live_stop_loss_alert(strategy_id):
-        warnings.append("当前真实模式止损保护仍在生效。")
-        return preview.model_copy(
-            update={
-                "allowed": False,
-                "blocked_reason": "当前已触发真实模式止损保护，请先人工复核真实仓位后再决定是否恢复策略执行。",
-                "recommended_action": "请先人工复核真实仓位与策略参数，确认无误后再恢复策略执行。",
-                "warnings": warnings,
-            }
-        )
-    return preview.model_copy(update={"warnings": warnings})
-
-
-def _runtime_worker_execution_block_reason(runtime_health: Dict[str, Any]) -> Optional[str]:
-    if runtime_health["runtime_last_error"]:
-        return "当前策略运行线程存在异常，请先在设置页恢复运行线程后再执行真实策略。"
-    if runtime_health["runtime_worker_stale"]:
-        return "当前策略运行线程已停滞，请先在设置页恢复运行线程并确认最新信号后再执行真实策略。"
-    if runtime_health.get("runtime_worker_stopped"):
-        return "当前策略运行线程未运行，请先在设置页恢复运行线程后再执行真实策略。"
-    return None
-
-
-def build_strategy_execution_preview(strategy_id: str, mode: Optional[AccountMode] = None) -> ExecutionPreview:
-    state = repo.snapshot()
-    resolved_mode = mode or state.workspace_preferences.selected_mode
-    runtime_health = _build_strategy_runtime_worker_health()
-    if resolved_mode != AccountMode.PAPER:
-        runtime_block_reason = _runtime_worker_execution_block_reason(runtime_health)
-        if runtime_block_reason is not None:
-            raise RuntimeError(runtime_block_reason)
-    refresh_strategy_runtime_once()
-    try:
-        return _build_strategy_execution_preview_from_state(strategy_id, mode)
-    except RuntimeError as exc:
-        detail = str(exc)
-        if "私有 WS" not in detail and "公共 WS" not in detail:
-            raise
-        snapshot = next((item for item in repo.snapshot().strategy_runtime_snapshots if item.strategy_id == strategy_id), None)
-        if snapshot is None:
-            raise
-        return _build_blocked_strategy_execution_preview(snapshot, resolved_mode, detail)
-
-
-def _apply_runtime_blocked_preview_context(
-    item: StrategyRuntimeSnapshot,
-    preview: Optional[ExecutionPreview],
-) -> StrategyRuntimeSnapshot:
-    if preview is None or preview.allowed or not preview.blocked_reason:
-        return item
-    update: Dict[str, Any] = {
-        "guard_detail": preview.blocked_reason,
-        "note": preview.blocked_reason,
-        "next_action": preview.recommended_action or item.next_action,
-    }
-    if item.guard_state == "none":
-        update["guard_state"] = "auto_dispatch_blocked"
-    return item.model_copy(update=update)
-
-
-def build_strategy_runtime_response() -> List[StrategyRuntimeSnapshot]:
-    runtime_health_before_refresh = _build_strategy_runtime_worker_health()
-    items = refresh_strategy_runtime_once()
-    state = repo.snapshot()
-    resolved_mode = state.workspace_preferences.selected_mode
-    runtime_block_reason = None
-    if resolved_mode != AccountMode.PAPER:
-        runtime_block_reason = _runtime_worker_execution_block_reason(runtime_health_before_refresh)
-    private_order_history = parse_order_history(use_private_only=True)
-    next_items: List[StrategyRuntimeSnapshot] = []
-    for item in items:
-        item = _decorate_strategy_runtime_item(item)
-        active_order_count, active_order = _build_strategy_active_order_summary(
-            item.strategy_id,
-            item.mode,
-            item.symbol,
-            item.market,
-        )
-        (
-            last_execution_event_type,
-            last_execution_at,
-            last_execution_severity,
-            last_execution_detail,
-            last_execution_recommended_action,
-        ) = _build_strategy_last_execution_summary(
-            item.strategy_id,
-            item.symbol,
-            item.market,
-            item.mode,
-            private_order_history,
-        )
-        (
-            target_position_side,
-            target_position_size,
-            position_alignment,
-            position_alignment_detail,
-        ) = _build_strategy_position_alignment_summary(
-            item.strategy_id,
-            item.mode,
-            item.symbol,
-            item.market,
-            active_order_count,
-        )
-        current_position_side, current_position_size, current_position_avg_price = _build_strategy_current_position_summary(
-            item.mode,
-            item.symbol,
-            item.market,
-        )
-        item = item.model_copy(
-            update={
-                "active_order_count": active_order_count,
-                "active_order": active_order,
-                "current_position_side": current_position_side,
-                "current_position_size": current_position_size,
-                "current_position_avg_price": current_position_avg_price,
-                "target_position_side": target_position_side,
-                "target_position_size": target_position_size,
-                "position_alignment": position_alignment,
-                "position_alignment_detail": position_alignment_detail,
-                "last_execution_event_type": last_execution_event_type,
-                "last_execution_at": last_execution_at,
-                "last_execution_severity": last_execution_severity,
-                "last_execution_detail": last_execution_detail,
-            }
-        )
-        if (
-            item.guard_state == "auto_dispatch_blocked"
-            and last_execution_event_type in {"strategy.execution.blocked", "strategy.exchange_order.auto_blocked"}
-            and last_execution_detail
-        ):
-            recommended_action = last_execution_recommended_action or _build_execution_preview_recommended_action(last_execution_detail)
-            item = item.model_copy(
-                update={
-                    "note": last_execution_detail,
-                    "guard_detail": last_execution_detail,
-                    "next_action": recommended_action or item.next_action,
-                }
-            )
-        _sync_strategy_position_drift_issue(item, active_order_count=active_order_count)
-        if item.runtime_status == "paused":
-            next_items.append(item)
-            continue
-        if resolved_mode == AccountMode.PAPER or item.mode != resolved_mode:
-            next_items.append(item)
-            continue
-        if runtime_block_reason is not None:
-            blocked_item = item
-            if item.guard_state == "none":
-                blocked_item = item.model_copy(
-                    update={
-                        "guard_state": "auto_dispatch_blocked",
-                        "guard_detail": runtime_block_reason,
-                    }
-                )
-            blocked_preview = _build_blocked_strategy_execution_preview(blocked_item, resolved_mode, runtime_block_reason)
-            blocked_item = _apply_runtime_blocked_preview_context(blocked_item, blocked_preview)
-            next_items.append(
-                blocked_item.model_copy(
-                    update={
-                        "execution_preview": blocked_preview
-                    }
-                )
-            )
-            continue
-        try:
-            preview = _build_strategy_execution_preview_from_state(item.strategy_id, resolved_mode)
-        except RuntimeError as exc:
-            preview = _build_blocked_strategy_execution_preview(item, resolved_mode, str(exc))
-        except ValueError as exc:
-            preview = _build_blocked_strategy_execution_preview(item, resolved_mode, str(exc))
-        item = _apply_runtime_blocked_preview_context(item, preview)
-        next_items.append(item.model_copy(update={"execution_preview": preview}))
-    return next_items
-
-
-def dispatch_strategy_signal(strategy_id: str, payload: StrategyExecutionRequest) -> StrategyExecutionResult:
-    state = repo.snapshot()
-    resolved_mode = payload.mode or state.workspace_preferences.selected_mode
-    if resolved_mode != AccountMode.PAPER:
-        runtime_block_reason = _runtime_worker_execution_block_reason(_build_strategy_runtime_worker_health())
-        if runtime_block_reason is not None:
-            strategy = next((item for item in state.strategies if item.id == strategy_id), None)
-            snapshot = next((item for item in state.strategy_runtime_snapshots if item.strategy_id == strategy_id), None)
-            if strategy is not None:
-                symbol = snapshot.symbol if snapshot is not None else (strategy.symbols[0] if strategy.symbols else "")
-                watch_item = next((item for item in state.watchlist if item.symbol == symbol), None)
-                _ = watch_item
-                _record_strategy_manual_execution_issue(
-                    strategy_id,
-                    strategy.name,
-                    symbol,
-                    resolved_mode,
-                    runtime_block_reason,
-                    recommended_action=_build_manual_execution_recommended_action(runtime_block_reason),
-                )
-            raise StrategyExecutionBlockedError(
-                runtime_block_reason,
-                _build_manual_execution_recommended_action(runtime_block_reason),
-            )
-    refresh_strategy_runtime_once()
-    try:
-        return _dispatch_strategy_signal_from_state(strategy_id, payload)
-    except RuntimeError as exc:
-        if resolved_mode != AccountMode.PAPER:
-            strategy = next((item for item in repo.snapshot().strategies if item.id == strategy_id), None)
-            snapshot = next((item for item in repo.snapshot().strategy_runtime_snapshots if item.strategy_id == strategy_id), None)
-            if strategy is not None:
-                symbol = snapshot.symbol if snapshot is not None else (strategy.symbols[0] if strategy.symbols else "")
-                _record_strategy_manual_execution_issue(
-                    strategy_id,
-                    strategy.name,
-                    symbol,
-                    resolved_mode,
-                    str(exc),
-                    recommended_action=exc.recommended_action if isinstance(exc, StrategyExecutionBlockedError) else None,
-                )
-        raise
-
-
-def build_strategy_live_snapshot_payload() -> StrategyLiveSnapshot:
-    items = build_strategy_runtime_response()
-    return StrategyLiveSnapshot(
-        items=items,
-        generated_at=datetime.now(timezone.utc).astimezone().isoformat(),
+    return _build_strategy_activity_snapshot_model(
+        strategy=strategy,
+        symbol=symbol,
+        market=market,
+        runtime=runtime,
+        recent_data=recent_data,
+        latest_ops=payload_assemblies.latest_ops,
+        decision_sections=payload_assemblies.decision_sections,
+        lineage_context=payload_assemblies.lineage_context,
+        latest_tracking_job=summary_collections.latest_tracking_job,
+        recent_backtests=summary_collections.recent_backtests,
+        recent_reviews=summary_collections.recent_reviews,
+        recent_agent_jobs=summary_collections.recent_agent_jobs,
+        recent_proposals=payload_assemblies.recent_proposals,
+        recent_change_requests=payload_assemblies.recent_change_requests,
     )
 
 
-def run_strategy_runtime_loop() -> None:
-    strategy_runtime_state["running"] = True
-    while not strategy_runtime_stop_event.is_set():
-        try:
-            refresh_strategy_runtime_once(auto_dispatch=True)
-        except Exception as exc:  # pragma: no cover - background loop safety
-            strategy_runtime_state["last_error"] = str(exc)
-            try:
-                repo.add_event(
-                    event_type="strategy.runtime.worker.error",
-                    source="quant-core",
-                    severity=EventSeverity.WARNING,
-                    payload={"error": str(exc)},
-                )
-                repo._persist()  # type: ignore[attr-defined]
-            except Exception:
-                pass
-        if strategy_runtime_stop_event.wait(8.0):
-            break
-    strategy_runtime_state["running"] = False
-
-
-def _start_strategy_runtime_worker(clear_error: bool = False) -> bool:
-    global strategy_runtime_thread
-    if strategy_runtime_thread is not None and strategy_runtime_thread.is_alive():
-        return False
-    if clear_error:
-        strategy_runtime_state["last_error"] = None
-    strategy_runtime_state["started_once"] = True
-    strategy_runtime_state["running"] = False
-    strategy_runtime_stop_event.clear()
-    strategy_runtime_thread = threading.Thread(
-        target=run_strategy_runtime_loop,
-        name="strategy-runtime-worker",
-        daemon=True,
+def _build_strategy_activity_review_context_decision_context(compact: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    decision_context = _prune_compact_review_value(
+        {
+            group_name: _pop_strategy_activity_context_fields(compact, field_names)
+            for group_name, field_names in _STRATEGY_ACTIVITY_REVIEW_CONTEXT_GROUP_FIELD_MAPS.items()
+        }
     )
-    strategy_runtime_thread.start()
-    return True
+    return decision_context if isinstance(decision_context, dict) and decision_context else None
 
 
-def _stop_strategy_runtime_worker(timeout: float = 3.0) -> bool:
-    global strategy_runtime_thread
-    thread = strategy_runtime_thread
-    strategy_runtime_stop_event.set()
-    if thread is None or not thread.is_alive():
-        strategy_runtime_state["running"] = False
-        strategy_runtime_thread = None
-        return True
-    thread.join(timeout=timeout)
-    if thread.is_alive():
-        return False
-    strategy_runtime_state["running"] = False
-    strategy_runtime_thread = None
-    return True
-
-
-def restart_strategy_runtime_worker(payload: RuntimeWorkerActionPayload) -> RuntimeWorkerActionResult:
-    requested_at = datetime.now(timezone.utc).astimezone().isoformat()
-    restart_failed_rule_key = "strategy-runtime-worker:restart-failed"
-    repo.add_event(
-        event_type="strategy.runtime.worker.restart_requested",
-        source="desktop",
-        severity=EventSeverity.INFO,
-        payload={
-            "requested_by": payload.requested_by,
-            "reason": payload.reason or "手动恢复策略运行线程",
-        },
-    )
-    if not _stop_strategy_runtime_worker():
-        description = "尝试恢复后台策略运行线程时，线程未能在超时时间内停止。"
-        suggested_action = "稍后重试恢复运行线程；若反复失败，请打开系统日志/审计查看最近线程事件。"
-        with repo._lock:  # type: ignore[attr-defined]
-            changed = repo._upsert_system_alert_locked(  # type: ignore[attr-defined]
-                rule_key=restart_failed_rule_key,
-                severity="P1",
-                symbol="SYSTEM",
-                title="恢复运行线程失败",
-                description=description,
-                suggested_action=suggested_action,
-            )
-            if changed:
-                repo.add_event(
-                    event_type="strategy.runtime.worker.restart_failed_alerted",
-                    source="quant-core",
-                    severity=EventSeverity.WARNING,
-                    payload={"detail": description},
-                )
-                repo._refresh_derived_state()  # type: ignore[attr-defined]
-                repo._persist()  # type: ignore[attr-defined]
-        repo.add_event(
-            event_type="strategy.runtime.worker.restart_failed",
-            source="quant-core",
-            severity=EventSeverity.ERROR,
-            payload={
-                "requested_by": payload.requested_by,
-                "reason": payload.reason or "手动恢复策略运行线程",
-                "detail": description,
-            },
-        )
-        repo._persist()  # type: ignore[attr-defined]
-        raise RuntimeError("策略运行线程未能在超时时间内停止，请稍后重试。")
-    _start_strategy_runtime_worker(clear_error=True)
-    repo.add_event(
-        event_type="strategy.runtime.worker.restarted",
-        source="quant-core",
-        severity=EventSeverity.INFO,
-        payload={
-            "requested_by": payload.requested_by,
-            "reason": payload.reason or "手动恢复策略运行线程",
-        },
-    )
-    repo._persist()  # type: ignore[attr-defined]
-    _clear_strategy_runtime_worker_alerts(
-        restart_failed_rule_key,
-        resolved_event_type="strategy.runtime.worker.restart_failed_resolved",
-        resolution_detail="恢复运行线程失败的异常状态已解除。",
-    )
-    _sync_strategy_runtime_worker_issue_alerts()
-    running = bool(strategy_runtime_thread and strategy_runtime_thread.is_alive())
-    return RuntimeWorkerActionResult(
-        running=running,
-        restarted_at=requested_at,
-        last_error=strategy_runtime_state.get("last_error"),
-        last_refresh_at=strategy_runtime_state.get("last_refresh_at"),
-        message="策略运行线程已重新启动。" if running else "策略运行线程已收到重启请求。",
-    )
-
-
-def build_scheduler_snapshot_payload() -> SchedulerSnapshot:
-    state = repo.snapshot()
-    return SchedulerSnapshot(
-        scheduler=state.control_snapshot.scheduler,
-        jobs=state.agent_jobs,
-        change_requests=state.change_requests[:8],
-        latest_scheduler_command=_build_latest_scheduler_command(state.audit_events),
-    )
-
-
-def build_ai_live_snapshot_payload() -> AiLiveSnapshot:
-    state = repo.snapshot()
-    scheduler_snapshot = build_scheduler_snapshot_payload()
-    activity_feed = [
-        event
-        for event in state.audit_events
-        if event.source in {"openclaw", "desktop"}
-    ][:10]
-    return AiLiveSnapshot(
-        scheduler=scheduler_snapshot.scheduler,
-        jobs=scheduler_snapshot.jobs,
-        change_requests=scheduler_snapshot.change_requests,
-        latest_scheduler_command=scheduler_snapshot.latest_scheduler_command,
-        activity_feed=activity_feed,
-        generated_at=datetime.now(timezone.utc).astimezone().isoformat(),
-    )
-
-
-def build_ops_live_snapshot_payload() -> OpsLiveSnapshot:
-    _sync_strategy_runtime_worker_issue_alerts()
-    _sync_private_execution_channel_alerts()
-    state = repo.snapshot()
-    alerts = state.alerts
-    trades = parse_trades()
-    audit_events = state.audit_events[:80]
-    execution_health = _build_control_snapshot_response().execution_health
-    latest_scheduler_command = _build_latest_scheduler_command(state.audit_events)
-
-    return OpsLiveSnapshot(
-        summary=OpsLiveSummary(
-            pending_alerts=sum(1 for item in alerts if not item.acknowledged),
-            p0_alerts=sum(1 for item in alerts if item.severity == "P0" and not item.acknowledged),
-            recent_trades=len(trades[:20]),
-            manual_trades=sum(1 for item in trades if item.origin == "manual"),
-            strategy_trades=sum(1 for item in trades if item.origin == "strategy"),
-            audit_warnings=sum(1 for item in audit_events if item.severity == "warning"),
-            audit_critical=sum(1 for item in audit_events if item.severity == "critical"),
-            execution_issue_total=(
-                (1 if execution_health.runtime_worker_issue else 0)
-                +
-                execution_health.active_stop_loss_guards
-                + execution_health.cooldowns
-                + execution_health.auto_dispatch_blocked
-                + execution_health.rejection_guards
-                + execution_health.stale_order_guards
-                + execution_health.drifts
-            ),
-            execution_top_issue=execution_health.top_issue,
-            execution_top_issue_strategy_id=execution_health.top_issue_strategy_id,
-            execution_top_issue_strategy_name=execution_health.top_issue_strategy_name,
-            execution_top_issue_symbol=execution_health.top_issue_symbol,
-            execution_top_issue_detail=execution_health.top_issue_detail,
-            latest_event_type=audit_events[0].event_type if audit_events else None,
-        ),
-        alerts=alerts,
-        trades=trades,
-        audit_events=audit_events,
-        latest_scheduler_command=latest_scheduler_command,
-        generated_at=datetime.now(timezone.utc).astimezone().isoformat(),
-    )
-
-
-def build_account_live_snapshot_payload(mode: Optional[AccountMode] = None) -> AccountLiveSnapshot:
-    overview = parse_account_overview(mode=mode)
-    positions = parse_positions(mode=mode)
-    orders = parse_open_orders(mode=mode)
-    order_history = parse_order_history(mode=mode)
-    return AccountLiveSnapshot(
-        overview=overview,
-        positions=positions,
-        orders=orders,
-        order_history=order_history,
-        generated_at=datetime.now(timezone.utc).astimezone().isoformat(),
-    )
-
-
-def _summarize_strategy_activity_execution_preview(
-    preview: Optional[ExecutionPreview],
-) -> Optional[Dict[str, Any]]:
-    if preview is None:
-        return None
-    return {
-        "mode": preview.mode.value,
-        "allowed": preview.allowed,
-        "action": preview.action,
-        "side": preview.side.value,
-        "quantity": preview.quantity,
-        "price": preview.price,
-        "notional": preview.notional,
-        "blocked_reason": preview.blocked_reason,
-        "recommended_action": preview.recommended_action,
-        "projected_position_side": preview.projected_position_side,
-        "projected_position_size": preview.projected_position_size,
-        "available_balance_after": preview.available_balance_after,
-        "sizing_risk_budget": preview.sizing_risk_budget,
-        "sizing_budget_notional": preview.sizing_budget_notional,
-        "sizing_minimum_required_notional": preview.sizing_minimum_required_notional,
-        "sizing_available_balance_gap": preview.sizing_available_balance_gap,
-    }
-
-
-def _build_strategy_activity_review_context(strategy_id: str) -> Optional[Dict[str, Any]]:
-    if not strategy_id:
-        return None
-    try:
-        activity = build_strategy_activity_payload(strategy_id)
-    except KeyError:
-        return None
-
-    runtime = activity.runtime
-
-    def summarize_order(order: OrderRecord) -> str:
-        return (
-            f"{order.symbol} {order.side.value} {order.qty}@{order.price} · "
-            f"{order.status} · {order.source}"
-        )
-
-    def summarize_trade(trade: TradeRecord) -> str:
-        parts = [f"{trade.symbol} {trade.side.value} {trade.quantity}@{trade.price}", str(trade.status or "filled")]
-        pnl = str(trade.pnl or "").strip()
-        if pnl and pnl != "--":
-            parts.append(f"pnl {pnl}")
-        return " · ".join(parts)
-
-    def summarize_alert(alert: AlertRecord) -> str:
-        return f"{alert.severity} {alert.title} · {alert.description}"
-
-    def summarize_event(event: ExecutionEvent) -> str:
-        return AppRepository._summarize_execution_event(event)
-
-    def summarize_backtest(backtest: StrategyActivityBacktestSummary) -> str:
-        parts = [
-            f"{backtest.id} · {backtest.timeframe} · {backtest.data_range}",
-            backtest.status,
-            backtest.decision_readiness,
-        ]
-        if backtest.history_source != "exchange_history":
-            parts.append(backtest.history_source)
-        if backtest.source_change_request_id:
-            parts.append(f"变更 {backtest.source_change_request_id}")
-        if backtest.source_backtest_id:
-            parts.append(f"来源回测 {backtest.source_backtest_id}")
-        if backtest.source_review_id:
-            parts.append(f"来源复盘 {backtest.source_review_id}")
-        if backtest.source_proposal_id:
-            parts.append(f"来源提案 {backtest.source_proposal_id}")
-        return " · ".join(parts)
-
-    def summarize_review(review: StrategyActivityReviewSummary) -> str:
-        parts = [f"{review.id} · {review.period}", review.title]
-        if review.source_job_type:
-            job_parts = [f"任务 {review.source_job_type}"]
-            if review.source_job_status:
-                job_parts.append(review.source_job_status)
-            parts.append(" / ".join(job_parts))
-        if review.source_change_request_id:
-            parts.append(f"变更 {review.source_change_request_id}")
-        if review.backtest_id:
-            parts.append(f"回测 {review.backtest_id}")
-        if review.source_proposal_id:
-            parts.append(f"提案 {review.source_proposal_id}")
-        return " · ".join(parts)
-
-    def summarize_agent_job(job: StrategyActivityJobSummary) -> str:
-        parts = [f"{job.id} · {job.job_type}", job.status.value]
-        if job.backtest_id:
-            parts.append(f"回测 {job.backtest_id}")
-        if job.linked_review_title:
-            parts.append(f"结果 {job.linked_review_title}")
-        elif job.linked_review_id:
-            parts.append(f"复盘 {job.linked_review_id}")
-        elif job.result_summary:
-            parts.append(job.result_summary)
-        return " · ".join(parts)
-
-    def summarize_change_request(change_request: ChangeRequest) -> str:
-        parts = [f"{change_request.id} · {change_request.type}", change_request.status.value]
-        if change_request.manual_followup_required:
-            parts.append("需人工跟进")
-        if change_request.linked_backtest_id:
-            parts.append(f"回测 {change_request.linked_backtest_id}")
-        if change_request.linked_review_id:
-            parts.append(f"复盘 {change_request.linked_review_id}")
-        return " · ".join(parts)
-
-    def get_change_request_source_proposal_id(change_request: ChangeRequest) -> Optional[str]:
-        source_proposal_id = str(change_request.source_proposal_id or "").strip()
-        if source_proposal_id:
-            return source_proposal_id
-        payload_proposal_id = str(change_request.payload.get("proposal_id") or "").strip()
-        return payload_proposal_id or None
-
-    proposal_change_request_map: Dict[str, ChangeRequest] = {}
-    for change_request in activity.recent_change_requests:
-        source_proposal_id = get_change_request_source_proposal_id(change_request)
-        if source_proposal_id and source_proposal_id not in proposal_change_request_map:
-            proposal_change_request_map[source_proposal_id] = change_request
-
-    proposal_backtest_map: Dict[str, StrategyActivityBacktestSummary] = {}
-    for backtest in activity.recent_backtests:
-        source_proposal_id = str(backtest.source_proposal_id or "").strip()
-        if source_proposal_id and source_proposal_id not in proposal_backtest_map:
-            proposal_backtest_map[source_proposal_id] = backtest
-
-    proposal_review_map: Dict[str, ReviewDocument] = {}
-    for review in activity.recent_reviews:
-        source_proposal_id = str(review.source_proposal_id or "").strip()
-        if source_proposal_id and source_proposal_id not in proposal_review_map:
-            proposal_review_map[source_proposal_id] = review
-
-    backtest_by_id = {item.id: item for item in activity.recent_backtests}
-    review_by_id = {item.id: item for item in activity.recent_reviews}
-    agent_job_by_id = {item.id: item for item in activity.recent_agent_jobs}
-    review_by_backtest_id: Dict[str, ReviewDocument] = {}
-    for review in activity.recent_reviews:
-        backtest_id = str(review.backtest_id or "").strip()
-        if backtest_id and backtest_id not in review_by_backtest_id:
-            review_by_backtest_id[backtest_id] = review
-    agent_job_by_backtest_id: Dict[str, StrategyActivityJobSummary] = {}
-    for job in activity.recent_agent_jobs:
-        backtest_id = str(job.backtest_id or "").strip()
-        if backtest_id and backtest_id not in agent_job_by_backtest_id:
-            agent_job_by_backtest_id[backtest_id] = job
-
-    def get_linked_change_request_for_proposal(proposal: Optional[StrategyProposal]) -> Optional[ChangeRequest]:
-        if proposal is None:
-            return None
-        if activity.latest_actionable_proposal and activity.latest_actionable_proposal.id == proposal.id:
-            return activity.latest_actionable_proposal_change_request
-        if activity.latest_proposal and activity.latest_proposal.id == proposal.id:
-            return activity.latest_proposal_change_request
-        return proposal_change_request_map.get(proposal.id)
-
-    def get_linked_backtest_for_proposal(
-        proposal: Optional[StrategyProposal],
-    ) -> Optional[StrategyActivityBacktestSummary]:
-        if proposal is None:
-            return None
-        if activity.latest_actionable_proposal and activity.latest_actionable_proposal.id == proposal.id:
-            if activity.latest_actionable_proposal_backtest is not None:
-                return activity.latest_actionable_proposal_backtest
-        if activity.latest_proposal and activity.latest_proposal.id == proposal.id:
-            if activity.latest_proposal_backtest is not None:
-                return activity.latest_proposal_backtest
-        linked_backtest = proposal_backtest_map.get(proposal.id)
-        if linked_backtest is not None:
-            return linked_backtest
-        linked_change_request = proposal_change_request_map.get(proposal.id)
-        if linked_change_request and linked_change_request.linked_backtest_id:
-            return backtest_by_id.get(linked_change_request.linked_backtest_id)
-        linked_review = proposal_review_map.get(proposal.id)
-        if linked_review and linked_review.backtest_id:
-            return backtest_by_id.get(linked_review.backtest_id)
-        return None
-
-    def get_linked_review_for_proposal(proposal: Optional[StrategyProposal]) -> Optional[ReviewDocument]:
-        if proposal is None:
-            return None
-        if activity.latest_actionable_proposal and activity.latest_actionable_proposal.id == proposal.id:
-            if activity.latest_actionable_proposal_review is not None:
-                return activity.latest_actionable_proposal_review
-        if activity.latest_proposal and activity.latest_proposal.id == proposal.id:
-            if activity.latest_proposal_review is not None:
-                return activity.latest_proposal_review
-        linked_review = proposal_review_map.get(proposal.id)
-        if linked_review is not None:
-            return linked_review
-        linked_change_request = proposal_change_request_map.get(proposal.id)
-        if linked_change_request and linked_change_request.linked_review_id:
-            return review_by_id.get(linked_change_request.linked_review_id)
-        linked_backtest = get_linked_backtest_for_proposal(proposal)
-        if linked_backtest is not None:
-            return review_by_backtest_id.get(linked_backtest.id)
-        return None
-
-    def get_linked_job_for_proposal(
-        proposal: Optional[StrategyProposal],
-    ) -> Optional[StrategyActivityJobSummary]:
-        if proposal is None:
-            return None
-        if activity.latest_actionable_proposal and activity.latest_actionable_proposal.id == proposal.id:
-            if activity.latest_actionable_proposal_job is not None:
-                return activity.latest_actionable_proposal_job
-        if activity.latest_proposal and activity.latest_proposal.id == proposal.id:
-            if activity.latest_proposal_job is not None:
-                return activity.latest_proposal_job
-        linked_change_request = get_linked_change_request_for_proposal(proposal)
-        if linked_change_request and linked_change_request.follow_up_job_id:
-            linked_job = agent_job_by_id.get(linked_change_request.follow_up_job_id)
-            if linked_job is not None:
-                return linked_job
-        linked_review = get_linked_review_for_proposal(proposal)
-        if linked_review and linked_review.source_job_id:
-            linked_job = agent_job_by_id.get(linked_review.source_job_id)
-            if linked_job is not None:
-                return linked_job
-        linked_backtest = get_linked_backtest_for_proposal(proposal)
-        if linked_backtest is not None:
-            return agent_job_by_backtest_id.get(linked_backtest.id)
-        return None
-
-    def summarize_proposal(proposal: StrategyProposal) -> str:
-        parts = [
-            proposal.id,
-            proposal.proposal_type,
-            proposal.status,
-            proposal.title,
-            proposal.expected_impact,
-        ]
-        linked_change_request = get_linked_change_request_for_proposal(proposal)
-        linked_backtest = get_linked_backtest_for_proposal(proposal)
-        linked_review = get_linked_review_for_proposal(proposal)
-        linked_job = get_linked_job_for_proposal(proposal)
-        if linked_change_request:
-            parts.append(f"变更 {linked_change_request.id}")
-            if linked_change_request.manual_followup_required:
-                parts.append("需人工跟进")
-            if linked_change_request.follow_up_job_type:
-                follow_up_parts = [f"跟踪 {linked_change_request.follow_up_job_type}"]
-                if linked_change_request.follow_up_job_status:
-                    follow_up_parts.append(linked_change_request.follow_up_job_status.value)
-                if linked_change_request.linked_review_title:
-                    follow_up_parts.append(f"结果 {linked_change_request.linked_review_title}")
-                elif linked_change_request.follow_up_result_summary:
-                    follow_up_parts.append(linked_change_request.follow_up_result_summary)
-                parts.append(" / ".join(follow_up_parts))
-        elif linked_job:
-            follow_up_parts = [f"任务 {linked_job.job_type}"]
-            if linked_job.status:
-                follow_up_parts.append(linked_job.status.value)
-            if linked_job.linked_review_title:
-                follow_up_parts.append(f"结果 {linked_job.linked_review_title}")
-            elif linked_job.result_summary:
-                follow_up_parts.append(linked_job.result_summary)
-            parts.append(" / ".join(follow_up_parts))
-        elif proposal.proposal_type == "script_patch_proposal" and proposal.status in {"pending", "testing"}:
-            parts.append("接受后需人工跟进")
-        if linked_backtest:
-            parts.append(f"回测 {linked_backtest.id}")
-        if linked_review:
-            parts.append(f"复盘 {linked_review.id}")
-        return " · ".join(parts)
-
-    latest_key_audit_event = AppRepository._pick_latest_key_execution_event(activity.recent_audit_events)
-    latest_active_order_record = max(
-        activity.active_orders,
-        key=lambda item: parse_optional_iso_datetime(item.created_at),
-        default=None,
-    )
-    latest_historical_order_record = max(
-        activity.recent_orders,
-        key=lambda item: parse_optional_iso_datetime(item.created_at),
-        default=None,
-    )
-    latest_trade_record = max(
-        activity.recent_trades,
-        key=lambda item: parse_optional_iso_datetime(item.created_at),
-        default=None,
-    )
-    latest_alert_record = max(
-        activity.recent_alerts,
-        key=lambda item: parse_optional_iso_datetime(item.triggered_at),
-        default=None,
-    )
-    latest_pending_alert_record = max(
-        [item for item in activity.recent_alerts if not item.acknowledged],
-        key=lambda item: parse_optional_iso_datetime(item.triggered_at),
-        default=None,
-    )
-    latest_order_record = max(
-        [
-            item
-            for item in [
-                latest_active_order_record,
-                latest_historical_order_record,
-            ]
-            if item is not None
-        ],
-        key=lambda item: parse_optional_iso_datetime(item.created_at),
-        default=None,
-    )
-    latest_ops = _build_strategy_activity_latest_ops_snapshot(
-        latest_active_order_summary=summarize_order(latest_active_order_record) if latest_active_order_record else None,
-        latest_historical_order_summary=(
-            summarize_order(latest_historical_order_record) if latest_historical_order_record else None
-        ),
-        latest_order_summary=summarize_order(latest_order_record) if latest_order_record else None,
-        latest_pending_alert_summary=summarize_alert(latest_pending_alert_record) if latest_pending_alert_record else None,
-        latest_trade_summary=summarize_trade(latest_trade_record) if latest_trade_record else None,
-        latest_alert_summary=summarize_alert(latest_alert_record) if latest_alert_record else None,
-        latest_audit_event_summary=AppRepository._summarize_execution_event(latest_key_audit_event)
-        if latest_key_audit_event
-        else None,
-        latest_active_order_record=latest_active_order_record,
-        latest_historical_order_record=latest_historical_order_record,
-        latest_order_record=latest_order_record,
-        latest_pending_alert_record=latest_pending_alert_record,
-        latest_trade_record=latest_trade_record,
-        latest_alert_record=latest_alert_record,
-        latest_audit_event_record=latest_key_audit_event,
-    )
-
-    return {
-        "strategy_id": activity.strategy_id,
-        "strategy_name": activity.strategy_name,
-        "symbol": activity.symbol,
-        "mode": activity.mode.value,
-        "generated_at": activity.generated_at,
-        "runtime": (
-            {
-                "signal": runtime.signal,
-                "guard_state": runtime.guard_state,
-                "guard_detail": runtime.guard_detail,
-                "note": runtime.note,
-                "next_action": runtime.next_action,
-                "position_alignment": runtime.position_alignment,
-                "position_alignment_detail": runtime.position_alignment_detail,
-                "last_execution_event_type": runtime.last_execution_event_type,
-                "execution_preview": _summarize_strategy_activity_execution_preview(runtime.execution_preview),
-            }
-            if runtime is not None
-            else None
-        ),
-        "latest_runtime": _build_strategy_activity_latest_runtime_snapshot(runtime=runtime, latest_ops=latest_ops).model_dump(mode="json"),
-        "latest_ops": latest_ops.model_dump(mode="json"),
-        "active_order_count": len(activity.active_orders),
-        "active_orders": [summarize_order(order) for order in activity.active_orders[:3]],
-        "latest_active_order": latest_ops.latest_active_order,
-        "latest_active_order_record": (
-            latest_ops.latest_active_order_record.model_dump(mode="json") if latest_ops.latest_active_order_record else None
-        ),
-        "latest_historical_order": latest_ops.latest_historical_order,
-        "latest_historical_order_record": (
-            latest_ops.latest_historical_order_record.model_dump(mode="json")
-            if latest_ops.latest_historical_order_record
-            else None
-        ),
-        "latest_order": latest_ops.latest_order,
-        "latest_order_record": latest_ops.latest_order_record.model_dump(mode="json") if latest_ops.latest_order_record else None,
-        "recent_orders": [summarize_order(order) for order in activity.recent_orders[:3]],
-        "latest_trade": latest_ops.latest_trade,
-        "latest_trade_record": latest_ops.latest_trade_record.model_dump(mode="json") if latest_ops.latest_trade_record else None,
-        "recent_trades": [summarize_trade(trade) for trade in activity.recent_trades[:3]],
-        "latest_pending_alert": latest_ops.latest_pending_alert,
-        "latest_pending_alert_record": (
-            latest_ops.latest_pending_alert_record.model_dump(mode="json")
-            if latest_ops.latest_pending_alert_record
-            else None
-        ),
-        "latest_alert": latest_ops.latest_alert,
-        "latest_alert_record": latest_ops.latest_alert_record.model_dump(mode="json") if latest_ops.latest_alert_record else None,
-        "recent_alerts": [summarize_alert(alert) for alert in activity.recent_alerts[:3]],
-        "latest_proposal": summarize_proposal(activity.latest_proposal) if activity.latest_proposal else None,
-        "latest_actionable_proposal": (
-            summarize_proposal(activity.latest_actionable_proposal)
-            if activity.latest_actionable_proposal
-            else None
-        ),
-        "latest_proposal_change_request": (
-            summarize_change_request(activity.latest_proposal_change_request)
-            if activity.latest_proposal_change_request
-            else None
-        ),
-        "latest_proposal_backtest": (
-            summarize_backtest(activity.latest_proposal_backtest) if activity.latest_proposal_backtest else None
-        ),
-        "latest_proposal_backtest_record": (
-            activity.latest_proposal_backtest_record.model_dump(mode="json")
-            if activity.latest_proposal_backtest_record
-            else None
-        ),
-        "latest_proposal_review": (
-            summarize_review(activity.latest_proposal_review) if activity.latest_proposal_review else None
-        ),
-        "latest_proposal_review_record": (
-            activity.latest_proposal_review_record.model_dump(mode="json")
-            if activity.latest_proposal_review_record
-            else None
-        ),
-        "latest_proposal_job": (
-            summarize_agent_job(activity.latest_proposal_job) if activity.latest_proposal_job else None
-        ),
-        "latest_proposal_job_record": (
-            activity.latest_proposal_job_record.model_dump(mode="json")
-            if activity.latest_proposal_job_record
-            else None
-        ),
-        "latest_actionable_proposal_change_request": (
-            summarize_change_request(activity.latest_actionable_proposal_change_request)
-            if activity.latest_actionable_proposal_change_request
-            else None
-        ),
-        "latest_actionable_proposal_backtest": (
-            summarize_backtest(activity.latest_actionable_proposal_backtest)
-            if activity.latest_actionable_proposal_backtest
-            else None
-        ),
-        "latest_actionable_proposal_backtest_record": (
-            activity.latest_actionable_proposal_backtest_record.model_dump(mode="json")
-            if activity.latest_actionable_proposal_backtest_record
-            else None
-        ),
-        "latest_actionable_proposal_review": (
-            summarize_review(activity.latest_actionable_proposal_review)
-            if activity.latest_actionable_proposal_review
-            else None
-        ),
-        "latest_actionable_proposal_review_record": (
-            activity.latest_actionable_proposal_review_record.model_dump(mode="json")
-            if activity.latest_actionable_proposal_review_record
-            else None
-        ),
-        "latest_actionable_proposal_job": (
-            summarize_agent_job(activity.latest_actionable_proposal_job)
-            if activity.latest_actionable_proposal_job
-            else None
-        ),
-        "latest_actionable_proposal_job_record": (
-            activity.latest_actionable_proposal_job_record.model_dump(mode="json")
-            if activity.latest_actionable_proposal_job_record
-            else None
-        ),
-        "recent_proposals": [summarize_proposal(proposal) for proposal in activity.recent_proposals[:3]],
-        "latest_change_request": summarize_change_request(activity.latest_change_request) if activity.latest_change_request else None,
-        "latest_actionable_change_request": (
-            summarize_change_request(activity.latest_actionable_change_request)
-            if activity.latest_actionable_change_request
-            else None
-        ),
-        "latest_change_request_backtest_record": (
-            activity.latest_change_request_backtest_record.model_dump(mode="json")
-            if activity.latest_change_request_backtest_record
-            else None
-        ),
-        "latest_change_request_review_record": (
-            activity.latest_change_request_review_record.model_dump(mode="json")
-            if activity.latest_change_request_review_record
-            else None
-        ),
-        "latest_change_request_job_record": (
-            activity.latest_change_request_job_record.model_dump(mode="json")
-            if activity.latest_change_request_job_record
-            else None
-        ),
-        "latest_change_request_source_backtest_record": (
-            activity.latest_change_request_source_backtest_record.model_dump(mode="json")
-            if activity.latest_change_request_source_backtest_record
-            else None
-        ),
-        "latest_change_request_source_review_record": (
-            activity.latest_change_request_source_review_record.model_dump(mode="json")
-            if activity.latest_change_request_source_review_record
-            else None
-        ),
-        "latest_change_request_source_proposal_record": (
-            activity.latest_change_request_source_proposal_record.model_dump(mode="json")
-            if activity.latest_change_request_source_proposal_record
-            else None
-        ),
-        "latest_actionable_change_request_backtest_record": (
-            activity.latest_actionable_change_request_backtest_record.model_dump(mode="json")
-            if activity.latest_actionable_change_request_backtest_record
-            else None
-        ),
-        "latest_actionable_change_request_review_record": (
-            activity.latest_actionable_change_request_review_record.model_dump(mode="json")
-            if activity.latest_actionable_change_request_review_record
-            else None
-        ),
-        "latest_actionable_change_request_job_record": (
-            activity.latest_actionable_change_request_job_record.model_dump(mode="json")
-            if activity.latest_actionable_change_request_job_record
-            else None
-        ),
-        "latest_actionable_change_request_source_backtest_record": (
-            activity.latest_actionable_change_request_source_backtest_record.model_dump(mode="json")
-            if activity.latest_actionable_change_request_source_backtest_record
-            else None
-        ),
-        "latest_actionable_change_request_source_review_record": (
-            activity.latest_actionable_change_request_source_review_record.model_dump(mode="json")
-            if activity.latest_actionable_change_request_source_review_record
-            else None
-        ),
-        "latest_actionable_change_request_source_proposal_record": (
-            activity.latest_actionable_change_request_source_proposal_record.model_dump(mode="json")
-            if activity.latest_actionable_change_request_source_proposal_record
-            else None
-        ),
-        "recent_change_requests": [
-            summarize_change_request(change_request)
-            for change_request in activity.recent_change_requests[:3]
-        ],
-        "latest_backtest": summarize_backtest(activity.latest_backtest) if activity.latest_backtest else None,
-        "latest_actionable_backtest": (
-            summarize_backtest(activity.latest_actionable_backtest)
-            if activity.latest_actionable_backtest
-            else None
-        ),
-        "latest_backtest_record": (
-            activity.latest_backtest_record.model_dump(mode="json") if activity.latest_backtest_record else None
-        ),
-        "latest_actionable_backtest_record": (
-            activity.latest_actionable_backtest_record.model_dump(mode="json")
-            if activity.latest_actionable_backtest_record
-            else None
-        ),
-        "latest_actionable_backtest_review": (
-            summarize_review(activity.latest_actionable_backtest_review)
-            if activity.latest_actionable_backtest_review
-            else None
-        ),
-        "latest_backtest_review_record": (
-            activity.latest_backtest_review_record.model_dump(mode="json")
-            if activity.latest_backtest_review_record
-            else None
-        ),
-        "latest_backtest_job_record": (
-            activity.latest_backtest_job_record.model_dump(mode="json")
-            if activity.latest_backtest_job_record
-            else None
-        ),
-        "latest_actionable_backtest_review_record": (
-            activity.latest_actionable_backtest_review_record.model_dump(mode="json")
-            if activity.latest_actionable_backtest_review_record
-            else None
-        ),
-        "latest_actionable_backtest_job_record": (
-            activity.latest_actionable_backtest_job_record.model_dump(mode="json")
-            if activity.latest_actionable_backtest_job_record
-            else None
-        ),
-        "latest_actionable_backtest_job": (
-            summarize_agent_job(activity.latest_actionable_backtest_job)
-            if activity.latest_actionable_backtest_job
-            else None
-        ),
-        "latest_backtest_review": summarize_review(activity.latest_backtest_review) if activity.latest_backtest_review else None,
-        "latest_backtest_job": summarize_agent_job(activity.latest_backtest_job) if activity.latest_backtest_job else None,
-        "recent_backtests": [summarize_backtest(backtest) for backtest in activity.recent_backtests[:3]],
-        "latest_primary_review": summarize_review(activity.latest_primary_review) if activity.latest_primary_review else None,
-        "latest_actionable_primary_review": (
-            summarize_review(activity.latest_actionable_primary_review)
-            if activity.latest_actionable_primary_review
-            else None
-        ),
-        "latest_primary_review_record": (
-            activity.latest_primary_review_record.model_dump(mode="json")
-            if activity.latest_primary_review_record
-            else None
-        ),
-        "latest_actionable_primary_review_record": (
-            activity.latest_actionable_primary_review_record.model_dump(mode="json")
-            if activity.latest_actionable_primary_review_record
-            else None
-        ),
-        "latest_tracking_review": summarize_review(activity.latest_tracking_review) if activity.latest_tracking_review else None,
-        "latest_tracking_job": summarize_agent_job(activity.latest_tracking_job) if activity.latest_tracking_job else None,
-        "latest_tracking_review_record": (
-            activity.latest_tracking_review_record.model_dump(mode="json")
-            if activity.latest_tracking_review_record
-            else None
-        ),
-        "latest_tracking_job_record": (
-            activity.latest_tracking_job_record.model_dump(mode="json")
-            if activity.latest_tracking_job_record
-            else None
-        ),
-        "latest_retryable_tracking_job": (
-            summarize_agent_job(activity.latest_retryable_tracking_job)
-            if activity.latest_retryable_tracking_job
-            else None
-        ),
-        "latest_retryable_tracking_job_record": (
-            activity.latest_retryable_tracking_job_record.model_dump(mode="json")
-            if activity.latest_retryable_tracking_job_record
-            else None
-        ),
-        "latest_audit_event": latest_ops.latest_audit_event,
-        "latest_audit_event_record": (
-            latest_ops.latest_audit_event_record.model_dump(mode="json")
-            if latest_ops.latest_audit_event_record
-            else None
-        ),
-        "recent_reviews": [summarize_review(review) for review in activity.recent_reviews[:3]],
-        "recent_agent_jobs": [summarize_agent_job(job) for job in activity.recent_agent_jobs[:4]],
-        "recent_audit_events": [summarize_event(event) for event in activity.recent_audit_events[:4]],
-    }
+def _compact_strategy_activity_review_context(context: Dict[str, Any]) -> Dict[str, Any]:
+    compact = dict(context)
+    decision_context = _build_strategy_activity_review_context_decision_context(compact)
+    if decision_context:
+        compact["decision_context"] = decision_context
+    return compact
 
 
 def build_review_health_context() -> Dict[str, Any]:
@@ -9087,6 +4102,7 @@ def build_review_health_context() -> Dict[str, Any]:
             + execution_health.drifts
         ),
         "runtime_worker_top_issue": runtime_status.top_issue,
+        "runtime_worker_detail": runtime_status.last_error,
         "runtime_worker_recommended_action": runtime_status.recommended_action,
     }
 
@@ -9127,6 +4143,7 @@ def _derive_review_health_context_from_context(
         "execution_top_issue_strategy_activity": top_issue_strategy_activity,
         "execution_issue_total": context.get("execution_issue_total", execution_health.get("issue_total", 0)),
         "runtime_worker_top_issue": context.get("runtime_worker_top_issue"),
+        "runtime_worker_detail": context.get("runtime_worker_detail"),
         "runtime_worker_recommended_action": context.get("runtime_worker_recommended_action"),
     }
 
@@ -9429,13 +4446,51 @@ def build_agent_job_prompt(job_type: str, context: Dict[str, Any]) -> str:
         )
     if job_type == "reconcile_change_request":
         return (
-            "请用中文一句话总结这个变更请求的落实情况，并指出是否需要人工复核。"
+            "请用中文跟进这个变更请求的落实情况，优先直接输出一个 JSON 对象，不要加代码块，字段为：\n"
+            'summary: string  // 60 字以内，说明变更当前是否真正落地\n'
+            'landed: boolean  // 变更是否已按预期生效\n'
+            'needs_manual_review: boolean  // 是否仍需人工复核\n'
+            'needs_manual_review_detail: string  // 若需要人工复核，指出主要风险点；否则可为空字符串\n'
+            'next_actions: string[]  // 建议的下一步动作（最多 4 条，无建议则返回空数组）\n'
+            "如果你无法稳定输出 JSON，请退回为一段 120 字以内的中文总结。\n"
             f"上下文：{json.dumps(review_context, ensure_ascii=False)}"
         )
     return (
         "请用中文简短总结当前任务执行结果，并给出一句下一步建议。"
         f"上下文：{json.dumps(review_context, ensure_ascii=False)}"
     )
+
+
+def apply_reconcile_change_request_outcome_from_text(
+    job_context: Dict[str, Any],
+    text: str,
+    source: str = "openclaw",
+) -> Dict[str, Any]:
+    """Parse a ``reconcile_change_request`` agent response and write it back.
+
+    This is the glue between the ``OpenClawGatewayClient`` JSON parser and
+    ``AppRepository.apply_reconcile_change_request_outcome``; it keeps the
+    worker loop readable and makes the behavior unit-testable without needing
+    a running OpenClaw gateway.
+    """
+
+    change_request_id = str(job_context.get("change_request_id") or "").strip()
+    parsed = OpenClawGatewayClient.parse_reconcile_change_request_response(text)
+    if not change_request_id:
+        return parsed
+    try:
+        outcome_model = ReconcileChangeRequestOutcome(
+            change_request_id=change_request_id,
+            summary=parsed["summary"],
+            landed=parsed.get("landed"),
+            needs_manual_review=parsed.get("needs_manual_review"),
+            needs_manual_review_detail=parsed.get("needs_manual_review_detail"),
+            next_actions=parsed.get("next_actions") or [],
+        )
+    except ValidationError:
+        return parsed
+    repo.apply_reconcile_change_request_outcome(change_request_id, outcome_model, source=source)
+    return parsed
 
 
 def extract_first_json_object(text: str) -> Optional[Dict[str, Any]]:
@@ -10130,6 +5185,7 @@ def _merge_execution_health_review_risks(risks: List[str], context: Optional[Dic
         review_health_context.get("execution_top_issue_recommended_action") or ""
     ).strip()
     runtime_worker_top_issue = str(review_health_context.get("runtime_worker_top_issue") or "").strip()
+    runtime_worker_detail = str(review_health_context.get("runtime_worker_detail") or "").strip()
     runtime_worker_recommended_action = str(
         review_health_context.get("runtime_worker_recommended_action") or ""
     ).strip()
@@ -10144,22 +5200,41 @@ def _merge_execution_health_review_risks(risks: List[str], context: Optional[Dic
             sentences.append(f"建议：{recommended_action.rstrip('。')}。")
         return " ".join(sentences)
 
+    def has_complete_risk_entry(issue: str, detail: str = "", recommended_action: str = "") -> bool:
+        if not issue:
+            return False
+        return any(
+            issue in item
+            and (not detail or detail in item)
+            and (not recommended_action or recommended_action in item)
+            for item in merged
+        )
+
     execution_risk_entry = build_risk_entry(
         "执行健康提示",
         execution_top_issue,
         execution_top_issue_detail,
         execution_top_issue_recommended_action,
     )
-    if execution_risk_entry and not any(execution_top_issue in item for item in merged):
+    if execution_risk_entry and not has_complete_risk_entry(
+        execution_top_issue,
+        execution_top_issue_detail,
+        execution_top_issue_recommended_action,
+    ):
         merged.append(execution_risk_entry)
     if (
         runtime_worker_top_issue
         and runtime_worker_top_issue != execution_top_issue
-        and not any(runtime_worker_top_issue in item for item in merged)
+        and not has_complete_risk_entry(
+            runtime_worker_top_issue,
+            runtime_worker_detail,
+            runtime_worker_recommended_action,
+        )
     ):
         runtime_risk_entry = build_risk_entry(
             "运行线程提示",
             runtime_worker_top_issue,
+            detail=runtime_worker_detail,
             recommended_action=runtime_worker_recommended_action,
         )
         if runtime_risk_entry:
@@ -10579,6 +5654,18 @@ def run_agent_worker_loop() -> None:
                 elif job.job_type in {"review_strategy_change", "review_strategy_issue"}:
                     review = build_strategy_tracking_review_document(text, job.context, job.job_type)
                     repo.complete_agent_job(job.id, result_summary=text[:160], review=review, source="openclaw")
+                elif job.job_type == "reconcile_change_request":
+                    outcome = apply_reconcile_change_request_outcome_from_text(
+                        job.context,
+                        text,
+                        source="openclaw",
+                    )
+                    repo.complete_agent_job(
+                        job.id,
+                        result_summary=outcome.get("summary", text[:160])[:160],
+                        review=None,
+                        source="openclaw",
+                    )
                 else:
                     repo.complete_agent_job(job.id, result_summary=text[:160], review=None, source="openclaw")
                 update_agent_worker_state(
@@ -10651,6 +5738,58 @@ def run_agent_worker_loop() -> None:
             except Exception:
                 pass
             time.sleep(2.0)
+
+
+def probe_private_trade_route() -> BybitTradeProbeResult:
+    status = private_data.get_status()
+    if not status.can_query_private:
+        return BybitTradeProbeResult(
+            configured=False,
+            authenticated=False,
+            trade_permission=None,
+            outcome="not_configured",
+            detail="未检测到 Bybit 私有 API 配置，无法探测真实下单链路。",
+            tested_at=status.updated_at,
+        )
+
+    try:
+        result = private_data.probe_trade_route()
+    except RuntimeError as exc:
+        return BybitTradeProbeResult(
+            configured=True,
+            authenticated=False,
+            trade_permission=None,
+            outcome="network_error",
+            detail=str(exc),
+            tested_at=status.updated_at,
+        )
+
+    return BybitTradeProbeResult(
+        configured=True,
+        authenticated=result["outcome"] != "permission_denied",
+        trade_permission=result.get("trade_permission"),
+        outcome=result["outcome"],
+        detail=result["ret_msg"] or "Bybit 交易链路探测已完成。",
+        ret_code=result.get("ret_code"),
+        order_link_id=result.get("order_link_id"),
+        tested_at=result["tested_at"],
+    )
+
+
+
+def build_health_payload() -> dict:
+    state = repo.snapshot()
+    return {
+        "ok": True,
+        "service": "control-api",
+        "watchlist_count": len(state.watchlist),
+        "strategy_count": len(state.strategies),
+        "openclaw_connected": state.control_snapshot.scheduler.openclaw_connected,
+    }
+
+
+def format_sse(data: Dict[str, Any], event: str = "snapshot") -> str:
+    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
 @app.get("/health")
@@ -10779,6 +5918,4111 @@ def get_market_detail(symbol: str, timeframe: str = "1h"):
         )
 
 
+def build_manual_strategy_review_job(strategy_id: str, payload: StrategyTrackingReviewRequest) -> AgentJobCreate:
+    state = repo.snapshot()
+    strategy = next((item for item in state.strategies if item.id == strategy_id), None)
+    if strategy is None:
+        raise KeyError(strategy_id)
+
+    summary = payload.summary.strip()
+    if not summary:
+        raise ValueError("跟踪摘要不能为空。")
+
+    detail = (payload.detail or "").strip() or None
+    symbol = strategy.symbols[0] if strategy.symbols else "--"
+    request_key = (payload.request_key or "").strip() or uuid4().hex[:12]
+    base_context = enrich_review_job_context({
+        "strategy_id": strategy.id,
+        "strategy_name": strategy.name,
+        "symbol": symbol,
+        "mode": strategy.mode.value,
+        "summary": summary,
+        "detail": detail,
+        "requested_by": payload.requested_by,
+        "requested_at": datetime.now(timezone.utc).astimezone().isoformat(),
+        "review_strategy_activity": _build_strategy_activity_review_context(strategy.id),
+    })
+    if payload.review_kind == "issue":
+        return AgentJobCreate(
+            job_type="review_strategy_issue",
+            context={
+                **base_context,
+                "issue_type": "manual_issue_review",
+            },
+            allowed_actions=["review_strategy_issue", "summarize_execution_impact"],
+            timeout=75,
+            idempotency_key=f"strategy-manual-review:{strategy.id}:issue:{request_key}",
+            writeback_target="strategy_activity",
+        )
+
+    return AgentJobCreate(
+        job_type="review_strategy_change",
+        context={
+            **base_context,
+            "change_type": "manual_change_review",
+        },
+        allowed_actions=["review_strategy_change", "summarize_execution_impact"],
+        timeout=75,
+        idempotency_key=f"strategy-manual-review:{strategy.id}:change:{request_key}",
+        writeback_target="strategy_activity",
+    )
+
+def build_private_execution_preview(payload: ExecutionPreviewRequest) -> ExecutionPreview:
+    notional = payload.quantity * payload.price
+    base_preview = {
+        "symbol": payload.symbol.upper(),
+        "market": payload.market,
+        "mode": payload.mode,
+        "side": payload.side,
+        "origin": payload.origin,
+        "strategy_id": payload.strategy_id,
+        "quantity": payload.quantity,
+        "price": payload.price,
+        "notional": format_usdt(notional),
+        "generated_at": datetime.now(timezone.utc).astimezone().isoformat(),
+    }
+    status, access_error = resolve_private_mode_access(payload.mode)
+    if access_error is not None:
+        return ExecutionPreview(
+            **base_preview,
+            action="等待真实执行引擎",
+            allowed=False,
+            blocked_reason=access_error,
+            recommended_action=_build_execution_preview_recommended_action(access_error),
+            warnings=["当前结果仅适用于已配置且模式一致的 Demo / Live 私有 API。"],
+            current_position_size="--",
+            current_avg_price="--",
+            projected_position_size="--",
+            projected_avg_price="--",
+            available_balance_before="--",
+            available_balance_after="--",
+            estimated_realized_pnl="--",
+        )
+
+    try:
+        _wallet_status, wallet_snapshot, _wallet_updated_at = load_private_wallet_snapshot()
+        positions_status, position_items, positions_updated_at = load_private_positions_snapshot()
+    except RuntimeError as exc:
+        return ExecutionPreview(
+            **base_preview,
+            action="等待真实执行引擎",
+            allowed=False,
+            blocked_reason=str(exc),
+            recommended_action="请先恢复 Bybit 私有账户链路，再重试真实交易预检。",
+            warnings=["当前结果仅适用于已配置且链路可用的 Demo / Live 私有 API。"],
+            current_position_size="--",
+            current_avg_price="--",
+            projected_position_size="--",
+            projected_avg_price="--",
+            available_balance_before="--",
+            available_balance_after="--",
+            estimated_realized_pnl="--",
+        )
+
+    positions = build_position_records(position_items, positions_status, positions_updated_at)
+    position = next(
+        (
+            item
+            for item in positions
+            if item.symbol == payload.symbol.upper() and item.market == payload.market
+        ),
+        None,
+    )
+    current_qty = 0.0
+    current_avg = 0.0
+    if position is not None:
+        current_qty = parse_metric_number(position.size) * (1 if position.side == "long" else -1)
+        current_avg = parse_metric_number(position.avg_price)
+
+    signed_qty = payload.quantity if payload.side == Direction.BUY else -payload.quantity
+    next_qty = current_qty + signed_qty
+    close_qty = 0.0
+    realized_on_fill = 0.0
+
+    if current_qty != 0 and current_qty * signed_qty < 0:
+        close_qty = min(abs(current_qty), abs(signed_qty))
+        realized_on_fill = close_qty * (payload.price - current_avg) * (1 if current_qty > 0 else -1)
+
+    if current_qty == 0 or current_qty * signed_qty > 0:
+        total_size = abs(current_qty) + abs(signed_qty)
+        projected_avg = (
+            ((abs(current_qty) * current_avg) + (abs(signed_qty) * payload.price)) / total_size
+            if total_size > 0
+            else 0.0
+        )
+    elif abs(next_qty) <= 1e-9:
+        projected_avg = 0.0
+    elif current_qty * next_qty > 0:
+        projected_avg = current_avg
+    else:
+        projected_avg = payload.price
+
+    perp_balance_delta_notional = 0.0
+    perp_additional_required_notional = 0.0
+    if payload.market == "perp":
+        perp_balance_delta_notional = _calculate_private_perp_balance_delta_notional(
+            current_qty=current_qty,
+            next_qty=next_qty,
+            price=payload.price,
+        )
+        perp_additional_required_notional = max(perp_balance_delta_notional, 0.0)
+
+    available_before = float(wallet_snapshot.get("totalAvailableBalance") or 0)
+    preview_open_orders: List[OrderRecord] = []
+    if payload.exclude_order_id or payload.release_order_ids or (payload.market == "spot" and payload.side == Direction.SELL):
+        preview_open_orders = _load_private_open_order_records_for_preview()
+    available_before += _private_released_order_reservation(
+        preview_open_orders,
+        symbol=payload.symbol,
+        market=payload.market,
+        exclude_order_id=payload.exclude_order_id,
+        release_order_ids=payload.release_order_ids,
+    )
+    reserved_spot_sell_qty = 0.0
+    released_spot_sell_qty = 0.0
+    wallet_available_spot_qty: Optional[float] = None
+    if payload.market == "spot" and payload.side == Direction.SELL:
+        wallet_available_spot_qty = _private_wallet_available_spot_quantity(
+            wallet_snapshot,
+            symbol=payload.symbol,
+        )
+        reserved_spot_sell_qty = _private_reserved_spot_sell_quantity(
+            preview_open_orders,
+            symbol=payload.symbol,
+            exclude_order_id=payload.exclude_order_id,
+        )
+        released_spot_sell_qty = _private_released_spot_sell_reservation(
+            preview_open_orders,
+            symbol=payload.symbol,
+            exclude_order_id=payload.exclude_order_id,
+        )
+    blocked_reason = _validate_exchange_order_constraints(
+        symbol=payload.symbol,
+        market=payload.market,
+        quantity=payload.quantity,
+        price=payload.price,
+    )
+    recommended_action = _build_exchange_constraint_recommended_action(blocked_reason)
+    if blocked_reason is None and payload.market == "spot" and payload.side == Direction.BUY and available_before + 1e-9 < notional:
+        blocked_reason = _build_private_insufficient_balance_reason(
+            available_balance=available_before,
+            required_notional=notional,
+            buy_order=True,
+        )
+        recommended_action = _build_private_insufficient_balance_recommended_action(
+            account_type=status.account_type,
+            available_balance=available_before,
+            required_notional=notional,
+            buy_order=True,
+        )
+    elif blocked_reason is None and payload.market == "spot" and payload.side == Direction.SELL:
+        if wallet_available_spot_qty is not None:
+            available_spot_qty = max(wallet_available_spot_qty + released_spot_sell_qty, 0.0)
+        else:
+            available_spot_qty = max(current_qty - reserved_spot_sell_qty, 0.0)
+        if available_spot_qty + 1e-9 < payload.quantity:
+            blocked_reason = (
+                "当前 Bybit 现货可卖数量不足，"
+                f"扣除未成交卖单占用后最多可卖 {repo._format_quantity(available_spot_qty, 6)}。"
+            )
+            recommended_action = _build_private_spot_inventory_recommended_action(payload.symbol)
+    elif blocked_reason is None and payload.market == "perp" and available_before + 1e-9 < perp_additional_required_notional:
+        blocked_reason = _build_private_insufficient_balance_reason(
+            available_balance=available_before,
+            required_notional=perp_additional_required_notional,
+            buy_order=False,
+        )
+        recommended_action = _build_private_insufficient_balance_recommended_action(
+            account_type=status.account_type,
+            available_balance=available_before,
+            required_notional=perp_additional_required_notional,
+            buy_order=False,
+        )
+
+    warnings = [
+        "当前为真实交易顾问式预检，最终风控、最小下单单位和精度仍以 Bybit 返回为准。",
+    ]
+    if wallet_available_spot_qty is not None:
+        warnings.append(
+            f"当前 {payload.symbol.upper()} 钱包可用数量为 {repo._format_quantity(wallet_available_spot_qty, 6)}。"
+        )
+    if reserved_spot_sell_qty > 1e-9:
+        warnings.append(
+            f"当前已扣除 {payload.symbol.upper()} 未成交卖单占用 {repo._format_quantity(reserved_spot_sell_qty, 6)}。"
+        )
+    if close_qty > 0:
+        warnings.append("本次委托若成交，会先结算一部分已实现盈亏。")
+    if current_qty != 0 and current_qty * next_qty < 0:
+        warnings.append("本次委托若成交，会让当前仓位发生反手。")
+
+    if payload.market == "perp":
+        available_after = available_before - perp_balance_delta_notional
+    else:
+        available_after = available_before - (notional if payload.side == Direction.BUY else -notional)
+
+    return ExecutionPreview(
+        **base_preview,
+        action=repo._describe_execution_action_locked(payload.market, payload.side, current_qty, next_qty),  # type: ignore[attr-defined]
+        allowed=blocked_reason is None,
+        blocked_reason=blocked_reason,
+        recommended_action=recommended_action,
+        warnings=warnings,
+        current_position_side=repo._classify_position_side(current_qty),  # type: ignore[attr-defined]
+        current_position_size=repo._format_quantity(abs(current_qty), 6),  # type: ignore[attr-defined]
+        current_avg_price=repo._format_ratio(current_avg) if abs(current_qty) > 1e-9 else "--",  # type: ignore[attr-defined]
+        projected_position_side=repo._classify_position_side(next_qty),  # type: ignore[attr-defined]
+        projected_position_size=repo._format_quantity(abs(next_qty), 6),  # type: ignore[attr-defined]
+        projected_avg_price=repo._format_ratio(projected_avg) if abs(next_qty) > 1e-9 else "--",  # type: ignore[attr-defined]
+        available_balance_before=format_usdt(available_before),
+        available_balance_after=format_usdt(available_after),
+        estimated_realized_pnl=repo._format_usdt_delta(realized_on_fill) if close_qty > 0 else "--",  # type: ignore[attr-defined]
+    )
+
+def submit_exchange_order(
+    payload: ManualOrderRequest,
+    *,
+    origin: str = "manual",
+    strategy_id: Optional[str] = None,
+    requested_by: str = "desktop_operator",
+) -> OrderRecord:
+    status, access_error = resolve_private_mode_access(payload.mode)
+    if access_error is not None:
+        raise RuntimeError(access_error)
+
+    preview = build_private_execution_preview(
+        ExecutionPreviewRequest(
+            symbol=payload.symbol,
+            market=payload.market,
+            mode=payload.mode,
+            side=payload.side,
+            quantity=payload.quantity,
+            price=payload.price,
+            origin="manual",
+            note=payload.note,
+        )
+    )
+    if not preview.allowed:
+        raise RuntimeError(preview.blocked_reason or "当前真实交易预检未通过。")
+
+    reduce_only = _execution_preview_requires_reduce_only(preview)
+    if origin == "strategy" and strategy_id:
+        order_link_id = f"strategy-{payload.mode.value}-{strategy_id}-{uuid4().hex[:8]}"
+    else:
+        order_link_id = f"{origin}-{payload.mode.value}-{uuid4().hex[:12]}"
+    created_at = datetime.now(timezone.utc).astimezone().isoformat()
+    created_time_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    body = {
+        "category": "spot" if payload.market == "spot" else "linear",
+        "symbol": payload.symbol.upper(),
+        "side": "Buy" if payload.side == Direction.BUY else "Sell",
+        "orderType": "Limit",
+        "qty": serialize_decimal(payload.quantity),
+        "price": serialize_decimal(payload.price),
+        "timeInForce": "GTC",
+        "orderLinkId": order_link_id,
+    }
+    if payload.market == "perp":
+        body["reduceOnly"] = reduce_only
+    result = private_data.create_order(body)
+    order_id = str(result.get("orderId") or order_link_id)
+    order_status = str(result.get("orderStatus") or "New")
+
+    if hasattr(private_realtime, "get_open_orders_snapshot") and hasattr(private_realtime, "seed_open_orders_snapshot"):
+        current_orders = private_realtime.get_open_orders_snapshot() or []
+        next_orders = [
+            item
+            for item in current_orders
+            if str(item.get("orderId") or "") != order_id
+        ]
+        next_orders.insert(
+            0,
+            {
+                "orderId": order_id,
+                "orderLinkId": order_link_id,
+                "symbol": payload.symbol.upper(),
+                "category": body["category"],
+                "side": body["side"],
+                "orderType": body["orderType"],
+                "qty": body["qty"],
+                "price": body["price"],
+                "orderStatus": order_status,
+                "createdTime": str(created_time_ms),
+                "reduceOnly": body.get("reduceOnly"),
+            },
+        )
+        private_realtime.seed_open_orders_snapshot(next_orders)
+
+    upsert_private_order_history_cache(
+        status,
+        [
+            {
+                "orderId": order_id,
+                "orderLinkId": order_link_id,
+                "symbol": payload.symbol.upper(),
+                "category": body["category"],
+                "side": body["side"],
+                "orderType": body["orderType"],
+                "qty": body["qty"],
+                "price": body["price"],
+                "orderStatus": order_status,
+                "createdTime": str(created_time_ms),
+            }
+        ],
+    )
+    remember_private_order_metadata(
+        order_id,
+        origin=origin,
+        strategy_id=strategy_id,
+        requested_by=requested_by,
+        note=payload.note,
+    )
+
+    repo.add_event(
+        event_type="exchange_order.created",
+        source="quant-core",
+        severity=EventSeverity.INFO,
+        payload={
+            "origin": origin,
+            "strategy_id": strategy_id,
+            "mode": payload.mode.value,
+            "symbol": payload.symbol.upper(),
+            "market": payload.market,
+            "side": payload.side.value,
+            "quantity": payload.quantity,
+            "price": payload.price,
+            "order_id": order_id,
+            "order_link_id": order_link_id,
+            "account_mode": status.mode.value,
+            "note": payload.note,
+        },
+        symbol=payload.symbol.upper(),
+    )
+    repo._persist()  # type: ignore[attr-defined]
+
+    return OrderRecord(
+        source="bybit_private",
+        origin=origin,
+        strategy_id=strategy_id,
+        order_id=order_id,
+        symbol=payload.symbol.upper(),
+        market=payload.market,
+        side=payload.side,
+        order_type="Limit",
+        qty=serialize_decimal(payload.quantity),
+        price=serialize_decimal(payload.price),
+        status=order_status,
+        created_at=created_at,
+    )
+
+def cancel_exchange_order(order_id: str, requested_by: str, mode: Optional[AccountMode] = None) -> OrderRecord:
+    selected_mode = mode or repo.snapshot().workspace_preferences.selected_mode
+    status, access_error = resolve_private_mode_access(selected_mode)
+    if selected_mode == AccountMode.PAPER:
+        raise RuntimeError("当前工作台处于 Paper 模式，请使用本地 Paper 撤单接口。")
+    if access_error is not None:
+        raise RuntimeError(access_error)
+
+    orders = parse_open_orders(use_private_only=True)
+    target = next((item for item in orders if item.order_id == order_id), None)
+    if target is None:
+        raise KeyError(order_id)
+
+    body = {
+        "category": "spot" if target.market == "spot" else "linear",
+        "symbol": target.symbol,
+        "orderId": target.order_id,
+    }
+    result = private_data.cancel_order(body)
+    cancelled_order_id = str(result.get("orderId") or target.order_id)
+    remember_private_order_metadata(
+        cancelled_order_id,
+        origin=target.origin,
+        strategy_id=target.strategy_id,
+        requested_by=requested_by,
+    )
+
+    if hasattr(private_realtime, "get_open_orders_snapshot") and hasattr(private_realtime, "seed_open_orders_snapshot"):
+        next_orders = [
+            item
+            for item in (private_realtime.get_open_orders_snapshot() or [])
+            if str(item.get("orderId") or "") != cancelled_order_id
+        ]
+        private_realtime.seed_open_orders_snapshot(next_orders)
+
+    upsert_private_order_history_cache(
+        status,
+        [
+            {
+                "orderId": cancelled_order_id,
+                "symbol": target.symbol,
+                "category": "spot" if target.market == "spot" else "linear",
+                "side": "Buy" if target.side == Direction.BUY else "Sell",
+                "orderType": target.order_type,
+                "qty": target.qty.replace(",", ""),
+                "price": target.price.replace(",", ""),
+                "orderStatus": "Cancelled",
+                "createdTime": str(
+                    int(datetime.fromisoformat(target.created_at).astimezone(timezone.utc).timestamp() * 1000)
+                ),
+            }
+        ],
+    )
+
+    repo.add_event(
+        event_type="exchange_order.cancelled",
+        source="desktop",
+        severity=EventSeverity.WARNING,
+        payload={
+            "mode": status.mode.value,
+            "order_id": cancelled_order_id,
+            "symbol": target.symbol,
+            "market": target.market,
+            "origin": target.origin,
+            "strategy_id": target.strategy_id,
+            "requested_by": requested_by,
+        },
+        symbol=target.symbol,
+    )
+    repo._persist()  # type: ignore[attr-defined]
+
+    return target.model_copy(update={"status": "Cancelled"})
+
+def cancel_all_exchange_orders(requested_by: str) -> PaperOrderBulkCancelResult:
+    selected_mode = repo.snapshot().workspace_preferences.selected_mode
+    status, access_error = resolve_private_mode_access(selected_mode)
+    if selected_mode == AccountMode.PAPER:
+        raise RuntimeError("当前工作台处于 Paper 模式，请使用本地 Paper 全撤接口。")
+    if access_error is not None:
+        raise RuntimeError(access_error)
+
+    orders = parse_open_orders(use_private_only=True)
+    if not orders:
+        return PaperOrderBulkCancelResult(
+            cancelled_count=0,
+            cancelled_order_ids=[],
+            requested_by=requested_by,
+            updated_at=datetime.now(timezone.utc).astimezone().isoformat(),
+        )
+
+    grouped_requests: Dict[tuple[str, str], Dict[str, str]] = {}
+    for order in orders:
+        key = (order.market, order.symbol)
+        grouped_requests[key] = {
+            "category": "spot" if order.market == "spot" else "linear",
+            "symbol": order.symbol,
+        }
+
+    for body in grouped_requests.values():
+        private_data.cancel_all_orders(body)
+
+    for order in orders:
+        remember_private_order_metadata(
+            order.order_id,
+            origin=order.origin,
+            strategy_id=order.strategy_id,
+            requested_by=requested_by,
+        )
+
+    cancelled_order_ids = [order.order_id for order in orders]
+    if hasattr(private_realtime, "seed_open_orders_snapshot"):
+        private_realtime.seed_open_orders_snapshot([])
+
+    upsert_private_order_history_cache(
+        status,
+        [
+            {
+                "orderId": order.order_id,
+                "symbol": order.symbol,
+                "category": "spot" if order.market == "spot" else "linear",
+                "side": "Buy" if order.side == Direction.BUY else "Sell",
+                "orderType": order.order_type,
+                "qty": order.qty.replace(",", ""),
+                "price": order.price.replace(",", ""),
+                "orderStatus": "Cancelled",
+                "createdTime": str(
+                    int(datetime.fromisoformat(order.created_at).astimezone(timezone.utc).timestamp() * 1000)
+                ),
+            }
+            for order in orders
+        ],
+    )
+
+    repo.add_event(
+        event_type="exchange_order.cancelled_all",
+        source="desktop",
+        severity=EventSeverity.WARNING,
+        payload={
+            "mode": status.mode.value,
+            "requested_by": requested_by,
+            "cancelled_count": len(cancelled_order_ids),
+            "cancelled_order_ids": cancelled_order_ids,
+            "origins": [order.origin for order in orders],
+            "strategy_ids": [order.strategy_id for order in orders if order.strategy_id],
+        },
+    )
+    repo._persist()  # type: ignore[attr-defined]
+    return PaperOrderBulkCancelResult(
+        cancelled_count=len(cancelled_order_ids),
+        cancelled_order_ids=cancelled_order_ids,
+        requested_by=requested_by,
+        updated_at=datetime.now(timezone.utc).astimezone().isoformat(),
+    )
+
+def _market_reference_price(symbol: str, market: str) -> float:
+    ticker = market_data.get_ticker(symbol.upper(), market)
+    price = coerce_float(ticker.get("lastPrice"), 0.0)
+    if price <= 0:
+        raise RuntimeError(f"{symbol.upper()} 当前缺少可用行情，无法生成平仓委托。")
+    return price
+
+def _resolve_spot_close_quantity(symbol: str, position_qty: float) -> float:
+    upper_symbol = symbol.upper()
+    available_qty: Optional[float] = None
+    wallet_snapshot: Optional[Dict[str, Any]] = None
+    try:
+        _wallet_status, wallet_snapshot, _wallet_updated_at = load_private_wallet_snapshot()
+    except RuntimeError:
+        wallet_snapshot = None
+
+    if wallet_snapshot is not None:
+        available_qty = _private_wallet_available_spot_quantity(wallet_snapshot, symbol=upper_symbol)
+
+    if available_qty is None:
+        open_orders = _load_private_open_order_records_for_preview()
+        reserved_qty = _private_reserved_spot_sell_quantity(open_orders, symbol=upper_symbol)
+        available_qty = max(position_qty - reserved_qty, 0.0)
+
+    if available_qty <= 1e-9:
+        raise RuntimeError(
+            f"{upper_symbol} 当前现货可用数量为 0，可能已被未成交卖单占用或其他冻结量占用，请先撤销相关挂单后再平仓。"
+        )
+    if available_qty + 1e-9 < position_qty:
+        raise RuntimeError(
+            f"{upper_symbol} 当前现货仅有 {repo._format_quantity(available_qty, 6)} 可用于平仓，"
+            f"低于持仓数量 {repo._format_quantity(position_qty, 6)}；请先撤销相关挂单后再平仓。"
+        )
+    return position_qty
+
+def _prepare_exchange_close_order(target: PositionRecord) -> Dict[str, Any]:
+    quantity = coerce_float(str(target.size).replace(",", ""), 0.0)
+    if quantity <= 0:
+        raise RuntimeError(f"{target.symbol.upper()} 当前没有可平的真实持仓。")
+    if target.market == "spot":
+        quantity = _resolve_spot_close_quantity(target.symbol, quantity)
+    price = _market_reference_price(target.symbol, target.market)
+    side = Direction.SELL if target.side == "long" else Direction.BUY
+    return {
+        "quantity": quantity,
+        "price": price,
+        "side": side,
+    }
+
+def _submit_exchange_close_order(
+    *,
+    target: PositionRecord,
+    quantity: float,
+    price: float,
+    side: Direction,
+    status: BybitPrivateStatus,
+    requested_by: str,
+) -> OrderRecord:
+    selected_mode = repo.snapshot().workspace_preferences.selected_mode
+    order_link_id = f"close-{selected_mode.value}-{uuid4().hex[:12]}"
+    created_at = datetime.now(timezone.utc).astimezone().isoformat()
+    created_time_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    body = {
+        "category": "spot" if target.market == "spot" else "linear",
+        "symbol": target.symbol,
+        "side": "Buy" if side == Direction.BUY else "Sell",
+        "orderType": "Limit",
+        "qty": serialize_decimal(quantity),
+        "price": serialize_decimal(price),
+        "timeInForce": "GTC",
+        "orderLinkId": order_link_id,
+    }
+    if target.market == "perp":
+        body["reduceOnly"] = True
+
+    result = private_data.create_order(body)
+    order_id = str(result.get("orderId") or order_link_id)
+    order_status = str(result.get("orderStatus") or "New")
+    remember_private_order_metadata(
+        order_id,
+        origin="manual",
+        requested_by=requested_by,
+    )
+
+    if hasattr(private_realtime, "get_open_orders_snapshot") and hasattr(private_realtime, "seed_open_orders_snapshot"):
+        current_orders = private_realtime.get_open_orders_snapshot() or []
+        next_orders = [item for item in current_orders if str(item.get("orderId") or "") != order_id]
+        next_orders.insert(
+            0,
+            {
+                "orderId": order_id,
+                "orderLinkId": order_link_id,
+                "symbol": target.symbol,
+                "category": body["category"],
+                "side": body["side"],
+                "orderType": body["orderType"],
+                "qty": body["qty"],
+                "price": body["price"],
+                "orderStatus": order_status,
+                "createdTime": str(created_time_ms),
+            },
+        )
+        private_realtime.seed_open_orders_snapshot(next_orders)
+
+    upsert_private_order_history_cache(
+        status,
+        [
+            {
+                "orderId": order_id,
+                "orderLinkId": order_link_id,
+                "symbol": target.symbol,
+                "category": body["category"],
+                "side": body["side"],
+                "orderType": body["orderType"],
+                "qty": body["qty"],
+                "price": body["price"],
+                "orderStatus": order_status,
+                "createdTime": str(created_time_ms),
+            }
+        ],
+    )
+
+    repo.add_event(
+        event_type="exchange_position.close_submitted",
+        source="desktop",
+        severity=EventSeverity.INFO,
+        payload={
+            "mode": status.mode.value,
+            "requested_by": requested_by,
+            "symbol": target.symbol,
+            "market": target.market,
+            "position_side": target.side,
+            "origin": "manual",
+            "quantity": quantity,
+            "price": price,
+            "order_id": order_id,
+            "order_link_id": order_link_id,
+        },
+        symbol=target.symbol,
+    )
+    repo._persist()  # type: ignore[attr-defined]
+    return OrderRecord(
+        source="bybit_private",
+        origin="manual",
+        order_id=order_id,
+        symbol=target.symbol,
+        market=target.market,
+        side=side,
+        order_type="Limit",
+        qty=serialize_decimal(quantity),
+        price=serialize_decimal(price),
+        status=order_status,
+        created_at=created_at,
+    )
+
+def close_exchange_position(symbol: str, requested_by: str) -> OrderRecord:
+    selected_mode = repo.snapshot().workspace_preferences.selected_mode
+    status, access_error = resolve_private_mode_access(selected_mode)
+    if selected_mode == AccountMode.PAPER:
+        raise RuntimeError("当前工作台处于 Paper 模式，请使用本地 Paper 平仓接口。")
+    if access_error is not None:
+        raise RuntimeError(access_error)
+
+    positions = parse_positions(use_private_only=True)
+    matched_positions = [item for item in positions if item.symbol == symbol.upper()]
+    if not matched_positions:
+        raise KeyError(symbol.upper())
+    if len(matched_positions) > 1:
+        markets = " / ".join(sorted({item.market for item in matched_positions}))
+        raise RuntimeError(
+            f"{symbol.upper()} 当前同时存在多个市场持仓（{markets}），单笔平仓接口无法安全判定目标市场，请改用批量全平或先收敛到单一市场持仓后再操作。"
+        )
+    target = matched_positions[0]
+
+    prepared = _prepare_exchange_close_order(target)
+    return _submit_exchange_close_order(
+        target=target,
+        quantity=float(prepared["quantity"]),
+        price=float(prepared["price"]),
+        side=prepared["side"],
+        status=status,
+        requested_by=requested_by,
+    )
+
+def close_all_exchange_positions(requested_by: str) -> ExchangePositionBulkCloseResult:
+    selected_mode = repo.snapshot().workspace_preferences.selected_mode
+    status, access_error = resolve_private_mode_access(selected_mode)
+    if selected_mode == AccountMode.PAPER:
+        raise RuntimeError("当前工作台处于 Paper 模式，请使用本地 Paper 全平接口。")
+    if access_error is not None:
+        raise RuntimeError(access_error)
+
+    positions = parse_positions(use_private_only=True)
+    if not positions:
+        return ExchangePositionBulkCloseResult(
+            submitted_count=0,
+            order_ids=[],
+            requested_by=requested_by,
+            updated_at=datetime.now(timezone.utc).astimezone().isoformat(),
+        )
+
+    prepared_positions = [
+        (
+            position,
+            _prepare_exchange_close_order(position),
+        )
+        for position in positions
+    ]
+
+    submitted_orders: List[OrderRecord] = []
+    for position, prepared in prepared_positions:
+        submitted_orders.append(
+            _submit_exchange_close_order(
+                target=position,
+                quantity=float(prepared["quantity"]),
+                price=float(prepared["price"]),
+                side=prepared["side"],
+                status=status,
+                requested_by=requested_by,
+            )
+        )
+
+    repo.add_event(
+        event_type="exchange_position.close_all_submitted",
+        source="desktop",
+        severity=EventSeverity.INFO,
+        payload={
+            "mode": status.mode.value,
+            "requested_by": requested_by,
+            "submitted_count": len(submitted_orders),
+            "order_ids": [item.order_id for item in submitted_orders],
+            "symbols": [item.symbol for item in submitted_orders],
+        },
+    )
+    repo._persist()  # type: ignore[attr-defined]
+    return ExchangePositionBulkCloseResult(
+        submitted_count=len(submitted_orders),
+        order_ids=[item.order_id for item in submitted_orders],
+        requested_by=requested_by,
+        updated_at=datetime.now(timezone.utc).astimezone().isoformat(),
+    )
+
+def replace_exchange_order(
+    order_id: str,
+    quantity: float,
+    price: float,
+    requested_by: str,
+    mode: Optional[AccountMode] = None,
+) -> OrderRecord:
+    selected_mode = mode or repo.snapshot().workspace_preferences.selected_mode
+    status, access_error = resolve_private_mode_access(selected_mode)
+    if selected_mode == AccountMode.PAPER:
+        raise RuntimeError("当前工作台处于 Paper 模式，请使用本地 Paper 改单接口。")
+    if access_error is not None:
+        raise RuntimeError(access_error)
+
+    ensure_private_realtime_started()
+    raw_orders = private_realtime.get_open_orders_snapshot() if hasattr(private_realtime, "get_open_orders_snapshot") else []
+    if not raw_orders:
+        raw_orders = private_data.fetch_open_orders()
+        if hasattr(private_realtime, "seed_open_orders_snapshot"):
+            private_realtime.seed_open_orders_snapshot(raw_orders)
+
+    raw_target = next(
+        (
+            item
+            for item in raw_orders
+            if str(item.get("orderId") or "") == order_id
+        ),
+        None,
+    )
+    if raw_target is None:
+        raise KeyError(order_id)
+
+    target = build_order_records([raw_target])[0]
+    preview = build_private_execution_preview(
+        ExecutionPreviewRequest(
+            symbol=target.symbol,
+            market=target.market,
+            mode=selected_mode,
+            side=target.side,
+            quantity=quantity,
+            price=price,
+            origin="manual",
+            exclude_order_id=order_id,
+        )
+    )
+    if not preview.allowed:
+        raise RuntimeError(preview.blocked_reason or "当前真实委托改单预检未通过。")
+    desired_reduce_only = _execution_preview_requires_reduce_only(preview)
+    if _exchange_order_matches_requested_target(
+        target,
+        quantity,
+        price,
+        require_reduce_only=desired_reduce_only,
+    ):
+        repo.add_event(
+            event_type="exchange_order.replace_noop",
+            source="desktop",
+            severity=EventSeverity.INFO,
+            payload={
+                "mode": status.mode.value,
+                "requested_by": requested_by,
+                "order_id": order_id,
+                "symbol": target.symbol,
+                "market": target.market,
+                "origin": target.origin,
+                "strategy_id": target.strategy_id,
+                "side": target.side.value,
+                "quantity": quantity,
+                "price": price,
+            },
+            symbol=target.symbol,
+        )
+        repo._persist()  # type: ignore[attr-defined]
+        return target
+
+    body = {
+        "category": "spot" if target.market == "spot" else "linear",
+        "symbol": target.symbol,
+        "orderId": order_id,
+        "qty": serialize_decimal(quantity),
+        "price": serialize_decimal(price),
+    }
+    if target.market == "perp":
+        body["reduceOnly"] = desired_reduce_only
+    result = private_data.amend_order(body)
+    amended_order_id = str(result.get("orderId") or order_id)
+    order_status = str(result.get("orderStatus") or raw_target.get("orderStatus") or target.status or "New")
+    remember_private_order_metadata(
+        amended_order_id,
+        origin=target.origin,
+        strategy_id=target.strategy_id,
+        requested_by=requested_by,
+    )
+    next_order = {
+        **raw_target,
+        "orderId": amended_order_id,
+        "qty": body["qty"],
+        "price": body["price"],
+        "orderStatus": order_status,
+        "reduceOnly": body.get("reduceOnly"),
+    }
+
+    if hasattr(private_realtime, "seed_open_orders_snapshot"):
+        next_orders = []
+        for item in raw_orders:
+            if str(item.get("orderId") or "") == order_id:
+                next_orders.append(next_order)
+            else:
+                next_orders.append(item)
+        private_realtime.seed_open_orders_snapshot(next_orders)
+
+    upsert_private_order_history_cache(
+        status,
+        [
+            {
+                "orderId": amended_order_id,
+                "symbol": target.symbol,
+                "category": "spot" if target.market == "spot" else "linear",
+                "side": "Buy" if target.side == Direction.BUY else "Sell",
+                "orderType": target.order_type,
+                "qty": body["qty"],
+                "price": body["price"],
+                "orderStatus": order_status,
+                "createdTime": str(
+                    int(datetime.fromisoformat(target.created_at).astimezone(timezone.utc).timestamp() * 1000)
+                ),
+            }
+        ],
+    )
+
+    repo.add_event(
+        event_type="exchange_order.replaced",
+        source="desktop",
+        severity=EventSeverity.INFO,
+        payload={
+            "mode": status.mode.value,
+            "requested_by": requested_by,
+            "order_id": amended_order_id,
+            "symbol": target.symbol,
+            "market": target.market,
+            "origin": target.origin,
+            "strategy_id": target.strategy_id,
+            "side": target.side.value,
+            "previous_quantity": target.qty,
+            "previous_price": target.price,
+            "quantity": quantity,
+            "price": price,
+        },
+        symbol=target.symbol,
+    )
+    repo._persist()  # type: ignore[attr-defined]
+    return target.model_copy(
+        update={
+            "qty": serialize_decimal(quantity),
+            "price": serialize_decimal(price),
+            "status": order_status,
+        }
+    )
+
+def _announcement_symbols(title: str, summary: str) -> List[str]:
+    content = f"{title} {summary}".upper()
+    matched: List[str] = []
+    for item in repo.snapshot().watchlist:
+        base_symbol = item.symbol.replace("USDT", "")
+        if base_symbol and base_symbol in content and item.symbol not in matched:
+            matched.append(item.symbol)
+    return matched
+
+def _announcement_impact_score(title: str, tags: List[str]) -> int:
+    normalized_title = title.lower()
+    normalized_tags = {str(tag).strip().lower() for tag in tags}
+    if any(keyword in normalized_title for keyword in ("delist", "suspend", "maintenance", "incident", "下架", "暂停", "维护", "异常")):
+        return 88
+    if {"listing", "launchpad", "pre-market"} & normalized_tags:
+        return 82
+    if {"earn", "campaign", "product"} & normalized_tags:
+        return 68
+    return 58
+
+def build_news_feed(limit: int = 10) -> List[NewsEvent]:
+    seeded_news = list(repo.snapshot().news_events)
+    announcement_events: List[NewsEvent] = []
+    try:
+        announcements = market_data.get_announcements(locale="zh-TW", limit=limit)
+        for item in announcements:
+            title = str(item.get("title") or "Bybit 公告")
+            summary = str(item.get("description") or item.get("subtitle") or "请前往 Bybit 公告页查看详情。").strip()
+            tags = item.get("tags") or item.get("tag") or []
+            if isinstance(tags, str):
+                tag_list = [tags]
+            else:
+                tag_list = [str(tag) for tag in tags if str(tag).strip()]
+            announcement_events.append(
+                NewsEvent(
+                    id=str(item.get("id") or f"bybit-ann-{uuid4().hex[:10]}"),
+                    source="Bybit 公告",
+                    title=title,
+                    summary=summary,
+                    url=str(item.get("url") or "").strip() or None,
+                    symbols=_announcement_symbols(title, summary),
+                    impact_score=_announcement_impact_score(title, tag_list),
+                    published_at=timestamp_ms_to_iso(item.get("publishTime") or item.get("dateTimestamp")),
+                    category="announcement",
+                    related_alert_ids=[],
+                )
+            )
+    except RuntimeError:
+        announcement_events = []
+
+    merged = announcement_events + seeded_news
+    deduped: Dict[str, NewsEvent] = {}
+    for item in merged:
+        dedupe_key = f"{item.source}|{item.title}"
+        if dedupe_key not in deduped:
+            deduped[dedupe_key] = item
+    return sorted(deduped.values(), key=lambda item: item.published_at, reverse=True)[: max(limit, 10)]
+
+def build_market_live_snapshot_payload(symbol: str, timeframe: str = "1h") -> MarketLiveSnapshot:
+    started_at = time.perf_counter()
+    state = repo.snapshot()
+    uppercase_symbol = symbol.upper()
+    try:
+        normalized_timeframe = market_data.normalize_timeframe(timeframe)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    watchlist = market_data.enrich_watchlist_fast(state.watchlist)
+    if not watchlist:
+        raise HTTPException(status_code=404, detail="当前还没有可用自选品种。")
+    watch_item = next((item for item in watchlist if item.symbol == uppercase_symbol), None)
+    effective_symbol = uppercase_symbol
+    selection_corrected = False
+    if watch_item is None:
+        watch_item = watchlist[0]
+        effective_symbol = watch_item.symbol
+        selection_corrected = True
+
+    watchlist_details: List[MarketDetail] = []
+    detail_map: Dict[str, MarketDetail] = {}
+    live_detail: Optional[MarketDetail] = None
+
+    for item in watchlist:
+        seed_detail = state.market_details.get(item.symbol)
+        fallback_detail = build_runtime_market_fallback_detail(
+            symbol=item.symbol,
+            market=item.market,
+            timeframe=normalized_timeframe,
+            watch_item=item,
+            base_detail=seed_detail,
+        )
+        try:
+            detail = market_data.enrich_market_detail(
+                symbol=item.symbol,
+                market=item.market,
+                fallback_detail=fallback_detail,
+                watch_item=item,
+                timeframe=normalized_timeframe,
+                allow_rest_refresh=False,
+            )
+            if item.symbol == effective_symbol and len(detail.candles) == 0:
+                detail = market_data.enrich_market_detail(
+                    symbol=item.symbol,
+                    market=item.market,
+                    fallback_detail=fallback_detail,
+                    watch_item=item,
+                    timeframe=normalized_timeframe,
+                    allow_rest_refresh=True,
+                )
+        except RuntimeError as exc:
+            detail = build_runtime_market_fallback_detail(
+                symbol=item.symbol,
+                market=item.market,
+                timeframe=normalized_timeframe,
+                watch_item=item,
+                base_detail=seed_detail,
+                failure_reason=str(exc),
+            )
+        detail_map[item.symbol] = detail
+        watchlist_details.append(detail)
+        if item.symbol == effective_symbol:
+            live_detail = detail
+
+    if live_detail is None:
+        raise HTTPException(status_code=404, detail="当前自选中找不到该品种")
+
+    repo.sync_market_watchlist(watchlist, detail_map)
+
+    source_breakdown: Dict[str, int] = {}
+    for item in watchlist_details:
+        source_breakdown[item.source] = source_breakdown.get(item.source, 0) + 1
+    watchlist_real_detail_count = sum(1 for item in watchlist_details if item.source in {"bybit_ws", "bybit_rest"})
+    generated_in_ms = int((time.perf_counter() - started_at) * 1000)
+
+    return MarketLiveSnapshot(
+        selected_symbol=effective_symbol,
+        watchlist=watchlist,
+        detail=live_detail,
+        watchlist_details=watchlist_details,
+        diagnostics=MarketLiveDiagnostics(
+            requested_symbol=uppercase_symbol,
+            effective_symbol=effective_symbol,
+            timeframe=normalized_timeframe,
+            selection_corrected=selection_corrected,
+            detail_source=live_detail.source,
+            detail_candle_count=len(live_detail.candles),
+            watchlist_symbol_count=len(watchlist_details),
+            watchlist_real_detail_count=watchlist_real_detail_count,
+            watchlist_fallback_detail_count=max(len(watchlist_details) - watchlist_real_detail_count, 0),
+            watchlist_source_breakdown=source_breakdown,
+            generated_in_ms=generated_in_ms,
+        ),
+        generated_at=datetime.now(timezone.utc).astimezone().isoformat(),
+    )
+
+def _clear_strategy_auto_dispatch_alerts(strategy_id: str) -> bool:
+    changed = False
+    prefix = f"strategy-auto-dispatch:{strategy_id}:"
+    with repo._lock:  # type: ignore[attr-defined]
+        for alert in repo.state.alerts:  # type: ignore[attr-defined]
+            if alert.source_type != "system" or alert.acknowledged:
+                continue
+            rule_key = getattr(alert, "rule_key", None) or ""
+            if not rule_key.startswith(prefix):
+                continue
+            alert.acknowledged = True
+            changed = True
+        if changed:
+            repo._refresh_derived_state()  # type: ignore[attr-defined]
+            repo._persist()  # type: ignore[attr-defined]
+    return changed
+
+def _has_active_strategy_auto_dispatch_alert(strategy_id: str) -> bool:
+    prefix = f"strategy-auto-dispatch:{strategy_id}:"
+    with repo._lock:  # type: ignore[attr-defined]
+        return any(
+            alert.source_type == "system"
+            and not alert.acknowledged
+            and str(getattr(alert, "rule_key", None) or "").startswith(prefix)
+            for alert in repo.state.alerts  # type: ignore[attr-defined]
+        )
+
+def _clear_strategy_live_stop_loss_alerts(strategy_id: str) -> bool:
+    changed = False
+    prefix = f"strategy-live-stop-loss:{strategy_id}:"
+    with repo._lock:  # type: ignore[attr-defined]
+        for alert in repo.state.alerts:  # type: ignore[attr-defined]
+            if alert.source_type != "system" or alert.acknowledged:
+                continue
+            rule_key = getattr(alert, "rule_key", None) or ""
+            if not rule_key.startswith(prefix):
+                continue
+            alert.acknowledged = True
+            changed = True
+        if changed:
+            repo._refresh_derived_state()  # type: ignore[attr-defined]
+            repo._persist()  # type: ignore[attr-defined]
+    return changed
+
+def _has_active_strategy_live_stop_loss_alert(strategy_id: str) -> bool:
+    prefix = f"strategy-live-stop-loss:{strategy_id}:"
+    with repo._lock:  # type: ignore[attr-defined]
+        return any(
+            alert.source_type == "system"
+            and not alert.acknowledged
+            and str(getattr(alert, "rule_key", None) or "").startswith(prefix)
+            for alert in repo.state.alerts  # type: ignore[attr-defined]
+        )
+
+def _clear_strategy_position_drift_alerts(
+    strategy_id: str,
+    *,
+    resolution_detail: Optional[str] = None,
+) -> bool:
+    changed = False
+    prefix = f"strategy-position-drift:{strategy_id}:"
+    with repo._lock:  # type: ignore[attr-defined]
+        for alert in repo.state.alerts:  # type: ignore[attr-defined]
+            if alert.source_type != "system" or alert.acknowledged:
+                continue
+            rule_key = getattr(alert, "rule_key", None) or ""
+            if not rule_key.startswith(prefix):
+                continue
+            alert.acknowledged = True
+            changed = True
+        if changed:
+            repo.add_event(
+                event_type="strategy.position_drift.resolved",
+                source="quant-core",
+                severity=EventSeverity.INFO,
+                payload={
+                    "strategy_id": strategy_id,
+                    "detail": resolution_detail or "当前实际仓位已重新与策略目标对齐，偏离提醒已收起。",
+                },
+                strategy_id=strategy_id,
+            )
+            repo._refresh_derived_state()  # type: ignore[attr-defined]
+            repo._persist()  # type: ignore[attr-defined]
+    return changed
+
+def _has_active_strategy_position_drift_alert(strategy_id: str) -> bool:
+    prefix = f"strategy-position-drift:{strategy_id}:"
+    with repo._lock:  # type: ignore[attr-defined]
+        return any(
+            alert.source_type == "system"
+            and not alert.acknowledged
+            and str(getattr(alert, "rule_key", None) or "").startswith(prefix)
+            for alert in repo.state.alerts  # type: ignore[attr-defined]
+        )
+
+def _clear_strategy_exchange_rejected_alerts(
+    strategy_id: str,
+    *,
+    resolution_detail: Optional[str] = None,
+) -> bool:
+    changed = False
+    prefix = f"strategy-exchange-rejected:{strategy_id}:"
+    with repo._lock:  # type: ignore[attr-defined]
+        for alert in repo.state.alerts:  # type: ignore[attr-defined]
+            if alert.source_type != "system" or alert.acknowledged:
+                continue
+            rule_key = getattr(alert, "rule_key", None) or ""
+            if not rule_key.startswith(prefix):
+                continue
+            alert.acknowledged = True
+            changed = True
+        if changed:
+            repo.add_event(
+                event_type="strategy.exchange_order.rejection_resolved",
+                source="quant-core",
+                severity=EventSeverity.INFO,
+                payload={
+                    "strategy_id": strategy_id,
+                    "detail": resolution_detail or "真实策略委托已恢复正常，拒单提醒已收起。",
+                },
+                strategy_id=strategy_id,
+            )
+            repo._refresh_derived_state()  # type: ignore[attr-defined]
+            repo._persist()  # type: ignore[attr-defined]
+    return changed
+
+def _clear_strategy_exchange_rejection_guard_alerts(
+    strategy_id: str,
+    *,
+    resolution_detail: Optional[str] = None,
+) -> bool:
+    changed = False
+    prefix = f"strategy-exchange-rejection-guard:{strategy_id}:"
+    with repo._lock:  # type: ignore[attr-defined]
+        for alert in repo.state.alerts:  # type: ignore[attr-defined]
+            if alert.source_type != "system" or alert.acknowledged:
+                continue
+            rule_key = getattr(alert, "rule_key", None) or ""
+            if not rule_key.startswith(prefix):
+                continue
+            alert.acknowledged = True
+            changed = True
+        if changed:
+            repo.add_event(
+                event_type="strategy.exchange_order.rejection_guard.resolved",
+                source="quant-core",
+                severity=EventSeverity.INFO,
+                payload={
+                    "strategy_id": strategy_id,
+                    "detail": resolution_detail or "连续拒单熔断已解除，真实策略自动执行可继续人工复核后恢复。",
+                },
+                strategy_id=strategy_id,
+            )
+            repo._refresh_derived_state()  # type: ignore[attr-defined]
+            repo._persist()  # type: ignore[attr-defined]
+    return changed
+
+def _has_active_strategy_exchange_rejection_guard_alert(strategy_id: str) -> bool:
+    prefix = f"strategy-exchange-rejection-guard:{strategy_id}:"
+    with repo._lock:  # type: ignore[attr-defined]
+        return any(
+            alert.source_type == "system"
+            and not alert.acknowledged
+            and str(getattr(alert, "rule_key", None) or "").startswith(prefix)
+            for alert in repo.state.alerts  # type: ignore[attr-defined]
+        )
+
+def _clear_strategy_stale_order_alerts(
+    strategy_id: str,
+    *,
+    resolution_detail: Optional[str] = None,
+) -> bool:
+    changed = False
+    prefix = f"strategy-stale-order:{strategy_id}:"
+    with repo._lock:  # type: ignore[attr-defined]
+        for alert in repo.state.alerts:  # type: ignore[attr-defined]
+            if alert.source_type != "system" or alert.acknowledged:
+                continue
+            rule_key = getattr(alert, "rule_key", None) or ""
+            if not rule_key.startswith(prefix):
+                continue
+            alert.acknowledged = True
+            changed = True
+        if changed:
+            repo.add_event(
+                event_type="strategy.exchange_order.stale_resolved",
+                source="quant-core",
+                severity=EventSeverity.INFO,
+                payload={
+                    "strategy_id": strategy_id,
+                    "detail": resolution_detail or "停滞挂单异常已解除，旧提醒已收起。",
+                },
+                strategy_id=strategy_id,
+            )
+            repo._refresh_derived_state()  # type: ignore[attr-defined]
+            repo._persist()  # type: ignore[attr-defined]
+    return changed
+
+def _has_active_strategy_stale_order_alert(strategy_id: str) -> bool:
+    prefix = f"strategy-stale-order:{strategy_id}:"
+    with repo._lock:  # type: ignore[attr-defined]
+        return any(
+            alert.source_type == "system"
+            and not alert.acknowledged
+            and str(getattr(alert, "rule_key", None) or "").startswith(prefix)
+            for alert in repo.state.alerts  # type: ignore[attr-defined]
+        )
+
+def _queue_strategy_issue_review_locked(
+    *,
+    strategy_id: str,
+    strategy_name: str,
+    symbol: str,
+    mode: AccountMode,
+    issue_type: str,
+    summary: str,
+    detail: str,
+    rule_key: str,
+    severity: str = "P1",
+) -> None:
+    timestamp = datetime.now(timezone.utc).astimezone().isoformat()
+    repo._create_agent_job_locked(  # type: ignore[attr-defined]
+        AgentJobCreate(
+            job_type="review_strategy_issue",
+            context={
+                "issue_type": issue_type,
+                "summary": summary,
+                "detail": detail,
+                "severity": severity,
+                "strategy_id": strategy_id,
+                "strategy_name": strategy_name,
+                "symbol": symbol,
+                "mode": mode.value,
+                "rule_key": rule_key,
+                "triggered_at": timestamp,
+            },
+            allowed_actions=["review_strategy_issue", "summarize_execution_impact"],
+            timeout=60,
+            idempotency_key=f"strategy-issue-review:{rule_key}:{timestamp}",
+            writeback_target="strategy_activity",
+        ),
+        source="mock-orchestrator",
+    )
+
+def _record_strategy_auto_dispatch_issue(
+    strategy_id: str,
+    strategy_name: str,
+    symbol: str,
+    signal: str,
+    mode: AccountMode,
+    detail: str,
+    recommended_action: Optional[str] = None,
+) -> None:
+    rule_key = f"strategy-auto-dispatch:{strategy_id}:{signal}:{mode.value}"
+    suggested_action = recommended_action or _build_auto_dispatch_recommended_action(detail)
+    with repo._lock:  # type: ignore[attr-defined]
+        changed = repo._upsert_system_alert_locked(  # type: ignore[attr-defined]
+            rule_key=rule_key,
+            severity="P1",
+            symbol=symbol,
+            title=f"{symbol} 自动执行被拦截",
+            description=f"{strategy_name} 在 {mode.value.upper()} 自动执行时被阻断。{detail}",
+            suggested_action=suggested_action,
+            strategy_id=strategy_id,
+        )
+        if changed:
+            _queue_strategy_issue_review_locked(
+                strategy_id=strategy_id,
+                strategy_name=strategy_name,
+                symbol=symbol,
+                mode=mode,
+                issue_type="auto_dispatch_blocked",
+                summary=f"{symbol} 自动执行被拦截",
+                detail=detail,
+                rule_key=rule_key,
+            )
+            repo.add_event(
+                event_type="strategy.exchange_order.auto_blocked",
+                source="quant-core",
+                severity=EventSeverity.WARNING,
+                payload={
+                    "strategy_id": strategy_id,
+                    "strategy_name": strategy_name,
+                    "symbol": symbol,
+                    "signal": signal,
+                    "mode": mode.value,
+                    "detail": detail,
+                    "recommended_action": suggested_action,
+                },
+                symbol=symbol,
+                strategy_id=strategy_id,
+            )
+        repo._refresh_derived_state()  # type: ignore[attr-defined]
+        repo._persist()  # type: ignore[attr-defined]
+
+def _record_strategy_manual_execution_issue(
+    strategy_id: str,
+    strategy_name: str,
+    symbol: str,
+    mode: AccountMode,
+    detail: str,
+    recommended_action: Optional[str] = None,
+) -> None:
+    rule_key = f"strategy-blocked-execution:{strategy_id}:{mode.value}"
+    suggested_action = recommended_action or _build_manual_execution_recommended_action(detail)
+    with repo._lock:  # type: ignore[attr-defined]
+        changed = repo._upsert_system_alert_locked(  # type: ignore[attr-defined]
+            rule_key=rule_key,
+            severity="P1",
+            symbol=symbol,
+            title=f"{symbol} 手动策略执行被拦截",
+            description=f"{strategy_name} 在 {mode.value.upper()} 手动执行时被阻断。{detail}",
+            suggested_action=suggested_action,
+            strategy_id=strategy_id,
+        )
+        repo.add_event(
+            event_type="strategy.execution.blocked",
+            source="desktop-control",
+            severity=EventSeverity.WARNING,
+            payload={
+                "strategy_id": strategy_id,
+                "strategy_name": strategy_name,
+                "symbol": symbol,
+                "mode": mode.value,
+                "detail": detail,
+                "recommended_action": suggested_action,
+            },
+            symbol=symbol,
+            strategy_id=strategy_id,
+        )
+        if changed:
+            _queue_strategy_issue_review_locked(
+                strategy_id=strategy_id,
+                strategy_name=strategy_name,
+                symbol=symbol,
+                mode=mode,
+                issue_type="manual_execution_blocked",
+                summary=f"{symbol} 手动策略执行被拦截",
+                detail=detail,
+                rule_key=rule_key,
+            )
+            repo.add_event(
+                event_type="strategy.execution.blocked_alerted",
+                source="quant-core",
+                severity=EventSeverity.WARNING,
+                payload={
+                    "strategy_id": strategy_id,
+                    "strategy_name": strategy_name,
+                    "symbol": symbol,
+                    "mode": mode.value,
+                    "detail": detail,
+                    "recommended_action": suggested_action,
+                },
+                symbol=symbol,
+                strategy_id=strategy_id,
+            )
+        repo._refresh_derived_state()  # type: ignore[attr-defined]
+        repo._persist()  # type: ignore[attr-defined]
+
+def _clear_strategy_manual_execution_alerts(
+    strategy_id: str,
+    mode: AccountMode,
+    *,
+    resolution_detail: Optional[str] = None,
+) -> bool:
+    changed = False
+    rule_keys = {
+        f"strategy-blocked-execution:{strategy_id}:{mode.value}",
+        f"strategy-manual-execution:{strategy_id}:{mode.value}",
+    }
+    with repo._lock:  # type: ignore[attr-defined]
+        for alert in repo.state.alerts:  # type: ignore[attr-defined]
+            if alert.source_type != "system" or alert.acknowledged:
+                continue
+            if str(getattr(alert, "rule_key", None) or "") not in rule_keys:
+                continue
+            alert.acknowledged = True
+            changed = True
+        if changed:
+            repo.add_event(
+                event_type="strategy.execution.blocked_resolved",
+                source="quant-core",
+                severity=EventSeverity.INFO,
+                payload={
+                    "strategy_id": strategy_id,
+                    "mode": mode.value,
+                    "detail": resolution_detail or "后续手动策略执行已恢复成功，旧的拦截提醒已收起。",
+                },
+                strategy_id=strategy_id,
+            )
+            repo._refresh_derived_state()  # type: ignore[attr-defined]
+            repo._persist()  # type: ignore[attr-defined]
+    return changed
+
+def _sync_strategy_position_drift_issue(
+    snapshot: StrategyRuntimeSnapshot,
+    *,
+    active_order_count: int,
+) -> None:
+    if snapshot.mode == AccountMode.PAPER or snapshot.runtime_status != "running":
+        _clear_strategy_position_drift_alerts(snapshot.strategy_id)
+        return
+    if snapshot.position_alignment != "drifted":
+        detail = snapshot.position_alignment_detail or "当前仓位已经回到策略目标附近，偏离提醒已收起。"
+        _clear_strategy_position_drift_alerts(snapshot.strategy_id, resolution_detail=detail)
+        return
+
+    detail = snapshot.position_alignment_detail or "当前实际仓位与策略目标仍有偏差，尚未完全对齐。"
+    with repo._lock:  # type: ignore[attr-defined]
+        changed = repo._upsert_system_alert_locked(  # type: ignore[attr-defined]
+            rule_key=f"strategy-position-drift:{snapshot.strategy_id}:{snapshot.mode.value}",
+            severity="P1",
+            symbol=snapshot.symbol,
+            title=f"{snapshot.symbol} 策略仓位偏离目标",
+            description=(
+                f"{snapshot.strategy_name} 当前目标仓位 {snapshot.target_position_side} "
+                f"{snapshot.target_position_size or '--'}，但实际仓位仍未对齐。{detail}"
+            ),
+            suggested_action="切到策略页和账户页核对持仓、关联委托和执行预检，必要时人工补单或接管。",
+            strategy_id=snapshot.strategy_id,
+        )
+        if changed:
+            _queue_strategy_issue_review_locked(
+                strategy_id=snapshot.strategy_id,
+                strategy_name=snapshot.strategy_name,
+                symbol=snapshot.symbol,
+                mode=snapshot.mode,
+                issue_type="position_drift",
+                summary=f"{snapshot.symbol} 策略仓位偏离目标",
+                detail=detail,
+                rule_key=f"strategy-position-drift:{snapshot.strategy_id}:{snapshot.mode.value}",
+            )
+            repo.add_event(
+                event_type="strategy.position_drift.alerted",
+                source="quant-core",
+                severity=EventSeverity.WARNING,
+                payload={
+                    "strategy_id": snapshot.strategy_id,
+                    "strategy_name": snapshot.strategy_name,
+                    "symbol": snapshot.symbol,
+                    "mode": snapshot.mode.value,
+                    "target_position_side": snapshot.target_position_side,
+                    "target_position_size": snapshot.target_position_size,
+                    "detail": detail,
+                    "active_order_count": active_order_count,
+                },
+                symbol=snapshot.symbol,
+                strategy_id=snapshot.strategy_id,
+            )
+        repo._refresh_derived_state()  # type: ignore[attr-defined]
+        repo._persist()  # type: ignore[attr-defined]
+
+def _strategy_auto_dispatch_gate_reason(strategy: Optional[StrategySummary] = None) -> Optional[str]:
+    scheduler = repo.snapshot().control_snapshot.scheduler
+    if scheduler.status == "manual_override":
+        return "当前 AI 调度处于人工接管，后台自动执行已暂停。"
+    if scheduler.status == "paused":
+        return "当前 AI 调度已暂停，后台自动执行已暂停。"
+    if scheduler.freeze_publish:
+        return "当前已冻结自动发布，后台自动执行暂不继续提交新委托。"
+    if strategy is not None and strategy.mode in {AccountMode.DEMO, AccountMode.LIVE}:
+        state = repo.snapshot()
+        market = _resolve_strategy_primary_market(state, strategy)
+        symbol = strategy.symbols[0] if strategy.symbols else ""
+        if symbol:
+            public_channel_issue = get_public_execution_channel_issue(market, symbol)
+            if public_channel_issue is not None:
+                return public_channel_issue
+        private_channel_issue = get_private_execution_channel_issue(strategy.mode)
+        if private_channel_issue is not None:
+            return private_channel_issue
+    return None
+
+def _strategy_parameter_float(strategy: StrategySummary, key: str) -> Optional[float]:
+    for parameter in strategy.parameters:
+        if parameter.key != key:
+            continue
+        try:
+            return float(parameter.value)
+        except (TypeError, ValueError):
+            return None
+    return None
+
+def _strategy_parameter_int(strategy: StrategySummary, key: str) -> Optional[int]:
+    value = _strategy_parameter_float(strategy, key)
+    if value is None:
+        return None
+    return int(round(value))
+
+def _strategy_live_stop_loss_cooldown_remaining_minutes(strategy: StrategySummary) -> Optional[int]:
+    cooldown_minutes = _strategy_parameter_float(strategy, "cooldown_minutes") or 0.0
+    if cooldown_minutes <= 0:
+        return None
+    latest_guard_event = next(
+        (
+            event
+            for event in repo.snapshot().audit_events
+            if event.event_type == "strategy.exchange_stop_loss.alerted"
+            and event.strategy_id == strategy.id
+        ),
+        None,
+    )
+    if latest_guard_event is None:
+        return None
+    try:
+        occurred_at = datetime.fromisoformat(latest_guard_event.occurred_at)
+    except ValueError:
+        return None
+    elapsed_minutes = (datetime.now(timezone.utc).astimezone() - occurred_at).total_seconds() / 60
+    remaining = int(round(cooldown_minutes - elapsed_minutes))
+    return remaining if remaining > 0 else None
+
+def _strategy_exchange_rejection_guard_threshold(strategy: StrategySummary) -> int:
+    return max(_strategy_parameter_int(strategy, "rejection_guard_count") or 2, 1)
+
+def _strategy_exchange_rejection_guard_window_minutes(strategy: StrategySummary) -> int:
+    return max(_strategy_parameter_int(strategy, "rejection_guard_window_minutes") or 15, 1)
+
+def _strategy_exchange_rejection_guard_cooldown_minutes(strategy: StrategySummary) -> int:
+    return max(_strategy_parameter_int(strategy, "rejection_cooldown_minutes") or 20, 1)
+
+def _strategy_exchange_rejection_event_time(event: ExecutionEvent) -> datetime:
+    raw_value = event.payload.get("order_created_at") or event.occurred_at
+    try:
+        return datetime.fromisoformat(str(raw_value))
+    except (TypeError, ValueError):
+        return datetime.fromtimestamp(0, tz=timezone.utc)
+
+def _strategy_exchange_rejection_recent_count(strategy: StrategySummary) -> int:
+    threshold_window = _strategy_exchange_rejection_guard_window_minutes(strategy)
+    cutoff = datetime.now(timezone.utc).astimezone() - timedelta(minutes=threshold_window)
+    return sum(
+        1
+        for event in repo.snapshot().audit_events
+        if event.strategy_id == strategy.id
+        and event.event_type == "exchange_order.rejected"
+        and _strategy_exchange_rejection_event_time(event) >= cutoff
+    )
+
+def _strategy_exchange_rejection_guard_remaining_minutes(strategy: StrategySummary) -> Optional[int]:
+    if strategy.mode == AccountMode.PAPER or strategy.status in {"paper_only", "paused", "shadow"}:
+        return None
+    threshold = _strategy_exchange_rejection_guard_threshold(strategy)
+    cooldown_minutes = _strategy_exchange_rejection_guard_cooldown_minutes(strategy)
+    threshold_window = _strategy_exchange_rejection_guard_window_minutes(strategy)
+    if threshold <= 0 or cooldown_minutes <= 0 or threshold_window <= 0:
+        return None
+
+    cutoff = datetime.now(timezone.utc).astimezone() - timedelta(minutes=threshold_window)
+    recent_events = [
+        event
+        for event in repo.snapshot().audit_events
+        if event.strategy_id == strategy.id
+        and event.event_type == "exchange_order.rejected"
+        and _strategy_exchange_rejection_event_time(event) >= cutoff
+    ]
+    if len(recent_events) < threshold:
+        return None
+    latest_event = max(recent_events, key=_strategy_exchange_rejection_event_time)
+    latest_at = _strategy_exchange_rejection_event_time(latest_event)
+    elapsed_minutes = (datetime.now(timezone.utc).astimezone() - latest_at).total_seconds() / 60
+    remaining = int(round(cooldown_minutes - elapsed_minutes))
+    return remaining if remaining > 0 else None
+
+def _strategy_exchange_order_stale_minutes(strategy: StrategySummary) -> int:
+    return max(_strategy_parameter_int(strategy, "stale_order_minutes") or 20, 1)
+
+def _parse_order_created_at(value: Optional[str]) -> datetime:
+    if not value:
+        return datetime.fromtimestamp(0, tz=timezone.utc)
+    try:
+        return datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return datetime.fromtimestamp(0, tz=timezone.utc)
+
+def _strategy_active_order_stale_age_minutes(order: OrderRecord) -> int:
+    created_at = _parse_order_created_at(order.created_at)
+    elapsed_minutes = (datetime.now(timezone.utc).astimezone() - created_at).total_seconds() / 60
+    return max(int(round(elapsed_minutes)), 0)
+
+def _is_strategy_active_order_stale(strategy: StrategySummary, order: Optional[OrderRecord]) -> bool:
+    if order is None or strategy.mode == AccountMode.PAPER:
+        return False
+    return _strategy_active_order_stale_age_minutes(order) >= _strategy_exchange_order_stale_minutes(strategy)
+
+def _record_strategy_live_stop_loss_issue(
+    strategy: StrategySummary,
+    snapshot: StrategyRuntimeSnapshot,
+    position: PositionRecord,
+    *,
+    stop_loss_pct: float,
+    cancelled_count: int,
+) -> None:
+    detail = (
+        f"{snapshot.symbol} 当前参考价 {snapshot.last_price:.4f} 已触发 {stop_loss_pct:.2f}% 真实模式止损保护；"
+        "后台自动执行已暂停，请先人工复核真实仓位。"
+    )
+    with repo._lock:  # type: ignore[attr-defined]
+        changed = repo._upsert_system_alert_locked(  # type: ignore[attr-defined]
+            rule_key=f"strategy-live-stop-loss:{strategy.id}:{strategy.mode.value}",
+            severity="P0",
+            symbol=snapshot.symbol,
+            title=f"{strategy.name} 触发真实模式止损保护",
+            description=detail,
+            suggested_action="打开策略页和账户页复核真实持仓、止损参数与当前委托，确认后再决定是否恢复自动执行。",
+            strategy_id=strategy.id,
+        )
+        if changed:
+            repo.add_event(
+                event_type="strategy.exchange_stop_loss.alerted",
+                source="quant-core",
+                severity=EventSeverity.CRITICAL,
+                payload={
+                    "strategy_id": strategy.id,
+                    "strategy_name": strategy.name,
+                    "symbol": snapshot.symbol,
+                    "market": snapshot.market,
+                    "mode": strategy.mode.value,
+                    "stop_loss_pct": stop_loss_pct,
+                    "last_price": snapshot.last_price,
+                    "position_size": position.size,
+                    "avg_price": position.avg_price,
+                    "cancelled_orders": cancelled_count,
+                },
+                symbol=snapshot.symbol,
+                strategy_id=strategy.id,
+            )
+        repo._refresh_derived_state()  # type: ignore[attr-defined]
+        repo._persist()  # type: ignore[attr-defined]
+
+def _cancel_strategy_exchange_orders(
+    strategy_id: str,
+    symbol: str,
+    market: str,
+    mode: AccountMode,
+    requested_by: str,
+    reason: str,
+) -> int:
+    existing_orders = [
+        item
+        for item in parse_open_orders(use_private_only=True)
+        if item.source == "bybit_private"
+        and item.origin == "strategy"
+        and (item.strategy_id == strategy_id or item.strategy_id is None)
+        and item.symbol == symbol
+        and item.market == market
+    ]
+    cancelled_count = 0
+    for order in existing_orders:
+        cancel_exchange_order(order.order_id, requested_by, mode)
+        cancelled_count += 1
+        repo.add_event(
+            event_type="strategy.exchange_order.cancelled_inactive",
+            source="quant-core",
+            severity=EventSeverity.INFO,
+            payload={
+                "strategy_id": strategy_id,
+                "symbol": symbol,
+                "market": market,
+                "mode": mode.value,
+                "order_id": order.order_id,
+                "reason": reason,
+                "requested_by": requested_by,
+            },
+            symbol=symbol,
+            strategy_id=strategy_id,
+        )
+    if cancelled_count:
+        repo._persist()  # type: ignore[attr-defined]
+    return cancelled_count
+
+def _exchange_order_matches_requested_target(
+    order: OrderRecord,
+    quantity: float,
+    price: float,
+    *,
+    require_reduce_only: bool = False,
+) -> bool:
+    matches = (
+        abs(parse_metric_number(order.qty) - float(quantity)) <= 1e-9
+        and abs(parse_metric_number(order.price) - float(price)) <= 1e-9
+    )
+    if not matches:
+        return False
+    if not require_reduce_only:
+        return True
+    return _raw_private_order_reduce_only_enabled(_find_private_raw_open_order(order.order_id))
+
+def _apply_live_strategy_stop_loss_guards(current_items: List[StrategyRuntimeSnapshot]) -> None:
+    state = repo.snapshot()
+    strategies_by_id = {item.id: item for item in state.strategies}
+    positions = parse_positions(use_private_only=True)
+    positions_by_key = {(item.symbol, item.market): item for item in positions}
+
+    for snapshot in current_items:
+        strategy = strategies_by_id.get(snapshot.strategy_id)
+        if strategy is None:
+            continue
+        if strategy.mode not in {AccountMode.LIVE, AccountMode.DEMO}:
+            _clear_strategy_live_stop_loss_alerts(snapshot.strategy_id)
+            continue
+        if strategy.status in {"paper_only", "paused", "shadow"} or snapshot.runtime_status != "running":
+            _clear_strategy_live_stop_loss_alerts(snapshot.strategy_id)
+            continue
+
+        stop_loss_pct = _strategy_parameter_float(strategy, "stop_loss_pct")
+        cooldown_remaining = _strategy_live_stop_loss_cooldown_remaining_minutes(strategy)
+        if stop_loss_pct is None or stop_loss_pct <= 0:
+            if cooldown_remaining is not None:
+                continue
+            _clear_strategy_live_stop_loss_alerts(snapshot.strategy_id)
+            continue
+
+        position = positions_by_key.get((snapshot.symbol, snapshot.market))
+        if position is None:
+            if cooldown_remaining is not None:
+                continue
+            _clear_strategy_live_stop_loss_alerts(snapshot.strategy_id)
+            continue
+
+        current_qty = parse_metric_number(position.size) * (1 if position.side == "long" else -1)
+        current_avg = parse_metric_number(position.avg_price)
+        if abs(current_qty) <= 1e-9 or current_avg <= 0:
+            if cooldown_remaining is not None:
+                continue
+            _clear_strategy_live_stop_loss_alerts(snapshot.strategy_id)
+            continue
+
+        stop_triggered = False
+        if current_qty > 0 and snapshot.last_price <= current_avg * (1 - stop_loss_pct / 100):
+            stop_triggered = True
+        elif current_qty < 0 and snapshot.last_price >= current_avg * (1 + stop_loss_pct / 100):
+            stop_triggered = True
+
+        if not stop_triggered:
+            if _has_active_strategy_live_stop_loss_alert(snapshot.strategy_id) or cooldown_remaining is not None:
+                continue
+            _clear_strategy_live_stop_loss_alerts(snapshot.strategy_id)
+            continue
+
+        cancelled_count = _cancel_strategy_exchange_orders(
+            snapshot.strategy_id,
+            snapshot.symbol,
+            snapshot.market,
+            strategy.mode,
+            "strategy_runtime_worker",
+            "当前参考价已触发真实模式止损保护，自动撤销旧策略委托并暂停后台自动执行。",
+        )
+        _record_strategy_live_stop_loss_issue(
+            strategy,
+            snapshot,
+            position,
+            stop_loss_pct=stop_loss_pct,
+            cancelled_count=cancelled_count,
+        )
+
+def _dispatch_strategy_signal_from_state(strategy_id: str, payload: StrategyExecutionRequest) -> StrategyExecutionResult:
+    preview = _build_strategy_execution_preview_from_state(strategy_id, payload.mode)
+    state = repo.snapshot()
+    resolved_mode = payload.mode or state.workspace_preferences.selected_mode
+    strategy = next((item for item in state.strategies if item.id == strategy_id), None)
+    if strategy is None:
+        raise KeyError(strategy_id)
+    snapshot = next((item for item in state.strategy_runtime_snapshots if item.strategy_id == strategy_id), None)
+    if snapshot is None:
+        raise RuntimeError("当前策略运行态尚未准备好，请先刷新策略页后再试。")
+
+    def _record_manual_execution_blocked(detail: str, recommended_action: Optional[str] = None) -> None:
+        _record_strategy_manual_execution_issue(
+            strategy_id,
+            strategy.name,
+            snapshot.symbol,
+            resolved_mode,
+            detail,
+            recommended_action=recommended_action,
+        )
+
+    if resolved_mode == AccountMode.PAPER:
+        if not preview.allowed:
+            detail = preview.blocked_reason or "当前策略 Paper 执行预检未通过。"
+            _record_manual_execution_blocked(detail, preview.recommended_action)
+            raise StrategyExecutionBlockedError(detail, preview.recommended_action)
+        trade = repo.execute_strategy_signal(
+            strategy_id,
+            payload.requested_by,
+            payload.note,
+        )
+        _clear_strategy_manual_execution_alerts(
+            strategy_id,
+            resolved_mode,
+            resolution_detail="后续 Paper 手动策略执行已恢复成功，旧的拦截提醒已收起。",
+        )
+        return StrategyExecutionResult(
+            kind="paper_trade",
+            strategy_id=strategy_id,
+            mode=resolved_mode,
+            preview=preview,
+            trade=trade,
+            message=f"{strategy.name} 已按当前策略信号写入 Paper 成交。",
+            generated_at=datetime.now(timezone.utc).astimezone().isoformat(),
+        )
+
+    if not preview.allowed:
+        detail = preview.blocked_reason or "当前策略真实模式执行预检未通过。"
+        _record_manual_execution_blocked(detail, preview.recommended_action)
+        raise StrategyExecutionBlockedError(detail, preview.recommended_action)
+
+    side = preview.side
+    quantity = preview.quantity
+    price = preview.price
+    existing_strategy_orders = [
+        item
+        for item in parse_open_orders(use_private_only=True)
+        if item.source == "bybit_private"
+        and item.origin == "strategy"
+        and item.strategy_id == strategy_id
+        and item.symbol == snapshot.symbol
+        and item.market == snapshot.market
+    ]
+    matching_order = next((item for item in existing_strategy_orders if item.side == side), None)
+    stale_orders = [
+        item
+        for item in existing_strategy_orders
+        if matching_order is None or item.order_id != matching_order.order_id
+    ]
+
+    for stale_order in stale_orders:
+        cancel_exchange_order(stale_order.order_id, payload.requested_by, resolved_mode)
+        repo.add_event(
+            event_type="strategy.exchange_order.cancelled_stale",
+            source="quant-core",
+            severity=EventSeverity.WARNING,
+            payload={
+                "strategy_id": strategy_id,
+                "strategy_name": strategy.name,
+                "symbol": stale_order.symbol,
+                "order_id": stale_order.order_id,
+                "mode": resolved_mode.value,
+                "requested_by": payload.requested_by,
+            },
+            symbol=stale_order.symbol,
+            strategy_id=strategy_id,
+        )
+
+    preview_requires_reduce_only = _execution_preview_requires_reduce_only(preview)
+    if matching_order is not None:
+        if _exchange_order_matches_requested_target(
+            matching_order,
+            quantity,
+            price,
+            require_reduce_only=preview_requires_reduce_only,
+        ):
+            _clear_strategy_manual_execution_alerts(
+                strategy_id,
+                resolved_mode,
+                resolution_detail="后续真实手动策略执行已恢复成功，旧的拦截提醒已收起。",
+            )
+            _clear_strategy_exchange_rejected_alerts(
+                strategy_id,
+                resolution_detail="当前真实策略委托已重新进入有效状态，拒单提醒已收起。",
+            )
+            _clear_strategy_exchange_rejection_guard_alerts(
+                strategy_id,
+                resolution_detail="当前真实策略委托已重新进入有效状态，连续拒单熔断已收起。",
+            )
+            _clear_strategy_stale_order_alerts(
+                strategy_id,
+                resolution_detail="当前真实策略委托已重新进入有效状态，停滞挂单提醒已收起。",
+            )
+            repo.add_event(
+                event_type="strategy.exchange_order.reused_existing",
+                source="quant-core",
+                severity=EventSeverity.INFO,
+                payload={
+                    "strategy_id": strategy_id,
+                    "strategy_name": strategy.name,
+                    "symbol": snapshot.symbol,
+                    "mode": resolved_mode.value,
+                    "order_id": matching_order.order_id,
+                    "quantity": quantity,
+                    "price": price,
+                    "requested_by": payload.requested_by,
+                },
+                symbol=snapshot.symbol,
+                strategy_id=strategy_id,
+            )
+            repo._persist()  # type: ignore[attr-defined]
+            return StrategyExecutionResult(
+                kind="exchange_order",
+                strategy_id=strategy_id,
+                mode=resolved_mode,
+                preview=preview,
+                order=matching_order,
+                message=f"{strategy.name} 当前真实策略委托已经与最新信号一致，无需改单。",
+                generated_at=datetime.now(timezone.utc).astimezone().isoformat(),
+            )
+        order = replace_exchange_order(
+            matching_order.order_id,
+            quantity,
+            price,
+            payload.requested_by,
+            resolved_mode,
+        )
+        _clear_strategy_manual_execution_alerts(
+            strategy_id,
+            resolved_mode,
+            resolution_detail="后续真实手动策略执行已恢复成功，旧的拦截提醒已收起。",
+        )
+        _clear_strategy_exchange_rejected_alerts(
+            strategy_id,
+            resolution_detail="最新真实策略委托已成功改单，拒单提醒已收起。",
+        )
+        _clear_strategy_exchange_rejection_guard_alerts(
+            strategy_id,
+            resolution_detail="最新真实策略委托已成功改单，连续拒单熔断已收起。",
+        )
+        _clear_strategy_stale_order_alerts(
+            strategy_id,
+            resolution_detail="最新真实策略委托已成功改单，停滞挂单提醒已收起。",
+        )
+        repo.add_event(
+            event_type="strategy.exchange_order.replaced_existing",
+            source="quant-core",
+            severity=EventSeverity.INFO,
+            payload={
+                "strategy_id": strategy_id,
+                "strategy_name": strategy.name,
+                "symbol": snapshot.symbol,
+                "mode": resolved_mode.value,
+                "order_id": order.order_id,
+                "quantity": quantity,
+                "price": price,
+                "requested_by": payload.requested_by,
+            },
+            symbol=snapshot.symbol,
+            strategy_id=strategy_id,
+        )
+        repo._persist()  # type: ignore[attr-defined]
+        return StrategyExecutionResult(
+            kind="exchange_order",
+            strategy_id=strategy_id,
+            mode=resolved_mode,
+            preview=preview,
+            order=order,
+            message=f"{strategy.name} 已复用当前策略委托并更新为最新信号参数。",
+            generated_at=datetime.now(timezone.utc).astimezone().isoformat(),
+        )
+
+    order = submit_exchange_order(
+        ManualOrderRequest(
+            symbol=snapshot.symbol,
+            market=snapshot.market,
+            mode=resolved_mode,
+            side=side,
+            quantity=quantity,
+            price=price,
+            note=payload.note or f"{strategy.name} 按当前策略信号提交真实委托。",
+        ),
+        origin="strategy",
+        strategy_id=strategy_id,
+        requested_by=payload.requested_by,
+    )
+    _clear_strategy_manual_execution_alerts(
+        strategy_id,
+        resolved_mode,
+        resolution_detail="后续真实手动策略执行已恢复成功，旧的拦截提醒已收起。",
+    )
+    _clear_strategy_exchange_rejected_alerts(
+        strategy_id,
+        resolution_detail="最新真实策略委托已成功提交，拒单提醒已收起。",
+    )
+    _clear_strategy_exchange_rejection_guard_alerts(
+        strategy_id,
+        resolution_detail="最新真实策略委托已成功提交，连续拒单熔断已收起。",
+    )
+    _clear_strategy_stale_order_alerts(
+        strategy_id,
+        resolution_detail="最新真实策略委托已成功提交，停滞挂单提醒已收起。",
+    )
+    repo.add_event(
+        event_type="strategy.exchange_order.submitted",
+        source="quant-core",
+        severity=EventSeverity.INFO,
+        payload={
+            "strategy_id": strategy_id,
+            "strategy_name": strategy.name,
+            "symbol": snapshot.symbol,
+            "market": snapshot.market,
+            "mode": resolved_mode.value,
+            "signal": snapshot.signal,
+            "side": side.value,
+            "quantity": quantity,
+            "price": price,
+            "order_id": order.order_id,
+            "requested_by": payload.requested_by,
+        },
+        symbol=snapshot.symbol,
+        strategy_id=strategy_id,
+    )
+    repo._persist()  # type: ignore[attr-defined]
+    return StrategyExecutionResult(
+        kind="exchange_order",
+        strategy_id=strategy_id,
+        mode=resolved_mode,
+        preview=preview,
+        order=order,
+        message=f"{strategy.name} 已按当前策略信号向 Bybit 提交真实委托。",
+        generated_at=datetime.now(timezone.utc).astimezone().isoformat(),
+    )
+
+def _auto_dispatch_strategy_signal_changes(
+    previous_by_id: Dict[str, StrategyRuntimeSnapshot],
+    current_items: List[StrategyRuntimeSnapshot],
+) -> None:
+    state = repo.snapshot()
+    strategies_by_id = {item.id: item for item in state.strategies}
+    for snapshot in current_items:
+        previous = previous_by_id.get(snapshot.strategy_id)
+        strategy = strategies_by_id.get(snapshot.strategy_id)
+        if strategy is None:
+            continue
+        pending_reconcile = _has_active_strategy_auto_dispatch_alert(snapshot.strategy_id)
+        gate_reason = _strategy_auto_dispatch_gate_reason(strategy)
+        if strategy.mode == AccountMode.PAPER or strategy.status in {"paper_only", "paused", "shadow"}:
+            _cancel_strategy_exchange_orders(
+                snapshot.strategy_id,
+                snapshot.symbol,
+                snapshot.market,
+                strategy.mode,
+                "strategy_runtime_worker",
+                "策略已暂停或切入影子/仅模拟模式，自动撤销旧策略委托。",
+            )
+            _clear_strategy_auto_dispatch_alerts(snapshot.strategy_id)
+            continue
+        cooldown_remaining = _strategy_live_stop_loss_cooldown_remaining_minutes(strategy)
+        if cooldown_remaining is not None:
+            _cancel_strategy_exchange_orders(
+                snapshot.strategy_id,
+                snapshot.symbol,
+                snapshot.market,
+                strategy.mode,
+                "strategy_runtime_worker",
+                f"当前处于真实模式止损后冷却期，剩余约 {cooldown_remaining} 分钟，后台自动执行继续保持暂停。",
+            )
+            continue
+        if _has_active_strategy_live_stop_loss_alert(snapshot.strategy_id):
+            _cancel_strategy_exchange_orders(
+                snapshot.strategy_id,
+                snapshot.symbol,
+                snapshot.market,
+                strategy.mode,
+                "strategy_runtime_worker",
+                "当前参考价已触发真实模式止损保护，后台自动执行继续保持暂停。",
+            )
+            continue
+        rejection_guard_remaining = _strategy_exchange_rejection_guard_remaining_minutes(strategy)
+        if rejection_guard_remaining is not None:
+            _cancel_strategy_exchange_orders(
+                snapshot.strategy_id,
+                snapshot.symbol,
+                snapshot.market,
+                strategy.mode,
+                "strategy_runtime_worker",
+                f"最近真实策略委托连续拒绝，冷却剩余约 {rejection_guard_remaining} 分钟，后台自动执行继续保持暂停。",
+            )
+            continue
+        if gate_reason is not None:
+            scheduler_status = repo.snapshot().control_snapshot.scheduler.status
+            if (
+                scheduler_status in {"paused", "manual_override"}
+                or "公共 WS" in gate_reason
+                or "私有 WS" in gate_reason
+            ):
+                _cancel_strategy_exchange_orders(
+                    snapshot.strategy_id,
+                    snapshot.symbol,
+                    snapshot.market,
+                    strategy.mode,
+                    "strategy_runtime_worker",
+                    gate_reason,
+                )
+            _record_strategy_auto_dispatch_issue(
+                snapshot.strategy_id,
+                snapshot.strategy_name,
+                snapshot.symbol,
+                snapshot.signal,
+                strategy.mode,
+                gate_reason,
+            )
+            continue
+        if snapshot.runtime_status != "running":
+            _cancel_strategy_exchange_orders(
+                snapshot.strategy_id,
+                snapshot.symbol,
+                snapshot.market,
+                strategy.mode,
+                "strategy_runtime_worker",
+                "策略运行态不再处于 running，自动撤销旧策略委托。",
+            )
+            _clear_strategy_auto_dispatch_alerts(snapshot.strategy_id)
+            continue
+        active_order_count, active_order = _build_strategy_active_order_summary(
+            snapshot.strategy_id,
+            strategy.mode,
+            snapshot.symbol,
+            snapshot.market,
+        )
+        if strategy.mode != AccountMode.PAPER and active_order_count > 1:
+            active_orders = _list_strategy_active_orders(
+                snapshot.strategy_id,
+                strategy.mode,
+                snapshot.symbol,
+                snapshot.market,
+            )
+            for stale_order in active_orders[1:]:
+                cancel_exchange_order(stale_order.order_id, "strategy_runtime_worker", strategy.mode)
+                repo.add_event(
+                    event_type="strategy.exchange_order.cancelled_surplus",
+                    source="quant-core",
+                    severity=EventSeverity.WARNING,
+                    payload={
+                        "strategy_id": snapshot.strategy_id,
+                        "strategy_name": snapshot.strategy_name,
+                        "symbol": snapshot.symbol,
+                        "mode": strategy.mode.value,
+                        "kept_order_id": active_orders[0].order_id if active_orders else None,
+                        "cancelled_order_id": stale_order.order_id,
+                    },
+                    symbol=snapshot.symbol,
+                    strategy_id=snapshot.strategy_id,
+                )
+            repo._persist()  # type: ignore[attr-defined]
+            active_order_count, active_order = _build_strategy_active_order_summary(
+                snapshot.strategy_id,
+                strategy.mode,
+                snapshot.symbol,
+                snapshot.market,
+            )
+        if active_order is not None and _is_strategy_active_order_stale(strategy, active_order):
+            stale_age_minutes = _strategy_active_order_stale_age_minutes(active_order)
+            cancel_exchange_order(active_order.order_id, "strategy_runtime_worker", strategy.mode)
+            repo.add_event(
+                event_type="strategy.exchange_order.cancelled_stale_timeout",
+                source="quant-core",
+                severity=EventSeverity.WARNING,
+                payload={
+                    "strategy_id": snapshot.strategy_id,
+                    "strategy_name": snapshot.strategy_name,
+                    "symbol": snapshot.symbol,
+                    "order_id": active_order.order_id,
+                    "mode": strategy.mode.value,
+                    "stale_age_minutes": stale_age_minutes,
+                    "threshold_minutes": _strategy_exchange_order_stale_minutes(strategy),
+                },
+                symbol=snapshot.symbol,
+                strategy_id=snapshot.strategy_id,
+            )
+            repo._persist()  # type: ignore[attr-defined]
+            active_order_count = 0
+            active_order = None
+        if previous is None:
+            continue
+        if (
+            previous.signal == snapshot.signal
+            and previous.runtime_status == snapshot.runtime_status
+            and not pending_reconcile
+        ):
+            if (
+                strategy.mode != AccountMode.PAPER
+                and snapshot.runtime_status == "running"
+                and snapshot.signal != "watch"
+                and active_order_count == 0
+            ):
+                try:
+                    reconcile_preview = _build_strategy_execution_preview_from_state(snapshot.strategy_id, strategy.mode)
+                except RuntimeError:
+                    continue
+                if reconcile_preview.allowed and reconcile_preview.quantity > 0:
+                    repo.add_event(
+                        event_type="strategy.exchange_order.reconcile_missing_order",
+                        source="quant-core",
+                        severity=EventSeverity.WARNING,
+                        payload={
+                            "strategy_id": snapshot.strategy_id,
+                            "strategy_name": snapshot.strategy_name,
+                            "symbol": snapshot.symbol,
+                            "signal": snapshot.signal,
+                            "mode": strategy.mode.value,
+                            "quantity": reconcile_preview.quantity,
+                            "price": reconcile_preview.price,
+                        },
+                        symbol=snapshot.symbol,
+                        strategy_id=snapshot.strategy_id,
+                    )
+                    repo._persist()  # type: ignore[attr-defined]
+                else:
+                    continue
+            else:
+                continue
+        if snapshot.signal == "watch":
+            _cancel_strategy_exchange_orders(
+                snapshot.strategy_id,
+                snapshot.symbol,
+                snapshot.market,
+                strategy.mode,
+                "strategy_runtime_worker",
+                "策略信号回到 watch，自动撤销旧策略委托。",
+            )
+            _clear_strategy_auto_dispatch_alerts(snapshot.strategy_id)
+            continue
+        try:
+            _dispatch_strategy_signal_from_state(
+                snapshot.strategy_id,
+                StrategyExecutionRequest(
+                    requested_by="strategy_runtime_worker",
+                    note=f"{snapshot.strategy_name} 自动执行最新策略信号。",
+                    mode=strategy.mode,
+                ),
+            )
+            _clear_strategy_auto_dispatch_alerts(snapshot.strategy_id)
+        except RuntimeError as exc:
+            detail = str(exc)
+            if "无需再次提交委托" in detail:
+                _clear_strategy_auto_dispatch_alerts(snapshot.strategy_id)
+                repo.add_event(
+                    event_type="strategy.exchange_order.auto_noop",
+                    source="quant-core",
+                    severity=EventSeverity.INFO,
+                    payload={
+                        "strategy_id": snapshot.strategy_id,
+                        "strategy_name": snapshot.strategy_name,
+                        "symbol": snapshot.symbol,
+                        "signal": snapshot.signal,
+                        "mode": strategy.mode.value,
+                        "detail": detail,
+                    },
+                    symbol=snapshot.symbol,
+                    strategy_id=snapshot.strategy_id,
+                )
+                repo._persist()  # type: ignore[attr-defined]
+                continue
+            recommended_action = exc.recommended_action if isinstance(exc, StrategyExecutionBlockedError) else None
+            _record_strategy_auto_dispatch_issue(
+                snapshot.strategy_id,
+                snapshot.strategy_name,
+                snapshot.symbol,
+                snapshot.signal,
+                strategy.mode,
+                detail,
+                recommended_action=recommended_action,
+            )
+        except Exception as exc:  # pragma: no cover - defensive guard for background worker
+            _record_strategy_auto_dispatch_issue(
+                snapshot.strategy_id,
+                snapshot.strategy_name,
+                snapshot.symbol,
+                snapshot.signal,
+                strategy.mode,
+                f"后台自动执行异常：{exc}",
+            )
+
+def refresh_strategy_runtime_once(auto_dispatch: bool = False) -> List[StrategyRuntimeSnapshot]:
+    state = repo.snapshot()
+    previous_by_id = {item.strategy_id: item for item in state.strategy_runtime_snapshots}
+    evaluated_at = datetime.now(timezone.utc).astimezone().isoformat()
+    try:
+        watchlist = market_data.enrich_watchlist(state.watchlist)
+    except RuntimeError:
+        watchlist = list(state.watchlist)
+
+    watchlist_by_symbol = {item.symbol: item for item in watchlist}
+    detail_overrides: Dict[str, MarketDetail] = {}
+    snapshots: List[StrategyRuntimeSnapshot] = []
+
+    for strategy in state.strategies:
+        if not strategy.symbols:
+            continue
+        symbol = strategy.symbols[0]
+        watch_item = watchlist_by_symbol.get(symbol)
+        if watch_item is None:
+            continue
+        fallback_detail = state.market_details.get(symbol) or build_market_detail_for_watchlist(watch_item)
+        try:
+            detail = market_data.enrich_market_detail(
+                symbol=symbol,
+                market=watch_item.market,
+                fallback_detail=fallback_detail.model_copy(update={"timeframe": "1h"}),
+                watch_item=watch_item,
+                timeframe="1h",
+            )
+        except RuntimeError:
+            detail = fallback_detail.model_copy(update={"timeframe": "1h"})
+        detail_overrides[symbol] = detail
+        snapshots.append(
+            evaluate_strategy_runtime(
+                strategy=strategy,
+                detail=detail,
+                watch_item=watch_item,
+                evaluated_at=evaluated_at,
+            )
+        )
+
+    repo.sync_market_watchlist(watchlist, detail_overrides if detail_overrides else None)
+    strategy_runtime_state["last_refresh_at"] = evaluated_at
+    strategy_runtime_state["last_error"] = None
+    updated = repo.update_strategy_runtime_snapshots(snapshots)
+    _apply_live_strategy_stop_loss_guards(updated)
+    if auto_dispatch:
+        _auto_dispatch_strategy_signal_changes(previous_by_id, updated)
+    private_order_history = parse_order_history(use_private_only=True, force_refresh=True)
+    _sync_strategy_exchange_order_history_events(private_order_history)
+    _sync_strategy_exchange_order_history_alerts(private_order_history)
+    _sync_strategy_stale_order_issues(updated)
+    _sync_strategy_exchange_rejection_guards(updated)
+    _sync_strategy_position_drift_issues(updated)
+    return updated
+
+def _build_blocked_strategy_execution_preview(
+    snapshot: StrategyRuntimeSnapshot,
+    mode: AccountMode,
+    detail: str,
+) -> ExecutionPreview:
+    fallback_side = Direction.BUY if snapshot.signal != "short" else Direction.SELL
+    return ExecutionPreview(
+        symbol=snapshot.symbol,
+        market=snapshot.market,
+        mode=mode,
+        side=fallback_side,
+        origin="strategy",
+        strategy_id=snapshot.strategy_id,
+        quantity=0.0,
+        price=round(snapshot.reference_price or snapshot.last_price, 6),
+        notional="--",
+        action=snapshot.next_action,
+        allowed=False,
+        blocked_reason=detail,
+        recommended_action=_build_execution_preview_recommended_action(detail),
+        warnings=[detail],
+        current_position_side="flat",
+        current_position_size="--",
+        current_avg_price="--",
+        projected_position_side="flat",
+        projected_position_size="--",
+        projected_avg_price="--",
+        available_balance_before="--",
+        available_balance_after="--",
+        estimated_realized_pnl="--",
+        generated_at=datetime.now(timezone.utc).astimezone().isoformat(),
+    )
+
+def _decorate_strategy_runtime_item(item: StrategyRuntimeSnapshot) -> StrategyRuntimeSnapshot:
+    if _has_active_strategy_live_stop_loss_alert(item.strategy_id):
+        detail = "当前已触发真实模式止损保护，后台自动执行已暂停。"
+        return item.model_copy(
+            update={
+                "note": detail,
+                "next_action": "请先复核真实仓位、止损参数和遗留委托，再决定是否恢复自动执行。",
+                "guard_state": "live_stop_loss",
+                "guard_detail": detail,
+            }
+        )
+    state = repo.snapshot()
+    strategy = next((entry for entry in state.strategies if entry.id == item.strategy_id), None)
+    if strategy is not None:
+        public_channel_issue = (
+            get_public_execution_channel_issue(item.market, item.symbol)
+            if strategy.mode in {AccountMode.DEMO, AccountMode.LIVE} and strategy.status == "running"
+            else None
+        )
+        if public_channel_issue is not None:
+            return item.model_copy(
+                update={
+                    "note": public_channel_issue,
+                    "next_action": _build_public_execution_channel_recommended_action(public_channel_issue),
+                    "guard_state": "auto_dispatch_blocked",
+                    "guard_detail": public_channel_issue,
+                }
+            )
+        private_channel_issue = (
+            get_private_execution_channel_issue(strategy.mode)
+            if strategy.mode in {AccountMode.DEMO, AccountMode.LIVE} and strategy.status == "running"
+            else None
+        )
+        if private_channel_issue is not None:
+            return item.model_copy(
+                update={
+                    "note": private_channel_issue,
+                    "next_action": _build_private_execution_channel_recommended_action(
+                        private_channel_issue,
+                        last_error=str(private_realtime.get_status().get("last_error") or "").strip() or None,
+                    ),
+                    "guard_state": "auto_dispatch_blocked",
+                    "guard_detail": private_channel_issue,
+                }
+            )
+        cooldown_remaining = _strategy_live_stop_loss_cooldown_remaining_minutes(strategy)
+        if cooldown_remaining is not None:
+            detail = f"当前处于真实模式止损后冷却期，剩余约 {cooldown_remaining} 分钟。"
+            return item.model_copy(
+                update={
+                    "note": detail,
+                    "next_action": "冷却结束前不再恢复自动执行；请先人工复核真实仓位和策略参数。",
+                    "guard_state": "cooldown",
+                    "guard_detail": detail,
+                }
+            )
+        if _has_active_strategy_stale_order_alert(item.strategy_id):
+            detail = "当前存在长时间未处理的真实策略挂单，请先复核并决定是否人工处理或等待后台重发。"
+            return item.model_copy(
+                update={
+                    "note": detail,
+                    "next_action": "优先检查当前挂单价格与市场偏离，再决定是否人工改单、撤单或切入人工接管。",
+                    "guard_state": "auto_dispatch_blocked",
+                    "guard_detail": detail,
+                }
+            )
+        rejection_guard_remaining = _strategy_exchange_rejection_guard_remaining_minutes(strategy)
+        if rejection_guard_remaining is not None:
+            detail = f"最近真实策略委托连续拒绝，自动执行冷却剩余约 {rejection_guard_remaining} 分钟。"
+            return item.model_copy(
+                update={
+                    "note": detail,
+                    "next_action": "请先核对真实仓位、最小下单限制和委托参数，确认无误后再恢复自动执行。",
+                    "guard_state": "auto_dispatch_blocked",
+                    "guard_detail": detail,
+                }
+            )
+    if _has_active_strategy_auto_dispatch_alert(item.strategy_id):
+        state = repo.snapshot()
+        alert = _find_latest_active_system_alert_by_prefix(state, f"strategy-auto-dispatch:{item.strategy_id}:")
+        detail = "当前自动执行被系统拦截，请先查看执行预检和当前委托。"
+        next_action = "必要时进入人工接管，确认处理完成后再恢复自动执行。"
+        if alert is not None and "私有 WS" in alert.description:
+            detail = alert.description
+            next_action = alert.suggested_action or _build_private_execution_channel_recommended_action(alert.description)
+        elif alert is not None and ("公共 WS" in alert.description or "公共实时链路" in alert.description):
+            detail = alert.description
+            next_action = alert.suggested_action or _build_public_execution_channel_recommended_action(alert.description)
+        return item.model_copy(
+            update={
+                "note": detail,
+                "next_action": next_action,
+                "guard_state": "auto_dispatch_blocked",
+                "guard_detail": detail,
+            }
+        )
+    return item.model_copy(update={"guard_state": "none", "guard_detail": None})
+
+def _list_strategy_active_orders(
+    strategy_id: str,
+    mode: AccountMode,
+    symbol: str,
+    market: str,
+) -> List[OrderRecord]:
+    if mode == AccountMode.PAPER:
+        orders = repo.get_paper_orders()
+    else:
+        orders = parse_open_orders(use_private_only=True)
+    matching = [
+        item
+        for item in orders
+        if item.origin == "strategy"
+        and item.symbol == symbol
+        and item.market == market
+        and (item.strategy_id == strategy_id or (item.strategy_id is None and mode != AccountMode.PAPER))
+    ]
+    matching.sort(key=lambda item: item.created_at, reverse=True)
+    return matching
+
+def _build_strategy_active_order_summary(
+    strategy_id: str,
+    mode: AccountMode,
+    symbol: str,
+    market: str,
+) -> tuple[int, Optional[OrderRecord]]:
+    matching = _list_strategy_active_orders(strategy_id, mode, symbol, market)
+    return len(matching), matching[0] if matching else None
+
+def _build_strategy_position_alignment_summary(
+    strategy_id: str,
+    mode: AccountMode,
+    symbol: str,
+    market: str,
+    active_order_count: int,
+) -> tuple[str, Optional[str], str, Optional[str]]:
+    if mode == AccountMode.PAPER:
+        positions = repo.get_paper_positions()
+    else:
+        positions = parse_positions(use_private_only=True)
+    position = next((item for item in positions if item.symbol == symbol and item.market == market), None)
+    current_signed_qty = 0.0
+    if position is not None:
+        current_signed_qty = parse_metric_number(position.size) * (1 if position.side == "long" else -1)
+
+    try:
+        hint = repo.get_strategy_signal_order_hint(strategy_id)
+        target_signed_qty = float(hint["target_signed_qty"])
+        if mode != AccountMode.PAPER:
+            existing_strategy_orders = _list_strategy_private_open_orders(strategy_id, symbol, market)
+            _release_order_ids, released_buy_reservation = _strategy_order_release_context(existing_strategy_orders)
+            reusable_open_order_abs = _strategy_reusable_open_order_abs(
+                existing_strategy_orders,
+                raw_target_signed_qty=target_signed_qty,
+            )
+            target_resolution = _resolve_balance_linked_strategy_target_signed_qty(
+                symbol=symbol,
+                market=market,
+                mode=mode,
+                price=float(hint["price"]),
+                raw_target_signed_qty=target_signed_qty,
+                current_signed_qty=current_signed_qty,
+                risk_budget=hint.get("risk_budget"),
+                released_buy_reservation=released_buy_reservation,
+                reusable_open_order_abs=reusable_open_order_abs,
+            )
+            target_signed_qty = float(target_resolution["display_target_signed_qty"])
+            if target_resolution["blocked_reason"]:
+                return (
+                    repo._classify_position_side(target_signed_qty),  # type: ignore[attr-defined]
+                    normalize_number(abs(target_signed_qty), 6),
+                    "unknown",
+                    str(target_resolution["blocked_reason"]),
+                )
+    except Exception:
+        return "flat", None, "unknown", "当前策略信号仍在观察或目标仓位暂不可用。"
+
+    delta_signed_qty = round(target_signed_qty - current_signed_qty, 12)
+    target_position_side = repo._classify_position_side(target_signed_qty)  # type: ignore[attr-defined]
+    target_position_size = normalize_number(abs(target_signed_qty), 6)
+
+    if abs(delta_signed_qty) <= 1e-9:
+        return (
+            target_position_side,
+            target_position_size,
+            "aligned",
+            "当前实际仓位已与策略目标仓位对齐。",
+        )
+    if active_order_count > 0:
+        return (
+            target_position_side,
+            target_position_size,
+            "reconciling",
+            "当前存在策略关联委托，正在向目标仓位对齐。",
+        )
+    return (
+        target_position_side,
+        target_position_size,
+        "drifted",
+        "当前实际仓位与策略目标仍有偏差，尚未完全对齐。",
+    )
+
+def _build_strategy_current_position_summary(
+    mode: AccountMode,
+    symbol: str,
+    market: str,
+) -> tuple[str, Optional[str], Optional[str]]:
+    if mode == AccountMode.PAPER:
+        positions = repo.get_paper_positions()
+    else:
+        positions = parse_positions(use_private_only=True)
+    position = next((item for item in positions if item.symbol == symbol and item.market == market), None)
+    if position is None:
+        return "flat", None, None
+    avg_price = position.avg_price if position.avg_price not in {"", "--"} else None
+    return position.side, position.size, avg_price
+
+def _sync_strategy_exchange_order_history_events(history_items: List[OrderRecord]) -> None:
+    def _event_payload_matches(item: ExecutionEvent, event_type: str, order_id: str) -> bool:
+        return item.event_type == event_type and str(item.payload.get("order_id") or "") == order_id
+
+    changed = False
+    with repo._lock:  # type: ignore[attr-defined]
+        for order in history_items:
+            if order.origin != "strategy" or not order.strategy_id:
+                continue
+            status_normalized = order.status.lower()
+            if "fill" in status_normalized:
+                event_type = "exchange_order.filled"
+                severity = EventSeverity.INFO
+                detail = f"真实策略委托已成交 {order.qty}@{order.price} ({order.status})"
+            elif "cancel" in status_normalized:
+                event_type = "exchange_order.cancelled"
+                severity = EventSeverity.WARNING
+                detail = f"真实策略委托已撤销 {order.qty}@{order.price} ({order.status})"
+            elif "reject" in status_normalized:
+                event_type = "exchange_order.rejected"
+                severity = EventSeverity.ERROR
+                detail = f"真实策略委托被拒绝 {order.qty}@{order.price} ({order.status})"
+            else:
+                continue
+            if any(_event_payload_matches(event, event_type, order.order_id) for event in repo.state.audit_events):  # type: ignore[attr-defined]
+                continue
+            repo.add_event(
+                event_type=event_type,
+                source="quant-core",
+                severity=severity,
+                payload={
+                    "order_id": order.order_id,
+                    "order_created_at": order.created_at,
+                    "strategy_id": order.strategy_id,
+                    "symbol": order.symbol,
+                    "market": order.market,
+                    "status": order.status,
+                    "qty": order.qty,
+                    "price": order.price,
+                    "detail": detail,
+                },
+                symbol=order.symbol,
+                strategy_id=order.strategy_id,
+            )
+            changed = True
+        if changed:
+            repo._persist()  # type: ignore[attr-defined]
+
+def _sync_strategy_exchange_order_history_alerts(history_items: List[OrderRecord]) -> None:
+    snapshot_state = repo.snapshot()
+    strategies_by_id = {item.id: item for item in snapshot_state.strategies}
+    fallback_mode = snapshot_state.workspace_preferences.selected_mode
+
+    def _parse_order_time(value: Optional[str]) -> datetime:
+        if not value:
+            return datetime.fromtimestamp(0, tz=timezone.utc)
+        try:
+            return datetime.fromisoformat(value)
+        except ValueError:
+            return datetime.fromtimestamp(0, tz=timezone.utc)
+
+    latest_by_strategy: Dict[str, OrderRecord] = {}
+    for order in history_items:
+        if order.origin != "strategy" or not order.strategy_id:
+            continue
+        current = latest_by_strategy.get(order.strategy_id)
+        if current is None or _parse_order_time(order.created_at) >= _parse_order_time(current.created_at):
+            latest_by_strategy[order.strategy_id] = order
+
+    for strategy_id, order in latest_by_strategy.items():
+        if "reject" not in order.status.lower():
+            _clear_strategy_exchange_rejected_alerts(
+                strategy_id,
+                resolution_detail="最新真实策略委托已不再处于拒单状态，异常提醒已收起。",
+            )
+            continue
+        strategy = strategies_by_id.get(strategy_id)
+        strategy_name = strategy.name if strategy is not None else strategy_id
+        issue_mode = strategy.mode if strategy is not None else fallback_mode
+        changed = False
+        with repo._lock:  # type: ignore[attr-defined]
+            changed = repo._upsert_system_alert_locked(  # type: ignore[attr-defined]
+                rule_key=f"strategy-exchange-rejected:{strategy_id}:{order.order_id}",
+                severity="P1",
+                symbol=order.symbol,
+                title=f"{order.symbol} 策略真实委托被拒绝",
+                description=(
+                    f"{strategy_name} 最近一笔真实策略委托被交易所拒绝。"
+                    f"委托参数 {order.qty}@{order.price}，状态 {order.status}。"
+                ),
+                suggested_action="打开策略页、交易记录和账户页复核真实仓位、委托参数与模式配置。",
+                strategy_id=strategy_id,
+            )
+            if changed:
+                _queue_strategy_issue_review_locked(
+                    strategy_id=strategy_id,
+                    strategy_name=strategy_name,
+                    symbol=order.symbol,
+                    mode=issue_mode,
+                    issue_type="exchange_order_rejected",
+                    summary=f"{order.symbol} 策略真实委托被拒绝",
+                    detail=f"委托参数 {order.qty}@{order.price}，状态 {order.status}。",
+                    rule_key=f"strategy-exchange-rejected:{strategy_id}:{order.order_id}",
+                )
+                repo._refresh_derived_state()  # type: ignore[attr-defined]
+                repo._persist()  # type: ignore[attr-defined]
+
+def _sync_strategy_exchange_rejection_guards(current_items: List[StrategyRuntimeSnapshot]) -> None:
+    state = repo.snapshot()
+    strategies_by_id = {item.id: item for item in state.strategies}
+    for snapshot in current_items:
+        strategy = strategies_by_id.get(snapshot.strategy_id)
+        if strategy is None:
+            continue
+        remaining = _strategy_exchange_rejection_guard_remaining_minutes(strategy)
+        if remaining is None:
+            _clear_strategy_exchange_rejection_guard_alerts(
+                snapshot.strategy_id,
+                resolution_detail="连续拒单熔断已结束，真实策略自动执行可在人工确认后恢复。",
+            )
+            continue
+        rejection_count = _strategy_exchange_rejection_recent_count(strategy)
+        detail = (
+            f"最近 {_strategy_exchange_rejection_guard_window_minutes(strategy)} 分钟真实策略委托已连续拒绝 "
+            f"{rejection_count} 次，自动执行冷却剩余约 {remaining} 分钟。"
+        )
+        with repo._lock:  # type: ignore[attr-defined]
+            changed = repo._upsert_system_alert_locked(  # type: ignore[attr-defined]
+                rule_key=f"strategy-exchange-rejection-guard:{snapshot.strategy_id}:{snapshot.mode.value}",
+                severity="P1",
+                symbol=snapshot.symbol,
+                title=f"{snapshot.symbol} 策略连续拒单已熔断",
+                description=f"{snapshot.strategy_name} 当前已进入连续拒单冷却期。{detail}",
+                suggested_action="先复核交易所模式、仓位、委托参数和最小下单约束，确认后再恢复自动执行。",
+                strategy_id=snapshot.strategy_id,
+            )
+            if changed:
+                _queue_strategy_issue_review_locked(
+                    strategy_id=snapshot.strategy_id,
+                    strategy_name=snapshot.strategy_name,
+                    symbol=snapshot.symbol,
+                    mode=snapshot.mode,
+                    issue_type="exchange_rejection_guard",
+                    summary=f"{snapshot.symbol} 策略连续拒单已熔断",
+                    detail=detail,
+                    rule_key=f"strategy-exchange-rejection-guard:{snapshot.strategy_id}:{snapshot.mode.value}",
+                )
+                repo.add_event(
+                    event_type="strategy.exchange_order.rejection_guard.alerted",
+                    source="quant-core",
+                    severity=EventSeverity.WARNING,
+                    payload={
+                        "strategy_id": snapshot.strategy_id,
+                        "strategy_name": snapshot.strategy_name,
+                        "symbol": snapshot.symbol,
+                        "mode": snapshot.mode.value,
+                        "rejection_count": rejection_count,
+                        "window_minutes": _strategy_exchange_rejection_guard_window_minutes(strategy),
+                        "cooldown_remaining_minutes": remaining,
+                        "detail": detail,
+                    },
+                    symbol=snapshot.symbol,
+                    strategy_id=snapshot.strategy_id,
+                )
+                repo._refresh_derived_state()  # type: ignore[attr-defined]
+                repo._persist()  # type: ignore[attr-defined]
+
+def _sync_strategy_stale_order_issues(current_items: List[StrategyRuntimeSnapshot]) -> None:
+    state = repo.snapshot()
+    strategies_by_id = {item.id: item for item in state.strategies}
+    for snapshot in current_items:
+        strategy = strategies_by_id.get(snapshot.strategy_id)
+        if strategy is None:
+            continue
+        active_order_count, active_order = _build_strategy_active_order_summary(
+            snapshot.strategy_id,
+            snapshot.mode,
+            snapshot.symbol,
+            snapshot.market,
+        )
+        if (
+            snapshot.mode == AccountMode.PAPER
+            or snapshot.runtime_status != "running"
+            or active_order_count == 0
+            or active_order is None
+            or not _is_strategy_active_order_stale(strategy, active_order)
+        ):
+            _clear_strategy_stale_order_alerts(
+                snapshot.strategy_id,
+                resolution_detail="当前已不再存在长时间未处理的策略挂单，停滞提醒已收起。",
+            )
+            continue
+
+        stale_age_minutes = _strategy_active_order_stale_age_minutes(active_order)
+        detail = (
+            f"当前真实策略委托已挂单约 {stale_age_minutes} 分钟仍未成交或撤单，"
+            f"超过 { _strategy_exchange_order_stale_minutes(strategy) } 分钟阈值。"
+        )
+        with repo._lock:  # type: ignore[attr-defined]
+            changed = repo._upsert_system_alert_locked(  # type: ignore[attr-defined]
+                rule_key=f"strategy-stale-order:{snapshot.strategy_id}:{active_order.order_id}",
+                severity="P1",
+                symbol=snapshot.symbol,
+                title=f"{snapshot.symbol} 策略挂单停滞",
+                description=f"{snapshot.strategy_name} 当前存在长时间未处理的真实策略委托。{detail}",
+                suggested_action="先复核委托价格是否偏离、交易所限制与市场状态；必要时改价、撤单或人工接管。",
+                strategy_id=snapshot.strategy_id,
+            )
+            if changed:
+                _queue_strategy_issue_review_locked(
+                    strategy_id=snapshot.strategy_id,
+                    strategy_name=snapshot.strategy_name,
+                    symbol=snapshot.symbol,
+                    mode=snapshot.mode,
+                    issue_type="stale_order",
+                    summary=f"{snapshot.symbol} 策略挂单停滞",
+                    detail=detail,
+                    rule_key=f"strategy-stale-order:{snapshot.strategy_id}:{active_order.order_id}",
+                )
+                repo.add_event(
+                    event_type="strategy.exchange_order.stale_alerted",
+                    source="quant-core",
+                    severity=EventSeverity.WARNING,
+                    payload={
+                        "strategy_id": snapshot.strategy_id,
+                        "strategy_name": snapshot.strategy_name,
+                        "symbol": snapshot.symbol,
+                        "mode": snapshot.mode.value,
+                        "order_id": active_order.order_id,
+                        "stale_age_minutes": stale_age_minutes,
+                        "threshold_minutes": _strategy_exchange_order_stale_minutes(strategy),
+                        "detail": detail,
+                    },
+                    symbol=snapshot.symbol,
+                    strategy_id=snapshot.strategy_id,
+                )
+                repo._refresh_derived_state()  # type: ignore[attr-defined]
+                repo._persist()  # type: ignore[attr-defined]
+
+def _build_strategy_last_execution_summary(
+    strategy_id: str,
+    symbol: str,
+    market: str,
+    mode: AccountMode,
+    recent_order_history: Optional[List[OrderRecord]] = None,
+) -> tuple[Optional[str], Optional[str], Optional[EventSeverity], Optional[str], Optional[str]]:
+    strategy_execution_events = {
+        "strategy.exchange_order.cancelled_inactive",
+        "strategy.exchange_order.cancelled_stale",
+        "strategy.exchange_order.cancelled_stale_timeout",
+        "strategy.exchange_order.reused_existing",
+        "strategy.exchange_order.replaced_existing",
+        "strategy.exchange_order.submitted",
+        "strategy.exchange_order.reconcile_missing_order",
+        "strategy.exchange_order.auto_blocked",
+        "strategy.exchange_order.auto_noop",
+        "strategy.execution.blocked",
+    }
+
+    def _parse_iso(value: Optional[str]) -> datetime:
+        if not value:
+            return datetime.fromtimestamp(0, tz=timezone.utc)
+        try:
+            return datetime.fromisoformat(value)
+        except ValueError:
+            return datetime.fromtimestamp(0, tz=timezone.utc)
+
+    best_event_type: Optional[str] = None
+    best_occurred_at: Optional[str] = None
+    best_severity: Optional[EventSeverity] = None
+    best_detail: Optional[str] = None
+    best_recommended_action: Optional[str] = None
+    best_at = datetime.fromtimestamp(0, tz=timezone.utc)
+
+    for event in repo.snapshot().audit_events:
+        if event.strategy_id != strategy_id:
+            continue
+        if not (
+            event.event_type in strategy_execution_events
+            or event.event_type.startswith("strategy.paper_trade.")
+            or event.event_type == "strategy.paper_stop_loss.executed"
+            or event.event_type.startswith("exchange_order.")
+        ):
+            continue
+        detail = (
+            str(event.payload.get("detail") or "").strip()
+            or str(event.payload.get("message") or "").strip()
+            or (
+                f'order_id={event.payload.get("order_id")}'
+                if event.payload.get("order_id")
+                else event.event_type
+            )
+        )
+        event_sort_key = event.payload.get("order_created_at") if event.event_type.startswith("exchange_order.") else event.occurred_at
+        occurred_at = _parse_iso(event_sort_key)
+        if occurred_at >= best_at:
+            best_event_type = event.event_type
+            best_occurred_at = event.occurred_at
+            best_severity = event.severity
+            best_detail = detail
+            best_recommended_action = str(event.payload.get("recommended_action") or "").strip() or None
+            best_at = occurred_at
+
+    if mode != AccountMode.PAPER:
+        history_items = recent_order_history if recent_order_history is not None else parse_order_history(use_private_only=True)
+        for order in history_items:
+            if order.origin != "strategy":
+                continue
+            if order.symbol != symbol or order.market != market:
+                continue
+            if order.strategy_id not in {strategy_id, None}:
+                continue
+            order_at = _parse_iso(order.created_at)
+            if order_at < best_at:
+                continue
+            status_normalized = order.status.lower()
+            if "fill" in status_normalized:
+                event_type = "exchange_order.filled"
+                severity = EventSeverity.INFO
+                detail = f"最近真实策略委托已成交 {order.qty}@{order.price} ({order.status})"
+            elif "cancel" in status_normalized:
+                event_type = "exchange_order.cancelled"
+                severity = EventSeverity.WARNING
+                detail = f"最近真实策略委托已撤销 {order.qty}@{order.price} ({order.status})"
+            elif "reject" in status_normalized:
+                event_type = "exchange_order.rejected"
+                severity = EventSeverity.ERROR
+                detail = f"最近真实策略委托被拒绝 {order.qty}@{order.price} ({order.status})"
+            else:
+                event_type = "exchange_order.updated"
+                severity = EventSeverity.INFO
+                detail = f"最近真实策略委托状态 {order.status} {order.qty}@{order.price}"
+            best_event_type = event_type
+            best_occurred_at = order.created_at
+            best_severity = severity
+            best_detail = detail
+            best_recommended_action = None
+            best_at = order_at
+
+    return best_event_type, best_occurred_at, best_severity, best_detail, best_recommended_action
+
+def _sync_strategy_position_drift_issues(current_items: List[StrategyRuntimeSnapshot]) -> None:
+    for snapshot in current_items:
+        active_order_count, _active_order = _build_strategy_active_order_summary(
+            snapshot.strategy_id,
+            snapshot.mode,
+            snapshot.symbol,
+            snapshot.market,
+        )
+        (
+            target_position_side,
+            target_position_size,
+            position_alignment,
+            position_alignment_detail,
+        ) = _build_strategy_position_alignment_summary(
+            snapshot.strategy_id,
+            snapshot.mode,
+            snapshot.symbol,
+            snapshot.market,
+            active_order_count,
+        )
+        enriched = snapshot.model_copy(
+            update={
+                "target_position_side": target_position_side,
+                "target_position_size": target_position_size,
+                "position_alignment": position_alignment,
+                "position_alignment_detail": position_alignment_detail,
+            }
+        )
+        _sync_strategy_position_drift_issue(enriched, active_order_count=active_order_count)
+
+def _get_strategy_signal_order_hint_for_runtime_snapshot(
+    strategy_id: str,
+    runtime_snapshot: StrategyRuntimeSnapshot,
+) -> Dict[str, Any]:
+    current_getter = repo.get_strategy_signal_order_hint
+    if getattr(current_getter, "__func__", None) is AppRepository.get_strategy_signal_order_hint:
+        with repo._lock:  # type: ignore[attr-defined]
+            strategy = repo._find_strategy(strategy_id)  # type: ignore[attr-defined]
+            target_signed_qty = repo._resolve_strategy_target_signed_qty_locked(  # type: ignore[attr-defined]
+                strategy,
+                runtime_snapshot,
+            )
+        if target_signed_qty is None:
+            raise ValueError("当前策略仍处于 watch 观察状态，暂时没有可提交的委托方向。")
+        price = round(runtime_snapshot.reference_price or runtime_snapshot.last_price, 6)
+        return {
+            "strategy_id": strategy.id,
+            "strategy_name": strategy.name,
+            "symbol": runtime_snapshot.symbol,
+            "market": runtime_snapshot.market,
+            "signal": runtime_snapshot.signal,
+            "risk_budget": strategy.risk_budget,
+            "target_signed_qty": target_signed_qty,
+            "price": price,
+            "note": runtime_snapshot.next_action,
+        }
+
+    with repo._lock:  # type: ignore[attr-defined]
+        original_snapshots = list(repo.state.strategy_runtime_snapshots)
+        next_snapshots = [
+            runtime_snapshot if item.strategy_id == strategy_id else item
+            for item in repo.state.strategy_runtime_snapshots
+        ]
+        if not any(item.strategy_id == strategy_id for item in repo.state.strategy_runtime_snapshots):
+            next_snapshots.append(runtime_snapshot)
+        repo.state.strategy_runtime_snapshots = next_snapshots
+    try:
+        return current_getter(strategy_id)
+    finally:
+        with repo._lock:  # type: ignore[attr-defined]
+            repo.state.strategy_runtime_snapshots = original_snapshots
+
+def _build_strategy_execution_preview_from_state(
+    strategy_id: str,
+    mode: Optional[AccountMode] = None,
+    runtime_snapshot_override: Optional[StrategyRuntimeSnapshot] = None,
+) -> ExecutionPreview:
+    state = repo.snapshot()
+    resolved_mode = mode or state.workspace_preferences.selected_mode
+    runtime_health = _build_strategy_runtime_worker_health()
+    strategy = next((item for item in state.strategies if item.id == strategy_id), None)
+    if strategy is None:
+        raise KeyError(strategy_id)
+
+    snapshot = runtime_snapshot_override or next(
+        (item for item in state.strategy_runtime_snapshots if item.strategy_id == strategy_id),
+        None,
+    )
+    if snapshot is None:
+        raise RuntimeError("当前策略运行态尚未准备好，请先刷新策略页后再试。")
+    if snapshot.runtime_status == "paused":
+        raise RuntimeError("当前策略已暂停，不能生成执行预检。")
+    if resolved_mode == AccountMode.PAPER:
+        if not (strategy.mode == AccountMode.PAPER or strategy.status == "paper_only"):
+            raise RuntimeError("当前策略并未运行在 Paper 模式，不能生成 Paper 执行预检。")
+    elif strategy.mode != resolved_mode:
+        raise RuntimeError(f"当前策略并未运行在 {resolved_mode.value.upper()} 模式，不能直接按该模式执行。")
+
+    if resolved_mode == AccountMode.PAPER:
+        preview = snapshot.execution_preview
+        if preview is None:
+            raise RuntimeError("当前策略没有可执行的 Paper 预检结果。")
+        return preview
+
+    public_channel_issue = get_public_execution_channel_issue(snapshot.market, snapshot.symbol)
+    if public_channel_issue is not None:
+        raise RuntimeError(public_channel_issue)
+
+    private_channel_issue = get_private_execution_channel_issue(resolved_mode)
+    if private_channel_issue is not None:
+        raise RuntimeError(private_channel_issue)
+
+    if runtime_health["runtime_last_error"]:
+        raise RuntimeError("当前策略运行线程存在异常，请先在设置页恢复运行线程后再执行真实策略。")
+    if runtime_health["runtime_worker_stale"]:
+        raise RuntimeError("当前策略运行线程已停滞，请先在设置页恢复运行线程并确认最新信号后再执行真实策略。")
+
+    cooldown_remaining = _strategy_live_stop_loss_cooldown_remaining_minutes(strategy)
+    if cooldown_remaining is not None:
+        raise RuntimeError(f"当前处于真实模式止损后冷却期，剩余约 {cooldown_remaining} 分钟，请先人工复核后再恢复策略执行。")
+    rejection_guard_remaining = _strategy_exchange_rejection_guard_remaining_minutes(strategy)
+    if rejection_guard_remaining is not None:
+        raise RuntimeError(
+            f"最近真实策略委托连续拒绝，自动执行冷却剩余约 {rejection_guard_remaining} 分钟，请先人工复核交易所约束和委托参数。"
+        )
+
+    if runtime_snapshot_override is not None:
+        hint = _get_strategy_signal_order_hint_for_runtime_snapshot(strategy_id, snapshot)
+    else:
+        hint = repo.get_strategy_signal_order_hint(strategy_id)
+    positions = parse_positions(use_private_only=True)
+    position = next(
+        (
+            item
+            for item in positions
+            if item.symbol == hint["symbol"] and item.market == hint["market"]
+        ),
+        None,
+    )
+    current_signed_qty = 0.0
+    if position is not None:
+        current_signed_qty = parse_metric_number(position.size) * (1 if position.side == "long" else -1)
+    existing_strategy_orders = _list_strategy_private_open_orders(strategy_id, hint["symbol"], hint["market"])
+    release_order_ids, released_buy_reservation = _strategy_order_release_context(existing_strategy_orders)
+    reusable_open_order_abs = _strategy_reusable_open_order_abs(
+        existing_strategy_orders,
+        raw_target_signed_qty=float(hint["target_signed_qty"]),
+    )
+    target_resolution = _resolve_balance_linked_strategy_target_signed_qty(
+        symbol=hint["symbol"],
+        market=hint["market"],
+        mode=resolved_mode,
+        price=float(hint["price"]),
+        raw_target_signed_qty=float(hint["target_signed_qty"]),
+        current_signed_qty=current_signed_qty,
+        risk_budget=hint.get("risk_budget"),
+        released_buy_reservation=released_buy_reservation,
+        reusable_open_order_abs=reusable_open_order_abs,
+    )
+    target_signed_qty = float(target_resolution["target_signed_qty"])
+    preview_target_signed_qty = float(target_resolution["preview_target_signed_qty"])
+    strategy_adjustment_warnings = list(target_resolution["warnings"])
+    delta_signed_qty = round(preview_target_signed_qty - current_signed_qty, 12)
+    if abs(delta_signed_qty) <= 1e-9 and target_resolution["blocked_reason"] is not None:
+        current_position_side = repo._classify_position_side(current_signed_qty)  # type: ignore[attr-defined]
+        current_position_size = repo._format_quantity(abs(current_signed_qty), 6)  # type: ignore[attr-defined]
+        current_avg_price = position.avg_price if position is not None and abs(current_signed_qty) > 1e-9 else "--"
+        return ExecutionPreview(
+            symbol=hint["symbol"],
+            market=hint["market"],
+            mode=resolved_mode,
+            side=Direction.BUY if float(hint["target_signed_qty"]) > current_signed_qty else Direction.SELL,
+            origin="strategy",
+            strategy_id=strategy_id,
+            quantity=0.0,
+            price=round(float(hint["price"]), 6),
+            notional=format_usdt(0.0),
+            action=hint["note"] or "等待真实执行引擎",
+            allowed=False,
+            blocked_reason=str(target_resolution["blocked_reason"]),
+            recommended_action=target_resolution["recommended_action"],
+            sizing_risk_budget=target_resolution["sizing_risk_budget"],
+            sizing_budget_notional=target_resolution["sizing_budget_notional"],
+            sizing_minimum_required_notional=target_resolution["sizing_minimum_required_notional"],
+            sizing_available_balance_gap=target_resolution["sizing_available_balance_gap"],
+            warnings=strategy_adjustment_warnings,
+            current_position_side=current_position_side,
+            current_position_size=current_position_size,
+            current_avg_price=current_avg_price,
+            projected_position_side=current_position_side,
+            projected_position_size=current_position_size,
+            projected_avg_price=current_avg_price,
+            available_balance_before="--",
+            available_balance_after="--",
+            estimated_realized_pnl="--",
+            generated_at=datetime.now(timezone.utc).astimezone().isoformat(),
+        )
+    if abs(delta_signed_qty) <= 1e-9:
+        raise RuntimeError("当前真实持仓已经与策略目标一致，无需再次提交委托。")
+    side = Direction.BUY if delta_signed_qty > 0 else Direction.SELL
+    price, price_adjustment_warning = _align_strategy_limit_price_to_exchange_constraints(
+        hint["symbol"],
+        hint["market"],
+        side,
+        float(hint["price"]),
+    )
+    preview = build_private_execution_preview(
+        ExecutionPreviewRequest(
+            symbol=hint["symbol"],
+            market=hint["market"],
+            mode=resolved_mode,
+            side=side,
+            quantity=abs(delta_signed_qty),
+            price=price,
+            origin="strategy",
+            strategy_id=strategy_id,
+            note=hint["note"],
+            release_order_ids=release_order_ids,
+        )
+    )
+    if price_adjustment_warning is not None:
+        strategy_adjustment_warnings.append(price_adjustment_warning)
+    warnings = strategy_adjustment_warnings + list(preview.warnings)
+    if target_resolution["blocked_reason"] is not None:
+        return preview.model_copy(
+            update={
+                "allowed": False,
+                "blocked_reason": target_resolution["blocked_reason"],
+                "recommended_action": target_resolution["recommended_action"],
+                "sizing_risk_budget": target_resolution["sizing_risk_budget"],
+                "sizing_budget_notional": target_resolution["sizing_budget_notional"],
+                "sizing_minimum_required_notional": target_resolution["sizing_minimum_required_notional"],
+                "sizing_available_balance_gap": target_resolution["sizing_available_balance_gap"],
+                "warnings": warnings,
+            }
+        )
+    matching_order = next((item for item in existing_strategy_orders if item.side == side), None)
+    stale_orders = [
+        item
+        for item in existing_strategy_orders
+        if matching_order is None or item.order_id != matching_order.order_id
+    ]
+    if matching_order is not None:
+        if _exchange_order_matches_requested_target(
+            matching_order,
+            preview.quantity,
+            preview.price,
+            require_reduce_only=_execution_preview_requires_reduce_only(preview),
+        ):
+            warnings.append("当前已有同参数策略委托，若继续执行会直接复用旧委托。")
+        else:
+            warnings.append("当前已有策略委托，若继续执行会按最新信号参数改单。")
+    if stale_orders:
+        warnings.append("当前还存在旧策略委托，若继续执行会先自动撤掉旧委托。")
+    if _has_active_strategy_live_stop_loss_alert(strategy_id):
+        warnings.append("当前真实模式止损保护仍在生效。")
+        return preview.model_copy(
+            update={
+                "allowed": False,
+                "blocked_reason": "当前已触发真实模式止损保护，请先人工复核真实仓位后再决定是否恢复策略执行。",
+                "recommended_action": "请先人工复核真实仓位与策略参数，确认无误后再恢复策略执行。",
+                "warnings": warnings,
+            }
+        )
+    return preview.model_copy(update={"warnings": warnings})
+
+def _runtime_worker_execution_block_reason(runtime_health: Dict[str, Any]) -> Optional[str]:
+    if runtime_health["runtime_last_error"]:
+        return "当前策略运行线程存在异常，请先在设置页恢复运行线程后再执行真实策略。"
+    if runtime_health["runtime_worker_stale"]:
+        return "当前策略运行线程已停滞，请先在设置页恢复运行线程并确认最新信号后再执行真实策略。"
+    if runtime_health.get("runtime_worker_stopped"):
+        return "当前策略运行线程未运行，请先在设置页恢复运行线程后再执行真实策略。"
+    return None
+
+def build_strategy_execution_preview(strategy_id: str, mode: Optional[AccountMode] = None) -> ExecutionPreview:
+    state = repo.snapshot()
+    resolved_mode = mode or state.workspace_preferences.selected_mode
+    runtime_health = _build_strategy_runtime_worker_health()
+    if resolved_mode != AccountMode.PAPER:
+        runtime_block_reason = _runtime_worker_execution_block_reason(runtime_health)
+        if runtime_block_reason is not None:
+            raise RuntimeError(runtime_block_reason)
+    refresh_strategy_runtime_once()
+    try:
+        return _build_strategy_execution_preview_from_state(strategy_id, mode)
+    except RuntimeError as exc:
+        detail = str(exc)
+        if "私有 WS" not in detail and "公共 WS" not in detail:
+            raise
+        snapshot = next((item for item in repo.snapshot().strategy_runtime_snapshots if item.strategy_id == strategy_id), None)
+        if snapshot is None:
+            raise
+        return _build_blocked_strategy_execution_preview(snapshot, resolved_mode, detail)
+
+def _apply_runtime_blocked_preview_context(
+    item: StrategyRuntimeSnapshot,
+    preview: Optional[ExecutionPreview],
+) -> StrategyRuntimeSnapshot:
+    if preview is None or preview.allowed or not preview.blocked_reason:
+        return item
+    update: Dict[str, Any] = {
+        "guard_detail": preview.blocked_reason,
+        "note": preview.blocked_reason,
+        "next_action": preview.recommended_action or item.next_action,
+    }
+    if item.guard_state == "none":
+        update["guard_state"] = "auto_dispatch_blocked"
+    return item.model_copy(update=update)
+
+def build_strategy_runtime_response() -> List[StrategyRuntimeSnapshot]:
+    runtime_health_before_refresh = _build_strategy_runtime_worker_health()
+    items = refresh_strategy_runtime_once()
+    state = repo.snapshot()
+    resolved_mode = state.workspace_preferences.selected_mode
+    runtime_block_reason = None
+    if resolved_mode != AccountMode.PAPER:
+        runtime_block_reason = _runtime_worker_execution_block_reason(runtime_health_before_refresh)
+    private_order_history = parse_order_history(use_private_only=True)
+    next_items: List[StrategyRuntimeSnapshot] = []
+    for item in items:
+        item = _decorate_strategy_runtime_item(item)
+        active_order_count, active_order = _build_strategy_active_order_summary(
+            item.strategy_id,
+            item.mode,
+            item.symbol,
+            item.market,
+        )
+        (
+            last_execution_event_type,
+            last_execution_at,
+            last_execution_severity,
+            last_execution_detail,
+            last_execution_recommended_action,
+        ) = _build_strategy_last_execution_summary(
+            item.strategy_id,
+            item.symbol,
+            item.market,
+            item.mode,
+            private_order_history,
+        )
+        (
+            target_position_side,
+            target_position_size,
+            position_alignment,
+            position_alignment_detail,
+        ) = _build_strategy_position_alignment_summary(
+            item.strategy_id,
+            item.mode,
+            item.symbol,
+            item.market,
+            active_order_count,
+        )
+        current_position_side, current_position_size, current_position_avg_price = _build_strategy_current_position_summary(
+            item.mode,
+            item.symbol,
+            item.market,
+        )
+        item = item.model_copy(
+            update={
+                "active_order_count": active_order_count,
+                "active_order": active_order,
+                "current_position_side": current_position_side,
+                "current_position_size": current_position_size,
+                "current_position_avg_price": current_position_avg_price,
+                "target_position_side": target_position_side,
+                "target_position_size": target_position_size,
+                "position_alignment": position_alignment,
+                "position_alignment_detail": position_alignment_detail,
+                "last_execution_event_type": last_execution_event_type,
+                "last_execution_at": last_execution_at,
+                "last_execution_severity": last_execution_severity,
+                "last_execution_detail": last_execution_detail,
+            }
+        )
+        if (
+            item.guard_state == "auto_dispatch_blocked"
+            and last_execution_event_type in {"strategy.execution.blocked", "strategy.exchange_order.auto_blocked"}
+            and last_execution_detail
+        ):
+            recommended_action = last_execution_recommended_action or _build_execution_preview_recommended_action(last_execution_detail)
+            item = item.model_copy(
+                update={
+                    "note": last_execution_detail,
+                    "guard_detail": last_execution_detail,
+                    "next_action": recommended_action or item.next_action,
+                }
+            )
+        _sync_strategy_position_drift_issue(item, active_order_count=active_order_count)
+        if item.runtime_status == "paused":
+            next_items.append(item)
+            continue
+        if resolved_mode == AccountMode.PAPER or item.mode != resolved_mode:
+            next_items.append(item)
+            continue
+        if runtime_block_reason is not None:
+            blocked_item = item
+            if item.guard_state == "none":
+                blocked_item = item.model_copy(
+                    update={
+                        "guard_state": "auto_dispatch_blocked",
+                        "guard_detail": runtime_block_reason,
+                    }
+                )
+            blocked_preview = _build_blocked_strategy_execution_preview(blocked_item, resolved_mode, runtime_block_reason)
+            blocked_item = _apply_runtime_blocked_preview_context(blocked_item, blocked_preview)
+            next_items.append(
+                blocked_item.model_copy(
+                    update={
+                        "execution_preview": blocked_preview
+                    }
+                )
+            )
+            continue
+        try:
+            preview = _build_strategy_execution_preview_from_state(item.strategy_id, resolved_mode)
+        except RuntimeError as exc:
+            preview = _build_blocked_strategy_execution_preview(item, resolved_mode, str(exc))
+        except ValueError as exc:
+            preview = _build_blocked_strategy_execution_preview(item, resolved_mode, str(exc))
+        item = _apply_runtime_blocked_preview_context(item, preview)
+        next_items.append(item.model_copy(update={"execution_preview": preview}))
+    return next_items
+
+
+def dispatch_strategy_signal(strategy_id: str, payload: StrategyExecutionRequest) -> StrategyExecutionResult:
+    state = repo.snapshot()
+    resolved_mode = payload.mode or state.workspace_preferences.selected_mode
+    if resolved_mode != AccountMode.PAPER:
+        runtime_block_reason = _runtime_worker_execution_block_reason(_build_strategy_runtime_worker_health())
+        if runtime_block_reason is not None:
+            strategy = next((item for item in state.strategies if item.id == strategy_id), None)
+            snapshot = next((item for item in state.strategy_runtime_snapshots if item.strategy_id == strategy_id), None)
+            if strategy is not None:
+                symbol = snapshot.symbol if snapshot is not None else (strategy.symbols[0] if strategy.symbols else "")
+                watch_item = next((item for item in state.watchlist if item.symbol == symbol), None)
+                _ = watch_item
+                _record_strategy_manual_execution_issue(
+                    strategy_id,
+                    strategy.name,
+                    symbol,
+                    resolved_mode,
+                    runtime_block_reason,
+                    recommended_action=_build_manual_execution_recommended_action(runtime_block_reason),
+                )
+            raise StrategyExecutionBlockedError(
+                runtime_block_reason,
+                _build_manual_execution_recommended_action(runtime_block_reason),
+            )
+    refresh_strategy_runtime_once()
+    try:
+        return _dispatch_strategy_signal_from_state(strategy_id, payload)
+    except RuntimeError as exc:
+        if resolved_mode != AccountMode.PAPER:
+            strategy = next((item for item in repo.snapshot().strategies if item.id == strategy_id), None)
+            snapshot = next((item for item in repo.snapshot().strategy_runtime_snapshots if item.strategy_id == strategy_id), None)
+            if strategy is not None:
+                symbol = snapshot.symbol if snapshot is not None else (strategy.symbols[0] if strategy.symbols else "")
+                _record_strategy_manual_execution_issue(
+                    strategy_id,
+                    strategy.name,
+                    symbol,
+                    resolved_mode,
+                    str(exc),
+                    recommended_action=exc.recommended_action if isinstance(exc, StrategyExecutionBlockedError) else None,
+                )
+        raise
+
+
+def build_strategy_live_snapshot_payload() -> StrategyLiveSnapshot:
+    items = build_strategy_runtime_response()
+    return StrategyLiveSnapshot(
+        items=items,
+        generated_at=datetime.now(timezone.utc).astimezone().isoformat(),
+    )
+
+
+def run_strategy_runtime_loop() -> None:
+    strategy_runtime_state["running"] = True
+    while not strategy_runtime_stop_event.is_set():
+        try:
+            refresh_strategy_runtime_once(auto_dispatch=True)
+        except Exception as exc:  # pragma: no cover - background loop safety
+            strategy_runtime_state["last_error"] = str(exc)
+            try:
+                repo.add_event(
+                    event_type="strategy.runtime.worker.error",
+                    source="quant-core",
+                    severity=EventSeverity.WARNING,
+                    payload={"error": str(exc)},
+                )
+                repo._persist()  # type: ignore[attr-defined]
+            except Exception:
+                pass
+        if strategy_runtime_stop_event.wait(8.0):
+            break
+    strategy_runtime_state["running"] = False
+
+
+def _start_strategy_runtime_worker(clear_error: bool = False) -> bool:
+    global strategy_runtime_thread
+    if strategy_runtime_thread is not None and strategy_runtime_thread.is_alive():
+        return False
+    if clear_error:
+        strategy_runtime_state["last_error"] = None
+    strategy_runtime_state["started_once"] = True
+    strategy_runtime_state["running"] = False
+    strategy_runtime_stop_event.clear()
+    strategy_runtime_thread = threading.Thread(
+        target=run_strategy_runtime_loop,
+        name="strategy-runtime-worker",
+        daemon=True,
+    )
+    strategy_runtime_thread.start()
+    return True
+
+
+def _stop_strategy_runtime_worker(timeout: float = 3.0) -> bool:
+    global strategy_runtime_thread
+    thread = strategy_runtime_thread
+    strategy_runtime_stop_event.set()
+    if thread is None or not thread.is_alive():
+        strategy_runtime_state["running"] = False
+        strategy_runtime_thread = None
+        return True
+    thread.join(timeout=timeout)
+    if thread.is_alive():
+        return False
+    strategy_runtime_state["running"] = False
+    strategy_runtime_thread = None
+    return True
+
+
+def restart_strategy_runtime_worker(payload: RuntimeWorkerActionPayload) -> RuntimeWorkerActionResult:
+    requested_at = datetime.now(timezone.utc).astimezone().isoformat()
+    restart_failed_rule_key = "strategy-runtime-worker:restart-failed"
+    repo.add_event(
+        event_type="strategy.runtime.worker.restart_requested",
+        source="desktop",
+        severity=EventSeverity.INFO,
+        payload={
+            "requested_by": payload.requested_by,
+            "reason": payload.reason or "手动恢复策略运行线程",
+        },
+    )
+    if not _stop_strategy_runtime_worker():
+        description = "尝试恢复后台策略运行线程时，线程未能在超时时间内停止。"
+        suggested_action = "稍后重试恢复运行线程；若反复失败，请打开系统日志/审计查看最近线程事件。"
+        with repo._lock:  # type: ignore[attr-defined]
+            changed = repo._upsert_system_alert_locked(  # type: ignore[attr-defined]
+                rule_key=restart_failed_rule_key,
+                severity="P1",
+                symbol="SYSTEM",
+                title="恢复运行线程失败",
+                description=description,
+                suggested_action=suggested_action,
+            )
+            if changed:
+                repo.add_event(
+                    event_type="strategy.runtime.worker.restart_failed_alerted",
+                    source="quant-core",
+                    severity=EventSeverity.WARNING,
+                    payload={"detail": description},
+                )
+                repo._refresh_derived_state()  # type: ignore[attr-defined]
+                repo._persist()  # type: ignore[attr-defined]
+        repo.add_event(
+            event_type="strategy.runtime.worker.restart_failed",
+            source="quant-core",
+            severity=EventSeverity.ERROR,
+            payload={
+                "requested_by": payload.requested_by,
+                "reason": payload.reason or "手动恢复策略运行线程",
+                "detail": description,
+            },
+        )
+        repo._persist()  # type: ignore[attr-defined]
+        raise RuntimeError("策略运行线程未能在超时时间内停止，请稍后重试。")
+    _start_strategy_runtime_worker(clear_error=True)
+    repo.add_event(
+        event_type="strategy.runtime.worker.restarted",
+        source="quant-core",
+        severity=EventSeverity.INFO,
+        payload={
+            "requested_by": payload.requested_by,
+            "reason": payload.reason or "手动恢复策略运行线程",
+        },
+    )
+    repo._persist()  # type: ignore[attr-defined]
+    _clear_strategy_runtime_worker_alerts(
+        restart_failed_rule_key,
+        resolved_event_type="strategy.runtime.worker.restart_failed_resolved",
+        resolution_detail="恢复运行线程失败的异常状态已解除。",
+    )
+    _sync_strategy_runtime_worker_issue_alerts()
+    running = bool(strategy_runtime_thread and strategy_runtime_thread.is_alive())
+    return RuntimeWorkerActionResult(
+        running=running,
+        restarted_at=requested_at,
+        last_error=strategy_runtime_state.get("last_error"),
+        last_refresh_at=strategy_runtime_state.get("last_refresh_at"),
+        message="策略运行线程已重新启动。" if running else "策略运行线程已收到重启请求。",
+    )
+
+
+def build_scheduler_snapshot_payload() -> SchedulerSnapshot:
+    state = repo.snapshot()
+    return SchedulerSnapshot(
+        scheduler=state.control_snapshot.scheduler,
+        jobs=state.agent_jobs,
+        change_requests=state.change_requests[:8],
+        latest_scheduler_command=_build_latest_scheduler_command(state.audit_events),
+    )
+
+
+def build_ai_live_snapshot_payload() -> AiLiveSnapshot:
+    state = repo.snapshot()
+    scheduler_snapshot = build_scheduler_snapshot_payload()
+    activity_feed = [
+        event
+        for event in state.audit_events
+        if event.source in {"openclaw", "desktop"}
+    ][:10]
+    return AiLiveSnapshot(
+        scheduler=scheduler_snapshot.scheduler,
+        jobs=scheduler_snapshot.jobs,
+        change_requests=scheduler_snapshot.change_requests,
+        latest_scheduler_command=scheduler_snapshot.latest_scheduler_command,
+        activity_feed=activity_feed,
+        generated_at=datetime.now(timezone.utc).astimezone().isoformat(),
+    )
+
+
+def build_ops_live_snapshot_payload() -> OpsLiveSnapshot:
+    _sync_strategy_runtime_worker_issue_alerts()
+    _sync_private_execution_channel_alerts()
+    state = repo.snapshot()
+    alerts = state.alerts
+    trades = parse_trades()
+    audit_events = state.audit_events[:80]
+    execution_health = _build_control_snapshot_response().execution_health
+    latest_scheduler_command = _build_latest_scheduler_command(state.audit_events)
+
+    return OpsLiveSnapshot(
+        summary=OpsLiveSummary(
+            pending_alerts=sum(1 for item in alerts if not item.acknowledged),
+            p0_alerts=sum(1 for item in alerts if item.severity == "P0" and not item.acknowledged),
+            recent_trades=len(trades[:20]),
+            manual_trades=sum(1 for item in trades if item.origin == "manual"),
+            strategy_trades=sum(1 for item in trades if item.origin == "strategy"),
+            audit_warnings=sum(1 for item in audit_events if item.severity == "warning"),
+            audit_critical=sum(1 for item in audit_events if item.severity == "critical"),
+            execution_issue_total=(
+                (1 if execution_health.runtime_worker_issue else 0)
+                +
+                execution_health.active_stop_loss_guards
+                + execution_health.cooldowns
+                + execution_health.auto_dispatch_blocked
+                + execution_health.rejection_guards
+                + execution_health.stale_order_guards
+                + execution_health.drifts
+            ),
+            execution_top_issue=execution_health.top_issue,
+            execution_top_issue_strategy_id=execution_health.top_issue_strategy_id,
+            execution_top_issue_strategy_name=execution_health.top_issue_strategy_name,
+            execution_top_issue_symbol=execution_health.top_issue_symbol,
+            execution_top_issue_detail=execution_health.top_issue_detail,
+            latest_event_type=audit_events[0].event_type if audit_events else None,
+        ),
+        alerts=alerts,
+        trades=trades,
+        audit_events=audit_events,
+        latest_scheduler_command=latest_scheduler_command,
+        generated_at=datetime.now(timezone.utc).astimezone().isoformat(),
+    )
+
+
+def build_account_live_snapshot_payload(mode: Optional[AccountMode] = None) -> AccountLiveSnapshot:
+    overview = parse_account_overview(mode=mode)
+    positions = parse_positions(mode=mode)
+    orders = parse_open_orders(mode=mode)
+    order_history = parse_order_history(mode=mode)
+    return AccountLiveSnapshot(
+        overview=overview,
+        positions=positions,
+        orders=orders,
+        order_history=order_history,
+        generated_at=datetime.now(timezone.utc).astimezone().isoformat(),
+    )
+
+
+def _summarize_strategy_activity_execution_preview(
+    preview: Optional[ExecutionPreview],
+) -> Optional[Dict[str, Any]]:
+    if preview is None:
+        return None
+    return {
+        "mode": preview.mode.value,
+        "allowed": preview.allowed,
+        "action": preview.action,
+        "side": preview.side.value,
+        "quantity": preview.quantity,
+        "price": preview.price,
+        "notional": preview.notional,
+        "blocked_reason": preview.blocked_reason,
+        "recommended_action": preview.recommended_action,
+        "projected_position_side": preview.projected_position_side,
+        "projected_position_size": preview.projected_position_size,
+        "available_balance_after": preview.available_balance_after,
+        "sizing_risk_budget": preview.sizing_risk_budget,
+        "sizing_budget_notional": preview.sizing_budget_notional,
+        "sizing_minimum_required_notional": preview.sizing_minimum_required_notional,
+        "sizing_available_balance_gap": preview.sizing_available_balance_gap,
+    }
+
+
+def _build_strategy_activity_review_context(strategy_id: str) -> Optional[Dict[str, Any]]:
+    if not strategy_id:
+        return None
+    try:
+        activity = build_strategy_activity_payload(strategy_id)
+    except KeyError:
+        return None
+
+    runtime = activity.runtime
+    indexes = build_strategy_activity_review_context_indexes(activity)
+
+    latest_key_audit_event = AppRepository._pick_latest_key_execution_event(activity.recent_audit_events)
+    latest_active_order_record = max(
+        activity.active_orders,
+        key=lambda item: parse_optional_iso_datetime(item.created_at),
+        default=None,
+    )
+    latest_historical_order_record = max(
+        activity.recent_orders,
+        key=lambda item: parse_optional_iso_datetime(item.created_at),
+        default=None,
+    )
+    latest_trade_record = max(
+        activity.recent_trades,
+        key=lambda item: parse_optional_iso_datetime(item.created_at),
+        default=None,
+    )
+    latest_alert_record = max(
+        activity.recent_alerts,
+        key=lambda item: parse_optional_iso_datetime(item.triggered_at),
+        default=None,
+    )
+    latest_pending_alert_record = max(
+        [item for item in activity.recent_alerts if not item.acknowledged],
+        key=lambda item: parse_optional_iso_datetime(item.triggered_at),
+        default=None,
+    )
+    latest_order_record = max(
+        [
+            item
+            for item in [
+                latest_active_order_record,
+                latest_historical_order_record,
+            ]
+            if item is not None
+        ],
+        key=lambda item: parse_optional_iso_datetime(item.created_at),
+        default=None,
+    )
+    latest_ops = _build_strategy_activity_latest_ops_snapshot(
+        latest_active_order_summary=summarize_order(latest_active_order_record) if latest_active_order_record else None,
+        latest_historical_order_summary=(
+            summarize_order(latest_historical_order_record) if latest_historical_order_record else None
+        ),
+        latest_order_summary=summarize_order(latest_order_record) if latest_order_record else None,
+        latest_pending_alert_summary=summarize_alert(latest_pending_alert_record) if latest_pending_alert_record else None,
+        latest_trade_summary=summarize_trade(latest_trade_record) if latest_trade_record else None,
+        latest_alert_summary=summarize_alert(latest_alert_record) if latest_alert_record else None,
+        latest_audit_event_summary=AppRepository._summarize_execution_event(latest_key_audit_event)
+        if latest_key_audit_event
+        else None,
+        latest_active_order_record=latest_active_order_record,
+        latest_historical_order_record=latest_historical_order_record,
+        latest_order_record=latest_order_record,
+        latest_pending_alert_record=latest_pending_alert_record,
+        latest_trade_record=latest_trade_record,
+        latest_alert_record=latest_alert_record,
+        latest_audit_event_record=latest_key_audit_event,
+    )
+
+    return {
+        "strategy_id": activity.strategy_id,
+        "strategy_name": activity.strategy_name,
+        "symbol": activity.symbol,
+        "mode": activity.mode.value,
+        "generated_at": activity.generated_at,
+        "decision_context": (
+            activity.decision_context.model_dump(mode="json")
+            if activity.decision_context is not None
+            else None
+        ),
+        "activity_sections": (
+            activity.activity_sections.model_dump(mode="json")
+            if activity.activity_sections is not None
+            else None
+        ),
+        "runtime": (
+            {
+                "signal": runtime.signal,
+                "guard_state": runtime.guard_state,
+                "guard_detail": runtime.guard_detail,
+                "note": runtime.note,
+                "next_action": runtime.next_action,
+                "position_alignment": runtime.position_alignment,
+                "position_alignment_detail": runtime.position_alignment_detail,
+                "last_execution_event_type": runtime.last_execution_event_type,
+                "execution_preview": _summarize_strategy_activity_execution_preview(runtime.execution_preview),
+            }
+            if runtime is not None
+            else None
+        ),
+        "latest_runtime": _build_strategy_activity_latest_runtime_snapshot(runtime=runtime, latest_ops=latest_ops).model_dump(mode="json"),
+        "latest_ops": latest_ops.model_dump(mode="json"),
+        "active_order_count": len(activity.active_orders),
+        "active_orders": [summarize_order(order) for order in activity.active_orders[:3]],
+        "latest_active_order": latest_ops.latest_active_order,
+        "latest_active_order_record": (
+            latest_ops.latest_active_order_record.model_dump(mode="json") if latest_ops.latest_active_order_record else None
+        ),
+        "latest_historical_order": latest_ops.latest_historical_order,
+        "latest_historical_order_record": (
+            latest_ops.latest_historical_order_record.model_dump(mode="json")
+            if latest_ops.latest_historical_order_record
+            else None
+        ),
+        "latest_order": latest_ops.latest_order,
+        "latest_order_record": latest_ops.latest_order_record.model_dump(mode="json") if latest_ops.latest_order_record else None,
+        "recent_orders": [summarize_order(order) for order in activity.recent_orders[:3]],
+        "latest_trade": latest_ops.latest_trade,
+        "latest_trade_record": latest_ops.latest_trade_record.model_dump(mode="json") if latest_ops.latest_trade_record else None,
+        "recent_trades": [summarize_trade(trade) for trade in activity.recent_trades[:3]],
+        "latest_pending_alert": latest_ops.latest_pending_alert,
+        "latest_pending_alert_record": (
+            latest_ops.latest_pending_alert_record.model_dump(mode="json")
+            if latest_ops.latest_pending_alert_record
+            else None
+        ),
+        "latest_alert": latest_ops.latest_alert,
+        "latest_alert_record": latest_ops.latest_alert_record.model_dump(mode="json") if latest_ops.latest_alert_record else None,
+        "recent_alerts": [summarize_alert(alert) for alert in activity.recent_alerts[:3]],
+        "latest_proposal": (
+            summarize_strategy_activity_proposal(activity, activity.latest_proposal, indexes)
+            if activity.latest_proposal
+            else None
+        ),
+        "latest_actionable_proposal": (
+            summarize_strategy_activity_proposal(activity, activity.latest_actionable_proposal, indexes)
+            if activity.latest_actionable_proposal
+            else None
+        ),
+        "latest_proposal_change_request": (
+            summarize_change_request(activity.latest_proposal_change_request)
+            if activity.latest_proposal_change_request
+            else None
+        ),
+        "latest_proposal_backtest": (
+            summarize_backtest(activity.latest_proposal_backtest) if activity.latest_proposal_backtest else None
+        ),
+        "latest_proposal_backtest_record": (
+            activity.latest_proposal_backtest_record.model_dump(mode="json")
+            if activity.latest_proposal_backtest_record
+            else None
+        ),
+        "latest_proposal_review": (
+            summarize_review(activity.latest_proposal_review) if activity.latest_proposal_review else None
+        ),
+        "latest_proposal_review_record": (
+            activity.latest_proposal_review_record.model_dump(mode="json")
+            if activity.latest_proposal_review_record
+            else None
+        ),
+        "latest_proposal_job": (
+            summarize_agent_job(activity.latest_proposal_job) if activity.latest_proposal_job else None
+        ),
+        "latest_proposal_job_record": (
+            activity.latest_proposal_job_record.model_dump(mode="json")
+            if activity.latest_proposal_job_record
+            else None
+        ),
+        "latest_actionable_proposal_change_request": (
+            summarize_change_request(activity.latest_actionable_proposal_change_request)
+            if activity.latest_actionable_proposal_change_request
+            else None
+        ),
+        "latest_actionable_proposal_backtest": (
+            summarize_backtest(activity.latest_actionable_proposal_backtest)
+            if activity.latest_actionable_proposal_backtest
+            else None
+        ),
+        "latest_actionable_proposal_backtest_record": (
+            activity.latest_actionable_proposal_backtest_record.model_dump(mode="json")
+            if activity.latest_actionable_proposal_backtest_record
+            else None
+        ),
+        "latest_actionable_proposal_review": (
+            summarize_review(activity.latest_actionable_proposal_review)
+            if activity.latest_actionable_proposal_review
+            else None
+        ),
+        "latest_actionable_proposal_review_record": (
+            activity.latest_actionable_proposal_review_record.model_dump(mode="json")
+            if activity.latest_actionable_proposal_review_record
+            else None
+        ),
+        "latest_actionable_proposal_job": (
+            summarize_agent_job(activity.latest_actionable_proposal_job)
+            if activity.latest_actionable_proposal_job
+            else None
+        ),
+        "latest_actionable_proposal_job_record": (
+            activity.latest_actionable_proposal_job_record.model_dump(mode="json")
+            if activity.latest_actionable_proposal_job_record
+            else None
+        ),
+        "recent_proposals": [
+            summarize_strategy_activity_proposal(activity, proposal, indexes)
+            for proposal in activity.recent_proposals[:3]
+        ],
+        "latest_change_request": summarize_change_request(activity.latest_change_request) if activity.latest_change_request else None,
+        "latest_actionable_change_request": (
+            summarize_change_request(activity.latest_actionable_change_request)
+            if activity.latest_actionable_change_request
+            else None
+        ),
+        "latest_change_request_backtest_record": (
+            activity.latest_change_request_backtest_record.model_dump(mode="json")
+            if activity.latest_change_request_backtest_record
+            else None
+        ),
+        "latest_change_request_review_record": (
+            activity.latest_change_request_review_record.model_dump(mode="json")
+            if activity.latest_change_request_review_record
+            else None
+        ),
+        "latest_change_request_job_record": (
+            activity.latest_change_request_job_record.model_dump(mode="json")
+            if activity.latest_change_request_job_record
+            else None
+        ),
+        "latest_change_request_source_backtest_record": (
+            activity.latest_change_request_source_backtest_record.model_dump(mode="json")
+            if activity.latest_change_request_source_backtest_record
+            else None
+        ),
+        "latest_change_request_source_review_record": (
+            activity.latest_change_request_source_review_record.model_dump(mode="json")
+            if activity.latest_change_request_source_review_record
+            else None
+        ),
+        "latest_change_request_source_proposal_record": (
+            activity.latest_change_request_source_proposal_record.model_dump(mode="json")
+            if activity.latest_change_request_source_proposal_record
+            else None
+        ),
+        "latest_actionable_change_request_backtest_record": (
+            activity.latest_actionable_change_request_backtest_record.model_dump(mode="json")
+            if activity.latest_actionable_change_request_backtest_record
+            else None
+        ),
+        "latest_actionable_change_request_review_record": (
+            activity.latest_actionable_change_request_review_record.model_dump(mode="json")
+            if activity.latest_actionable_change_request_review_record
+            else None
+        ),
+        "latest_actionable_change_request_job_record": (
+            activity.latest_actionable_change_request_job_record.model_dump(mode="json")
+            if activity.latest_actionable_change_request_job_record
+            else None
+        ),
+        "latest_actionable_change_request_source_backtest_record": (
+            activity.latest_actionable_change_request_source_backtest_record.model_dump(mode="json")
+            if activity.latest_actionable_change_request_source_backtest_record
+            else None
+        ),
+        "latest_actionable_change_request_source_review_record": (
+            activity.latest_actionable_change_request_source_review_record.model_dump(mode="json")
+            if activity.latest_actionable_change_request_source_review_record
+            else None
+        ),
+        "latest_actionable_change_request_source_proposal_record": (
+            activity.latest_actionable_change_request_source_proposal_record.model_dump(mode="json")
+            if activity.latest_actionable_change_request_source_proposal_record
+            else None
+        ),
+        "recent_change_requests": [
+            summarize_change_request(change_request)
+            for change_request in activity.recent_change_requests[:3]
+        ],
+        "latest_backtest": summarize_backtest(activity.latest_backtest) if activity.latest_backtest else None,
+        "latest_actionable_backtest": (
+            summarize_backtest(activity.latest_actionable_backtest)
+            if activity.latest_actionable_backtest
+            else None
+        ),
+        "latest_backtest_record": (
+            activity.latest_backtest_record.model_dump(mode="json") if activity.latest_backtest_record else None
+        ),
+        "latest_actionable_backtest_record": (
+            activity.latest_actionable_backtest_record.model_dump(mode="json")
+            if activity.latest_actionable_backtest_record
+            else None
+        ),
+        "latest_actionable_backtest_review": (
+            summarize_review(activity.latest_actionable_backtest_review)
+            if activity.latest_actionable_backtest_review
+            else None
+        ),
+        "latest_backtest_review_record": (
+            activity.latest_backtest_review_record.model_dump(mode="json")
+            if activity.latest_backtest_review_record
+            else None
+        ),
+        "latest_backtest_job_record": (
+            activity.latest_backtest_job_record.model_dump(mode="json")
+            if activity.latest_backtest_job_record
+            else None
+        ),
+        "latest_actionable_backtest_review_record": (
+            activity.latest_actionable_backtest_review_record.model_dump(mode="json")
+            if activity.latest_actionable_backtest_review_record
+            else None
+        ),
+        "latest_actionable_backtest_job_record": (
+            activity.latest_actionable_backtest_job_record.model_dump(mode="json")
+            if activity.latest_actionable_backtest_job_record
+            else None
+        ),
+        "latest_actionable_backtest_job": (
+            summarize_agent_job(activity.latest_actionable_backtest_job)
+            if activity.latest_actionable_backtest_job
+            else None
+        ),
+        "latest_backtest_review": summarize_review(activity.latest_backtest_review) if activity.latest_backtest_review else None,
+        "latest_backtest_job": summarize_agent_job(activity.latest_backtest_job) if activity.latest_backtest_job else None,
+        "recent_backtests": [summarize_backtest(backtest) for backtest in activity.recent_backtests[:3]],
+        "latest_primary_review": summarize_review(activity.latest_primary_review) if activity.latest_primary_review else None,
+        "latest_actionable_primary_review": (
+            summarize_review(activity.latest_actionable_primary_review)
+            if activity.latest_actionable_primary_review
+            else None
+        ),
+        "latest_primary_review_record": (
+            activity.latest_primary_review_record.model_dump(mode="json")
+            if activity.latest_primary_review_record
+            else None
+        ),
+        "latest_actionable_primary_review_record": (
+            activity.latest_actionable_primary_review_record.model_dump(mode="json")
+            if activity.latest_actionable_primary_review_record
+            else None
+        ),
+        "latest_tracking_review": summarize_review(activity.latest_tracking_review) if activity.latest_tracking_review else None,
+        "latest_tracking_job": summarize_agent_job(activity.latest_tracking_job) if activity.latest_tracking_job else None,
+        "latest_tracking_review_record": (
+            activity.latest_tracking_review_record.model_dump(mode="json")
+            if activity.latest_tracking_review_record
+            else None
+        ),
+        "latest_tracking_job_record": (
+            activity.latest_tracking_job_record.model_dump(mode="json")
+            if activity.latest_tracking_job_record
+            else None
+        ),
+        "latest_retryable_tracking_job": (
+            summarize_agent_job(activity.latest_retryable_tracking_job)
+            if activity.latest_retryable_tracking_job
+            else None
+        ),
+        "latest_retryable_tracking_job_record": (
+            activity.latest_retryable_tracking_job_record.model_dump(mode="json")
+            if activity.latest_retryable_tracking_job_record
+            else None
+        ),
+        "latest_audit_event": latest_ops.latest_audit_event,
+        "latest_audit_event_record": (
+            latest_ops.latest_audit_event_record.model_dump(mode="json")
+            if latest_ops.latest_audit_event_record
+            else None
+        ),
+        "recent_reviews": [summarize_review(review) for review in activity.recent_reviews[:3]],
+        "recent_agent_jobs": [summarize_agent_job(job) for job in activity.recent_agent_jobs[:4]],
+        "recent_audit_events": [summarize_event(event) for event in activity.recent_audit_events[:4]],
+    }
+
+
+
 @app.get("/api/strategies")
 def get_strategies():
     return repo.snapshot().strategies
@@ -10789,7 +10033,11 @@ def get_strategy_runtime():
     return build_strategy_runtime_response()
 
 
-@app.get("/api/strategies/{strategy_id}/activity", response_model=StrategyActivitySnapshot)
+@app.get(
+    "/api/strategies/{strategy_id}/activity",
+    response_model=StrategyActivitySnapshot,
+    response_model_exclude_none=True,
+)
 def get_strategy_activity(strategy_id: str):
     try:
         return build_strategy_activity_payload(strategy_id)
@@ -11343,6 +10591,48 @@ def ensure_background_services_started() -> None:
         )
         agent_worker_thread.start()
     _start_strategy_runtime_worker()
+
+
+@app.get("/api/strategies/{strategy_id}/risk-hints")
+def get_strategy_runtime_risk_hints(strategy_id: str):
+    """Expose structured stop/target/band reference prices for a strategy.
+
+    Additive read-only helper: derives hints from the same market detail the
+    runtime evaluator already sees, so the UI (or risk-gate middleware) can
+    surface concrete "距离止损/止盈" numbers without re-implementing the math.
+    """
+
+    from strategy_runtime import compute_strategy_runtime_risk_hints
+
+    state = repo.snapshot()
+    strategy = next((item for item in state.strategies if item.id == strategy_id), None)
+    if strategy is None:
+        raise HTTPException(status_code=404, detail=f"策略不存在: {strategy_id}")
+    if not strategy.symbols:
+        raise HTTPException(status_code=400, detail="策略未绑定任何交易对，无法生成风控提示。")
+
+    symbol = strategy.symbols[0]
+    watch_item = next((item for item in state.watchlist if item.symbol == symbol), None)
+    if watch_item is None:
+        raise HTTPException(status_code=404, detail=f"观察列表未包含 {symbol}，无法生成风控提示。")
+
+    fallback_detail = state.market_details.get(symbol) or build_market_detail_for_watchlist(watch_item)
+    try:
+        detail = market_data.enrich_market_detail(
+            symbol=symbol,
+            market=watch_item.market,
+            fallback_detail=fallback_detail.model_copy(update={"timeframe": "1h"}),
+            watch_item=watch_item,
+            timeframe="1h",
+        )
+    except RuntimeError:
+        detail = fallback_detail.model_copy(update={"timeframe": "1h"})
+
+    return compute_strategy_runtime_risk_hints(
+        strategy=strategy,
+        detail=detail,
+        watch_item=watch_item,
+    )
 
 
 if __name__ == "__main__":

@@ -6,6 +6,7 @@ import {
   desktopNotificationSignature,
   duplicateDesktopNotificationCooldownMs,
   isAbsoluteLocalPath,
+  readNotificationSnoozeUntil,
   sendDesktopNotificationWithSettings,
   type DesktopNotificationDelivery,
   type DesktopNotificationPayload,
@@ -30,6 +31,8 @@ export function useDesktopUiActions({
   desktopNotificationPermissionRequestedRef,
   recentDesktopNotificationRef,
 }: UseDesktopUiActionsArgs) {
+  // Read the snooze cutoff fresh at every dispatch call so timer ticks / UI edits
+  // take effect without re-creating the callback on every state update.
   const showFeedback = useCallback(
     (tone: ActionFeedbackState['tone'], title: string, detail: string) => {
       setActionFeedback({ tone, title, detail })
@@ -59,10 +62,12 @@ export function useDesktopUiActions({
           return 'suppressed'
         }
       }
+      const snoozeUntilMs = readNotificationSnoozeUntil(now)
       const delivery = await sendDesktopNotificationWithSettings(
         payload,
         settings,
         desktopNotificationPermissionRequestedRef,
+        { snoozeUntilMs, now },
       )
       if (delivery === 'delivered' && shouldApplyCooldown) {
         recentDesktopNotificationRef.current.set(signature, now)

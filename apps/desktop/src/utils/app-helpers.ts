@@ -38,6 +38,126 @@ export type DesktopNotificationPayload = {
 export type DesktopNotificationDelivery = 'delivered' | 'suppressed' | 'unavailable'
 export const duplicateDesktopNotificationCooldownMs = 2 * 60 * 1000
 
+export const NOTIFICATION_SNOOZE_STORAGE_KEY = 'bybit-desktop.notification-snooze-until'
+export const NOTIFICATION_SNOOZE_CHANGE_EVENT = 'bybit-desktop:notification-snooze-change'
+export const notificationSnoozePresetsMinutes = [15, 30, 60, 120] as const
+export type NotificationSnoozePresetMinutes = (typeof notificationSnoozePresetsMinutes)[number]
+// Upper safety cap so a stale localStorage entry cannot silence notifications indefinitely.
+export const notificationSnoozeMaxMinutes = 12 * 60
+
+function coerceSnoozeTimestamp(raw: unknown): number | null {
+  if (typeof raw !== 'string') {
+    return null
+  }
+  const trimmed = raw.trim()
+  if (!trimmed) {
+    return null
+  }
+  const value = Number.parseInt(trimmed, 10)
+  if (!Number.isFinite(value) || value <= 0) {
+    return null
+  }
+  return value
+}
+
+export function readNotificationSnoozeUntil(now = Date.now()): number | null {
+  if (typeof window === 'undefined') {
+    return null
+  }
+  try {
+    const raw = window.localStorage.getItem(NOTIFICATION_SNOOZE_STORAGE_KEY)
+    const value = coerceSnoozeTimestamp(raw)
+    if (value == null) {
+      return null
+    }
+    if (value <= now) {
+      window.localStorage.removeItem(NOTIFICATION_SNOOZE_STORAGE_KEY)
+      return null
+    }
+    const maxAllowed = now + notificationSnoozeMaxMinutes * 60 * 1000
+    return value > maxAllowed ? maxAllowed : value
+  } catch {
+    return null
+  }
+}
+
+function dispatchNotificationSnoozeChange(value: number | null) {
+  if (typeof window === 'undefined' || typeof window.dispatchEvent !== 'function') {
+    return
+  }
+  try {
+    window.dispatchEvent(new CustomEvent(NOTIFICATION_SNOOZE_CHANGE_EVENT, { detail: value }))
+  } catch {
+    // Older environments without CustomEvent support silently ignore this hint channel.
+  }
+}
+
+export function writeNotificationSnoozeUntil(value: number | null) {
+  if (typeof window === 'undefined') {
+    return
+  }
+  try {
+    if (value == null) {
+      window.localStorage.removeItem(NOTIFICATION_SNOOZE_STORAGE_KEY)
+    } else {
+      window.localStorage.setItem(NOTIFICATION_SNOOZE_STORAGE_KEY, String(Math.round(value)))
+    }
+  } catch (error) {
+    console.warn('写入临时通知静默状态失败。', error)
+  }
+  dispatchNotificationSnoozeChange(value)
+}
+
+export function scheduleNotificationSnoozeMinutes(
+  minutes: number,
+  now = Date.now(),
+): number | null {
+  if (!Number.isFinite(minutes) || minutes <= 0) {
+    writeNotificationSnoozeUntil(null)
+    return null
+  }
+  const clampedMinutes = Math.min(notificationSnoozeMaxMinutes, Math.round(minutes))
+  const until = now + clampedMinutes * 60 * 1000
+  writeNotificationSnoozeUntil(until)
+  return until
+}
+
+export function isNotificationSnoozeActive(
+  snoozeUntilMs: number | null | undefined,
+  now = Date.now(),
+) {
+  if (snoozeUntilMs == null) {
+    return false
+  }
+  return Number.isFinite(snoozeUntilMs) && snoozeUntilMs > now
+}
+
+export function remainingNotificationSnoozeMinutes(
+  snoozeUntilMs: number | null | undefined,
+  now = Date.now(),
+) {
+  if (!isNotificationSnoozeActive(snoozeUntilMs, now)) {
+    return 0
+  }
+  return Math.max(1, Math.ceil(((snoozeUntilMs ?? 0) - now) / 60000))
+}
+
+export function formatNotificationSnoozeUntilLabel(
+  snoozeUntilMs: number | null | undefined,
+  now = Date.now(),
+) {
+  if (!isNotificationSnoozeActive(snoozeUntilMs, now)) {
+    return null
+  }
+  const date = new Date(snoozeUntilMs ?? 0)
+  if (Number.isNaN(date.getTime())) {
+    return null
+  }
+  const hours = date.getHours().toString().padStart(2, '0')
+  const minutes = date.getMinutes().toString().padStart(2, '0')
+  return `${hours}:${minutes}`
+}
+
 if (typeof window !== 'undefined') {
   const diagnosticWindow = window as Window & { __bybitGlobalErrorBridgeInstalled?: boolean }
   if (!diagnosticWindow.__bybitGlobalErrorBridgeInstalled) {
@@ -223,13 +343,25 @@ export function notificationQuietHoursLabel(settings?: SettingsPayload | null) {
   return `${settings.notification_quiet_hours_start} - ${settings.notification_quiet_hours_end}`
 }
 
+export type DesktopNotificationSuppressionContext = {
+  snoozeUntilMs?: number | null
+  now?: number
+}
+
 export async function sendDesktopNotificationWithSettings(
   payload: DesktopNotificationPayload,
   settings: SettingsPayload | null | undefined,
   permissionRequestedRef?: { current: boolean },
+  suppression?: DesktopNotificationSuppressionContext,
 ): Promise<DesktopNotificationDelivery> {
-  if (payload.urgency !== 'critical' && isNotificationQuietHoursActive(settings)) {
-    return 'suppressed'
+  if (payload.urgency !== 'critical') {
+    const evaluatedAt = suppression?.now ?? Date.now()
+    if (isNotificationQuietHoursActive(settings, new Date(evaluatedAt))) {
+      return 'suppressed'
+    }
+    if (isNotificationSnoozeActive(suppression?.snoozeUntilMs ?? null, evaluatedAt)) {
+      return 'suppressed'
+    }
   }
   return (await sendDesktopNotification(payload, permissionRequestedRef)) ? 'delivered' : 'unavailable'
 }
@@ -2239,12 +2371,17 @@ export function tradeActivitySummary(trade: TradeRecord) {
   return `${trade.symbol} · ${trade.side === 'buy' ? '买' : '卖'} · ${trade.quantity}@${trade.price}`
 }
 
+function resolveActivityLatestOpsCompat(activity?: StrategyActivitySnapshot | null) {
+  return activity?.latest_ops ?? activity?.latest_runtime?.latest_ops ?? null
+}
+
 export function strategyActivityLatestOrderSummary(
   activity?: StrategyActivitySnapshot | null,
   latestOrderRecord?: OrderRecord | null,
 ) {
-  if (activity?.latest_order) return activity.latest_order
-  const order = latestOrderRecord ?? activity?.latest_order_record ?? activity?.recent_orders[0]
+  const latestOps = resolveActivityLatestOpsCompat(activity)
+  if (latestOps?.latest_order) return latestOps.latest_order
+  const order = latestOrderRecord ?? latestOps?.latest_order_record ?? activity?.recent_orders[0]
   return order ? `${orderActivitySummary(order)} · ${order.status}` : null
 }
 
@@ -2252,9 +2389,10 @@ export function strategyActivityLatestHistoricalOrderSummary(
   activity?: StrategyActivitySnapshot | null,
   latestHistoricalOrderRecord?: OrderRecord | null,
 ) {
-  if (activity?.latest_historical_order) return activity.latest_historical_order
+  const latestOps = resolveActivityLatestOpsCompat(activity)
+  if (latestOps?.latest_historical_order) return latestOps.latest_historical_order
   const order =
-    latestHistoricalOrderRecord ?? activity?.latest_historical_order_record ?? activity?.recent_orders[0]
+    latestHistoricalOrderRecord ?? latestOps?.latest_historical_order_record ?? activity?.recent_orders[0]
   return order ? `${orderActivitySummary(order)} · ${order.status}` : null
 }
 
@@ -2262,8 +2400,9 @@ export function strategyActivityLatestTradeSummary(
   activity?: StrategyActivitySnapshot | null,
   latestTradeRecord?: TradeRecord | null,
 ) {
-  if (activity?.latest_trade) return activity.latest_trade
-  const trade = latestTradeRecord ?? activity?.latest_trade_record ?? activity?.recent_trades[0]
+  const latestOps = resolveActivityLatestOpsCompat(activity)
+  if (latestOps?.latest_trade) return latestOps.latest_trade
+  const trade = latestTradeRecord ?? latestOps?.latest_trade_record ?? activity?.recent_trades[0]
   return trade ? `${tradeActivitySummary(trade)} · ${trade.status ?? 'filled'} · pnl ${trade.pnl}` : null
 }
 
@@ -2271,8 +2410,9 @@ export function strategyActivityLatestAlertSummary(
   activity?: StrategyActivitySnapshot | null,
   latestAlertRecord?: AlertRecord | null,
 ) {
-  if (activity?.latest_alert) return activity.latest_alert
-  const alert = latestAlertRecord ?? activity?.latest_alert_record ?? activity?.recent_alerts[0]
+  const latestOps = resolveActivityLatestOpsCompat(activity)
+  if (latestOps?.latest_alert) return latestOps.latest_alert
+  const alert = latestAlertRecord ?? latestOps?.latest_alert_record ?? activity?.recent_alerts[0]
   if (!alert) return null
   const detail = [alert.description, alert.suggested_action].filter(Boolean).join(' · ')
   return `${alert.severity} ${alert.title}${detail ? ` · ${detail}` : ''}`
@@ -2282,10 +2422,11 @@ export function strategyActivityLatestPendingAlertSummary(
   activity?: StrategyActivitySnapshot | null,
   latestPendingAlertRecord?: AlertRecord | null,
 ) {
-  if (activity?.latest_pending_alert) return activity.latest_pending_alert
+  const latestOps = resolveActivityLatestOpsCompat(activity)
+  if (latestOps?.latest_pending_alert) return latestOps.latest_pending_alert
   const alert =
     latestPendingAlertRecord ??
-    activity?.latest_pending_alert_record ??
+    latestOps?.latest_pending_alert_record ??
     activity?.recent_alerts.find((item) => !item.acknowledged) ??
     null
   if (!alert) return null
@@ -2297,8 +2438,9 @@ export function strategyActivityLatestAuditSummary(
   activity?: StrategyActivitySnapshot | null,
   latestAuditEventRecord?: ExecutionEvent | null,
 ) {
-  if (activity?.latest_audit_event) return activity.latest_audit_event
-  const event = latestAuditEventRecord ?? activity?.latest_audit_event_record ?? activity?.recent_audit_events[0]
+  const latestOps = resolveActivityLatestOpsCompat(activity)
+  if (latestOps?.latest_audit_event) return latestOps.latest_audit_event
+  const event = latestAuditEventRecord ?? latestOps?.latest_audit_event_record ?? activity?.recent_audit_events[0]
   return event ? `${event.event_type} · ${summarizeAuditEvent(event)}` : null
 }
 

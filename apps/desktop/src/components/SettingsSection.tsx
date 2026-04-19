@@ -14,18 +14,13 @@ import type {
   SettingsPayload,
   StrategySummary,
 } from '../types'
-import type { SettingsDraft, SettingsNotificationChannel } from '../utils/app-helpers'
+import type { OpenLocalPathOptions, SettingsDraft, SettingsNotificationChannel } from './settings-section/ConnectionConfigPanel.types'
 import {
   BybitDiagnosticsPanel,
   ConnectionConfigPanel,
   GrafanaStatusPanel,
   RuntimeControlPanel,
 } from './settings-section'
-
-type OpenLocalPathOptions = {
-  label: string
-  revealInFolder?: boolean
-}
 
 type SettingsSectionProps = {
   workspaceDirty: boolean

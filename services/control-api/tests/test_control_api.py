@@ -1461,14 +1461,31 @@ class BybitPublicMarketClientUnitTests(unittest.TestCase):
     def test_candle_cache_ttl_is_timeframe_aware(self) -> None:
         client = BybitPublicMarketClient(base_url="https://api.bybit.com")
 
-        self.assertEqual(client._candle_cache_ttl_for_timeframe("15m"), 20.0)
-        self.assertEqual(client._candle_cache_ttl_for_timeframe("1h"), 20.0)
-        self.assertEqual(client._candle_cache_ttl_for_timeframe("4h"), 45.0)
-        self.assertEqual(client._candle_cache_ttl_for_timeframe("1d"), 120.0)
-        self.assertEqual(client._candle_cache_ttl_for_timeframe("15m", history=True), 45.0)
-        self.assertEqual(client._candle_cache_ttl_for_timeframe("1h", history=True), 60.0)
-        self.assertEqual(client._candle_cache_ttl_for_timeframe("4h", history=True), 90.0)
-        self.assertEqual(client._candle_cache_ttl_for_timeframe("1d", history=True), 180.0)
+        self.assertEqual(client._candle_cache_ttl_for_timeframe("15m"), 1.0)
+        self.assertEqual(client._candle_cache_ttl_for_timeframe("1h"), 2.0)
+        self.assertEqual(client._candle_cache_ttl_for_timeframe("4h"), 3.0)
+        self.assertEqual(client._candle_cache_ttl_for_timeframe("1d"), 4.0)
+        self.assertEqual(client._candle_cache_ttl_for_timeframe("15m", history=True), 3.0)
+        self.assertEqual(client._candle_cache_ttl_for_timeframe("1h", history=True), 4.0)
+        self.assertEqual(client._candle_cache_ttl_for_timeframe("4h", history=True), 6.0)
+        self.assertEqual(client._candle_cache_ttl_for_timeframe("1d", history=True), 8.0)
+
+    def test_get_candles_cached_only_skips_stale_entries(self) -> None:
+        client = BybitPublicMarketClient(base_url="https://api.bybit.com")
+        stale_at = time.monotonic() - 30
+        cached_candle = CandlePoint(
+            time="2026-03-31T05:30:00+08:00",
+            open=66_410,
+            high=66_520,
+            low=66_350,
+            close=66_480,
+            volume=1_800,
+        )
+
+        client._candle_history_cache[("BTCUSDT", "perp", "15m", 48)] = (stale_at, [cached_candle])  # type: ignore[attr-defined]
+        client._candle_cache[("BTCUSDT", "perp", "15", 48)] = (stale_at, [cached_candle])  # type: ignore[attr-defined]
+
+        self.assertEqual(client.get_candles_cached_only("BTCUSDT", "perp", timeframe="15m"), [])
 
     def test_probe_rest_connectivity_caches_latest_result(self) -> None:
         class ProbeConnectivityClient(BybitPublicMarketClient):
@@ -1588,6 +1605,108 @@ class BybitPublicMarketClientUnitTests(unittest.TestCase):
         self.assertEqual(detail.source, fallback_detail.source)
         self.assertEqual(detail.headline, fallback_detail.headline)
         self.assertEqual(len(detail.candles), len(fallback_detail.candles))
+
+    def test_realtime_market_detail_uses_cached_snapshot_stats_when_rest_refresh_is_disabled(self) -> None:
+        client = BybitPublicMarketClient(base_url="https://api.bybit.com")
+        item = WatchlistInstrument(
+            symbol="BTCUSDT",
+            market="perp",
+            last_price=66_727.3,
+            change_24h=1.2,
+            volume_24h=1_000_000,
+            signal="active",
+            position_side="flat",
+            risk_level="medium",
+        )
+        fallback_detail = build_market_detail_for_watchlist(item)
+        cached_at = time.monotonic()
+        cached_ticker = {
+            "lastPrice": "66727.3",
+            "price24hPcnt": "0.018",
+            "highPrice24h": "70000",
+            "lowPrice24h": "65000",
+            "fundingRate": "0.00025",
+            "openInterestValue": "125000000",
+        }
+        cached_orderbook = {
+            "bids": [OrderBookLevel(price=66726.8, size=12.4, total=12.4)],
+            "asks": [OrderBookLevel(price=66727.1, size=11.1, total=11.1)],
+        }
+        cached_trades = [
+            MarketRecentTrade(
+                side="buy",
+                price=66_727.3,
+                size=0.42,
+                value=28_025.466,
+                occurred_at="2026-03-31T06:00:05+08:00",
+                is_block_trade=False,
+            )
+        ]
+        cached_candles = [
+            CandlePoint(
+                time="2026-03-31T05:30:00+08:00",
+                open=66_410,
+                high=66_520,
+                low=66_350,
+                close=66_480,
+                volume=1_800,
+            ),
+            CandlePoint(
+                time="2026-03-31T05:45:00+08:00",
+                open=66_480,
+                high=66_710,
+                low=66_420,
+                close=66_620,
+                volume=1_950,
+            ),
+        ]
+        client._set_cached_entry(  # type: ignore[attr-defined]
+            client._ticker_cache,
+            ("BTCUSDT", "perp"),
+            (cached_at, cached_ticker),
+            max_entries=client._ticker_cache_max_entries,
+        )
+        client._set_cached_entry(  # type: ignore[attr-defined]
+            client._orderbook_cache,
+            ("BTCUSDT", "perp", 8),
+            (cached_at, cached_orderbook),
+            max_entries=client._orderbook_cache_max_entries,
+        )
+        client._set_cached_entry(  # type: ignore[attr-defined]
+            client._recent_trade_cache,
+            ("BTCUSDT", "perp", 12),
+            (cached_at, cached_trades),
+            max_entries=client._recent_trade_cache_max_entries,
+        )
+        client._set_cached_entry(  # type: ignore[attr-defined]
+            client._candle_cache,
+            ("BTCUSDT", "perp", client.interval_for_timeframe("15m"), 48),
+            (cached_at, cached_candles),
+            max_entries=client._candle_cache_max_entries,
+        )
+
+        detail = client.enrich_market_detail(
+            symbol="BTCUSDT",
+            market="perp",
+            fallback_detail=fallback_detail,
+            watch_item=item,
+            timeframe="15m",
+            allow_rest_refresh=False,
+        )
+
+        self.assertEqual(detail.source, fallback_detail.source)
+        self.assertEqual(detail.timeframe, "15m")
+        self.assertEqual(detail.stats["数据源"], "本地快照")
+        self.assertEqual(detail.stats["24h振幅"], "7.69%")
+        self.assertEqual(detail.stats["资金费率"], "0.0250%")
+        self.assertEqual(detail.stats["持仓价值"], "0.12B")
+        self.assertEqual(detail.stats["24h高点"], "70,000.00")
+        self.assertEqual(detail.stats["24h低点"], "65,000.00")
+        self.assertEqual(detail.bids[0].price, 66_726.8)
+        self.assertEqual(detail.asks[0].price, 66_727.1)
+        self.assertEqual(detail.recent_public_trades[0].price, 66_727.3)
+        self.assertEqual(len(detail.candles), len(cached_candles))
+        self.assertEqual(detail.candles[-1].close, 66_620)
 
     def test_realtime_market_detail_keeps_ws_path_non_blocking_when_depth_snapshots_are_missing(self) -> None:
         client = RealtimeTickerOnlyMarketClient()
@@ -3398,6 +3517,260 @@ class ReviewParsingUnitTests(unittest.TestCase):
             )
 
 
+class ReconcileChangeRequestOutcomeUnitTests(unittest.TestCase):
+    def _make_change_request(self) -> str:
+        payload = ChangeRequestCreate(
+            type="alert_rule.update",
+            payload={"symbol": "BTCUSDT", "strategy_id": "btc-trend-01"},
+            summary="调高 BTCUSDT 提醒阈值",
+        )
+        created = control_main.repo.create_change_request(payload)
+        return created.id
+
+    def test_parse_reconcile_change_request_response_structured_json(self) -> None:
+        from openclaw_client import OpenClawGatewayClient  # type: ignore
+
+        raw = (
+            '{"summary": "提醒阈值已更新，运行线程正常",'
+            ' "landed": true,'
+            ' "needs_manual_review": false,'
+            ' "needs_manual_review_detail": "",'
+            ' "next_actions": ["观察 24 小时", "若再次触发补审计"]}'
+        )
+        parsed = OpenClawGatewayClient.parse_reconcile_change_request_response(raw)
+        self.assertEqual(parsed["summary"], "提醒阈值已更新，运行线程正常")
+        self.assertTrue(parsed["landed"])
+        self.assertFalse(parsed["needs_manual_review"])
+        self.assertIsNone(parsed["needs_manual_review_detail"])
+        self.assertEqual(parsed["next_actions"], ["观察 24 小时", "若再次触发补审计"])
+
+    def test_parse_reconcile_change_request_response_with_manual_review(self) -> None:
+        from openclaw_client import OpenClawGatewayClient  # type: ignore
+
+        raw = (
+            "```json\n"
+            '{"summary": "脚本补丁尚未生效",'
+            ' "landed": false,'
+            ' "needs_manual_review": "yes",'
+            ' "needs_manual_review_detail": "策略运行线程停滞，需要人工排查",'
+            ' "next_actions": "恢复运行线程;重新排队变更"}\n'
+            "```"
+        )
+        parsed = OpenClawGatewayClient.parse_reconcile_change_request_response(raw)
+        self.assertTrue(parsed["needs_manual_review"])
+        self.assertIn("策略运行线程停滞", parsed["needs_manual_review_detail"] or "")
+        self.assertEqual(parsed["next_actions"], ["恢复运行线程", "重新排队变更"])
+        self.assertFalse(parsed["landed"])
+
+    def test_parse_reconcile_change_request_response_plain_text_fallback(self) -> None:
+        from openclaw_client import OpenClawGatewayClient  # type: ignore
+
+        parsed = OpenClawGatewayClient.parse_reconcile_change_request_response(
+            "变更已经按预期落地，没有额外风险。"
+        )
+        self.assertEqual(parsed["summary"], "变更已经按预期落地，没有额外风险。")
+        self.assertIsNone(parsed["landed"])
+        self.assertIsNone(parsed["needs_manual_review"])
+        self.assertEqual(parsed["next_actions"], [])
+
+    def test_parse_reconcile_change_request_response_blank_text_falls_back_to_default_summary(self) -> None:
+        from openclaw_client import OpenClawGatewayClient  # type: ignore
+
+        parsed = OpenClawGatewayClient.parse_reconcile_change_request_response("")
+        self.assertEqual(parsed["summary"], "OpenClaw 已返回变更请求跟进结果。")
+        self.assertIsNone(parsed["landed"])
+        self.assertIsNone(parsed["needs_manual_review"])
+
+    def test_build_reconcile_change_request_prompt_requests_structured_json(self) -> None:
+        prompt = control_main.build_agent_job_prompt(
+            "reconcile_change_request",
+            {
+                "change_request_id": "cr-demo-01",
+                "change_type": "alert_rule.update",
+                "summary": "调高 BTCUSDT 提醒阈值",
+                "strategy_id": "btc-trend-01",
+                "target_mode": "paper",
+            },
+        )
+        self.assertIn("landed", prompt)
+        self.assertIn("needs_manual_review", prompt)
+        self.assertIn("next_actions", prompt)
+        self.assertIn("上下文：", prompt)
+
+    def test_apply_reconcile_change_request_outcome_flags_manual_followup(self) -> None:
+        change_request_id = self._make_change_request()
+        raw_response = json.dumps(
+            {
+                "summary": "策略运行线程停滞，变更尚未落地",
+                "landed": False,
+                "needs_manual_review": True,
+                "needs_manual_review_detail": "先恢复运行线程再推进",
+                "next_actions": ["恢复运行线程", "复核报警配置"],
+            },
+            ensure_ascii=False,
+        )
+
+        parsed = control_main.apply_reconcile_change_request_outcome_from_text(
+            {"change_request_id": change_request_id},
+            raw_response,
+            source="openclaw",
+        )
+        self.assertTrue(parsed["needs_manual_review"])
+
+        snapshot = control_main.repo.snapshot()
+        record = next(item for item in snapshot.change_requests if item.id == change_request_id)
+        self.assertTrue(record.manual_followup_required)
+        self.assertEqual(record.manual_followup_detail, "先恢复运行线程再推进")
+        self.assertEqual(record.follow_up_result_summary, "策略运行线程停滞，变更尚未落地")
+
+        # A follow-up outcome saying "landed" should clear the manual follow-up flag.
+        cleared = control_main.apply_reconcile_change_request_outcome_from_text(
+            {"change_request_id": change_request_id},
+            json.dumps(
+                {
+                    "summary": "运行线程恢复后变更已生效",
+                    "landed": True,
+                    "needs_manual_review": False,
+                    "needs_manual_review_detail": "",
+                    "next_actions": [],
+                },
+                ensure_ascii=False,
+            ),
+            source="openclaw",
+        )
+        self.assertFalse(cleared["needs_manual_review"])
+
+        snapshot_after = control_main.repo.snapshot()
+        record_after = next(item for item in snapshot_after.change_requests if item.id == change_request_id)
+        self.assertFalse(record_after.manual_followup_required)
+        self.assertIsNone(record_after.manual_followup_detail)
+        self.assertEqual(record_after.follow_up_result_summary, "运行线程恢复后变更已生效")
+
+    def test_apply_reconcile_change_request_outcome_emits_audit_event(self) -> None:
+        change_request_id = self._make_change_request()
+        control_main.apply_reconcile_change_request_outcome_from_text(
+            {"change_request_id": change_request_id},
+            "变更已经按预期落地，没有额外风险。",
+            source="openclaw",
+        )
+        snapshot = control_main.repo.snapshot()
+        matched = [
+            evt
+            for evt in snapshot.audit_events
+            if evt.event_type == "change_request.reconcile_outcome"
+            and (evt.payload or {}).get("change_request_id") == change_request_id
+        ]
+        self.assertTrue(matched, "expected reconcile outcome audit event")
+        self.assertEqual((matched[0].payload or {}).get("source"), "openclaw")
+
+    def test_apply_reconcile_change_request_outcome_unknown_id_is_noop(self) -> None:
+        # Should simply return parsed payload without raising.
+        parsed = control_main.apply_reconcile_change_request_outcome_from_text(
+            {"change_request_id": "cr-does-not-exist"},
+            "任意中文总结",
+            source="openclaw",
+        )
+        self.assertEqual(parsed["summary"], "任意中文总结")
+
+
+class ControlApiHelperUnitTests(unittest.TestCase):
+    def test_load_private_positions_snapshot_fetches_and_seeds_realtime_cache(self) -> None:
+        original_private = control_main.private_data
+        original_realtime = control_main.private_realtime
+
+        class CountingPrivateClient(StubConfiguredTradingBybitPrivateClient):
+            def __init__(self) -> None:
+                super().__init__()
+                self.fetch_positions_calls = 0
+
+            def fetch_positions(self) -> list[Dict[str, Any]]:
+                self.fetch_positions_calls += 1
+                return super().fetch_positions()
+
+        private_client = CountingPrivateClient()
+        realtime_client = StubBybitPrivateRealtimeClient(client=private_client, positions=[])
+        control_main.private_data = private_client
+        control_main.private_realtime = realtime_client
+        self.addCleanup(setattr, control_main, "private_data", original_private)
+        self.addCleanup(setattr, control_main, "private_realtime", original_realtime)
+
+        status, positions, updated_at = control_main.load_private_positions_snapshot()
+
+        self.assertEqual(private_client.fetch_positions_calls, 1)
+        self.assertEqual(len(positions), 2)
+        self.assertEqual(realtime_client.get_positions_snapshot(), positions)
+        self.assertEqual(updated_at, control_main.get_private_runtime_updated_at(status))
+
+        cached_status, cached_positions, cached_updated_at = control_main.load_private_positions_snapshot()
+
+        self.assertEqual(private_client.fetch_positions_calls, 1)
+        self.assertEqual(cached_status.account_type, status.account_type)
+        self.assertEqual(cached_positions, positions)
+        self.assertEqual(cached_updated_at, updated_at)
+
+
+class PrometheusLabelEscapeTests(unittest.TestCase):
+    def test_label_value_none_becomes_empty_string(self) -> None:
+        self.assertEqual(control_main.prometheus_label_value(None), "")
+
+    def test_label_value_passes_through_plain_string(self) -> None:
+        self.assertEqual(control_main.prometheus_label_value("running"), "running")
+
+    def test_label_value_escapes_double_quote(self) -> None:
+        self.assertEqual(
+            control_main.prometheus_label_value('status"} malicious{x="1'),
+            'status\\"} malicious{x=\\"1',
+        )
+
+    def test_label_value_escapes_backslash_before_quote(self) -> None:
+        self.assertEqual(
+            control_main.prometheus_label_value('a\\"b'),
+            'a\\\\\\"b',
+        )
+
+    def test_label_value_escapes_newline(self) -> None:
+        self.assertEqual(
+            control_main.prometheus_label_value("line1\nline2"),
+            "line1\\nline2",
+        )
+
+    def test_label_value_coerces_non_string(self) -> None:
+        self.assertEqual(control_main.prometheus_label_value(42), "42")
+        self.assertEqual(control_main.prometheus_label_value(True), "True")
+
+    def test_labels_wraps_each_value_in_quotes(self) -> None:
+        rendered = control_main.prometheus_labels(status="running", queue=3)
+        self.assertEqual(rendered, 'status="running",queue="3"')
+
+    def test_labels_escapes_injection_attempt(self) -> None:
+        rendered = control_main.prometheus_labels(status='x"} fake_metric{y="1')
+        self.assertEqual(rendered, 'status="x\\"} fake_metric{y=\\"1"')
+
+    def test_labels_preserves_key_ordering(self) -> None:
+        rendered = control_main.prometheus_labels(z="a", a="b", m="c")
+        self.assertEqual(rendered, 'z="a",a="b",m="c"')
+
+    def test_prometheus_metrics_escapes_injected_scheduler_status(self) -> None:
+        original_scheduler = control_main.repo.state.control_snapshot.scheduler
+        mutated_scheduler = original_scheduler.model_copy(
+            update={"status": 'running"} injected_metric{evil="1'}
+        )
+        control_main.repo.state.control_snapshot.scheduler = mutated_scheduler
+        self.addCleanup(
+            setattr,
+            control_main.repo.state.control_snapshot,
+            "scheduler",
+            original_scheduler,
+        )
+
+        output = control_main.build_prometheus_metrics()
+
+        self.assertIn(
+            'status="running\\"} injected_metric{evil=\\"1"',
+            output,
+        )
+
+
 class ControlApiIntegrationTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -3485,6 +3858,10 @@ class ControlApiIntegrationTests(unittest.TestCase):
 
     def _get_text(self, path: str) -> tuple[int, str]:
         return _request_text(self._base_url, "GET", path)
+
+    def _assert_missing_keys(self, payload: Dict[str, Any], *keys: str) -> None:
+        for key in keys:
+            self.assertNotIn(key, payload)
 
     def _reset_strategy_paper_state(self, strategy_id: str) -> None:
         control_main.repo.state.trades = [
@@ -8163,53 +8540,105 @@ class ControlApiIntegrationTests(unittest.TestCase):
         self.assertEqual(activity["latest_backtest"]["timeframe"], "1h")
         self.assertEqual(activity["latest_backtest_record"]["id"], "bt-001")
         self.assertEqual(activity["latest_backtest_record"]["timeframe"], "1h")
-        self.assertIsNone(activity["latest_actionable_backtest"])
-        self.assertIsNone(activity["latest_actionable_backtest_record"])
-        self.assertIsNone(activity["latest_backtest_review"])
-        self.assertIsNone(activity["latest_backtest_job"])
-        self.assertIsNone(activity["latest_actionable_backtest_review"])
-        self.assertIsNone(activity["latest_actionable_backtest_job"])
-        self.assertIsNone(activity["latest_backtest_review_record"])
-        self.assertIsNone(activity["latest_backtest_job_record"])
-        self.assertIsNone(activity["latest_actionable_backtest_review_record"])
-        self.assertIsNone(activity["latest_actionable_backtest_job_record"])
+        self._assert_missing_keys(
+            activity,
+            "latest_actionable_backtest",
+            "latest_actionable_backtest_record",
+            "latest_backtest_review",
+            "latest_backtest_job",
+            "latest_actionable_backtest_review",
+            "latest_actionable_backtest_job",
+            "latest_backtest_review_record",
+            "latest_backtest_job_record",
+            "latest_actionable_backtest_review_record",
+            "latest_actionable_backtest_job_record",
+        )
         self.assertTrue(any(item["id"] == "bt-001" for item in activity["recent_backtests"]))
         self.assertTrue(any(item["id"] == "review-20260330-daily" for item in activity["recent_reviews"]))
         self.assertEqual(activity["latest_primary_review"]["id"], "review-20260330-daily")
         self.assertEqual(activity["latest_primary_review_record"]["id"], "review-20260330-daily")
-        self.assertIsNone(activity["latest_actionable_primary_review"])
-        self.assertIsNone(activity["latest_actionable_primary_review_record"])
-        self.assertIsNone(activity["latest_tracking_review"])
-        self.assertIsNone(activity["latest_tracking_review_record"])
+        self._assert_missing_keys(
+            activity,
+            "latest_actionable_primary_review",
+            "latest_actionable_primary_review_record",
+            "latest_tracking_review",
+            "latest_tracking_review_record",
+        )
         self.assertIn(
             activity["latest_tracking_job"]["job_type"],
             {"review_strategy_change", "review_strategy_issue"},
         )
         self.assertEqual(activity["latest_tracking_job_record"]["id"], activity["latest_tracking_job"]["id"])
-        self.assertIsNone(activity["latest_retryable_tracking_job_record"])
-        self.assertEqual(activity["latest_audit_event_record"]["event_type"], "openclaw.job.queued")
-        self.assertEqual(activity["latest_audit_event_record"]["summary"], "任务已入队：review_strategy_issue")
-        self.assertEqual(activity["latest_audit_event_record"]["priority"], 1)
-        self.assertTrue(activity["latest_audit_event_record"]["is_key_event"])
+        self.assertNotIn("latest_retryable_tracking_job_record", activity)
+        decision_context = activity["decision_context"]
+        self.assertEqual(decision_context["backtest"]["latest_record"]["id"], "bt-001")
+        self.assertEqual(decision_context["review"]["latest_primary_record"]["id"], "review-20260330-daily")
+        self.assertEqual(decision_context["tracking"]["latest_job_record"]["id"], activity["latest_tracking_job"]["id"])
+        activity_sections = activity["activity_sections"]
+        self.assertEqual(activity_sections["backtest"]["latest"]["id"], activity["latest_backtest"]["id"])
+        self.assertEqual(activity_sections["proposal"]["latest"]["id"], activity["latest_proposal"]["id"])
         self.assertEqual(
-            activity["latest_audit_event_record"]["payload"]["job_type"],
+            activity_sections["change_request"]["latest"]["id"],
+            activity["latest_change_request"]["id"],
+        )
+        self.assertEqual(
+            activity_sections["review"]["latest_primary"]["id"],
+            activity["latest_primary_review"]["id"],
+        )
+        self.assertEqual(
+            activity_sections["tracking"]["latest_job"]["id"],
+            activity["latest_tracking_job"]["id"],
+        )
+        self.assertEqual(
+            activity["latest_ops"]["latest_audit_event_record"]["event_type"],
+            "openclaw.job.queued",
+        )
+        self.assertEqual(
+            activity["latest_ops"]["latest_audit_event_record"]["summary"],
+            "任务已入队：review_strategy_issue",
+        )
+        self.assertEqual(activity["latest_ops"]["latest_audit_event_record"]["priority"], 1)
+        self.assertTrue(activity["latest_ops"]["latest_audit_event_record"]["is_key_event"])
+        self.assertEqual(
+            activity["latest_ops"]["latest_audit_event_record"]["payload"]["job_type"],
             activity["latest_tracking_job"]["job_type"],
+        )
+        self._assert_missing_keys(
+            activity,
+            "latest_active_order",
+            "latest_active_order_record",
+            "latest_historical_order",
+            "latest_historical_order_record",
+            "latest_order",
+            "latest_order_record",
+            "latest_pending_alert",
+            "latest_pending_alert_record",
+            "latest_trade",
+            "latest_trade_record",
+            "latest_alert",
+            "latest_alert_record",
+            "latest_audit_event",
+            "latest_audit_event_record",
         )
         self.assertIn("latest_ops", activity)
         self.assertEqual(activity["latest_ops"]["latest_order_record"]["order_id"], "hist-live-strategy-001")
-        self.assertEqual(activity["latest_ops"]["latest_trade_record"]["id"], activity["latest_trade_record"]["id"])
-        self.assertEqual(activity["latest_ops"]["latest_alert_record"]["id"], activity["latest_alert_record"]["id"])
+        self.assertEqual(
+            activity["latest_ops"]["latest_trade_record"]["id"],
+            activity["latest_runtime"]["latest_ops"]["latest_trade_record"]["id"],
+        )
+        self.assertEqual(
+            activity["latest_ops"]["latest_alert_record"]["id"],
+            activity["latest_runtime"]["latest_ops"]["latest_alert_record"]["id"],
+        )
         self.assertEqual(
             activity["latest_ops"]["latest_audit_event_record"]["event_type"],
-            activity["latest_audit_event_record"]["event_type"],
+            activity["latest_runtime"]["latest_ops"]["latest_audit_event_record"]["event_type"],
         )
         self.assertIn("latest_runtime", activity)
         self.assertEqual(
             activity["latest_runtime"]["latest_ops"]["latest_order_record"]["order_id"],
             "hist-live-strategy-001",
         )
-        self.assertEqual(activity["latest_order_record"]["order_id"], "hist-live-strategy-001")
-        self.assertEqual(activity["latest_order_record"]["symbol"], "BTCUSDT")
         self.assertTrue(any(item["order_id"] == "hist-live-strategy-001" for item in activity["recent_orders"]))
         self.assertTrue(any(item["event_type"] == "exchange_order.filled" for item in activity["recent_audit_events"]))
         self.assertTrue(any(item["job_type"] == "review_strategy_change" for item in activity["recent_agent_jobs"]))
@@ -8222,12 +8651,15 @@ class ControlApiIntegrationTests(unittest.TestCase):
         )
         self.assertTrue(any(item["id"] == review_change["id"] for item in activity["recent_change_requests"]))
         self.assertEqual(activity["latest_change_request"]["id"], activity["recent_change_requests"][0]["id"])
-        self.assertIsNone(activity["latest_change_request_source_backtest_record"])
-        self.assertIsNone(activity["latest_change_request_source_review_record"])
-        self.assertIsNone(activity["latest_change_request_source_proposal_record"])
-        self.assertIsNone(activity["latest_actionable_change_request_source_backtest_record"])
-        self.assertIsNone(activity["latest_actionable_change_request_source_review_record"])
-        self.assertIsNone(activity["latest_actionable_change_request_source_proposal_record"])
+        self._assert_missing_keys(
+            activity,
+            "latest_change_request_source_backtest_record",
+            "latest_change_request_source_review_record",
+            "latest_change_request_source_proposal_record",
+            "latest_actionable_change_request_source_backtest_record",
+            "latest_actionable_change_request_source_review_record",
+            "latest_actionable_change_request_source_proposal_record",
+        )
         manual_followup_change = next(
             (item for item in activity["recent_change_requests"] if item["id"] == followup_change["id"]),
             None,
@@ -8242,34 +8674,99 @@ class ControlApiIntegrationTests(unittest.TestCase):
         self.assertTrue(any(item["id"] == "prop-002" for item in activity["recent_proposals"]))
         self.assertEqual(activity["latest_proposal"]["id"], activity["recent_proposals"][0]["id"])
         self.assertEqual(activity["latest_actionable_proposal"]["id"], "prop-002")
-        self.assertIsNone(activity["latest_proposal_change_request"])
-        self.assertIsNone(activity["latest_proposal_backtest"])
-        self.assertIsNone(activity["latest_proposal_review"])
-        self.assertIsNone(activity["latest_proposal_job"])
-        self.assertIsNone(activity["latest_proposal_backtest_record"])
-        self.assertIsNone(activity["latest_proposal_review_record"])
-        self.assertIsNone(activity["latest_proposal_job_record"])
-        self.assertIsNone(activity["latest_actionable_proposal_change_request"])
-        self.assertIsNone(activity["latest_actionable_proposal_backtest"])
-        self.assertIsNone(activity["latest_actionable_proposal_review"])
-        self.assertIsNone(activity["latest_actionable_proposal_job"])
-        self.assertIsNone(activity["latest_actionable_proposal_backtest_record"])
-        self.assertIsNone(activity["latest_actionable_proposal_review_record"])
-        self.assertIsNone(activity["latest_actionable_proposal_job_record"])
-        self.assertIsNone(activity["latest_change_request_backtest_record"])
-        self.assertIsNone(activity["latest_change_request_review_record"])
-        self.assertIsNone(activity["latest_change_request_job_record"])
-        self.assertIsNone(activity["latest_actionable_change_request_backtest_record"])
-        self.assertIsNone(activity["latest_actionable_change_request_review_record"])
-        self.assertIsNone(activity["latest_actionable_change_request_job_record"])
-        self.assertIsNone(activity["latest_actionable_change_request"])
-        self.assertIsNone(activity["latest_retryable_tracking_job"])
+        self._assert_missing_keys(
+            activity,
+            "latest_proposal_change_request",
+            "latest_proposal_backtest",
+            "latest_proposal_review",
+            "latest_proposal_job",
+            "latest_proposal_backtest_record",
+            "latest_proposal_review_record",
+            "latest_proposal_job_record",
+            "latest_actionable_proposal_change_request",
+            "latest_actionable_proposal_backtest",
+            "latest_actionable_proposal_review",
+            "latest_actionable_proposal_job",
+            "latest_actionable_proposal_backtest_record",
+            "latest_actionable_proposal_review_record",
+            "latest_actionable_proposal_job_record",
+            "latest_change_request_backtest_record",
+            "latest_change_request_review_record",
+            "latest_change_request_job_record",
+            "latest_actionable_change_request_backtest_record",
+            "latest_actionable_change_request_review_record",
+            "latest_actionable_change_request_job_record",
+            "latest_actionable_change_request",
+            "latest_retryable_tracking_job",
+        )
         latest_proposal = next((item for item in activity["recent_proposals"] if item["id"] == "prop-002"), None)
         self.assertIsNotNone(latest_proposal)
         assert latest_proposal is not None
         self.assertEqual(latest_proposal["strategy_id"], "trend-btc-01")
         self.assertEqual(latest_proposal["proposal_type"], "publish_recommendation")
         self.assertEqual(latest_proposal["status"], "pending")
+
+    def test_strategy_activity_orders_recent_proposals_by_created_at(self) -> None:
+        base_review = control_main.repo.state.reviews[0]
+        base_proposal = next(
+            proposal for proposal in base_review.proposals if proposal.strategy_id == "trend-btc-01"
+        )
+        older_proposal = base_proposal.model_copy(
+            update={
+                "id": "prop-order-older-001",
+                "title": "较早提案",
+                "description": "这条提案更早产生，用来验证 recent_proposals 排序。",
+                "created_at": "2026-03-30T08:00:00+08:00",
+                "status": "testing",
+            }
+        )
+        newer_proposal = base_proposal.model_copy(
+            update={
+                "id": "prop-order-newer-001",
+                "title": "较新提案",
+                "description": "这条提案更新产生，必须排在 recent_proposals 第一位。",
+                "created_at": "2026-03-30T09:30:00+08:00",
+                "status": "pending",
+            }
+        )
+        older_review = base_review.model_copy(
+            deep=True,
+            update={
+                "id": "review-proposal-order-older-001",
+                "title": "较早复盘",
+                "summary": "较早复盘里的提案应排在后面。",
+                "created_at": "2026-03-30T08:10:00+08:00",
+                "proposals": [older_proposal],
+            },
+        )
+        newer_review = base_review.model_copy(
+            deep=True,
+            update={
+                "id": "review-proposal-order-newer-001",
+                "title": "较新复盘",
+                "summary": "较新复盘里的提案应排在前面。",
+                "created_at": "2026-03-30T09:40:00+08:00",
+                "proposals": [newer_proposal],
+            },
+        )
+        control_main.repo.state.reviews = [older_review, newer_review]
+        control_main.repo._persist(control_main.repo.state)
+
+        activity_status, activity = self._get("/api/strategies/trend-btc-01/activity")
+        self.assertEqual(activity_status, 200)
+        self.assertEqual(
+            [item["id"] for item in activity["recent_reviews"][:2]],
+            ["review-proposal-order-newer-001", "review-proposal-order-older-001"],
+        )
+        self.assertEqual(
+            [item["id"] for item in activity["recent_proposals"][:2]],
+            ["prop-order-newer-001", "prop-order-older-001"],
+        )
+        self.assertEqual(activity["latest_proposal"]["id"], "prop-order-newer-001")
+        self.assertEqual(activity["latest_actionable_proposal"]["id"], "prop-order-newer-001")
+        self.assertEqual(activity["activity_sections"]["proposal"]["latest"]["id"], "prop-order-newer-001")
+        self.assertEqual(activity["recent_proposals"][0]["created_at"], "2026-03-30T09:30:00+08:00")
+        self.assertEqual(activity["recent_proposals"][1]["created_at"], "2026-03-30T08:00:00+08:00")
 
     def test_get_strategy_activity_uses_cached_runtime_snapshot(self) -> None:
         control_main.repo.state.strategy_runtime_snapshots = [
@@ -8304,6 +8801,81 @@ class ControlApiIntegrationTests(unittest.TestCase):
         self.assertEqual(activity["runtime"]["strategy_id"], "trend-btc-01")
         self.assertIsNotNone(activity["runtime"]["signal"])
         self.assertIsNotNone(activity["runtime"]["last_price"])
+
+    def test_review_strategy_activity_context_scans_primary_reviews_once(self) -> None:
+        now = datetime.now(timezone.utc).astimezone()
+        primary_review = ReviewDocument(
+            id="review-primary-actionable-001",
+            period="backtest",
+            strategy_id="trend-btc-01",
+            backtest_id="bt-primary-actionable-001",
+            source_change_request_id=None,
+            source_backtest_id=None,
+            source_review_id=None,
+            source_proposal_id=None,
+            trigger_reason=None,
+            source_job_id=None,
+            source_job_type=None,
+            source_job_status=None,
+            decision_readiness=None,
+            decision_readiness_detail=None,
+            decision_recommended_data_range="最近 180 天",
+            decision_recommended_timeframe="4h",
+            decision_readiness_action=None,
+            title="可行动主复盘",
+            summary="主复盘需要保留为 actionable primary。",
+            highlights=[],
+            risks=[],
+            proposals=[],
+            created_at=(now - timedelta(seconds=5)).isoformat(),
+        )
+        tracking_review = ReviewDocument(
+            id="review-tracking-issue-001",
+            period="strategy_issue",
+            strategy_id="trend-btc-01",
+            backtest_id=None,
+            source_change_request_id=None,
+            source_backtest_id=None,
+            source_review_id=None,
+            source_proposal_id=None,
+            trigger_reason=None,
+            source_job_id=None,
+            source_job_type=None,
+            source_job_status=None,
+            decision_readiness=None,
+            decision_readiness_detail=None,
+            decision_recommended_data_range=None,
+            decision_recommended_timeframe=None,
+            decision_readiness_action=None,
+            title="跟踪复盘",
+            summary="跟踪复盘不应进入 primary actionable。",
+            highlights=[],
+            risks=[],
+            proposals=[],
+            created_at=now.isoformat(),
+        )
+        control_main.repo.state.reviews.insert(0, primary_review)
+        control_main.repo.state.reviews.insert(0, tracking_review)
+        self.addCleanup(
+            lambda: control_main.repo.state.reviews.remove(tracking_review)
+            if tracking_review in control_main.repo.state.reviews
+            else None
+        )
+        self.addCleanup(
+            lambda: control_main.repo.state.reviews.remove(primary_review)
+            if primary_review in control_main.repo.state.reviews
+            else None
+        )
+
+        activity_context = control_main.repo._build_review_strategy_activity_context_locked("trend-btc-01")
+        self.assertIsNotNone(activity_context)
+        assert activity_context is not None
+        self.assertIn(primary_review.id, str(activity_context["latest_primary_review"] or ""))
+        self.assertIn(primary_review.id, str(activity_context["latest_actionable_primary_review"] or ""))
+        self.assertIn(tracking_review.id, str(activity_context["latest_tracking_review"] or ""))
+        review_context = activity_context["decision_context"]["review"]
+        self.assertEqual(review_context["latest_primary_record"]["id"], primary_review.id)
+        self.assertEqual(review_context["latest_actionable_primary_record"]["id"], primary_review.id)
 
     def test_strategy_runtime_rejected_exchange_order_creates_system_alert(self) -> None:
         original_market = control_main.market_data
@@ -10238,6 +10810,22 @@ class ControlApiIntegrationTests(unittest.TestCase):
             r'bybit_control_market_live_watchlist_fallback_detail_count\{timeframe="1h"\} \d+',
         )
 
+    def test_metrics_endpoint_escapes_strategy_id_labels(self) -> None:
+        injected_strategy_id = 'trend"\n\\btc'
+        first_strategy = control_main.repo.state.strategies[0]
+        control_main.repo.state.strategies[0] = first_strategy.model_copy(update={"id": injected_strategy_id})
+        control_main.repo._persist(control_main.repo.state)
+
+        metrics_status, metrics_body = self._get_text("/metrics")
+        self.assertEqual(metrics_status, 200)
+
+        escaped_strategy_id = (
+            injected_strategy_id.replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"')
+        )
+
+        self.assertIn(f'strategy_id="{escaped_strategy_id}"', metrics_body)
+        self.assertNotIn(f'strategy_id="{injected_strategy_id}"', metrics_body)
+
     def test_settings_endpoint_updates_local_settings_and_grafana_status(self) -> None:
         status, payload = self._post(
             "/api/settings",
@@ -10860,17 +11448,24 @@ class ControlApiIntegrationTests(unittest.TestCase):
         activity_context = control_main._build_strategy_activity_review_context("trend-btc-01")
         self.assertIsNotNone(activity_context)
         assert activity_context is not None
-        self.assertEqual(activity_context["latest_change_request_job_record"]["id"], job.id)
-        self.assertEqual(activity_context["latest_change_request_review_record"]["id"], review.id)
-        self.assertEqual(activity_context["latest_change_request_source_backtest_record"]["id"], "bt-001")
+        change_request_context = activity_context["decision_context"]["change_request"]
+        self.assertEqual(change_request_context["latest_job_record"]["id"], job.id)
+        self.assertEqual(change_request_context["latest_review_record"]["id"], review.id)
+        self.assertEqual(change_request_context["latest_source_backtest_record"]["id"], "bt-001")
         self.assertEqual(
-            activity_context["latest_change_request_source_review_record"]["id"],
+            change_request_context["latest_source_review_record"]["id"],
             "review-20260330-daily",
         )
-        self.assertEqual(activity_context["latest_change_request_source_proposal_record"]["id"], "prop-002")
+        self.assertEqual(change_request_context["latest_source_proposal_record"]["id"], "prop-002")
 
         activity_status, activity = self._get("/api/strategies/trend-btc-01/activity")
         self.assertEqual(activity_status, 200)
+        change_request_context = activity["decision_context"]["change_request"]
+        self.assertEqual(change_request_context["latest_job_record"]["id"], job.id)
+        self.assertEqual(change_request_context["latest_review_record"]["id"], review.id)
+        self.assertEqual(change_request_context["latest_source_backtest_record"]["id"], "bt-001")
+        self.assertEqual(change_request_context["latest_source_review_record"]["id"], "review-20260330-daily")
+        self.assertEqual(change_request_context["latest_source_proposal_record"]["id"], "prop-002")
         self.assertEqual(activity["latest_change_request_job_record"]["id"], job.id)
         self.assertEqual(activity["latest_change_request_review_record"]["id"], review.id)
         self.assertEqual(activity["latest_change_request_source_backtest_record"]["id"], "bt-001")
@@ -10916,27 +11511,90 @@ class ControlApiIntegrationTests(unittest.TestCase):
         assert activity_context is not None
         self.assertIn(change_request["id"], str(activity_context["latest_actionable_change_request"] or ""))
         self.assertIn(follow_up_job_id, str(activity_context["latest_retryable_tracking_job"] or ""))
-        self.assertEqual(activity_context["latest_actionable_change_request_job_record"]["id"], follow_up_job_id)
-        self.assertIsNone(activity_context["latest_actionable_change_request_review_record"])
-        self.assertEqual(activity_context["latest_actionable_change_request_source_backtest_record"]["id"], "bt-001")
+        change_request_context = activity_context["decision_context"]["change_request"]
+        self.assertEqual(change_request_context["actionable_job_record"]["id"], follow_up_job_id)
+        self.assertIsNone(change_request_context.get("actionable_review_record"))
+        self.assertEqual(change_request_context["actionable_source_backtest_record"]["id"], "bt-001")
         self.assertEqual(
-            activity_context["latest_actionable_change_request_source_review_record"]["id"],
+            change_request_context["actionable_source_review_record"]["id"],
             "review-20260330-daily",
         )
-        self.assertEqual(activity_context["latest_actionable_change_request_source_proposal_record"]["id"], "prop-002")
+        self.assertEqual(change_request_context["actionable_source_proposal_record"]["id"], "prop-002")
 
         activity_status, activity = self._get("/api/strategies/trend-btc-01/activity")
         self.assertEqual(activity_status, 200)
         self.assertEqual(activity["latest_actionable_change_request"]["id"], change_request["id"])
         self.assertEqual(activity["latest_retryable_tracking_job"]["id"], follow_up_job_id)
+        change_request_context = activity["decision_context"]["change_request"]
+        self.assertEqual(change_request_context["actionable_job_record"]["id"], follow_up_job_id)
+        self.assertIsNone(change_request_context.get("actionable_review_record"))
+        self.assertEqual(change_request_context["actionable_source_backtest_record"]["id"], "bt-001")
+        self.assertEqual(change_request_context["actionable_source_review_record"]["id"], "review-20260330-daily")
+        self.assertEqual(change_request_context["actionable_source_proposal_record"]["id"], "prop-002")
         self.assertEqual(activity["latest_actionable_change_request_job_record"]["id"], follow_up_job_id)
-        self.assertIsNone(activity["latest_actionable_change_request_review_record"])
+        self.assertNotIn("latest_actionable_change_request_review_record", activity)
         self.assertEqual(activity["latest_actionable_change_request_source_backtest_record"]["id"], "bt-001")
         self.assertEqual(
             activity["latest_actionable_change_request_source_review_record"]["id"],
             "review-20260330-daily",
         )
         self.assertEqual(activity["latest_actionable_change_request_source_proposal_record"]["id"], "prop-002")
+
+    def test_review_strategy_activity_context_scans_change_requests_once(self) -> None:
+        control_main.repo.state.control_snapshot.scheduler.current_job_id = None
+        first = control_main.repo.create_change_request(
+            control_main.ChangeRequestCreate(
+                type="strategy.parameter.update",
+                payload={"strategy_id": "trend-btc-01", "fast_ma": 13},
+                requested_by="unit_test",
+                target_mode=AccountMode.PAPER,
+                priority="high",
+                summary="旧变更请求",
+            )
+        )
+        first_job = next(item for item in control_main.repo.state.agent_jobs if item.id == first.follow_up_job_id)
+        control_main.repo.fail_agent_job(first_job.id, "OpenClaw 任务执行失败。", source="local_fallback")
+
+        second = control_main.repo.create_change_request(
+            control_main.ChangeRequestCreate(
+                type="strategy.risk_update",
+                payload={"strategy_id": "trend-btc-01", "risk_budget": "9%"},
+                requested_by="unit_test",
+                target_mode=AccountMode.PAPER,
+                priority="high",
+                summary="更新的普通变更请求",
+            )
+        )
+        second_job = next(item for item in control_main.repo.state.agent_jobs if item.id == second.follow_up_job_id)
+        self.addCleanup(
+            lambda: control_main.repo.state.change_requests.remove(second)
+            if second in control_main.repo.state.change_requests
+            else None
+        )
+        self.addCleanup(
+            lambda: control_main.repo.state.change_requests.remove(first)
+            if first in control_main.repo.state.change_requests
+            else None
+        )
+        self.addCleanup(
+            lambda: control_main.repo.state.agent_jobs.remove(first_job)
+            if first_job in control_main.repo.state.agent_jobs
+            else None
+        )
+        self.addCleanup(
+            lambda: control_main.repo.state.agent_jobs.remove(second_job)
+            if second_job in control_main.repo.state.agent_jobs
+            else None
+        )
+
+        activity_context = control_main.repo._build_review_strategy_activity_context_locked("trend-btc-01")
+        self.assertIsNotNone(activity_context)
+        assert activity_context is not None
+        self.assertIn(second.id, str(activity_context["latest_change_request"] or ""))
+        self.assertIn(first.id, str(activity_context["latest_actionable_change_request"] or ""))
+        change_request_context = activity_context["decision_context"]["change_request"]
+        self.assertEqual(change_request_context["latest_job_record"]["id"], second.follow_up_job_id)
+        self.assertEqual(change_request_context["actionable_job_record"]["id"], first.follow_up_job_id)
 
     def test_change_request_follow_up_fields_reset_when_retrying_cancelled_tracking_job(self) -> None:
         status, change_request = self._post(
@@ -11189,7 +11847,8 @@ class ControlApiIntegrationTests(unittest.TestCase):
             )
         )
         self.assertIn(job["id"], str(activity_context["latest_tracking_job"] or ""))
-        self.assertEqual(activity_context["latest_tracking_job_record"]["id"], job["id"])
+        tracking_context = activity_context["decision_context"]["tracking"]
+        self.assertEqual(tracking_context["latest_job_record"]["id"], job["id"])
         self.assertIn("latest_proposal", activity_context)
         self.assertIn("latest_proposal_change_request", activity_context)
         self.assertIn("latest_proposal_backtest", activity_context)
@@ -11339,13 +11998,20 @@ class ControlApiIntegrationTests(unittest.TestCase):
 
         activity_status, activity = self._get("/api/strategies/trend-btc-01/activity")
         self.assertEqual(activity_status, 200)
-        self.assertIn("已终止 2 个任务", str(activity.get("latest_audit_event") or ""))
-        self.assertIn("回测 bt-audit-001", str(activity.get("latest_audit_event") or ""))
-        self.assertIn("需人工跟进", str(activity.get("latest_audit_event") or ""))
-        self.assertEqual(activity["latest_audit_event_record"]["event_type"], "scheduler.command")
-        self.assertEqual(activity["latest_audit_event_record"]["summary"], "已终止 2 个任务。")
-        self.assertIn("回测 bt-audit-001", str(activity["latest_audit_event_record"]["impact_detail"] or ""))
-        self.assertEqual(activity["latest_audit_event_record"]["payload"]["summary"], "已终止 2 个任务。")
+        self._assert_missing_keys(activity, "latest_audit_event", "latest_audit_event_record")
+        self.assertIn("已终止 2 个任务", str(activity["latest_ops"].get("latest_audit_event") or ""))
+        self.assertIn("回测 bt-audit-001", str(activity["latest_ops"].get("latest_audit_event") or ""))
+        self.assertIn("需人工跟进", str(activity["latest_ops"].get("latest_audit_event") or ""))
+        self.assertEqual(activity["latest_ops"]["latest_audit_event_record"]["event_type"], "scheduler.command")
+        self.assertEqual(activity["latest_ops"]["latest_audit_event_record"]["summary"], "已终止 2 个任务。")
+        self.assertIn(
+            "回测 bt-audit-001",
+            str(activity["latest_ops"]["latest_audit_event_record"]["impact_detail"] or ""),
+        )
+        self.assertEqual(
+            activity["latest_ops"]["latest_audit_event_record"]["payload"]["summary"],
+            "已终止 2 个任务。",
+        )
 
     def test_review_strategy_activity_context_includes_latest_alert_order_and_trade(self) -> None:
         now = datetime.now(timezone.utc).astimezone().isoformat()
@@ -11544,27 +12210,42 @@ class ControlApiIntegrationTests(unittest.TestCase):
 
         activity_status, activity = self._get(f"/api/strategies/{strategy_id}/activity")
         self.assertEqual(activity_status, 200)
-        self.assertIn("ETHUSDT 卖 0.250@999999", str(activity.get("latest_order") or ""))
-        self.assertIn("New", str(activity.get("latest_order") or ""))
-        self.assertIn("ETHUSDT 卖 0.250@999999", str(activity.get("latest_active_order") or ""))
-        self.assertIn("New", str(activity.get("latest_active_order") or ""))
-        self.assertIn("ETHUSDT 买 0.500@3568", str(activity.get("latest_historical_order") or ""))
-        self.assertIn("filled", str(activity.get("latest_historical_order") or ""))
-        self.assertEqual(activity["latest_active_order_record"]["order_id"], "order-review-context-active-001")
-        self.assertEqual(activity["latest_historical_order_record"]["order_id"], "order-review-context-001")
-        self.assertEqual(activity["latest_order_record"]["order_id"], "order-review-context-active-001")
-        self.assertIn("ETHUSDT 卖 0.25@3576.0", str(activity.get("latest_trade") or ""))
-        self.assertIn("filled", str(activity.get("latest_trade") or ""))
+        self._assert_missing_keys(
+            activity,
+            "latest_active_order",
+            "latest_active_order_record",
+            "latest_historical_order",
+            "latest_historical_order_record",
+            "latest_order",
+            "latest_order_record",
+            "latest_pending_alert",
+            "latest_pending_alert_record",
+            "latest_trade",
+            "latest_trade_record",
+            "latest_alert",
+            "latest_alert_record",
+        )
+        self.assertIn("ETHUSDT 卖 0.250@999999", str(activity["latest_ops"].get("latest_order") or ""))
+        self.assertIn("New", str(activity["latest_ops"].get("latest_order") or ""))
+        self.assertIn("ETHUSDT 卖 0.250@999999", str(activity["latest_ops"].get("latest_active_order") or ""))
+        self.assertIn("New", str(activity["latest_ops"].get("latest_active_order") or ""))
+        self.assertIn("ETHUSDT 买 0.500@3568", str(activity["latest_ops"].get("latest_historical_order") or ""))
+        self.assertIn("filled", str(activity["latest_ops"].get("latest_historical_order") or ""))
+        self.assertEqual(activity["latest_ops"]["latest_active_order_record"]["order_id"], "order-review-context-active-001")
+        self.assertEqual(activity["latest_ops"]["latest_historical_order_record"]["order_id"], "order-review-context-001")
+        self.assertEqual(activity["latest_ops"]["latest_order_record"]["order_id"], "order-review-context-active-001")
+        self.assertIn("ETHUSDT 卖 0.25@3576.0", str(activity["latest_ops"].get("latest_trade") or ""))
+        self.assertIn("filled", str(activity["latest_ops"].get("latest_trade") or ""))
         self.assertIn("latest_ops", activity)
         self.assertEqual(activity["latest_ops"]["latest_trade_record"]["id"], "trade-review-context-002")
         self.assertIn("latest_runtime", activity)
         self.assertEqual(activity["latest_runtime"]["latest_ops"]["latest_trade_record"]["id"], "trade-review-context-002")
-        self.assertEqual(activity["latest_trade_record"]["id"], "trade-review-context-002")
+        self.assertEqual(activity["latest_ops"]["latest_trade_record"]["id"], "trade-review-context-002")
         self.assertEqual(activity["recent_trades"][0]["id"], "trade-review-context-002")
-        self.assertIn("P0 ETH 二次执行阻断", str(activity.get("latest_alert") or ""))
-        self.assertIn("P1 ETH 待处理执行提醒", str(activity.get("latest_pending_alert") or ""))
-        self.assertEqual(activity["latest_pending_alert_record"]["id"], "alert-review-context-003")
-        self.assertEqual(activity["latest_alert_record"]["id"], "alert-review-context-002")
+        self.assertIn("P0 ETH 二次执行阻断", str(activity["latest_ops"].get("latest_alert") or ""))
+        self.assertIn("P1 ETH 待处理执行提醒", str(activity["latest_ops"].get("latest_pending_alert") or ""))
+        self.assertEqual(activity["latest_ops"]["latest_pending_alert_record"]["id"], "alert-review-context-003")
+        self.assertEqual(activity["latest_ops"]["latest_alert_record"]["id"], "alert-review-context-002")
         self.assertEqual(activity["recent_alerts"][0]["id"], "alert-review-context-002")
 
     def test_build_backtest_payload_prefers_strategy_market_resolution_when_watchlist_missing(self) -> None:
@@ -12404,7 +13085,7 @@ class ControlApiIntegrationTests(unittest.TestCase):
         self.assertEqual(activity["latest_actionable_backtest"]["id"], "bt-child-001")
         self.assertEqual(activity["latest_actionable_backtest_review"]["id"], review.id)
         self.assertEqual(activity["latest_actionable_backtest_review"]["backtest_id"], "bt-child-001")
-        self.assertIsNone(activity["latest_actionable_backtest_job"])
+        self.assertNotIn("latest_actionable_backtest_job", activity)
         self.assertEqual(activity["latest_primary_review"]["id"], review.id)
         self.assertEqual(activity["latest_actionable_primary_review"]["id"], review.id)
         self.assertEqual(activity["latest_primary_review"]["source_change_request_id"], "cr-parent-001")
@@ -12606,41 +13287,89 @@ class ControlApiIntegrationTests(unittest.TestCase):
         self.assertIsNone(activity_context["latest_proposal_change_request"])
         self.assertIsNone(activity_context["latest_proposal_review"])
         self.assertIn(review_job["id"], str(activity_context["latest_proposal_job"] or ""))
-        self.assertEqual(activity_context["latest_proposal_backtest_record"]["id"], result["created_backtest"]["id"])
-        self.assertIsNone(activity_context["latest_proposal_review_record"])
-        self.assertEqual(activity_context["latest_proposal_job_record"]["id"], review_job["id"])
-        self.assertEqual(activity_context["latest_backtest_record"]["id"], result["created_backtest"]["id"])
+        proposal_context = activity_context["decision_context"]["proposal"]
+        backtest_context = activity_context["decision_context"]["backtest"]
+        self.assertEqual(proposal_context["latest_backtest_record"]["id"], result["created_backtest"]["id"])
+        self.assertIsNone(proposal_context.get("latest_review_record"))
+        self.assertEqual(proposal_context["latest_job_record"]["id"], review_job["id"])
+        self.assertEqual(backtest_context["latest_record"]["id"], result["created_backtest"]["id"])
         self.assertEqual(
-            activity_context["latest_actionable_backtest_record"]["id"],
+            backtest_context["actionable_record"]["id"],
             result["created_backtest"]["id"],
         )
         self.assertIn(result["created_backtest"]["id"], str(activity_context["latest_backtest"] or ""))
         self.assertIn(review_job["id"], str(activity_context["latest_backtest_job"] or ""))
         self.assertIsNone(activity_context["latest_backtest_review"])
-        self.assertEqual(activity_context["latest_backtest_job_record"]["id"], review_job["id"])
-        self.assertEqual(activity_context["latest_actionable_backtest_job_record"]["id"], review_job["id"])
-        self.assertIsNone(activity_context["latest_backtest_review_record"])
-        self.assertIsNone(activity_context["latest_actionable_backtest_review_record"])
+        self.assertEqual(backtest_context["latest_job_record"]["id"], review_job["id"])
+        self.assertEqual(backtest_context["actionable_job_record"]["id"], review_job["id"])
+        self.assertIsNone(backtest_context.get("latest_review_record"))
+        self.assertIsNone(backtest_context.get("actionable_review_record"))
 
         activity_status, activity = self._get("/api/strategies/sol-breakout-03/activity")
         self.assertEqual(activity_status, 200)
+        proposal_context = activity["decision_context"]["proposal"]
+        backtest_context = activity["decision_context"]["backtest"]
+        self.assertEqual(proposal_context["latest_backtest_record"]["id"], result["created_backtest"]["id"])
+        self.assertIsNone(proposal_context.get("latest_review_record"))
+        self.assertEqual(proposal_context["latest_job_record"]["id"], review_job["id"])
+        self.assertEqual(backtest_context["latest_record"]["id"], result["created_backtest"]["id"])
+        self.assertEqual(backtest_context["actionable_record"]["id"], result["created_backtest"]["id"])
+        self.assertEqual(backtest_context["latest_job_record"]["id"], review_job["id"])
+        self.assertEqual(backtest_context["actionable_job_record"]["id"], review_job["id"])
         self.assertEqual(activity["latest_proposal"]["id"], "prop-003")
         self.assertEqual(activity["latest_proposal_backtest"]["id"], result["created_backtest"]["id"])
         self.assertEqual(activity["latest_proposal_job"]["id"], review_job["id"])
         self.assertEqual(activity["latest_proposal_backtest_record"]["id"], result["created_backtest"]["id"])
-        self.assertIsNone(activity["latest_proposal_review_record"])
+        self.assertNotIn("latest_proposal_review_record", activity)
         self.assertEqual(activity["latest_proposal_job_record"]["id"], review_job["id"])
         self.assertEqual(activity["latest_backtest_record"]["id"], result["created_backtest"]["id"])
         self.assertEqual(activity["latest_actionable_backtest_record"]["id"], result["created_backtest"]["id"])
         self.assertEqual(activity["latest_backtest_job_record"]["id"], review_job["id"])
         self.assertEqual(activity["latest_actionable_backtest_job_record"]["id"], review_job["id"])
-        self.assertIsNone(activity["latest_backtest_review_record"])
-        self.assertIsNone(activity["latest_actionable_backtest_review_record"])
-        self.assertIsNone(activity["latest_proposal_change_request"])
-        self.assertIsNone(activity["latest_proposal_review"])
-        self.assertIsNone(activity["latest_actionable_proposal_backtest_record"])
-        self.assertIsNone(activity["latest_actionable_proposal_review_record"])
-        self.assertIsNone(activity["latest_actionable_proposal_job_record"])
+        self._assert_missing_keys(
+            activity,
+            "latest_backtest_review_record",
+            "latest_actionable_backtest_review_record",
+            "latest_proposal_change_request",
+            "latest_proposal_review",
+            "latest_actionable_proposal_backtest_record",
+            "latest_actionable_proposal_review_record",
+            "latest_actionable_proposal_job_record",
+        )
+
+    def test_strategy_activity_ignores_retryable_backtest_jobs_from_other_strategies(self) -> None:
+        control_main.repo.state.control_snapshot.scheduler.current_job_id = None
+        created = control_main.repo.create_agent_job(
+            control_main.AgentJobCreate(
+                job_type="generate_backtest_review",
+                context={
+                    "strategy_id": "sol-breakout-03",
+                    "backtest_id": "bt-001",
+                },
+                allowed_actions=["review_backtest"],
+                timeout=60,
+                idempotency_key="unit-test-cross-strategy-backtest-retryable-job",
+                writeback_target="ai_review",
+            )
+        )
+        failed = control_main.repo.fail_agent_job(created.id, "cross strategy failed job", source="local_fallback")
+        self.assertEqual(failed.status.value, "failed")
+
+        activity_context = control_main.repo._build_review_strategy_activity_context_locked("trend-btc-01")
+        self.assertIsNotNone(activity_context)
+        assert activity_context is not None
+        self.assertIsNone(activity_context.get("latest_actionable_backtest"))
+        self.assertIsNone(activity_context.get("latest_actionable_backtest_record"))
+        self.assertIsNone(activity_context.get("latest_actionable_backtest_job"))
+
+        activity_status, activity = self._get("/api/strategies/trend-btc-01/activity")
+        self.assertEqual(activity_status, 200)
+        self._assert_missing_keys(
+            activity,
+            "latest_actionable_backtest",
+            "latest_actionable_backtest_record",
+            "latest_actionable_backtest_job",
+        )
 
     def test_backtest_launch_change_request_preserves_source_change_request_lineage(self) -> None:
         status, change_request = self._post(

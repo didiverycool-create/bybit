@@ -20,6 +20,8 @@ type MarketWorkspaceContainerProps = {
     marketHeader: MarketWorkspaceSectionProps['marketHeader']
     marketDetailLoading: MarketWorkspaceSectionProps['marketDetailLoading']
     marketDetailErrorMessage: MarketWorkspaceSectionProps['marketDetailErrorMessage']
+    marketLiveStatusMessage: MarketWorkspaceSectionProps['marketLiveStatusMessage']
+    marketLiveStatusTitle: MarketWorkspaceSectionProps['marketLiveStatusTitle']
     selectedMarketTimeframe: MarketWorkspaceSectionProps['selectedMarketTimeframe']
     marketTimeframeOptions: MarketWorkspaceSectionProps['marketTimeframeOptions']
     manualTradingBlockedReason: MarketWorkspaceSectionProps['manualTradingBlockedReason']
@@ -52,6 +54,8 @@ export default function MarketWorkspaceContainer({
       marketHeader={marketState.marketHeader}
       marketDetailLoading={marketState.marketDetailLoading}
       marketDetailErrorMessage={marketState.marketDetailErrorMessage}
+      marketLiveStatusMessage={marketState.marketLiveStatusMessage}
+      marketLiveStatusTitle={marketState.marketLiveStatusTitle}
       selectedWatchAlertLabel={watchlistState.selectedWatchAlertLabel}
       selectedMarketTimeframe={marketState.selectedMarketTimeframe}
       marketTimeframeOptions={marketState.marketTimeframeOptions}

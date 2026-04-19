@@ -28,14 +28,50 @@ export async function runMarketSwitchSmoke(
   const smokeRenderBudgetMs = 1800;
   const smokeSwitchTimeoutMs = 3000;
   const smokeSelfHealTimeoutMs = 6000;
+  const captureTimeoutMs = 1500;
+  const isSemanticallyReadyChartSnapshot = (
+    snapshot: {
+      renderedMarketSymbol?: string | null;
+      renderedMarketTimeframe?: string | null;
+      renderedMarketCandleCount?: number;
+      renderedMarketDetailSource?: string | null;
+      renderedMarketGeneratedMs?: number;
+      latestPriceValue?: string | null;
+      chartCanvasCount?: number;
+      chartInnerHtmlLength?: number;
+    } | null,
+    {
+      symbol,
+      timeframe,
+    }: {
+      symbol: string;
+      timeframe: string;
+    },
+  ) =>
+    snapshot?.renderedMarketSymbol === symbol &&
+    snapshot?.renderedMarketTimeframe === timeframe &&
+    (snapshot?.renderedMarketCandleCount ?? 0) >= 10 &&
+    Boolean(snapshot?.renderedMarketDetailSource && snapshot.renderedMarketDetailSource !== "mock") &&
+    (snapshot?.renderedMarketGeneratedMs ?? -1) >= 0 &&
+    Boolean(snapshot?.latestPriceValue && snapshot.latestPriceValue !== "--") &&
+    ((snapshot?.chartCanvasCount ?? 0) >= 1 || (snapshot?.chartInnerHtmlLength ?? 0) >= 300);
 
   const captureState = async (label: string, output: string) => {
     try {
       const delayedSnapshot = await win.webContents.executeJavaScript(buildSnapshotScript);
       console.log(label, JSON.stringify(delayedSnapshot));
-      const image = await win.webContents.capturePage();
-      fs.writeFileSync(output, image.toPNG());
-      console.log("[renderer:capture]", output);
+      const image = await Promise.race([
+        win.webContents.capturePage(),
+        new Promise<null>((resolve) => {
+          setTimeout(() => resolve(null), captureTimeoutMs);
+        }),
+      ]);
+      if (image) {
+        fs.writeFileSync(output, image.toPNG());
+        console.log("[renderer:capture]", output);
+      } else {
+        console.warn("[renderer:capture-timeout]", output);
+      }
       return delayedSnapshot;
     } catch (error) {
       console.error("[renderer:capture-failed]", error);
@@ -85,8 +121,10 @@ export async function runMarketSwitchSmoke(
           state?.localSelectedSymbol &&
           state.localSelectedSymbol !== "__SMOKE_INVALID__" &&
           chartSnapshot?.activeMarketSymbol === state.localSelectedSymbol &&
-          chartSnapshot?.renderedMarketSymbol === state.localSelectedSymbol &&
-          chartSnapshot?.chartCanvasCount >= 1;
+          isSemanticallyReadyChartSnapshot(chartSnapshot, {
+            symbol: state.localSelectedSymbol,
+            timeframe: state.localTimeframe ?? "1h",
+          });
         if (healed) {
           await win.webContents.executeJavaScript(
             "sessionStorage.removeItem('bybit-smoke-market-switch-local-workspace-phase')",

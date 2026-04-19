@@ -1,14 +1,12 @@
-import { AlertTriangle, X } from 'lucide-react'
+import { X } from 'lucide-react'
 
 import type { ExecutionPreview, Mode, OrderRecord } from '../types'
-import { positionSideLabel } from '../utils/app-helpers'
 
-type ManualOrderDraft = {
-  side: 'buy' | 'sell'
-  quantity: string
-  price: string
-  note: string
-}
+import ManualTradeActionsSection from './ManualTradeActionsSection'
+import ManualTradeFormSection from './ManualTradeFormSection'
+import ManualTradePreviewSection from './ManualTradePreviewSection'
+
+import type { ManualOrderDraft } from './manualTradePanelTypes'
 
 type ManualTradePanelProps = {
   open: boolean
@@ -109,168 +107,33 @@ export default function ManualTradePanel({
         </div>
 
         <div className="floating-panel__body">
-          <div className="field-grid">
-            <label className="field">
-              <span>方向</span>
-              <select
-                value={manualOrder.side}
-                disabled={Boolean(editingOrder)}
-                onChange={(event) =>
-                  onManualOrderChange({
-                    ...manualOrder,
-                    side: event.target.value as 'buy' | 'sell',
-                  })
-                }
-              >
-                <option value="buy">买入</option>
-                <option value="sell">卖出</option>
-              </select>
-            </label>
-            <label className="field">
-              <span>数量</span>
-              <input
-                value={manualOrder.quantity}
-                onChange={(event) =>
-                  onManualOrderChange({
-                    ...manualOrder,
-                    quantity: event.target.value,
-                  })
-                }
-              />
-            </label>
-            <label className="field">
-              <span>价格</span>
-              <input
-                value={manualOrder.price}
-                onChange={(event) =>
-                  onManualOrderChange({
-                    ...manualOrder,
-                    price: event.target.value,
-                  })
-                }
-              />
-            </label>
-            <label className="field field--wide">
-              <span>备注</span>
-              <input
-                value={manualOrder.note}
-                onChange={(event) =>
-                  onManualOrderChange({
-                    ...manualOrder,
-                    note: event.target.value,
-                  })
-                }
-                placeholder="例如：盘中人工接管后的手动对冲"
-              />
-            </label>
-          </div>
+          <ManualTradeFormSection
+            editingOrder={editingOrder}
+            manualOrder={manualOrder}
+            onManualOrderChange={onManualOrderChange}
+          />
 
-          {(previewLoading || preview) && (
-            <div className={`execution-preview ${preview?.allowed === false ? 'is-blocked' : ''}`} aria-live="polite">
-              <div className="execution-preview__head">
-                <span className="section-label">执行预检</span>
-                {preview && <strong>{preview.action}</strong>}
-              </div>
-              {previewLoading && !preview ? (
-                <div className="execution-preview__line">
-                  正在评估本次成交对{selectedMode === 'paper' ? ' Paper 账户' : '当前 Bybit 账户'}和持仓的影响...
-                </div>
-              ) : preview ? (
-                <>
-                  <div className="execution-preview__line">
-                    <span>名义价值 {preview.notional}</span>
-                    <span>
-                      可用余额 {preview.available_balance_before} {'→'} {preview.available_balance_after}
-                    </span>
-                  </div>
-                  <div className="execution-preview__line">
-                    <span>
-                      当前持仓 {positionSideLabel(preview.current_position_side)} · {preview.current_position_size}
-                    </span>
-                    <span>
-                      成交后 {positionSideLabel(preview.projected_position_side)} · {preview.projected_position_size}
-                    </span>
-                  </div>
-                  <div className="execution-preview__line">
-                    <span>参考均价 {preview.current_avg_price}</span>
-                    <span>成交后均价 {preview.projected_avg_price}</span>
-                    <span>预估已实现 {preview.estimated_realized_pnl}</span>
-                  </div>
-                  {!preview.allowed && preview.blocked_reason && (
-                    <div className="execution-preview__line">
-                      <span>{preview.blocked_reason}</span>
-                    </div>
-                  )}
-                  {preview.recommended_action && (
-                    <div className="execution-preview__line">
-                      <span>建议 {preview.recommended_action}</span>
-                    </div>
-                  )}
-                  {preview.warnings.length > 0 && (
-                    <div className="execution-preview__warnings">
-                      {preview.warnings.map((warning) => (
-                        <span key={warning}>{warning}</span>
-                      ))}
-                    </div>
-                  )}
-                </>
-              ) : null}
-            </div>
-          )}
+          <ManualTradePreviewSection
+            selectedMode={selectedMode}
+            previewLoading={previewLoading}
+            preview={preview}
+          />
 
-          <div className="inline-actions">
-            {editingOrder ? (
-              <>
-                <button
-                  type="button"
-                  className="primary-button"
-                  disabled={Boolean(blockedReason) || replacePending}
-                  onClick={onReplace}
-                >
-                  提交改单
-                </button>
-                <button
-                  type="button"
-                  className="ghost-button"
-                  disabled={!serviceAvailable || cancelPending}
-                  onClick={onCancelCurrent}
-                >
-                  撤销当前委托
-                </button>
-              </>
-            ) : (
-              <>
-                <button
-                  type="button"
-                  className="primary-button"
-                  disabled={Boolean(blockedReason) || submitPending}
-                  onClick={onSubmitManual}
-                >
-                  {selectedMode === 'paper' ? '提交手动交易' : `提交 ${selectedMode.toUpperCase()} 委托`}
-                </button>
-                {selectedMode === 'paper' && (
-                  <button
-                    type="button"
-                    className="ghost-button"
-                    disabled={Boolean(blockedReason) || paperPending}
-                    onClick={onSubmitPaper}
-                  >
-                    挂 Paper 限价单
-                  </button>
-                )}
-              </>
-            )}
-          </div>
-
-          {blockedReason && (
-            <div className="service-banner service-banner--warning service-banner--inline">
-              <AlertTriangle size={16} />
-              <div>
-                <strong>{blockedTitle}</strong>
-                <p>{blockedReason}</p>
-              </div>
-            </div>
-          )}
+          <ManualTradeActionsSection
+            editingOrder={editingOrder}
+            selectedMode={selectedMode}
+            blockedTitle={blockedTitle}
+            blockedReason={blockedReason}
+            serviceAvailable={serviceAvailable}
+            submitPending={submitPending}
+            paperPending={paperPending}
+            replacePending={replacePending}
+            cancelPending={cancelPending}
+            onSubmitManual={onSubmitManual}
+            onSubmitPaper={onSubmitPaper}
+            onReplace={onReplace}
+            onCancelCurrent={onCancelCurrent}
+          />
         </div>
       </aside>
     </div>

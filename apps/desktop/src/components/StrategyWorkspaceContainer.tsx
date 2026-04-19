@@ -1,26 +1,8 @@
 import type { StrategySummary } from '../types'
+import type { StrategyWorkspaceCurrentPanelState } from './buildStrategyWorkspaceCurrentPanelState'
 import type { StrategyCurrentPanelProps } from './StrategyCurrentPanel'
 import type { StrategyExecutionContextSectionProps } from './StrategyExecutionContextSection'
 import StrategyWorkspaceSection from './StrategyWorkspaceSection'
-
-type StrategyWorkspaceCurrentPanelState = Omit<
-  StrategyCurrentPanelProps,
-  | 'selectedStrategy'
-  | 'executionContextProps'
-  | 'onOpenStrategyEditor'
-  | 'onExecuteSelectedStrategySignal'
-  | 'onOpenStrategyActivityPanel'
-  | 'onOpenStrategyTrackingPanel'
-  | 'onRestartStrategyRuntimeWorker'
-  | 'onSubmitBacktest'
-  | 'onToggleStrategyStatus'
-  | 'onOpenReplayReview'
-  | 'onOpenChangeRequest'
-  | 'onOpenBacktestDetail'
-  | 'onOpenSourceReview'
-  | 'onOpenStrategyProposal'
-  | 'onRerunBacktestFromReview'
->
 
 type StrategyWorkspaceExecutionContextState = Omit<
   StrategyExecutionContextSectionProps,
@@ -84,7 +66,9 @@ export default function StrategyWorkspaceContainer({
   const currentPanelProps = selectedStrategy && executionContextState
     ? {
         selectedStrategy,
-        ...currentPanelState,
+        summaryState: currentPanelState.summaryState,
+        actionsState: currentPanelState.actionsState,
+        notesState: currentPanelState.notesState,
         executionContextProps: {
           ...executionContextState,
           onOpenChangeRequest: actions.onOpenChangeRequest,

@@ -1,25 +1,14 @@
 import { useQuery } from '@tanstack/react-query'
 
 import { api } from '../api'
-import type {
-  BybitPrivateStatus,
-  ExecutionPreview,
-  MarketDetail,
-  Mode,
-  StrategyRuntimeSnapshot,
-} from '../types'
+import type { BybitPrivateStatus, ExecutionPreview, MarketDetail, Mode, StrategyRuntimeSnapshot } from '../types'
 
-type ManualOrderState = {
-  side: 'buy' | 'sell'
-  quantity: string
-  price: string
-  note: string
-}
+import type { ManualOrderDraft } from './manualTradePanelTypes'
 
 type UseManualTradePreviewModelArgs = {
   marketDetail: MarketDetail | null | undefined
   selectedMode: Mode
-  manualOrder: ManualOrderState
+  manualOrder: ManualOrderDraft
   manualTradePanelOpen: boolean
   serviceAvailable: boolean
   editingOrderId: string | null

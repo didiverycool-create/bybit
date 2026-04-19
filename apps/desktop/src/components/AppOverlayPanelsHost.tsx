@@ -11,7 +11,7 @@ import StrategyEditorPanel from './StrategyEditorPanel'
 import StrategyTrackingPanel from './StrategyTrackingPanel'
 import WatchlistManagerPanel from './WatchlistManagerPanel'
 
-type AppOverlayPanelsHostProps = {
+export type AppOverlayPanelsHostProps = {
   statusInspectorPanelProps: ComponentProps<typeof StatusInspectorPanel>
   watchlistManagerPanelProps: ComponentProps<typeof WatchlistManagerPanel>
   schedulerControlsPanelProps: ComponentProps<typeof SchedulerControlsPanel>

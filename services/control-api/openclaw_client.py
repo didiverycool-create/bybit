@@ -255,6 +255,124 @@ class OpenClawGatewayClient:
 
             time.sleep(0.2)
 
+    @staticmethod
+    def _extract_first_json_object(text: str) -> Optional[Dict[str, Any]]:
+        if not text:
+            return None
+        stripped = text.strip()
+        if not stripped:
+            return None
+        candidates: List[str] = [stripped]
+        if "```" in stripped:
+            for part in stripped.split("```"):
+                candidate = part.strip()
+                if candidate.lower().startswith("json"):
+                    candidate = candidate[4:].strip()
+                if candidate.startswith("{") and candidate.endswith("}"):
+                    candidates.append(candidate)
+        for candidate in candidates:
+            if not candidate.startswith("{"):
+                start = candidate.find("{")
+                end = candidate.rfind("}")
+                if start == -1 or end == -1 or end <= start:
+                    continue
+                candidate = candidate[start : end + 1]
+            try:
+                parsed = json.loads(candidate)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, dict):
+                return parsed
+        return None
+
+    @staticmethod
+    def _coerce_bool_flag(value: Any) -> Optional[bool]:
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            return bool(value)
+        if isinstance(value, str):
+            token = value.strip().lower()
+            if token in {"true", "yes", "y", "1", "需要", "是", "待人工", "manual", "needed"}:
+                return True
+            if token in {"false", "no", "n", "0", "不需要", "否", "auto", "clean"}:
+                return False
+        return None
+
+    @staticmethod
+    def _coerce_string_list(value: Any, limit: int = 6) -> List[str]:
+        out: List[str] = []
+        if isinstance(value, list):
+            items = value
+        elif isinstance(value, str):
+            items = [segment for segment in value.replace("；", ";").split(";")]
+        else:
+            items = []
+        for item in items:
+            text = str(item).strip()
+            if text:
+                out.append(text)
+            if len(out) >= limit:
+                break
+        return out
+
+    @classmethod
+    def parse_reconcile_change_request_response(cls, text: Optional[str]) -> Dict[str, Any]:
+        """Parse the structured response for a ``reconcile_change_request`` agent job.
+
+        Accepts either a JSON object of the form
+        ``{"summary", "landed", "needs_manual_review", "needs_manual_review_detail",
+        "next_actions"}`` or a plain-text summary fallback.
+
+        The returned dict always contains ``summary``, ``landed``,
+        ``needs_manual_review``, ``needs_manual_review_detail``, ``next_actions``
+        and ``raw_text`` keys so that downstream call sites never have to branch
+        on whether OpenClaw actually produced a JSON payload.
+        """
+
+        raw_text = (text or "").strip()
+        parsed = cls._extract_first_json_object(raw_text)
+        summary: str
+        landed: Optional[bool]
+        needs_manual: Optional[bool]
+        manual_detail: Optional[str]
+        next_actions: List[str]
+        if isinstance(parsed, dict):
+            summary = str(parsed.get("summary") or "").strip()
+            landed = cls._coerce_bool_flag(parsed.get("landed"))
+            needs_manual = cls._coerce_bool_flag(
+                parsed.get("needs_manual_review")
+                if parsed.get("needs_manual_review") is not None
+                else parsed.get("manual_followup_required")
+            )
+            manual_detail_raw = parsed.get("needs_manual_review_detail") or parsed.get("manual_followup_detail")
+            manual_detail = str(manual_detail_raw).strip() if manual_detail_raw else None
+            next_actions = cls._coerce_string_list(parsed.get("next_actions"))
+        else:
+            summary = raw_text
+            landed = None
+            needs_manual = None
+            manual_detail = None
+            next_actions = []
+
+        if not summary:
+            summary = "OpenClaw 已返回变更请求跟进结果。"
+
+        # Infer a sensible manual detail if the prompt only flagged ``needs_manual_review``.
+        if needs_manual and not manual_detail:
+            manual_detail = summary[:160]
+
+        return {
+            "summary": summary,
+            "landed": landed,
+            "needs_manual_review": bool(needs_manual) if needs_manual is not None else None,
+            "needs_manual_review_detail": manual_detail,
+            "next_actions": next_actions,
+            "raw_text": raw_text,
+        }
+
     def get_status(self, worker_state: Optional[Dict[str, Any]] = None) -> OpenClawStatus:
         config = self._load_config()
         gateway = config.get("gateway", {})

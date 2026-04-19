@@ -1,7 +1,7 @@
 import type { ComponentProps } from 'react'
 
-import type { StrategyActivitySnapshot, StrategySummary } from '../types'
-import { formatDateTime, strategyActivityHeadline } from '../utils/app-helpers'
+import type { StrategySummary } from '../types'
+import { formatDateTime } from '../utils/app-helpers'
 import StrategyActivityFloatingPanel from './StrategyActivityFloatingPanel'
 
 type StrategyActivityFloatingPanelProps = ComponentProps<typeof StrategyActivityFloatingPanel>
@@ -9,7 +9,6 @@ type StrategyActivityFloatingPanelProps = ComponentProps<typeof StrategyActivity
 type StrategyActivityFloatingPanelContainerProps = {
   panelOpen: boolean
   selectedStrategy: StrategySummary | null
-  selectedStrategyActivity?: StrategyActivitySnapshot | null
   activeStrategyId: string | null
   queryState: {
     status: StrategyActivityFloatingPanelProps['queryStatus']
@@ -20,6 +19,11 @@ type StrategyActivityFloatingPanelContainerProps = {
   serviceState: {
     serviceAvailable: boolean
     strategyTrackingPending: boolean
+  }
+  activityMeta: {
+    activityAvailable: boolean
+    generatedAt: string | null
+    headline: string
   }
   sectionProps: {
     topOpsProps?: StrategyActivityFloatingPanelProps['topOpsProps']
@@ -35,10 +39,10 @@ type StrategyActivityFloatingPanelContainerProps = {
 export default function StrategyActivityFloatingPanelContainer({
   panelOpen,
   selectedStrategy,
-  selectedStrategyActivity,
   activeStrategyId,
   queryState,
   serviceState,
+  activityMeta,
   sectionProps,
   onTrack,
   onClose,
@@ -47,8 +51,8 @@ export default function StrategyActivityFloatingPanelContainer({
     return null
   }
 
-  const strategyHeadlineText = `${strategyActivityHeadline(selectedStrategyActivity)}${
-    selectedStrategyActivity?.generated_at ? ` · 更新于 ${formatDateTime(selectedStrategyActivity.generated_at)}` : ''
+  const strategyHeadlineText = `${activityMeta.headline}${
+    activityMeta.generatedAt ? ` · 更新于 ${formatDateTime(activityMeta.generatedAt)}` : ''
   }`
 
   return (
@@ -61,15 +65,15 @@ export default function StrategyActivityFloatingPanelContainer({
       queryStrategyId={activeStrategyId}
       queryErrorMessage={queryState.errorMessage}
       queryLoading={queryState.loading}
-      activityAvailable={Boolean(selectedStrategyActivity)}
+      activityAvailable={activityMeta.activityAvailable}
       trackingDisabled={!serviceState.serviceAvailable || serviceState.strategyTrackingPending}
       onTrack={onTrack}
       onClose={onClose}
-      topOpsProps={selectedStrategyActivity ? sectionProps.topOpsProps : undefined}
-      topDecisionActionsProps={selectedStrategyActivity ? sectionProps.topDecisionActionsProps : undefined}
-      decisionSectionsProps={selectedStrategyActivity ? sectionProps.decisionSectionsProps : undefined}
-      reviewAndJobsProps={selectedStrategyActivity ? sectionProps.reviewAndJobsProps : undefined}
-      opsSectionProps={selectedStrategyActivity ? sectionProps.opsSectionProps : undefined}
+      topOpsProps={activityMeta.activityAvailable ? sectionProps.topOpsProps : undefined}
+      topDecisionActionsProps={activityMeta.activityAvailable ? sectionProps.topDecisionActionsProps : undefined}
+      decisionSectionsProps={activityMeta.activityAvailable ? sectionProps.decisionSectionsProps : undefined}
+      reviewAndJobsProps={activityMeta.activityAvailable ? sectionProps.reviewAndJobsProps : undefined}
+      opsSectionProps={activityMeta.activityAvailable ? sectionProps.opsSectionProps : undefined}
     />
   )
 }

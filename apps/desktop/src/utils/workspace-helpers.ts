@@ -86,6 +86,34 @@ export function normalizeCollapsedCardIds(ids: string[], orderedCardIds: string[
   return order.filter((id) => deduped.includes(id))
 }
 
+export function buildOverviewCardRecoveryState({
+  workspaceBootstrapOverviewCardOrder,
+  visibleOverviewCards,
+}: {
+  workspaceBootstrapOverviewCardOrder: string[]
+  visibleOverviewCards: string[]
+}) {
+  const missingAiCenter = !workspaceBootstrapOverviewCardOrder.includes('ai_center')
+  const missingStrategyWatch = !workspaceBootstrapOverviewCardOrder.includes('strategy_watch')
+  const missingAccountCenter = !workspaceBootstrapOverviewCardOrder.includes('account_center')
+  const hiddenAiCenter = !visibleOverviewCards.includes('ai_center')
+
+  if (!missingAiCenter && !missingStrategyWatch && !missingAccountCenter && !hiddenAiCenter) {
+    return null
+  }
+
+  const nextCardOrder = normalizeCardIds([...defaultCardOrder])
+  const nextVisibleOverviewCards = normalizeVisibleCardIds(
+    [...visibleOverviewCards, 'ai_center', 'strategy_watch', 'account_center'],
+    nextCardOrder,
+  )
+
+  return {
+    nextCardOrder,
+    nextVisibleOverviewCards,
+  }
+}
+
 export function normalizeWorkspaceMarketTimeframe(value: unknown): MarketTimeframe {
   const normalized = String(value ?? '1h').trim().toLowerCase()
   if (normalized === '15m' || normalized === '15') return '15m'

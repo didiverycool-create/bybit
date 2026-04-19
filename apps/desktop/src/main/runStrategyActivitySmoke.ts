@@ -24,16 +24,26 @@ export async function runStrategyActivitySmoke(
     "const readState = ${readStrategyActivityStateScript};",
     `const readState = ${readStrategyActivityStateScript};`,
   );
+  const captureTimeoutMs = 1500;
 
   setTimeout(async () => {
     const output = "/tmp/bybit-electron-strategy-activity.png";
     const captureStrategyActivityState = async (label: string) => {
       try {
         const state = await win.webContents.executeJavaScript(`(${readStrategyActivityStateScript})()`);
-        const image = await win.webContents.capturePage();
-        fs.writeFileSync(output, image.toPNG());
         console.log(label, JSON.stringify(state));
-        console.log("[renderer:capture]", output);
+        const image = await Promise.race([
+          win.webContents.capturePage(),
+          new Promise<null>((resolve) => {
+            setTimeout(() => resolve(null), captureTimeoutMs);
+          }),
+        ]);
+        if (image) {
+          fs.writeFileSync(output, image.toPNG());
+          console.log("[renderer:capture]", output);
+        } else {
+          console.warn("[renderer:strategy-activity-capture-timeout]", output);
+        }
         return state;
       } catch (error) {
         console.error("[renderer:strategy-activity-capture-failed]", error);

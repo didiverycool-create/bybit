@@ -1,24 +1,15 @@
-import type { AlertRecord, ChangeRequest, ExecutionEvent, Mode, OrderRecord, TradeRecord } from '../types'
-
-type UseWorkspaceOpsCollectionsModelArgs = {
-  alerts: AlertRecord[]
-  trades: TradeRecord[]
-  accountOrders: OrderRecord[]
-  accountOrderHistory: OrderRecord[]
-  auditEvents: ExecutionEvent[]
-  changeRequests: ChangeRequest[]
-  selectedSymbol: string
-  alertSeverityFilter: 'all' | AlertRecord['severity']
-  alertStatusFilter: 'all' | 'pending' | 'acknowledged'
-  alertScopeFilter: 'all' | 'selected'
-  tradeModeFilter: 'all' | Mode
-  tradeOriginFilter: 'all' | TradeRecord['origin']
-  tradeScopeFilter: 'all' | 'selected'
-  auditSeverityFilter: 'all' | ExecutionEvent['severity']
-  auditSourceFilter: 'all' | string
-  auditScopeFilter: 'all' | 'selected'
-  auditSearch: string
-}
+import {
+  buildWorkspaceOpsAuditSourceOptions,
+  buildWorkspaceOpsFilteredAccountOrders,
+  buildWorkspaceOpsFilteredAlerts,
+  buildWorkspaceOpsFilteredAuditEvents,
+  buildWorkspaceOpsFilteredOrderHistory,
+  buildWorkspaceOpsFilteredTrades,
+  buildWorkspaceOpsHeadlineAlert,
+  buildWorkspaceOpsOverviewQueuedRequests,
+  buildWorkspaceOpsRankedAlerts,
+} from './workspaceOpsCollectionsHelpers'
+import type { UseWorkspaceOpsCollectionsModelArgs, UseWorkspaceOpsCollectionsModelResult } from './useWorkspaceOpsCollectionsModel.types'
 
 export function useWorkspaceOpsCollectionsModel({
   alerts,
@@ -38,91 +29,46 @@ export function useWorkspaceOpsCollectionsModel({
   auditSourceFilter,
   auditScopeFilter,
   auditSearch,
-}: UseWorkspaceOpsCollectionsModelArgs) {
-  const headlineAlert = [...alerts]
-    .filter((item) => !item.acknowledged)
-    .sort((left, right) => {
-      const severityRank = { P0: 0, P1: 1, P2: 2 }
-      return severityRank[left.severity] - severityRank[right.severity]
-    })[0]
-  const rankedAlerts = [...alerts].sort((left, right) => {
-    const severityRank = { P0: 0, P1: 1, P2: 2 }
-    const acknowledgedRank = Number(left.acknowledged) - Number(right.acknowledged)
-    if (acknowledgedRank !== 0) {
-      return acknowledgedRank
-    }
-    return severityRank[left.severity] - severityRank[right.severity]
-  })
+}: UseWorkspaceOpsCollectionsModelArgs): UseWorkspaceOpsCollectionsModelResult {
+  const headlineAlert = buildWorkspaceOpsHeadlineAlert(alerts)
+  const rankedAlerts = buildWorkspaceOpsRankedAlerts(alerts)
   const pendingAlertsCount = rankedAlerts.filter((item) => !item.acknowledged).length
-  const filteredAlerts = rankedAlerts.filter((item) => {
-    if (alertSeverityFilter !== 'all' && item.severity !== alertSeverityFilter) {
-      return false
-    }
-    if (alertStatusFilter === 'pending' && item.acknowledged) {
-      return false
-    }
-    if (alertStatusFilter === 'acknowledged' && !item.acknowledged) {
-      return false
-    }
-    if (alertScopeFilter === 'selected' && item.symbol !== selectedSymbol) {
-      return false
-    }
-    return true
+  const filteredAlerts = buildWorkspaceOpsFilteredAlerts({
+    rankedAlerts,
+    selectedSymbol,
+    alertSeverityFilter,
+    alertStatusFilter,
+    alertScopeFilter,
   })
-  const filteredTrades = trades.filter((item) => {
-    if (tradeModeFilter !== 'all' && item.mode !== tradeModeFilter) {
-      return false
-    }
-    if (tradeOriginFilter !== 'all' && item.origin !== tradeOriginFilter) {
-      return false
-    }
-    if (tradeScopeFilter === 'selected' && item.symbol !== selectedSymbol) {
-      return false
-    }
-    return true
+  const filteredTrades = buildWorkspaceOpsFilteredTrades({
+    trades,
+    selectedSymbol,
+    tradeModeFilter,
+    tradeOriginFilter,
+    tradeScopeFilter,
   })
-  const filteredAccountOrders = accountOrders.filter((item) => {
-    if ((tradeOriginFilter === 'manual' || tradeOriginFilter === 'strategy') && item.origin !== tradeOriginFilter) {
-      return false
-    }
-    if (tradeScopeFilter === 'selected' && item.symbol !== selectedSymbol) {
-      return false
-    }
-    return true
+  const filteredAccountOrders = buildWorkspaceOpsFilteredAccountOrders({
+    accountOrders,
+    selectedSymbol,
+    tradeOriginFilter,
+    tradeScopeFilter,
   })
-  const filteredOrderHistory = accountOrderHistory.filter((item) => {
-    if ((tradeOriginFilter === 'manual' || tradeOriginFilter === 'strategy') && item.origin !== tradeOriginFilter) {
-      return false
-    }
-    if (tradeScopeFilter === 'selected' && item.symbol !== selectedSymbol) {
-      return false
-    }
-    return true
+  const filteredOrderHistory = buildWorkspaceOpsFilteredOrderHistory({
+    accountOrderHistory,
+    selectedSymbol,
+    tradeOriginFilter,
+    tradeScopeFilter,
   })
-  const auditSourceOptions = Array.from(new Set(auditEvents.map((item) => item.source))).slice(0, 8)
-  const filteredAuditEvents = auditEvents.filter((item) => {
-    if (auditSeverityFilter !== 'all' && item.severity !== auditSeverityFilter) {
-      return false
-    }
-    if (auditSourceFilter !== 'all' && item.source !== auditSourceFilter) {
-      return false
-    }
-    if (auditScopeFilter === 'selected' && item.symbol !== selectedSymbol) {
-      return false
-    }
-    if (!auditSearch.trim()) {
-      return true
-    }
-    const needle = auditSearch.trim().toLowerCase()
-    const payloadText = JSON.stringify(item.payload).toLowerCase()
-    return (
-      item.event_type.toLowerCase().includes(needle) ||
-      item.source.toLowerCase().includes(needle) ||
-      String(item.symbol ?? '').toLowerCase().includes(needle) ||
-      payloadText.includes(needle)
-    )
+  const auditSourceOptions = buildWorkspaceOpsAuditSourceOptions(auditEvents)
+  const filteredAuditEvents = buildWorkspaceOpsFilteredAuditEvents({
+    auditEvents,
+    selectedSymbol,
+    auditSeverityFilter,
+    auditSourceFilter,
+    auditScopeFilter,
+    auditSearch,
   })
-  const overviewQueuedRequests = changeRequests.filter((item) => item.status !== 'applied').slice(0, 4)
+  const overviewQueuedRequests = buildWorkspaceOpsOverviewQueuedRequests(changeRequests)
 
   return {
     headlineAlert,

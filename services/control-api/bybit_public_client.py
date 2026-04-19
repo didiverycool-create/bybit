@@ -6,12 +6,36 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from hashlib import md5
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 from models import CandlePoint, MarketDetail, MarketRecentTrade, OrderBookLevel, WatchlistInstrument
+
+
+_LOCAL_SNAPSHOT_FALLBACK_KEYS = (
+    "24h振幅",
+    "24h高点",
+    "24h低点",
+    "资金费率",
+    "持仓价值",
+)
+
+
+def build_local_snapshot_market_detail_stats(
+    *,
+    base_stats: Dict[str, str],
+    fallback_stats: Optional[Mapping[str, str]] = None,
+    source_label: str,
+) -> Dict[str, str]:
+    stats: Dict[str, str] = dict(fallback_stats or {})
+    stats.update(base_stats)
+    stats["数据源"] = source_label
+    for key in _LOCAL_SNAPSHOT_FALLBACK_KEYS:
+        if key not in stats:
+            stats[key] = "--"
+    return stats
 try:
     from bybit_public_realtime import BybitPublicRealtimeClient
 except ModuleNotFoundError:
@@ -89,11 +113,16 @@ class BybitPublicMarketClient:
         self._connectivity_probe_cache: Optional[Tuple[float, Dict[str, object]]] = None
         self._candle_history_cache: Dict[Tuple[str, str, str, int], Tuple[float, List[CandlePoint]]] = {}
         self._ticker_cache_ttl = 3.0
+        # Keep REST candle caches short enough that timeframe switches and
+        # degraded WS fallbacks do not linger across multiple desktop refreshes.
+        # Longer windows still get a slightly higher TTL to avoid hammering the
+        # REST endpoint, but we keep the ceiling lower than the previous
+        # stale-window baseline.
         self._candle_cache_ttls = {
-            "15m": 20.0,
-            "1h": 20.0,
-            "4h": 45.0,
-            "1d": 120.0,
+            "15m": 1.0,
+            "1h": 2.0,
+            "4h": 3.0,
+            "1d": 4.0,
         }
         self._orderbook_cache_ttl = 3.0
         self._recent_trade_cache_ttl = 3.0
@@ -101,10 +130,10 @@ class BybitPublicMarketClient:
         self._instrument_cache_ttl = 600.0
         self._connectivity_probe_cache_ttl = 20.0
         self._candle_history_cache_ttls = {
-            "15m": 45.0,
-            "1h": 60.0,
-            "4h": 90.0,
-            "1d": 180.0,
+            "15m": 3.0,
+            "1h": 4.0,
+            "4h": 6.0,
+            "1d": 8.0,
         }
         self._candle_page_limit = 600
         self._ticker_cache_max_entries = 256
@@ -159,7 +188,10 @@ class BybitPublicMarketClient:
     def _candle_cache_ttl_for_timeframe(self, timeframe: str, *, history: bool = False) -> float:
         normalized = self.normalize_timeframe(timeframe)
         ttl_map = self._candle_history_cache_ttls if history else self._candle_cache_ttls
-        return ttl_map.get(normalized, 20.0 if not history else 60.0)
+        # `normalize_timeframe()` already constrains supported values. Keep a
+        # short fallback here so newly added timeframes do not silently inherit
+        # a much longer stale window before TTLs are wired explicitly.
+        return ttl_map.get(normalized, 3.0 if not history else 4.0)
 
     @staticmethod
     def _prune_cache_locked(cache: Dict[Any, Tuple[float, Any]], max_entries: int) -> None:
@@ -225,6 +257,80 @@ class BybitPublicMarketClient:
         return {
             "盘口价差": f"{spread_pct:.3f}% · {spread:.2f}",
             "Top5 买盘占比": f"{bid_share:.1f}% · {imbalance_prefix}{imbalance:.2f}",
+        }
+
+    def _build_market_detail_stats(
+        self,
+        *,
+        source_label: str,
+        bids: List[OrderBookLevel],
+        asks: List[OrderBookLevel],
+        ticker: Dict[str, object],
+        include_range: bool = True,
+    ) -> Dict[str, str]:
+        stats: Dict[str, str] = {
+            "数据源": source_label,
+            **self._build_orderbook_stats(bids, asks),
+        }
+
+        high_price = self._to_float(ticker.get("highPrice24h"))
+        low_price = self._to_float(ticker.get("lowPrice24h"))
+        if include_range:
+            amplitude = ((high_price - low_price) / low_price * 100) if low_price else 0.0
+            stats.update(
+                {
+                    "24h振幅": f"{amplitude:.2f}%",
+                    "24h高点": self._format_price(high_price) if high_price else "--",
+                    "24h低点": self._format_price(low_price) if low_price else "--",
+                }
+            )
+
+        funding_rate = ticker.get("fundingRate")
+        if funding_rate not in (None, ""):
+            stats["资金费率"] = f"{self._to_float(funding_rate) * 100:.4f}%"
+
+        open_interest_value = self._to_float(ticker.get("openInterestValue"))
+        if open_interest_value:
+            stats["持仓价值"] = f"{open_interest_value / 1_000_000_000:.2f}B"
+
+        return stats
+
+    def _resolve_market_detail_updated_at(
+        self,
+        symbol: str,
+        market: str,
+        *,
+        fallback_updated_at: Optional[str] = None,
+    ) -> str:
+        return (
+            self.realtime.get_symbol_last_message_at(symbol, market=market)
+            if hasattr(self.realtime, "get_symbol_last_message_at")
+            else None
+        ) or self.realtime.get_status().get("last_message_at") or fallback_updated_at or self._now_iso()
+
+    def _build_market_detail_update(
+        self,
+        *,
+        timeframe: str,
+        candles: List[CandlePoint],
+        bids: List[OrderBookLevel],
+        asks: List[OrderBookLevel],
+        recent_public_trades: List[MarketRecentTrade],
+        headline: str,
+        stats: Dict[str, str],
+        source: str,
+        updated_at: str,
+    ) -> Dict[str, object]:
+        return {
+            "timeframe": timeframe,
+            "candles": candles,
+            "bids": bids,
+            "asks": asks,
+            "recent_public_trades": recent_public_trades,
+            "headline": headline,
+            "stats": stats,
+            "source": source,
+            "updated_at": updated_at,
         }
 
     @staticmethod
@@ -744,14 +850,17 @@ class BybitPublicMarketClient:
             self._candle_history_cache,
             (self._cache_symbol(symbol), market, normalized_timeframe, target_limit),
         )
-        if history_cached:
+        now = time.monotonic()
+        if history_cached and now - history_cached[0] < self._candle_cache_ttl_for_timeframe(normalized_timeframe, history=True):
             return list(history_cached[1])
         interval = self.interval_for_timeframe(normalized_timeframe)
         candle_cached = self._get_cached_entry(
             self._candle_cache,
             (self._cache_symbol(symbol), market, interval, target_limit),
         )
-        return list(candle_cached[1]) if candle_cached else []
+        if candle_cached and now - candle_cached[0] < self._candle_cache_ttl_for_timeframe(normalized_timeframe):
+            return list(candle_cached[1])
+        return []
 
     def get_orderbook_cached_only(self, symbol: str, market: str, limit: int = 8) -> Dict[str, List[OrderBookLevel]]:
         cached = self._get_cached_entry(self._orderbook_cache, (self._cache_symbol(symbol), market, limit))
@@ -843,25 +952,15 @@ class BybitPublicMarketClient:
                     rescued_by_rest = False
             effective_candles = merged_candles or list(fallback_detail.candles)
 
-            high_price = self._to_float(ticker.get("highPrice24h"))
-            low_price = self._to_float(ticker.get("lowPrice24h"))
-            amplitude = ((high_price - low_price) / low_price * 100) if low_price else 0.0
             headline_suffix = "策略跟踪" if watch_item and watch_item.signal != "neutral" else "观察"
             live_bids = orderbook["bids"] or fallback_detail.bids
             live_asks = orderbook["asks"] or fallback_detail.asks
-            stats: Dict[str, str] = {
-                "数据源": "Bybit WS + REST",
-                **self._build_orderbook_stats(live_bids, live_asks),
-                "24h振幅": f"{amplitude:.2f}%",
-                "24h高点": self._format_price(high_price) if high_price else "--",
-                "24h低点": self._format_price(low_price) if low_price else "--",
-            }
-            funding_rate = ticker.get("fundingRate")
-            if funding_rate not in (None, ""):
-                stats["资金费率"] = f"{self._to_float(funding_rate) * 100:.4f}%"
-            open_interest_value = self._to_float(ticker.get("openInterestValue"))
-            if open_interest_value:
-                stats["持仓价值"] = f"{open_interest_value / 1_000_000_000:.2f}B"
+            stats = self._build_market_detail_stats(
+                source_label="Bybit WS + REST",
+                bids=live_bids,
+                asks=live_asks,
+                ticker=ticker,
+            )
             if rescued_by_rest:
                 stats["数据源"] = "Bybit REST K 线 + 实时深度"
             elif not merged_candles:
@@ -873,30 +972,23 @@ class BybitPublicMarketClient:
                 )
 
             return fallback_detail.model_copy(
-                update={
-                    "timeframe": normalized_timeframe,
-                    "candles": effective_candles,
-                    "bids": live_bids,
-                    "asks": live_asks,
-                    "recent_public_trades": recent_public_trades or fallback_detail.recent_public_trades,
-                    "headline": (
+                update=self._build_market_detail_update(
+                    timeframe=normalized_timeframe,
+                    candles=effective_candles,
+                    bids=live_bids,
+                    asks=live_asks,
+                    recent_public_trades=recent_public_trades or fallback_detail.recent_public_trades,
+                    headline=(
                         f"{symbol} 当前由 Bybit 公共行情驱动，处于{headline_suffix}状态"
                         if rescued_by_rest
-                        else
-                        f"{symbol} 当前由 Bybit 公共实时行情驱动，处于{headline_suffix}状态"
+                        else f"{symbol} 当前由 Bybit 公共实时行情驱动，处于{headline_suffix}状态"
                         if merged_candles
                         else fallback_detail.headline
                     ),
-                    "stats": stats if merged_candles else {**fallback_detail.stats, **stats},
-                    "source": "bybit_rest" if rescued_by_rest else ("bybit_ws" if merged_candles else fallback_detail.source),
-                    "updated_at": (
-                        self.realtime.get_symbol_last_message_at(symbol, market=market)
-                        if hasattr(self.realtime, "get_symbol_last_message_at")
-                        else None
-                    )
-                    or self.realtime.get_status().get("last_message_at")
-                    or self._now_iso(),
-                }
+                    stats=stats if merged_candles else {**fallback_detail.stats, **stats},
+                    source="bybit_rest" if rescued_by_rest else ("bybit_ws" if merged_candles else fallback_detail.source),
+                    updated_at=self._resolve_market_detail_updated_at(symbol, market),
+                )
             )
 
         if not allow_rest_refresh:
@@ -912,45 +1004,35 @@ class BybitPublicMarketClient:
             )
             live_bids = cached_orderbook["bids"] or fallback_detail.bids
             live_asks = cached_orderbook["asks"] or fallback_detail.asks
-            stats: Dict[str, str] = {
-                "数据源": "本地快照",
-                **self._build_orderbook_stats(live_bids, live_asks),
-            }
-            high_price = self._to_float(cached_ticker.get("highPrice24h"))
-            low_price = self._to_float(cached_ticker.get("lowPrice24h"))
-            amplitude = ((high_price - low_price) / low_price * 100) if low_price else 0.0
-            if high_price or low_price:
-                stats.update(
-                    {
-                        "24h振幅": f"{amplitude:.2f}%",
-                        "24h高点": self._format_price(high_price) if high_price else "--",
-                        "24h低点": self._format_price(low_price) if low_price else "--",
-                    }
-                )
-            funding_rate = cached_ticker.get("fundingRate")
-            if funding_rate not in (None, ""):
-                stats["资金费率"] = f"{self._to_float(funding_rate) * 100:.4f}%"
-            open_interest_value = self._to_float(cached_ticker.get("openInterestValue"))
-            if open_interest_value:
-                stats["持仓价值"] = f"{open_interest_value / 1_000_000_000:.2f}B"
+            base_stats = self._build_market_detail_stats(
+                source_label="本地快照",
+                bids=live_bids,
+                asks=live_asks,
+                ticker=cached_ticker,
+                include_range=bool(cached_ticker.get("highPrice24h") or cached_ticker.get("lowPrice24h")),
+            )
+            stats = build_local_snapshot_market_detail_stats(
+                base_stats=base_stats,
+                fallback_stats=fallback_detail.stats,
+                source_label="本地快照",
+            )
 
             return fallback_detail.model_copy(
-                update={
-                    "timeframe": normalized_timeframe,
-                    "candles": merged_candles or fallback_detail.candles,
-                    "bids": live_bids,
-                    "asks": live_asks,
-                    "recent_public_trades": cached_trades or fallback_detail.recent_public_trades,
-                    "headline": fallback_detail.headline,
-                    "stats": {**fallback_detail.stats, **stats},
-                    "source": fallback_detail.source,
-                    "updated_at": (
-                        self.realtime.get_symbol_last_message_at(symbol, market=market)
-                        if hasattr(self.realtime, "get_symbol_last_message_at")
-                        else None
-                    )
-                    or fallback_detail.updated_at,
-                }
+                update=self._build_market_detail_update(
+                    timeframe=normalized_timeframe,
+                    candles=merged_candles or fallback_detail.candles,
+                    bids=live_bids,
+                    asks=live_asks,
+                    recent_public_trades=cached_trades or fallback_detail.recent_public_trades,
+                    headline=fallback_detail.headline,
+                    stats=stats,
+                    source=fallback_detail.source,
+                    updated_at=self._resolve_market_detail_updated_at(
+                        symbol,
+                        market,
+                        fallback_updated_at=fallback_detail.updated_at,
+                    ),
+                )
             )
 
         ticker = self.get_ticker_cached(symbol, market)
@@ -959,39 +1041,28 @@ class BybitPublicMarketClient:
         recent_public_trades = self.get_recent_public_trades(symbol, market)
         updated_at = self._now_iso()
 
-        high_price = self._to_float(ticker.get("highPrice24h"))
-        low_price = self._to_float(ticker.get("lowPrice24h"))
-        amplitude = ((high_price - low_price) / low_price * 100) if low_price else 0.0
         headline_suffix = "策略跟踪" if watch_item and watch_item.signal != "neutral" else "观察"
         rest_bids = orderbook["bids"] or fallback_detail.bids
         rest_asks = orderbook["asks"] or fallback_detail.asks
-
-        stats: Dict[str, str] = {
-            "数据源": "Bybit REST",
-            **self._build_orderbook_stats(rest_bids, rest_asks),
-            "24h振幅": f"{amplitude:.2f}%",
-            "24h高点": self._format_price(high_price) if high_price else "--",
-            "24h低点": self._format_price(low_price) if low_price else "--",
-        }
-        funding_rate = ticker.get("fundingRate")
-        if funding_rate not in (None, ""):
-            stats["资金费率"] = f"{self._to_float(funding_rate) * 100:.4f}%"
-        open_interest_value = self._to_float(ticker.get("openInterestValue"))
-        if open_interest_value:
-            stats["持仓价值"] = f"{open_interest_value / 1_000_000_000:.2f}B"
+        stats = self._build_market_detail_stats(
+            source_label="Bybit REST",
+            bids=rest_bids,
+            asks=rest_asks,
+            ticker=ticker,
+        )
 
         return fallback_detail.model_copy(
-            update={
-                "timeframe": normalized_timeframe,
-                "candles": candles or fallback_detail.candles,
-                "bids": rest_bids,
-                "asks": rest_asks,
-                "recent_public_trades": recent_public_trades or fallback_detail.recent_public_trades,
-                "headline": f"{symbol} 当前由 Bybit 公共行情驱动，处于{headline_suffix}状态",
-                "stats": stats,
-                "source": "bybit_rest",
-                "updated_at": updated_at,
-            }
+            update=self._build_market_detail_update(
+                timeframe=normalized_timeframe,
+                candles=candles or fallback_detail.candles,
+                bids=rest_bids,
+                asks=rest_asks,
+                recent_public_trades=recent_public_trades or fallback_detail.recent_public_trades,
+                headline=f"{symbol} 当前由 Bybit 公共行情驱动，处于{headline_suffix}状态",
+                stats=stats,
+                source="bybit_rest",
+                updated_at=updated_at,
+            )
         )
 
     def start_realtime(self, watchlist: List[WatchlistInstrument]) -> bool:

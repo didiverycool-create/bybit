@@ -364,7 +364,136 @@ export interface StrategyActivityLatestRuntimeSnapshot {
   latest_ops?: StrategyActivityLatestOpsSnapshot | null
 }
 
-export interface StrategyActivitySnapshot {
+export interface StrategyActivityProposalDecisionContext {
+  latest_backtest_record?: BacktestRun | null
+  latest_review_record?: ReviewDocument | null
+  latest_job_record?: AgentJob | null
+  actionable_backtest_record?: BacktestRun | null
+  actionable_review_record?: ReviewDocument | null
+  actionable_job_record?: AgentJob | null
+}
+
+export interface StrategyActivityChangeRequestDecisionContext {
+  latest_backtest_record?: BacktestRun | null
+  latest_review_record?: ReviewDocument | null
+  latest_job_record?: AgentJob | null
+  latest_source_backtest_record?: BacktestRun | null
+  latest_source_review_record?: ReviewDocument | null
+  latest_source_proposal_record?: StrategyProposal | null
+  actionable_backtest_record?: BacktestRun | null
+  actionable_review_record?: ReviewDocument | null
+  actionable_job_record?: AgentJob | null
+  actionable_source_backtest_record?: BacktestRun | null
+  actionable_source_review_record?: ReviewDocument | null
+  actionable_source_proposal_record?: StrategyProposal | null
+}
+
+export interface StrategyActivityBacktestDecisionContext {
+  latest_record?: BacktestRun | null
+  actionable_record?: BacktestRun | null
+  latest_review_record?: ReviewDocument | null
+  latest_job_record?: AgentJob | null
+  actionable_review_record?: ReviewDocument | null
+  actionable_job_record?: AgentJob | null
+}
+
+export interface StrategyActivityReviewDecisionContext {
+  latest_primary_record?: ReviewDocument | null
+  latest_actionable_primary_record?: ReviewDocument | null
+}
+
+export interface StrategyActivityTrackingDecisionContext {
+  latest_review_record?: ReviewDocument | null
+  latest_job_record?: AgentJob | null
+  latest_retryable_job_record?: AgentJob | null
+}
+
+export interface StrategyActivityDecisionContext {
+  proposal?: StrategyActivityProposalDecisionContext | null
+  change_request?: StrategyActivityChangeRequestDecisionContext | null
+  backtest?: StrategyActivityBacktestDecisionContext | null
+  review?: StrategyActivityReviewDecisionContext | null
+  tracking?: StrategyActivityTrackingDecisionContext | null
+}
+
+export interface StrategyActivityProposalSection {
+  latest?: StrategyProposal | null
+  latest_actionable?: StrategyProposal | null
+  latest_change_request?: ChangeRequest | null
+  latest_backtest?: StrategyActivityBacktestSummary | null
+  latest_review?: StrategyActivityReviewSummary | null
+  latest_job?: StrategyActivityJobSummary | null
+  latest_backtest_record?: BacktestRun | null
+  latest_review_record?: ReviewDocument | null
+  latest_job_record?: AgentJob | null
+  latest_actionable_change_request?: ChangeRequest | null
+  latest_actionable_backtest?: StrategyActivityBacktestSummary | null
+  latest_actionable_review?: StrategyActivityReviewSummary | null
+  latest_actionable_job?: StrategyActivityJobSummary | null
+  latest_actionable_backtest_record?: BacktestRun | null
+  latest_actionable_review_record?: ReviewDocument | null
+  latest_actionable_job_record?: AgentJob | null
+}
+
+export interface StrategyActivityChangeRequestSection {
+  latest?: ChangeRequest | null
+  latest_actionable?: ChangeRequest | null
+  latest_backtest_record?: BacktestRun | null
+  latest_review_record?: ReviewDocument | null
+  latest_job_record?: AgentJob | null
+  latest_source_backtest_record?: BacktestRun | null
+  latest_source_review_record?: ReviewDocument | null
+  latest_source_proposal_record?: StrategyProposal | null
+  latest_actionable_backtest_record?: BacktestRun | null
+  latest_actionable_review_record?: ReviewDocument | null
+  latest_actionable_job_record?: AgentJob | null
+  latest_actionable_source_backtest_record?: BacktestRun | null
+  latest_actionable_source_review_record?: ReviewDocument | null
+  latest_actionable_source_proposal_record?: StrategyProposal | null
+}
+
+export interface StrategyActivityBacktestSection {
+  latest?: StrategyActivityBacktestSummary | null
+  latest_actionable?: StrategyActivityBacktestSummary | null
+  latest_record?: BacktestRun | null
+  latest_actionable_record?: BacktestRun | null
+  latest_review?: StrategyActivityReviewSummary | null
+  latest_job?: StrategyActivityJobSummary | null
+  latest_actionable_review?: StrategyActivityReviewSummary | null
+  latest_actionable_job?: StrategyActivityJobSummary | null
+  latest_review_record?: ReviewDocument | null
+  latest_job_record?: AgentJob | null
+  latest_actionable_review_record?: ReviewDocument | null
+  latest_actionable_job_record?: AgentJob | null
+}
+
+export interface StrategyActivityReviewSection {
+  latest_primary?: StrategyActivityReviewSummary | null
+  latest_actionable_primary?: StrategyActivityReviewSummary | null
+  latest_tracking?: StrategyActivityReviewSummary | null
+  latest_primary_record?: ReviewDocument | null
+  latest_actionable_primary_record?: ReviewDocument | null
+  latest_tracking_record?: ReviewDocument | null
+}
+
+export interface StrategyActivityTrackingSection {
+  latest_review?: StrategyActivityReviewSummary | null
+  latest_job?: StrategyActivityJobSummary | null
+  latest_retryable_job?: StrategyActivityJobSummary | null
+  latest_review_record?: ReviewDocument | null
+  latest_job_record?: AgentJob | null
+  latest_retryable_job_record?: AgentJob | null
+}
+
+export interface StrategyActivitySections {
+  proposal?: StrategyActivityProposalSection | null
+  change_request?: StrategyActivityChangeRequestSection | null
+  backtest?: StrategyActivityBacktestSection | null
+  review?: StrategyActivityReviewSection | null
+  tracking?: StrategyActivityTrackingSection | null
+}
+
+export interface StrategyActivitySnapshotCore {
   strategy_id: string
   strategy_name: string
   symbol: string
@@ -373,6 +502,11 @@ export interface StrategyActivitySnapshot {
   runtime?: StrategyRuntimeSnapshot | null
   latest_runtime?: StrategyActivityLatestRuntimeSnapshot | null
   latest_ops?: StrategyActivityLatestOpsSnapshot | null
+  decision_context?: StrategyActivityDecisionContext | null
+  activity_sections?: StrategyActivitySections | null
+}
+
+export interface StrategyActivitySnapshotBacktestReviewFlatFields {
   latest_backtest?: StrategyActivityBacktestSummary | null
   latest_actionable_backtest?: StrategyActivityBacktestSummary | null
   latest_backtest_record?: BacktestRun | null
@@ -393,6 +527,11 @@ export interface StrategyActivitySnapshot {
   latest_tracking_job?: StrategyActivityJobSummary | null
   latest_tracking_review_record?: ReviewDocument | null
   latest_tracking_job_record?: AgentJob | null
+  latest_retryable_tracking_job?: StrategyActivityJobSummary | null
+  latest_retryable_tracking_job_record?: AgentJob | null
+}
+
+export interface StrategyActivitySnapshotProposalFlatFields {
   latest_proposal?: StrategyProposal | null
   latest_actionable_proposal?: StrategyProposal | null
   latest_proposal_change_request?: ChangeRequest | null
@@ -409,6 +548,9 @@ export interface StrategyActivitySnapshot {
   latest_actionable_proposal_backtest_record?: BacktestRun | null
   latest_actionable_proposal_review_record?: ReviewDocument | null
   latest_actionable_proposal_job_record?: AgentJob | null
+}
+
+export interface StrategyActivitySnapshotChangeRequestFlatFields {
   latest_change_request?: ChangeRequest | null
   latest_actionable_change_request?: ChangeRequest | null
   latest_change_request_backtest_record?: BacktestRun | null
@@ -423,22 +565,14 @@ export interface StrategyActivitySnapshot {
   latest_actionable_change_request_source_backtest_record?: BacktestRun | null
   latest_actionable_change_request_source_review_record?: ReviewDocument | null
   latest_actionable_change_request_source_proposal_record?: StrategyProposal | null
-  latest_retryable_tracking_job?: StrategyActivityJobSummary | null
-  latest_retryable_tracking_job_record?: AgentJob | null
-  latest_active_order?: string | null
-  latest_historical_order?: string | null
-  latest_order?: string | null
-  latest_pending_alert?: string | null
-  latest_trade?: string | null
-  latest_alert?: string | null
-  latest_active_order_record?: OrderRecord | null
-  latest_historical_order_record?: OrderRecord | null
-  latest_order_record?: OrderRecord | null
-  latest_pending_alert_record?: AlertRecord | null
-  latest_trade_record?: TradeRecord | null
-  latest_alert_record?: AlertRecord | null
-  latest_audit_event?: string | null
-  latest_audit_event_record?: ExecutionEvent | null
+}
+
+export interface StrategyActivitySnapshotLineageFields
+  extends StrategyActivitySnapshotBacktestReviewFlatFields,
+    StrategyActivitySnapshotProposalFlatFields,
+    StrategyActivitySnapshotChangeRequestFlatFields {}
+
+export interface StrategyActivitySnapshotRecentCollections {
   recent_proposals: StrategyProposal[]
   recent_change_requests: ChangeRequest[]
   recent_backtests: StrategyActivityBacktestSummary[]
@@ -449,6 +583,12 @@ export interface StrategyActivitySnapshot {
   recent_alerts: AlertRecord[]
   recent_audit_events: ExecutionEvent[]
   recent_agent_jobs: StrategyActivityJobSummary[]
+}
+
+export interface StrategyActivitySnapshot
+  extends StrategyActivitySnapshotCore,
+    StrategyActivitySnapshotLineageFields,
+    StrategyActivitySnapshotRecentCollections {
   generated_at: string
 }
 

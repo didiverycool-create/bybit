@@ -1,0 +1,111 @@
+import type { BuildAppInteractionModelsArgsInput } from './buildAppInteractionModelsArgsShared'
+
+export function buildAppInteractionStrategyWorkflowSource({
+  refreshControlData,
+  selectedMode,
+  selectedStrategy,
+  selectedStrategyRuntimePreview,
+  selectedStrategyRuntime,
+  watchlist,
+  strategies,
+  backtests,
+  reviewCatalog,
+  snapshot,
+  backtestRangeDraft,
+  backtestTimeframeDraft,
+  strategyTrackingKind,
+  strategyTrackingSummary,
+  strategyTrackingDetail,
+  strategyTrackingRequestKey,
+  findProposalById,
+  setSelectedStrategyId,
+  setBacktestRangeDraft,
+  setBacktestTimeframeDraft,
+  setSelectedBacktestId,
+  setSelectedProposalId,
+  setStrategyTrackingPanelOpen,
+  setStrategyActivityPanelOpen,
+  setStrategyTrackingKind,
+  setStrategyTrackingSummary,
+  setStrategyTrackingDetail,
+  setStrategyTrackingRequestKey,
+  showFeedback,
+}: BuildAppInteractionModelsArgsInput) {
+  return {
+    refreshControlData,
+    selectedMode,
+    selectedStrategy,
+    selectedStrategyRuntimePreview,
+    selectedStrategyRuntime,
+    watchlist,
+    strategies,
+    backtests,
+    reviewCatalog,
+    schedulerState: snapshot?.scheduler,
+    backtestRangeDraft,
+    backtestTimeframeDraft,
+    strategyTrackingKind,
+    strategyTrackingSummary,
+    strategyTrackingDetail,
+    strategyTrackingRequestKey,
+    findProposalById,
+    setSelectedStrategyId,
+    setBacktestRangeDraft,
+    setBacktestTimeframeDraft,
+    setSelectedBacktestId,
+    setSelectedProposalId,
+    setStrategyTrackingPanelOpen,
+    setStrategyActivityPanelOpen,
+    setStrategyTrackingKind,
+    setStrategyTrackingSummary,
+    setStrategyTrackingDetail,
+    setStrategyTrackingRequestKey,
+    showFeedback,
+  }
+}
+
+export type AppInteractionStrategyWorkflowSource = ReturnType<
+  typeof buildAppInteractionStrategyWorkflowSource
+>
+
+export function buildAppInteractionWorkspaceControlSource({
+  refreshControlData,
+  queryClient,
+  settings,
+  settingsDraft,
+  settingsDraftDirty,
+  setSettingsDraft,
+  lastLoadedSettingsSignatureRef,
+  desktopNotificationsEnabled,
+  dispatchDesktopNotification,
+  watchlistDraftSymbol,
+  watchlistDraftMarket,
+  watchlistAlertDrafts,
+  setSelectedSymbol,
+  setWatchlistDraftSymbol,
+  setWatchlistManagerOpen,
+  showFeedback,
+}: BuildAppInteractionModelsArgsInput) {
+  return {
+    refreshControlData,
+    queryClient,
+    settings,
+    settingsDraft,
+    settingsDraftDirty,
+    setSettingsDraft,
+    lastLoadedSettingsSignatureRef,
+    desktopNotificationsEnabled,
+    dispatchDesktopNotification,
+    watchlistDraftSymbol,
+    watchlistDraftMarket,
+    watchlistAlertDrafts,
+    setSelectedSymbol,
+    setWatchlistDraftSymbol,
+    setWatchlistManagerOpen,
+    showFeedback,
+  }
+}
+
+export type AppInteractionWorkspaceControlSource = ReturnType<
+  typeof buildAppInteractionWorkspaceControlSource
+>

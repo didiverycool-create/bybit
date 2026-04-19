@@ -7,6 +7,7 @@ const isDev = !app.isPackaged;
 const shouldOpenDevTools = process.env.BYBIT_OPEN_DEVTOOLS === "1";
 const shouldRunMarketSwitchSmoke = isDev && process.env.BYBIT_SMOKE_MARKET_SWITCH === "1";
 const shouldRunStrategyActivitySmoke = isDev && process.env.BYBIT_SMOKE_STRATEGY_ACTIVITY === "1";
+const shouldRunRequestedSmoke = shouldRunStrategyActivitySmoke || shouldRunMarketSwitchSmoke;
 const strategyActivitySmokeRenderBudgetMs = Number(
   process.env.BYBIT_SMOKE_STRATEGY_ACTIVITY_RENDER_BUDGET_MS ?? "30000",
 );
@@ -215,6 +216,9 @@ function createTray() {
 
 function createWindow() {
   const initialWindowState = resolveWindowBoundsState();
+  let requestedSmokeStarted = false;
+  let didFinishLoad = false;
+  let readyForRequestedSmoke = false;
   const win = new BrowserWindow({
     ...initialWindowState.bounds,
     minWidth: minWindowWidth,
@@ -230,8 +234,20 @@ function createWindow() {
   });
   mainWindow = win;
 
+  const maybeStartRequestedSmoke = async () => {
+    if (!isDev || !shouldRunRequestedSmoke || requestedSmokeStarted || !didFinishLoad || !readyForRequestedSmoke) {
+      return;
+    }
+    requestedSmokeStarted = true;
+    await runRequestedSmokeOnLoad(win, {
+      shouldRunStrategyActivitySmoke,
+      shouldRunMarketSwitchSmoke,
+      controlApiBase,
+      strategyActivitySmokeRenderBudgetMs,
+    });
+  };
+
   if (isDev) {
-    let requestedSmokeStarted = false;
     win.loadURL("http://localhost:5173");
     if (shouldOpenDevTools) {
       win.webContents.openDevTools({ mode: "detach" });
@@ -255,16 +271,8 @@ function createWindow() {
       console.error(`[renderer:load-failed] ${errorCode} ${errorDescription} ${validatedURL}`);
     });
     win.webContents.on("did-finish-load", async () => {
-      if (requestedSmokeStarted || (!shouldRunStrategyActivitySmoke && !shouldRunMarketSwitchSmoke)) {
-        return;
-      }
-      requestedSmokeStarted = true;
-      await runRequestedSmokeOnLoad(win, {
-        shouldRunStrategyActivitySmoke,
-        shouldRunMarketSwitchSmoke,
-        controlApiBase,
-        strategyActivitySmokeRenderBudgetMs,
-      });
+      didFinishLoad = true;
+      await maybeStartRequestedSmoke();
     });
   } else {
     win.loadFile(path.join(__dirname, "../../dist/index.html"));
@@ -278,6 +286,10 @@ function createWindow() {
     win.focus();
     persistWindowBoundsState(win);
     updateTrayMenu();
+    if (isDev) {
+      readyForRequestedSmoke = true;
+      void maybeStartRequestedSmoke();
+    }
   });
 
   win.on("move", () => persistWindowBoundsState(win));

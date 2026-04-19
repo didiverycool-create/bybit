@@ -371,7 +371,136 @@ class StrategyActivityLatestRuntimeSnapshot(BaseModel):
     latest_ops: Optional[StrategyActivityLatestOpsSnapshot] = None
 
 
-class StrategyActivitySnapshot(BaseModel):
+class StrategyActivityProposalDecisionContext(BaseModel):
+    latest_backtest_record: Optional["BacktestRun"] = None
+    latest_review_record: Optional["ReviewDocument"] = None
+    latest_job_record: Optional["AgentJob"] = None
+    actionable_backtest_record: Optional["BacktestRun"] = None
+    actionable_review_record: Optional["ReviewDocument"] = None
+    actionable_job_record: Optional["AgentJob"] = None
+
+
+class StrategyActivityChangeRequestDecisionContext(BaseModel):
+    latest_backtest_record: Optional["BacktestRun"] = None
+    latest_review_record: Optional["ReviewDocument"] = None
+    latest_job_record: Optional["AgentJob"] = None
+    latest_source_backtest_record: Optional["BacktestRun"] = None
+    latest_source_review_record: Optional["ReviewDocument"] = None
+    latest_source_proposal_record: Optional["StrategyProposal"] = None
+    actionable_backtest_record: Optional["BacktestRun"] = None
+    actionable_review_record: Optional["ReviewDocument"] = None
+    actionable_job_record: Optional["AgentJob"] = None
+    actionable_source_backtest_record: Optional["BacktestRun"] = None
+    actionable_source_review_record: Optional["ReviewDocument"] = None
+    actionable_source_proposal_record: Optional["StrategyProposal"] = None
+
+
+class StrategyActivityBacktestDecisionContext(BaseModel):
+    latest_record: Optional["BacktestRun"] = None
+    actionable_record: Optional["BacktestRun"] = None
+    latest_review_record: Optional["ReviewDocument"] = None
+    latest_job_record: Optional["AgentJob"] = None
+    actionable_review_record: Optional["ReviewDocument"] = None
+    actionable_job_record: Optional["AgentJob"] = None
+
+
+class StrategyActivityReviewDecisionContext(BaseModel):
+    latest_primary_record: Optional["ReviewDocument"] = None
+    latest_actionable_primary_record: Optional["ReviewDocument"] = None
+
+
+class StrategyActivityTrackingDecisionContext(BaseModel):
+    latest_review_record: Optional["ReviewDocument"] = None
+    latest_job_record: Optional["AgentJob"] = None
+    latest_retryable_job_record: Optional["AgentJob"] = None
+
+
+class StrategyActivityDecisionContext(BaseModel):
+    proposal: Optional[StrategyActivityProposalDecisionContext] = None
+    change_request: Optional[StrategyActivityChangeRequestDecisionContext] = None
+    backtest: Optional[StrategyActivityBacktestDecisionContext] = None
+    review: Optional[StrategyActivityReviewDecisionContext] = None
+    tracking: Optional[StrategyActivityTrackingDecisionContext] = None
+
+
+class StrategyActivityProposalSection(BaseModel):
+    latest: Optional["StrategyProposal"] = None
+    latest_actionable: Optional["StrategyProposal"] = None
+    latest_change_request: Optional["ChangeRequest"] = None
+    latest_backtest: Optional["StrategyActivityBacktestSummary"] = None
+    latest_review: Optional["StrategyActivityReviewSummary"] = None
+    latest_job: Optional["StrategyActivityJobSummary"] = None
+    latest_backtest_record: Optional["BacktestRun"] = None
+    latest_review_record: Optional["ReviewDocument"] = None
+    latest_job_record: Optional["AgentJob"] = None
+    latest_actionable_change_request: Optional["ChangeRequest"] = None
+    latest_actionable_backtest: Optional["StrategyActivityBacktestSummary"] = None
+    latest_actionable_review: Optional["StrategyActivityReviewSummary"] = None
+    latest_actionable_job: Optional["StrategyActivityJobSummary"] = None
+    latest_actionable_backtest_record: Optional["BacktestRun"] = None
+    latest_actionable_review_record: Optional["ReviewDocument"] = None
+    latest_actionable_job_record: Optional["AgentJob"] = None
+
+
+class StrategyActivityChangeRequestSection(BaseModel):
+    latest: Optional["ChangeRequest"] = None
+    latest_actionable: Optional["ChangeRequest"] = None
+    latest_backtest_record: Optional["BacktestRun"] = None
+    latest_review_record: Optional["ReviewDocument"] = None
+    latest_job_record: Optional["AgentJob"] = None
+    latest_source_backtest_record: Optional["BacktestRun"] = None
+    latest_source_review_record: Optional["ReviewDocument"] = None
+    latest_source_proposal_record: Optional["StrategyProposal"] = None
+    latest_actionable_backtest_record: Optional["BacktestRun"] = None
+    latest_actionable_review_record: Optional["ReviewDocument"] = None
+    latest_actionable_job_record: Optional["AgentJob"] = None
+    latest_actionable_source_backtest_record: Optional["BacktestRun"] = None
+    latest_actionable_source_review_record: Optional["ReviewDocument"] = None
+    latest_actionable_source_proposal_record: Optional["StrategyProposal"] = None
+
+
+class StrategyActivityBacktestSection(BaseModel):
+    latest: Optional["StrategyActivityBacktestSummary"] = None
+    latest_actionable: Optional["StrategyActivityBacktestSummary"] = None
+    latest_record: Optional["BacktestRun"] = None
+    latest_actionable_record: Optional["BacktestRun"] = None
+    latest_review: Optional["StrategyActivityReviewSummary"] = None
+    latest_job: Optional["StrategyActivityJobSummary"] = None
+    latest_actionable_review: Optional["StrategyActivityReviewSummary"] = None
+    latest_actionable_job: Optional["StrategyActivityJobSummary"] = None
+    latest_review_record: Optional["ReviewDocument"] = None
+    latest_job_record: Optional["AgentJob"] = None
+    latest_actionable_review_record: Optional["ReviewDocument"] = None
+    latest_actionable_job_record: Optional["AgentJob"] = None
+
+
+class StrategyActivityReviewSection(BaseModel):
+    latest_primary: Optional["StrategyActivityReviewSummary"] = None
+    latest_actionable_primary: Optional["StrategyActivityReviewSummary"] = None
+    latest_tracking: Optional["StrategyActivityReviewSummary"] = None
+    latest_primary_record: Optional["ReviewDocument"] = None
+    latest_actionable_primary_record: Optional["ReviewDocument"] = None
+    latest_tracking_record: Optional["ReviewDocument"] = None
+
+
+class StrategyActivityTrackingSection(BaseModel):
+    latest_review: Optional["StrategyActivityReviewSummary"] = None
+    latest_job: Optional["StrategyActivityJobSummary"] = None
+    latest_retryable_job: Optional["StrategyActivityJobSummary"] = None
+    latest_review_record: Optional["ReviewDocument"] = None
+    latest_job_record: Optional["AgentJob"] = None
+    latest_retryable_job_record: Optional["AgentJob"] = None
+
+
+class StrategyActivitySections(BaseModel):
+    proposal: Optional[StrategyActivityProposalSection] = None
+    change_request: Optional[StrategyActivityChangeRequestSection] = None
+    backtest: Optional[StrategyActivityBacktestSection] = None
+    review: Optional[StrategyActivityReviewSection] = None
+    tracking: Optional[StrategyActivityTrackingSection] = None
+
+
+class StrategyActivitySnapshotCore(BaseModel):
     strategy_id: str
     strategy_name: str
     symbol: str
@@ -380,6 +509,11 @@ class StrategyActivitySnapshot(BaseModel):
     runtime: Optional[StrategyRuntimeSnapshot] = None
     latest_runtime: Optional[StrategyActivityLatestRuntimeSnapshot] = None
     latest_ops: Optional[StrategyActivityLatestOpsSnapshot] = None
+    decision_context: Optional[StrategyActivityDecisionContext] = None
+    activity_sections: Optional[StrategyActivitySections] = None
+
+
+class StrategyActivitySnapshotBacktestReviewFlatFields(BaseModel):
     latest_backtest: Optional["StrategyActivityBacktestSummary"] = None
     latest_actionable_backtest: Optional["StrategyActivityBacktestSummary"] = None
     latest_backtest_record: Optional["BacktestRun"] = None
@@ -400,6 +534,11 @@ class StrategyActivitySnapshot(BaseModel):
     latest_tracking_job: Optional["StrategyActivityJobSummary"] = None
     latest_tracking_review_record: Optional["ReviewDocument"] = None
     latest_tracking_job_record: Optional["AgentJob"] = None
+    latest_retryable_tracking_job: Optional["StrategyActivityJobSummary"] = None
+    latest_retryable_tracking_job_record: Optional["AgentJob"] = None
+
+
+class StrategyActivitySnapshotProposalFlatFields(BaseModel):
     latest_proposal: Optional["StrategyProposal"] = None
     latest_actionable_proposal: Optional["StrategyProposal"] = None
     latest_proposal_change_request: Optional["ChangeRequest"] = None
@@ -416,6 +555,9 @@ class StrategyActivitySnapshot(BaseModel):
     latest_actionable_proposal_backtest_record: Optional["BacktestRun"] = None
     latest_actionable_proposal_review_record: Optional["ReviewDocument"] = None
     latest_actionable_proposal_job_record: Optional["AgentJob"] = None
+
+
+class StrategyActivitySnapshotChangeRequestFlatFields(BaseModel):
     latest_change_request: Optional["ChangeRequest"] = None
     latest_actionable_change_request: Optional["ChangeRequest"] = None
     latest_change_request_backtest_record: Optional["BacktestRun"] = None
@@ -430,22 +572,17 @@ class StrategyActivitySnapshot(BaseModel):
     latest_actionable_change_request_source_backtest_record: Optional["BacktestRun"] = None
     latest_actionable_change_request_source_review_record: Optional["ReviewDocument"] = None
     latest_actionable_change_request_source_proposal_record: Optional["StrategyProposal"] = None
-    latest_retryable_tracking_job: Optional["StrategyActivityJobSummary"] = None
-    latest_retryable_tracking_job_record: Optional["AgentJob"] = None
-    latest_active_order: Optional[str] = None
-    latest_historical_order: Optional[str] = None
-    latest_order: Optional[str] = None
-    latest_pending_alert: Optional[str] = None
-    latest_trade: Optional[str] = None
-    latest_alert: Optional[str] = None
-    latest_active_order_record: Optional["OrderRecord"] = None
-    latest_historical_order_record: Optional["OrderRecord"] = None
-    latest_order_record: Optional["OrderRecord"] = None
-    latest_pending_alert_record: Optional["AlertRecord"] = None
-    latest_trade_record: Optional["TradeRecord"] = None
-    latest_alert_record: Optional["AlertRecord"] = None
-    latest_audit_event: Optional[str] = None
-    latest_audit_event_record: Optional["ExecutionEvent"] = None
+
+
+class StrategyActivitySnapshotLineageFields(
+    StrategyActivitySnapshotBacktestReviewFlatFields,
+    StrategyActivitySnapshotProposalFlatFields,
+    StrategyActivitySnapshotChangeRequestFlatFields,
+):
+    pass
+
+
+class StrategyActivitySnapshotRecentCollections(BaseModel):
     recent_proposals: List["StrategyProposal"] = Field(default_factory=list)
     recent_change_requests: List["ChangeRequest"] = Field(default_factory=list)
     recent_backtests: List["StrategyActivityBacktestSummary"] = Field(default_factory=list)
@@ -456,6 +593,13 @@ class StrategyActivitySnapshot(BaseModel):
     recent_alerts: List["AlertRecord"] = Field(default_factory=list)
     recent_audit_events: List["ExecutionEvent"] = Field(default_factory=list)
     recent_agent_jobs: List["StrategyActivityJobSummary"] = Field(default_factory=list)
+
+
+class StrategyActivitySnapshot(
+    StrategyActivitySnapshotCore,
+    StrategyActivitySnapshotLineageFields,
+    StrategyActivitySnapshotRecentCollections,
+):
     generated_at: str
 
 
@@ -1307,3 +1451,21 @@ class AppState(BaseModel):
     audit_events: List[ExecutionEvent]
     settings: SettingsPayload
     workspace_preferences: WorkspacePreferences
+
+
+class ReconcileChangeRequestOutcome(BaseModel):
+    """Structured outcome returned by a ``reconcile_change_request`` agent job.
+
+    This shape is populated from the OpenClaw agent response (JSON preferred,
+    plain-text fallback parsed best-effort). It is written back to the
+    originating ``ChangeRequest`` so the desktop can tell at a glance whether
+    the change actually landed or still needs human follow-up, and what the
+    next suggested actions are.
+    """
+
+    change_request_id: str
+    summary: str
+    landed: Optional[bool] = None
+    needs_manual_review: Optional[bool] = None
+    needs_manual_review_detail: Optional[str] = None
+    next_actions: List[str] = Field(default_factory=list)

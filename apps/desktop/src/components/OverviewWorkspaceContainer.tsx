@@ -19,6 +19,8 @@ type OverviewWorkspaceContainerProps = {
     marketDiagnostics: OverviewWorkspaceSectionProps['marketDiagnostics']
     marketDetailLoading: OverviewWorkspaceSectionProps['marketDetailLoading']
     marketDetailErrorMessage: OverviewWorkspaceSectionProps['marketDetailErrorMessage']
+    marketLiveStatusMessage: OverviewWorkspaceSectionProps['marketLiveStatusMessage']
+    marketLiveStatusTitle: OverviewWorkspaceSectionProps['marketLiveStatusTitle']
     snapshotExecutionHealth: OverviewWorkspaceSectionProps['snapshotExecutionHealth']
     marketDiagnosticsTitle: OverviewWorkspaceSectionProps['marketDiagnosticsTitle']
     marketDiagnosticsSummary: OverviewWorkspaceSectionProps['marketDiagnosticsSummary']
@@ -62,6 +64,8 @@ export default function OverviewWorkspaceContainer({
       marketDiagnostics={marketState.marketDiagnostics}
       marketDetailLoading={marketState.marketDetailLoading}
       marketDetailErrorMessage={marketState.marketDetailErrorMessage}
+      marketLiveStatusMessage={marketState.marketLiveStatusMessage}
+      marketLiveStatusTitle={marketState.marketLiveStatusTitle}
       snapshotExecutionHealth={marketState.snapshotExecutionHealth}
       marketDiagnosticsTitle={marketState.marketDiagnosticsTitle}
       marketDiagnosticsSummary={marketState.marketDiagnosticsSummary}

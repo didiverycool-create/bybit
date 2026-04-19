@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from statistics import mean, pstdev
-from typing import Iterable, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 from models import StrategyRuntimeSnapshot, StrategySummary, WatchlistInstrument
 
@@ -222,3 +222,183 @@ def evaluate_strategy_runtime(
         next_action=next_action,
         last_evaluated_at=evaluated_at or _now_iso(),
     )
+
+
+def _family_for_strategy(strategy: StrategySummary) -> str:
+    if "趋势" in strategy.name or strategy.id.startswith("trend"):
+        return "trend"
+    if "均值回归" in strategy.name or "revert" in strategy.id:
+        return "mean_revert"
+    return "breakout"
+
+
+def _pct_distance(reference: float, price: float) -> float:
+    if not reference:
+        return 0.0
+    return (price - reference) / reference * 100.0
+
+
+def _trend_risk_hint(strategy: StrategySummary, closes: List[float]) -> Dict[str, Any]:
+    fast_window = max(int(_param_value(strategy, "fast_ma", 21)), 3)
+    slow_window = max(int(_param_value(strategy, "slow_ma", 55)), fast_window + 1)
+    stop_loss_pct = max(_param_value(strategy, "stop_loss_pct", 1.2), 0.2)
+    take_profit_pct = max(_param_value(strategy, "take_profit_pct", 3.0), stop_loss_pct + 0.3)
+    fast_ma = _tail_mean(closes, fast_window)
+    slow_ma = _tail_mean(closes, slow_window)
+    last_price = closes[-1]
+    if last_price > fast_ma > slow_ma:
+        bias = "long"
+        stop_price = last_price * (1.0 - stop_loss_pct / 100.0)
+        target_price = last_price * (1.0 + take_profit_pct / 100.0)
+    elif last_price < fast_ma < slow_ma:
+        bias = "short"
+        stop_price = last_price * (1.0 + stop_loss_pct / 100.0)
+        target_price = last_price * (1.0 - take_profit_pct / 100.0)
+    else:
+        bias = "watch"
+        stop_price = slow_ma
+        target_price = fast_ma
+    return {
+        "family": "trend",
+        "bias": bias,
+        "stop_price": round(stop_price, 6),
+        "target_price": round(target_price, 6),
+        "stop_distance_pct": round(_pct_distance(last_price, stop_price), 3),
+        "target_distance_pct": round(_pct_distance(last_price, target_price), 3),
+        "fast_ma": round(fast_ma, 6),
+        "slow_ma": round(slow_ma, 6),
+        "stop_loss_pct": round(stop_loss_pct, 3),
+        "take_profit_pct": round(take_profit_pct, 3),
+    }
+
+
+def _mean_revert_risk_hint(strategy: StrategySummary, closes: List[float]) -> Dict[str, Any]:
+    window = min(max(len(closes), 5), 30)
+    sample = closes[-window:]
+    baseline = mean(sample)
+    std = pstdev(sample) if len(sample) >= 2 else 0.0
+    last_price = sample[-1]
+    entry = max(_param_value(strategy, "zscore_entry", 2.0), 0.8)
+    exit_value = max(_param_value(strategy, "zscore_exit", 0.5), 0.1)
+    zscore = (last_price - baseline) / std if std else 0.0
+    if zscore <= -entry:
+        bias = "long"
+    elif zscore >= entry:
+        bias = "short"
+    elif abs(zscore) <= exit_value:
+        bias = "flat"
+    else:
+        bias = "watch"
+    long_entry_price = baseline - entry * std
+    short_entry_price = baseline + entry * std
+    upper_exit = baseline + exit_value * std
+    lower_exit = baseline - exit_value * std
+    return {
+        "family": "mean_revert",
+        "bias": bias,
+        "baseline_price": round(baseline, 6),
+        "zscore": round(zscore, 3),
+        "long_entry_price": round(long_entry_price, 6),
+        "short_entry_price": round(short_entry_price, 6),
+        "long_exit_price": round(upper_exit, 6),
+        "short_exit_price": round(lower_exit, 6),
+        "stop_price": round(lower_exit if bias == "long" else upper_exit if bias == "short" else baseline, 6),
+        "target_price": round(baseline, 6),
+        "zscore_entry": round(entry, 3),
+        "zscore_exit": round(exit_value, 3),
+    }
+
+
+def _breakout_risk_hint(strategy: StrategySummary, closes: List[float]) -> Dict[str, Any]:
+    window = min(max(int(_param_value(strategy, "breakout_window", 18)), 8), max(len(closes) - 1, 8))
+    latest = closes[-1]
+    history = closes[-(window + 1) : -1] if len(closes) > 1 else closes
+    if not history:
+        history = closes[:-1] or closes
+    upper = max(history)
+    lower = min(history)
+    stop_loss_pct = max(_param_value(strategy, "stop_loss_pct", 1.8), 0.3)
+    take_profit_pct = max(_param_value(strategy, "take_profit_pct", 4.2), stop_loss_pct + 0.4)
+    if latest >= upper * 1.001:
+        bias = "long"
+        stop_price = latest * (1.0 - stop_loss_pct / 100.0)
+        target_price = latest * (1.0 + take_profit_pct / 100.0)
+    elif latest <= lower * 0.999:
+        bias = "short"
+        stop_price = latest * (1.0 + stop_loss_pct / 100.0)
+        target_price = latest * (1.0 - take_profit_pct / 100.0)
+    else:
+        bias = "watch"
+        stop_price = lower
+        target_price = upper
+    return {
+        "family": "breakout",
+        "bias": bias,
+        "upper_band": round(upper, 6),
+        "lower_band": round(lower, 6),
+        "stop_price": round(stop_price, 6),
+        "target_price": round(target_price, 6),
+        "stop_distance_pct": round(_pct_distance(latest, stop_price), 3),
+        "target_distance_pct": round(_pct_distance(latest, target_price), 3),
+        "window": window,
+        "stop_loss_pct": round(stop_loss_pct, 3),
+        "take_profit_pct": round(take_profit_pct, 3),
+    }
+
+
+def compute_strategy_runtime_risk_hints(
+    strategy: StrategySummary,
+    detail: Any,
+    watch_item: WatchlistInstrument,
+) -> Dict[str, Any]:
+    """Return structured stop/target/band pricing for the live-ops risk hint panel.
+
+    The output is a read-only snapshot; it never mutates the strategy or detail.
+    When the history has fewer than 6 candles we return an "insufficient" record
+    so callers can decide whether to surface a warning.
+    """
+
+    closes = [float(item.close) for item in detail.candles if getattr(item, "close", None) is not None]
+    last_price = closes[-1] if closes else float(watch_item.last_price)
+    family = _family_for_strategy(strategy)
+    generated_at = _now_iso()
+
+    base: Dict[str, Any] = {
+        "strategy_id": strategy.id,
+        "symbol": watch_item.symbol,
+        "market": watch_item.market,
+        "family": family,
+        "last_price": round(last_price, 6),
+        "generated_at": generated_at,
+    }
+
+    if strategy.status == "paused":
+        base.update(
+            {
+                "available": False,
+                "reason": "策略已暂停，不生成风控提示价。",
+                "bias": "flat",
+            }
+        )
+        return base
+
+    if len(closes) < 6:
+        base.update(
+            {
+                "available": False,
+                "reason": "历史 K 线不足 6 根，暂不生成止盈/止损参考价。",
+                "bias": "watch",
+            }
+        )
+        return base
+
+    if family == "trend":
+        hint = _trend_risk_hint(strategy, closes)
+    elif family == "mean_revert":
+        hint = _mean_revert_risk_hint(strategy, closes)
+    else:
+        hint = _breakout_risk_hint(strategy, closes)
+
+    base.update(hint)
+    base["available"] = True
+    return base
