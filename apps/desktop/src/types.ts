@@ -711,6 +711,14 @@ export interface BacktestBenchmarkStats {
   tracking_error_pct: number
 }
 
+export interface BacktestExposureStats {
+  return_skew: number
+  return_kurtosis: number
+  ulcer_index_pct: number
+  recovery_factor: number
+  downside_deviation_pct: number
+}
+
 export interface BacktestRun {
   id: string
   strategy_id: string
@@ -765,6 +773,7 @@ export interface BacktestRun {
   risk_ratios?: BacktestRiskRatios | null
   trade_rhythm_stats?: BacktestTradeRhythmStats | null
   benchmark_stats?: BacktestBenchmarkStats | null
+  exposure_stats?: BacktestExposureStats | null
   notes: string
 }
 

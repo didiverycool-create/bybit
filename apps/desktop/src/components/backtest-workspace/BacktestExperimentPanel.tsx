@@ -151,6 +151,22 @@ export default function BacktestExperimentPanel({
             </span>
           </div>
         )}
+        {selectedBacktest.exposure_stats && (
+          <div className="stack-row">
+            <strong>敞口统计</strong>
+            <span>
+              偏度 {selectedBacktest.exposure_stats.return_skew.toFixed(2)}
+              {' · '}
+              峰度 {selectedBacktest.exposure_stats.return_kurtosis.toFixed(2)}
+              {' · '}
+              Ulcer {selectedBacktest.exposure_stats.ulcer_index_pct.toFixed(2)}%
+              {' · '}
+              恢复因子 {selectedBacktest.exposure_stats.recovery_factor.toFixed(2)}
+              {' · '}
+              下行波动 {selectedBacktest.exposure_stats.downside_deviation_pct.toFixed(2)}%
+            </span>
+          </div>
+        )}
         <div className="stack-row">
           <strong>样本质量</strong>
           <span>{selectedBacktestSampleMeta?.description ?? '未标注'}</span>
