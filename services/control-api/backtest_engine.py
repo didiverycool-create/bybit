@@ -13,6 +13,22 @@ BACKTEST_ENGINE_MAX_CANDLES = 20_000
 
 
 @dataclass
+class BacktestVolatilityStats:
+    """Additional equity-curve volatility descriptors.
+
+    All percentage fields are expressed as plain numbers (e.g. ``1.23`` == 1.23%).
+    They are purely derived from the simulated equity curve and never raise on
+    degenerate inputs (empty / single-point curves → all zeros).
+    """
+
+    return_volatility_pct: float
+    annualized_volatility_pct: float
+    max_drawdown_duration_bars: int
+    max_run_up_pct: float
+    positive_bar_ratio_pct: float
+
+
+@dataclass
 class BacktestComputation:
     metrics: BacktestMetrics
     notes: str
@@ -28,6 +44,7 @@ class BacktestComputation:
     used_range_start: Optional[str]
     used_range_end: Optional[str]
     history_truncated: bool
+    volatility_stats: Optional[BacktestVolatilityStats] = None
 
 
 def _parameter_map(strategy: StrategySummary) -> Dict[str, object]:
@@ -141,6 +158,79 @@ def _compute_sharpe(period_returns: List[float], bars_per_year: float) -> float:
     return avg / std * math.sqrt(bars_per_year)
 
 
+def _max_drawdown_duration_bars(equity_curve: List[float]) -> int:
+    """Longest streak of consecutive bars where equity stays strictly below the
+    running peak. Safe on empty / single-point / flat curves (returns 0).
+    """
+    if len(equity_curve) < 2:
+        return 0
+    peak = equity_curve[0]
+    longest = 0
+    current = 0
+    for value in equity_curve:
+        if value >= peak:
+            peak = value
+            current = 0
+            continue
+        current += 1
+        if current > longest:
+            longest = current
+    return longest
+
+
+def _max_run_up_pct(equity_curve: List[float]) -> float:
+    """Largest unrealized gain vs the first valid equity point, as a percentage.
+
+    Returns 0.0 when the curve is empty, the first point is non-positive, or the
+    equity never exceeds the starting level.
+    """
+    if not equity_curve:
+        return 0.0
+    anchor = equity_curve[0]
+    if anchor <= 0:
+        return 0.0
+    best = anchor
+    for value in equity_curve:
+        if value > best:
+            best = value
+    if best <= anchor:
+        return 0.0
+    return (best / anchor - 1.0) * 100.0
+
+
+def _compute_volatility_stats(
+    equity_curve: List[float],
+    bars_per_year: float,
+) -> BacktestVolatilityStats:
+    """Derive volatility descriptors from the simulated equity curve.
+
+    Degenerate inputs (empty / single-point / non-positive start) yield zeroed
+    stats rather than raising — callers may inspect the curve separately to
+    decide whether the figures are meaningful.
+    """
+    period_returns = _compute_period_returns(equity_curve)
+    if len(period_returns) >= 2:
+        volatility = pstdev(period_returns)
+    else:
+        volatility = 0.0
+    if bars_per_year > 0 and volatility > 0:
+        annualized = volatility * math.sqrt(bars_per_year)
+    else:
+        annualized = 0.0
+    if period_returns:
+        positive = sum(1 for value in period_returns if value > 0)
+        positive_ratio = positive / len(period_returns) * 100.0
+    else:
+        positive_ratio = 0.0
+    return BacktestVolatilityStats(
+        return_volatility_pct=round(volatility, 4),
+        annualized_volatility_pct=round(annualized, 4),
+        max_drawdown_duration_bars=_max_drawdown_duration_bars(equity_curve),
+        max_run_up_pct=round(_max_run_up_pct(equity_curve), 4),
+        positive_bar_ratio_pct=round(positive_ratio, 2),
+    )
+
+
 def _mark_to_market_equity(entry_equity: float, trade_return_pct: float) -> float:
     return entry_equity * (1.0 + trade_return_pct / 100.0)
 
@@ -200,7 +290,7 @@ def _run_trend_follow(
     candles: List[CandlePoint],
     params: Dict[str, object],
     timeframe: str,
-) -> tuple[BacktestMetrics, bool]:
+) -> tuple[BacktestMetrics, bool, List[float]]:
     fast = max(int(float(params.get("fast_ma", 21))), 2)
     slow = max(int(float(params.get("slow_ma", 55))), fast + 1)
     risk_per_trade = max(float(params.get("risk_per_trade", 1.0)), 0.2) / 100.0
@@ -261,14 +351,14 @@ def _run_trend_follow(
         max(len(candles) - 1, 1),
     )
     metrics.max_drawdown = _format_signed_pct(_compute_max_drawdown(equity_curve))
-    return metrics, used_reference_path
+    return metrics, used_reference_path, equity_curve
 
 
 def _run_mean_reversion(
     candles: List[CandlePoint],
     params: Dict[str, object],
     timeframe: str,
-) -> tuple[BacktestMetrics, bool]:
+) -> tuple[BacktestMetrics, bool, List[float]]:
     entry = max(float(params.get("zscore_entry", 2.0)), 0.5)
     exit_value = max(float(params.get("zscore_exit", 0.5)), 0.1)
     stop_loss_pct = max(float(params.get("stop_loss_pct", 1.0)), 0.2)
@@ -333,14 +423,14 @@ def _run_mean_reversion(
         max(len(candles) - 1, 1),
     )
     metrics.max_drawdown = _format_signed_pct(_compute_max_drawdown(equity_curve))
-    return metrics, used_reference_path
+    return metrics, used_reference_path, equity_curve
 
 
 def _run_breakout(
     candles: List[CandlePoint],
     params: Dict[str, object],
     timeframe: str,
-) -> tuple[BacktestMetrics, bool]:
+) -> tuple[BacktestMetrics, bool, List[float]]:
     breakout_window = max(int(float(params.get("breakout_window", 18))), 5)
     volume_ratio = max(float(params.get("volume_ratio", 1.2)), 1.0)
     max_hold_hours = max(float(params.get("max_hold_hours", 6)), 1.0)
@@ -409,7 +499,7 @@ def _run_breakout(
         max(len(candles) - 1, 1),
     )
     metrics.max_drawdown = _format_signed_pct(_compute_max_drawdown(equity_curve))
-    return metrics, used_reference_path
+    return metrics, used_reference_path, equity_curve
 
 
 def run_local_backtest(strategy: StrategySummary, candles: List[CandlePoint], timeframe: str, data_range: str) -> BacktestComputation:
@@ -421,11 +511,15 @@ def run_local_backtest(strategy: StrategySummary, candles: List[CandlePoint], ti
     retrieved_range_start, retrieved_range_end = _candle_time_bounds(candles)
     used_range_start, used_range_end = _candle_time_bounds(effective_candles)
     if strategy.id.startswith("trend-"):
-        metrics, used_reference_path = _run_trend_follow(effective_candles, params, timeframe)
+        metrics, used_reference_path, final_equity_curve = _run_trend_follow(effective_candles, params, timeframe)
     elif strategy.id.startswith("eth-revert") or "均值回归" in strategy.name:
-        metrics, used_reference_path = _run_mean_reversion(effective_candles, params, timeframe)
+        metrics, used_reference_path, final_equity_curve = _run_mean_reversion(effective_candles, params, timeframe)
     else:
-        metrics, used_reference_path = _run_breakout(effective_candles, params, timeframe)
+        metrics, used_reference_path, final_equity_curve = _run_breakout(effective_candles, params, timeframe)
+    volatility_stats = _compute_volatility_stats(
+        final_equity_curve,
+        365 * 24 / _timeframe_hours(timeframe),
+    )
 
     notes = (
         f"由本地回测引擎基于 Bybit 历史 {timeframe} K 线生成，区间 {data_range}，"
@@ -450,4 +544,5 @@ def run_local_backtest(strategy: StrategySummary, candles: List[CandlePoint], ti
         used_range_start=used_range_start,
         used_range_end=used_range_end,
         history_truncated=history_truncated,
+        volatility_stats=volatility_stats,
     )

@@ -3673,6 +3673,128 @@ class ReconcileChangeRequestOutcomeUnitTests(unittest.TestCase):
         self.assertEqual(parsed["summary"], "任意中文总结")
 
 
+class StrategyTrackingReviewResponseUnitTests(unittest.TestCase):
+    def test_parse_strategy_tracking_review_response_structured_json(self) -> None:
+        from openclaw_client import OpenClawGatewayClient  # type: ignore
+
+        raw = (
+            '{"summary": "参数调整已落地，运行线程稳定",'
+            ' "status": "on_track",'
+            ' "findings": ["快速均线已切换", "最近 30 分钟无异常"],'
+            ' "next_actions": ["继续观察一个交易日", "若再触发告警则回滚"],'
+            ' "highlights": ["活跃委托 2 笔"],'
+            ' "risks": ["下一次变更需等待窗口"]}'
+        )
+        parsed = OpenClawGatewayClient.parse_strategy_tracking_review_response(raw)
+        self.assertEqual(parsed["summary"], "参数调整已落地，运行线程稳定")
+        self.assertEqual(parsed["status"], "on_track")
+        self.assertEqual(parsed["findings"], ["快速均线已切换", "最近 30 分钟无异常"])
+        self.assertEqual(parsed["next_actions"], ["继续观察一个交易日", "若再触发告警则回滚"])
+        self.assertEqual(parsed["highlights"], ["活跃委托 2 笔"])
+        self.assertEqual(parsed["risks"], ["下一次变更需等待窗口"])
+        self.assertEqual(parsed["raw_text"], raw)
+
+    def test_parse_strategy_tracking_review_response_status_alias_and_codeblock(self) -> None:
+        from openclaw_client import OpenClawGatewayClient  # type: ignore
+
+        raw = (
+            "```json\n"
+            '{"summary": "策略重启后问题仍在，建议升级人工处理",'
+            ' "status": "升级",'
+            ' "findings": "运行线程停滞;心跳丢失",'
+            ' "next_actions": "恢复运行线程;通知值班工程师"}\n'
+            "```"
+        )
+        parsed = OpenClawGatewayClient.parse_strategy_tracking_review_response(raw)
+        self.assertEqual(parsed["status"], "escalate")
+        self.assertEqual(parsed["findings"], ["运行线程停滞", "心跳丢失"])
+        self.assertEqual(parsed["next_actions"], ["恢复运行线程", "通知值班工程师"])
+
+    def test_parse_strategy_tracking_review_response_synthesizes_findings_from_highlights(self) -> None:
+        from openclaw_client import OpenClawGatewayClient  # type: ignore
+
+        raw = (
+            '{"summary": "变更回归观察中",'
+            ' "status": "needs_attention",'
+            ' "highlights": ["信号频率下降 20%", "活跃委托仍在 3 笔"],'
+            ' "risks": ["下一次 1h K 线仍需观察"],'
+            ' "next_actions": []}'
+        )
+        parsed = OpenClawGatewayClient.parse_strategy_tracking_review_response(raw)
+        self.assertEqual(parsed["status"], "needs_attention")
+        # findings omitted → synthesized from highlights + risks
+        self.assertEqual(
+            parsed["findings"],
+            ["信号频率下降 20%", "活跃委托仍在 3 笔", "下一次 1h K 线仍需观察"],
+        )
+        self.assertEqual(parsed["next_actions"], [])
+
+    def test_parse_strategy_tracking_review_response_plain_text_fallback(self) -> None:
+        from openclaw_client import OpenClawGatewayClient  # type: ignore
+
+        parsed = OpenClawGatewayClient.parse_strategy_tracking_review_response(
+            "策略变更已落实，建议继续观察执行健康。"
+        )
+        self.assertEqual(parsed["summary"], "策略变更已落实，建议继续观察执行健康。")
+        self.assertIsNone(parsed["status"])
+        self.assertEqual(parsed["findings"], [])
+        self.assertEqual(parsed["next_actions"], [])
+        self.assertEqual(parsed["highlights"], [])
+        self.assertEqual(parsed["risks"], [])
+
+    def test_parse_strategy_tracking_review_response_blank_uses_default_summary(self) -> None:
+        from openclaw_client import OpenClawGatewayClient  # type: ignore
+
+        parsed = OpenClawGatewayClient.parse_strategy_tracking_review_response("")
+        self.assertEqual(parsed["summary"], "OpenClaw 已返回策略跟踪结果。")
+        self.assertIsNone(parsed["status"])
+        self.assertEqual(parsed["findings"], [])
+        self.assertEqual(parsed["next_actions"], [])
+
+    def test_parse_strategy_tracking_review_response_unknown_status_defaults_to_none(self) -> None:
+        from openclaw_client import OpenClawGatewayClient  # type: ignore
+
+        raw = '{"summary": "结果不明", "status": "maybe"}'
+        parsed = OpenClawGatewayClient.parse_strategy_tracking_review_response(raw)
+        self.assertEqual(parsed["summary"], "结果不明")
+        self.assertIsNone(parsed["status"])
+
+    def test_build_review_strategy_change_prompt_requests_structured_status_fields(self) -> None:
+        prompt = control_main.build_agent_job_prompt(
+            "review_strategy_change",
+            {
+                "change_type": "parameter_update",
+                "summary": "调整 fast_ma=15",
+                "strategy_id": "trend-btc-01",
+                "target_mode": "paper",
+            },
+        )
+        self.assertIn("status", prompt)
+        self.assertIn("findings", prompt)
+        self.assertIn("next_actions", prompt)
+        self.assertIn("on_track", prompt)
+        self.assertIn("needs_attention", prompt)
+        self.assertIn("escalate", prompt)
+
+    def test_build_review_strategy_issue_prompt_requests_structured_status_fields(self) -> None:
+        prompt = control_main.build_agent_job_prompt(
+            "review_strategy_issue",
+            {
+                "issue_type": "runtime_guard_triggered",
+                "summary": "盈亏护栏触发",
+                "detail": "最大回撤触达预警阈值",
+                "strategy_id": "trend-btc-01",
+                "mode": "paper",
+            },
+        )
+        self.assertIn("status", prompt)
+        self.assertIn("findings", prompt)
+        self.assertIn("next_actions", prompt)
+        self.assertIn("on_track", prompt)
+        self.assertIn("needs_attention", prompt)
+        self.assertIn("escalate", prompt)
+
+
 class ControlApiHelperUnitTests(unittest.TestCase):
     def test_load_private_positions_snapshot_fetches_and_seeds_realtime_cache(self) -> None:
         original_private = control_main.private_data

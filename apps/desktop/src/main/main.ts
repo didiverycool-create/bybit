@@ -2,6 +2,12 @@ import { app, BrowserWindow, ipcMain, Menu, Notification, Tray, nativeImage, scr
 import fs from "node:fs";
 import path from "node:path";
 import { runRequestedSmokeOnLoad, shouldCloseRequestedSmokeOnLogMessage } from "./runRequestedSmokeOnLoad";
+import {
+  persistWindowBoundsState as persistWindowBoundsStateToFile,
+  readWindowBoundsState as readWindowBoundsStateFromFile,
+  resolveWindowBoundsState as resolveWindowBoundsStateFor,
+  windowStateFilePath as windowStateFilePathFor,
+} from "./window-bounds";
 
 const isDev = !app.isPackaged;
 const shouldOpenDevTools = process.env.BYBIT_OPEN_DEVTOOLS === "1";
@@ -39,14 +45,6 @@ type DesktopOpenPathResult = {
 let mainWindow: BrowserWindow | null = null;
 let appTray: Tray | null = null;
 
-type WindowBoundsState = {
-  x: number;
-  y: number;
-  width: number;
-  height: number;
-  maximized: boolean;
-};
-
 const defaultWindowWidth = 1600;
 const defaultWindowHeight = 1020;
 const minWindowWidth = 1280;
@@ -54,101 +52,27 @@ const minWindowHeight = 820;
 const windowStateFileName = "window-state.json";
 
 function windowStateFilePath() {
-  return path.join(app.getPath("userData"), windowStateFileName);
-}
-
-function coerceNumber(value: unknown) {
-  return typeof value === "number" && Number.isFinite(value) ? value : null;
-}
-
-function readWindowBoundsState(): WindowBoundsState | null {
-  try {
-    const raw = fs.readFileSync(windowStateFilePath(), "utf-8");
-    const parsed = JSON.parse(raw) as Partial<WindowBoundsState>;
-    const x = coerceNumber(parsed.x);
-    const y = coerceNumber(parsed.y);
-    const width = coerceNumber(parsed.width);
-    const height = coerceNumber(parsed.height);
-    if (x == null || y == null || width == null || height == null) {
-      return null;
-    }
-    return {
-      x,
-      y,
-      width,
-      height,
-      maximized: parsed.maximized === true,
-    };
-  } catch {
-    return null;
-  }
+  return windowStateFilePathFor(app.getPath("userData"), windowStateFileName);
 }
 
 function resolveWindowBoundsState() {
-  const saved = readWindowBoundsState();
-  if (!saved) {
-    return {
-      bounds: {
-        width: defaultWindowWidth,
-        height: defaultWindowHeight,
-      },
-      maximized: false,
-    };
+  const saved = readWindowBoundsStateFromFile(windowStateFilePath());
+  const result = resolveWindowBoundsStateFor(saved, screen, {
+    defaultWidth: defaultWindowWidth,
+    defaultHeight: defaultWindowHeight,
+    minWidth: minWindowWidth,
+    minHeight: minWindowHeight,
+  });
+  if (saved && (result.reason === "clamped" || result.reason === "fallback-no-display")) {
+    console.log(
+      `[window-state:restore] reason=${result.reason} saved=${JSON.stringify(saved)} resolved=${JSON.stringify(result.bounds)} maximized=${result.maximized}`,
+    );
   }
-
-  const width = Math.max(minWindowWidth, Math.round(saved.width));
-  const height = Math.max(minWindowHeight, Math.round(saved.height));
-  const bounds = {
-    x: Math.round(saved.x),
-    y: Math.round(saved.y),
-    width,
-    height,
-  };
-  const display = screen.getDisplayMatching(bounds);
-  const workArea = display.workArea;
-  const intersectsVisibleArea =
-    bounds.x < workArea.x + workArea.width &&
-    bounds.x + bounds.width > workArea.x &&
-    bounds.y < workArea.y + workArea.height &&
-    bounds.y + bounds.height > workArea.y;
-
-  if (!intersectsVisibleArea) {
-    return {
-      bounds: {
-        width: defaultWindowWidth,
-        height: defaultWindowHeight,
-      },
-      maximized: false,
-    };
-  }
-
-  return {
-    bounds,
-    maximized: saved.maximized,
-  };
-}
-
-function snapshotWindowBoundsState(win: BrowserWindow): WindowBoundsState {
-  const bounds = win.isMaximized() ? win.getNormalBounds() : win.getBounds();
-  return {
-    x: bounds.x,
-    y: bounds.y,
-    width: bounds.width,
-    height: bounds.height,
-    maximized: win.isMaximized(),
-  };
+  return result;
 }
 
 function persistWindowBoundsState(win: BrowserWindow) {
-  try {
-    fs.writeFileSync(
-      windowStateFilePath(),
-      JSON.stringify(snapshotWindowBoundsState(win), null, 2),
-      "utf-8",
-    );
-  } catch (error) {
-    console.error("[window-state:save-failed]", error);
-  }
+  persistWindowBoundsStateToFile(win, windowStateFilePath());
 }
 
 function createTrayIcon() {

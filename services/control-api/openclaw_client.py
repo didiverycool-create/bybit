@@ -373,6 +373,126 @@ class OpenClawGatewayClient:
             "raw_text": raw_text,
         }
 
+    # Canonical strategy-tracking review statuses. Keep in sync with the prompt
+    # text in ``main.build_agent_job_prompt`` so OpenClaw only has to emit one
+    # of these three vocab terms (with common Chinese aliases).
+    _STRATEGY_TRACKING_STATUS_ALIASES: Dict[str, str] = {
+        "on_track": "on_track",
+        "ontrack": "on_track",
+        "healthy": "on_track",
+        "ok": "on_track",
+        "fine": "on_track",
+        "稳定": "on_track",
+        "正常": "on_track",
+        "良好": "on_track",
+        "无需跟进": "on_track",
+        "needs_attention": "needs_attention",
+        "attention": "needs_attention",
+        "watch": "needs_attention",
+        "monitor": "needs_attention",
+        "warning": "needs_attention",
+        "关注": "needs_attention",
+        "观察": "needs_attention",
+        "需关注": "needs_attention",
+        "escalate": "escalate",
+        "critical": "escalate",
+        "manual": "escalate",
+        "urgent": "escalate",
+        "升级": "escalate",
+        "人工": "escalate",
+        "高危": "escalate",
+        "紧急": "escalate",
+    }
+
+    @classmethod
+    def _coerce_strategy_tracking_status(cls, value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            return None
+        token = str(value).strip().lower()
+        if not token:
+            return None
+        if token in cls._STRATEGY_TRACKING_STATUS_ALIASES:
+            return cls._STRATEGY_TRACKING_STATUS_ALIASES[token]
+        for alias, canonical in cls._STRATEGY_TRACKING_STATUS_ALIASES.items():
+            if alias in token:
+                return canonical
+        return None
+
+    @classmethod
+    def parse_strategy_tracking_review_response(cls, text: Optional[str]) -> Dict[str, Any]:
+        """Parse the structured response for ``review_strategy_change`` / ``review_strategy_issue``.
+
+        Accepts either a JSON object of the form
+        ``{"summary", "status", "findings", "next_actions", "highlights", "risks"}``
+        (status being one of ``on_track`` / ``needs_attention`` / ``escalate``)
+        or a plain-text fallback. Aliases such as ``"稳定"``, ``"watch"``,
+        ``"升级"`` are normalized to the canonical status vocabulary; any
+        unrecognized value degrades to ``None`` so callers can decide whether
+        to substitute a default.
+
+        The returned dict always contains ``summary``, ``status``, ``findings``,
+        ``next_actions``, ``highlights``, ``risks`` and ``raw_text`` so call
+        sites never have to branch on whether OpenClaw produced JSON — keeping
+        the worker loop simple and letting us add richer downstream rendering
+        without touching the parser again.
+        """
+
+        raw_text = (text or "").strip()
+        parsed = cls._extract_first_json_object(raw_text)
+        summary: str
+        status: Optional[str]
+        findings: List[str]
+        next_actions: List[str]
+        highlights: List[str]
+        risks: List[str]
+        if isinstance(parsed, dict):
+            summary = str(parsed.get("summary") or "").strip()
+            status = cls._coerce_strategy_tracking_status(parsed.get("status"))
+            findings = cls._coerce_string_list(parsed.get("findings"))
+            next_actions = cls._coerce_string_list(parsed.get("next_actions"))
+            highlights = cls._coerce_string_list(parsed.get("highlights"))
+            risks = cls._coerce_string_list(parsed.get("risks"))
+            # ``findings`` is the new canonical slot, but keep backwards
+            # compatibility with older prompts that only emitted highlights —
+            # when the agent returns highlights/risks and omits findings, we
+            # synthesize findings from them so downstream renderers always get
+            # a non-empty list if anything at all was reported.
+            if not findings:
+                synthesized: List[str] = []
+                for item in highlights:
+                    synthesized.append(item)
+                    if len(synthesized) >= 6:
+                        break
+                for item in risks:
+                    if len(synthesized) >= 6:
+                        break
+                    synthesized.append(item)
+                findings = synthesized
+        else:
+            summary = raw_text
+            status = None
+            findings = []
+            next_actions = []
+            highlights = []
+            risks = []
+
+        if not summary:
+            summary = "OpenClaw 已返回策略跟踪结果。"
+
+        return {
+            "summary": summary,
+            "status": status,
+            "findings": findings,
+            "next_actions": next_actions,
+            "highlights": highlights,
+            "risks": risks,
+            "raw_text": raw_text,
+        }
+
     def get_status(self, worker_state: Optional[Dict[str, Any]] = None) -> OpenClawStatus:
         config = self._load_config()
         gateway = config.get("gateway", {})

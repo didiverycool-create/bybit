@@ -3914,17 +3914,16 @@ def _build_lightweight_strategy_activity_runtime_snapshot(
     fallback_detail = state.market_details.get(symbol) or build_market_detail_for_watchlist(watch_item)
     evaluated_at = datetime.now(timezone.utc).astimezone().isoformat()
     detail = fallback_detail.model_copy(update={"timeframe": "1h"})
-    if not isinstance(market_data, BybitPublicMarketClient):
-        try:
-            detail = market_data.enrich_market_detail(
-                symbol=symbol,
-                market=watch_item.market,
-                fallback_detail=detail,
-                watch_item=watch_item,
-                timeframe="1h",
-            )
-        except RuntimeError:
-            pass
+    try:
+        detail = market_data.enrich_market_detail(
+            symbol=symbol,
+            market=watch_item.market,
+            fallback_detail=detail,
+            watch_item=watch_item,
+            timeframe="1h",
+        )
+    except RuntimeError:
+        pass
     try:
         return evaluate_strategy_runtime(
             strategy=strategy,
@@ -4413,9 +4412,12 @@ def build_agent_job_prompt(job_type: str, context: Dict[str, Any]) -> str:
         return (
             "请用中文输出一段紧凑的策略变更跟踪总结，不要使用 markdown。\n"
             "优先直接输出一个 JSON 对象，不要加代码块，字段为：\n"
-            'summary: string\n'
-            'highlights: string[]\n'
-            'risks: string[]\n'
+            'summary: string  // 120 字以内，说明变更是否真正落地\n'
+            'status: "on_track" | "needs_attention" | "escalate"  // 跟进状态\n'
+            'findings: string[]  // 关键观察（最多 4 条），结合执行健康与最近活动\n'
+            'next_actions: string[]  // 建议的下一步动作（最多 4 条，无建议则返回空数组）\n'
+            'highlights: string[]  // 可选：用于沿用旧版复盘摘要展示\n'
+            'risks: string[]  // 可选：需要重点关注的风险项\n'
             "如果你无法稳定输出 JSON，则退回为一段 120 字以内的中文总结。\n"
             f"变更类型：{review_context.get('change_type', '未知变更')}\n"
             f"变更摘要：{review_context.get('summary', '未提供')}\n"
@@ -4431,9 +4433,12 @@ def build_agent_job_prompt(job_type: str, context: Dict[str, Any]) -> str:
         return (
             "请用中文输出一段紧凑的策略问题跟踪总结，不要使用 markdown。\n"
             "优先直接输出一个 JSON 对象，不要加代码块，字段为：\n"
-            'summary: string\n'
-            'highlights: string[]\n'
-            'risks: string[]\n'
+            'summary: string  // 120 字以内，说明问题当前状态\n'
+            'status: "on_track" | "needs_attention" | "escalate"  // 跟进状态\n'
+            'findings: string[]  // 关键观察（最多 4 条），结合执行健康与最近活动\n'
+            'next_actions: string[]  // 建议的下一步动作（最多 4 条，无建议则返回空数组）\n'
+            'highlights: string[]  // 可选：用于沿用旧版复盘摘要展示\n'
+            'risks: string[]  // 可选：需要重点关注的风险项\n'
             "如果你无法稳定输出 JSON，则退回为一段 120 字以内的中文总结。\n"
             f"问题类型：{review_context.get('issue_type', '未知问题')}\n"
             f"问题摘要：{review_context.get('summary', '未提供')}\n"

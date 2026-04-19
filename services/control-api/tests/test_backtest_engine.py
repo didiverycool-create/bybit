@@ -65,7 +65,7 @@ class BacktestEngineUnitTests(unittest.TestCase):
             for index, price in enumerate([100.0, 101.0, 102.0, 103.0, 90.0, 106.0])
         ]
 
-        metrics, used_reference_path = backtest_engine._run_trend_follow(
+        metrics, used_reference_path, _equity_curve = backtest_engine._run_trend_follow(
             candles,
             {"fast_ma": 2, "slow_ma": 3, "risk_per_trade": 1.0},
             "1h",
@@ -81,7 +81,7 @@ class BacktestEngineUnitTests(unittest.TestCase):
             for index, price in enumerate([100.0, 110.0, 80.0, 120.0])
         ]
 
-        metrics, used_reference_path = backtest_engine._run_trend_follow(
+        metrics, used_reference_path, _equity_curve = backtest_engine._run_trend_follow(
             candles,
             {"fast_ma": 2, "slow_ma": 3, "risk_per_trade": 1.0},
             "1h",
@@ -153,6 +153,106 @@ class BacktestEngineUnitTests(unittest.TestCase):
         self.assertFalse(result.reference_only)
         self.assertEqual(result.metrics.trades, 1)
         self.assertEqual(result.sample_quality, "low_sample")
+
+    def test_compute_volatility_stats_returns_zeroed_descriptors_for_degenerate_curves(self) -> None:
+        for curve in ([], [100_000.0], [100_000.0, 100_000.0, 100_000.0]):
+            stats = backtest_engine._compute_volatility_stats(curve, bars_per_year=365.0)
+            self.assertEqual(stats.return_volatility_pct, 0.0)
+            self.assertEqual(stats.annualized_volatility_pct, 0.0)
+            self.assertEqual(stats.max_drawdown_duration_bars, 0)
+            self.assertEqual(stats.max_run_up_pct, 0.0)
+            if curve:
+                self.assertEqual(stats.positive_bar_ratio_pct, 0.0)
+
+    def test_compute_volatility_stats_tracks_longest_drawdown_streak(self) -> None:
+        # Peak at index 1 (120), curve then stays strictly below peak for 4
+        # consecutive bars before recovering; longest DD streak == 4.
+        curve = [100.0, 120.0, 110.0, 90.0, 95.0, 100.0, 125.0, 115.0]
+        stats = backtest_engine._compute_volatility_stats(curve, bars_per_year=365.0)
+
+        self.assertEqual(stats.max_drawdown_duration_bars, 4)
+        # Run-up anchored at the first point (100) → max equity 125 → +25%.
+        self.assertAlmostEqual(stats.max_run_up_pct, 25.0, places=4)
+        # 4 of 7 period returns are positive → ~57.14%.
+        self.assertAlmostEqual(stats.positive_bar_ratio_pct, round(4 / 7 * 100.0, 2), places=2)
+        self.assertGreater(stats.return_volatility_pct, 0.0)
+        # Annualized volatility must exceed raw per-bar volatility when
+        # bars_per_year > 1.
+        self.assertGreater(stats.annualized_volatility_pct, stats.return_volatility_pct)
+
+    def test_compute_volatility_stats_handles_non_positive_starting_equity(self) -> None:
+        # Max run-up anchors to the first point; non-positive anchor must not
+        # divide by zero or produce misleading run-up figures.
+        stats = backtest_engine._compute_volatility_stats([0.0, 50.0, 75.0], bars_per_year=365.0)
+        self.assertEqual(stats.max_run_up_pct, 0.0)
+
+    def test_run_local_backtest_attaches_volatility_stats_to_computation(self) -> None:
+        strategy = StrategySummary(
+            id="trend-btc-01",
+            name="BTC 趋势跟随",
+            category="template",
+            status="running",
+            symbols=["BTCUSDT"],
+            mode="paper",
+            version="v1",
+            pnl_7d="+0.0%",
+            max_drawdown="-0.0%",
+            risk_budget="18%",
+            description="test",
+            parameters=[
+                StrategyParameter(key="fast_ma", label="Fast", value=2),
+                StrategyParameter(key="slow_ma", label="Slow", value=3),
+                StrategyParameter(key="risk_per_trade", label="Risk", value=1.0),
+            ],
+        )
+        candles = [
+            backtest_engine.CandlePoint(time=f"2026-03-31T0{index}:00:00+08:00", open=price, high=price, low=price, close=price, volume=1000)
+            for index, price in enumerate([100.0, 101.0, 102.0, 103.0, 90.0, 106.0])
+        ]
+
+        result = backtest_engine.run_local_backtest(strategy, candles, "1h", "2026-03-01 ~ 2026-03-31")
+
+        self.assertIsNotNone(result.volatility_stats)
+        stats = result.volatility_stats
+        self.assertIsInstance(stats, backtest_engine.BacktestVolatilityStats)
+        self.assertGreaterEqual(stats.max_drawdown_duration_bars, 0)
+        self.assertGreaterEqual(stats.positive_bar_ratio_pct, 0.0)
+        self.assertLessEqual(stats.positive_bar_ratio_pct, 100.0)
+        self.assertGreaterEqual(stats.return_volatility_pct, 0.0)
+        self.assertGreaterEqual(stats.annualized_volatility_pct, stats.return_volatility_pct)
+
+    def test_run_local_backtest_tolerates_empty_candle_input(self) -> None:
+        strategy = StrategySummary(
+            id="trend-btc-01",
+            name="BTC 趋势跟随",
+            category="template",
+            status="running",
+            symbols=["BTCUSDT"],
+            mode="paper",
+            version="v1",
+            pnl_7d="+0.0%",
+            max_drawdown="-0.0%",
+            risk_budget="18%",
+            description="test",
+            parameters=[
+                StrategyParameter(key="fast_ma", label="Fast", value=2),
+                StrategyParameter(key="slow_ma", label="Slow", value=3),
+                StrategyParameter(key="risk_per_trade", label="Risk", value=1.0),
+            ],
+        )
+
+        result = backtest_engine.run_local_backtest(strategy, [], "1h", "2026-03-01 ~ 2026-03-31")
+
+        # Zero-candle run must not crash and must emit a coherent placeholder
+        # computation with zeroed volatility descriptors.
+        self.assertEqual(result.retrieved_candle_count, 0)
+        self.assertEqual(result.used_candle_count, 0)
+        self.assertEqual(result.metrics.trades, 0)
+        self.assertFalse(result.history_truncated)
+        self.assertIsNotNone(result.volatility_stats)
+        self.assertEqual(result.volatility_stats.return_volatility_pct, 0.0)
+        self.assertEqual(result.volatility_stats.max_drawdown_duration_bars, 0)
+        self.assertEqual(result.volatility_stats.max_run_up_pct, 0.0)
 
     def test_run_local_backtest_marks_history_truncated_when_input_exceeds_engine_window(self) -> None:
         strategy = StrategySummary(
