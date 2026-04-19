@@ -1,10 +1,12 @@
-import type { ComponentProps } from 'react'
+import { Suspense, lazy, type ComponentProps } from 'react'
 
 import type { StrategySummary } from '../types'
 import { formatDateTime } from '../utils/app-helpers'
-import StrategyActivityFloatingPanel from './StrategyActivityFloatingPanel'
+import type StrategyActivityFloatingPanelComponent from './StrategyActivityFloatingPanel'
 
-type StrategyActivityFloatingPanelProps = ComponentProps<typeof StrategyActivityFloatingPanel>
+const StrategyActivityFloatingPanel = lazy(() => import('./StrategyActivityFloatingPanel'))
+
+type StrategyActivityFloatingPanelProps = ComponentProps<typeof StrategyActivityFloatingPanelComponent>
 
 type StrategyActivityFloatingPanelContainerProps = {
   panelOpen: boolean
@@ -56,24 +58,26 @@ export default function StrategyActivityFloatingPanelContainer({
   }`
 
   return (
-    <StrategyActivityFloatingPanel
-      strategyName={selectedStrategy.name}
-      strategyHeadlineText={strategyHeadlineText}
-      queryEnabled={Boolean(activeStrategyId) && panelOpen}
-      queryStatus={queryState.status}
-      queryFetchStatus={queryState.fetchStatus}
-      queryStrategyId={activeStrategyId}
-      queryErrorMessage={queryState.errorMessage}
-      queryLoading={queryState.loading}
-      activityAvailable={activityMeta.activityAvailable}
-      trackingDisabled={!serviceState.serviceAvailable || serviceState.strategyTrackingPending}
-      onTrack={onTrack}
-      onClose={onClose}
-      topOpsProps={activityMeta.activityAvailable ? sectionProps.topOpsProps : undefined}
-      topDecisionActionsProps={activityMeta.activityAvailable ? sectionProps.topDecisionActionsProps : undefined}
-      decisionSectionsProps={activityMeta.activityAvailable ? sectionProps.decisionSectionsProps : undefined}
-      reviewAndJobsProps={activityMeta.activityAvailable ? sectionProps.reviewAndJobsProps : undefined}
-      opsSectionProps={activityMeta.activityAvailable ? sectionProps.opsSectionProps : undefined}
-    />
+    <Suspense fallback={<div className="empty-state empty-state--inline">策略活动面板加载中...</div>}>
+      <StrategyActivityFloatingPanel
+        strategyName={selectedStrategy.name}
+        strategyHeadlineText={strategyHeadlineText}
+        queryEnabled={Boolean(activeStrategyId) && panelOpen}
+        queryStatus={queryState.status}
+        queryFetchStatus={queryState.fetchStatus}
+        queryStrategyId={activeStrategyId}
+        queryErrorMessage={queryState.errorMessage}
+        queryLoading={queryState.loading}
+        activityAvailable={activityMeta.activityAvailable}
+        trackingDisabled={!serviceState.serviceAvailable || serviceState.strategyTrackingPending}
+        onTrack={onTrack}
+        onClose={onClose}
+        topOpsProps={activityMeta.activityAvailable ? sectionProps.topOpsProps : undefined}
+        topDecisionActionsProps={activityMeta.activityAvailable ? sectionProps.topDecisionActionsProps : undefined}
+        decisionSectionsProps={activityMeta.activityAvailable ? sectionProps.decisionSectionsProps : undefined}
+        reviewAndJobsProps={activityMeta.activityAvailable ? sectionProps.reviewAndJobsProps : undefined}
+        opsSectionProps={activityMeta.activityAvailable ? sectionProps.opsSectionProps : undefined}
+      />
+    </Suspense>
   )
 }

@@ -1,16 +1,16 @@
 import type { ComponentProps, Dispatch, SetStateAction } from 'react'
 
 import type { SectionKey } from '../types'
-import AccountInspectorPanel from './AccountInspectorPanel'
-import GrafanaPreviewPanel from './GrafanaPreviewPanel'
-import ManualTradePanel from './ManualTradePanel'
-import OrderHistoryPanel from './OrderHistoryPanel'
-import ReviewInspectorPanel from './ReviewInspectorPanel'
-import SchedulerControlsPanel from './SchedulerControlsPanel'
-import StatusInspectorPanel from './StatusInspectorPanel'
-import StrategyEditorPanel from './StrategyEditorPanel'
-import StrategyTrackingPanel from './StrategyTrackingPanel'
-import WatchlistManagerPanel from './WatchlistManagerPanel'
+import type AccountInspectorPanel from './AccountInspectorPanel'
+import type GrafanaPreviewPanel from './GrafanaPreviewPanel'
+import type ManualTradePanel from './ManualTradePanel'
+import type OrderHistoryPanel from './OrderHistoryPanel'
+import type ReviewInspectorPanel from './ReviewInspectorPanel'
+import type SchedulerControlsPanel from './SchedulerControlsPanel'
+import type StatusInspectorPanel from './StatusInspectorPanel'
+import type StrategyEditorPanel from './StrategyEditorPanel'
+import type StrategyTrackingPanel from './StrategyTrackingPanel'
+import type WatchlistManagerPanel from './WatchlistManagerPanel'
 
 export type StatusInspectorState = Pick<
   ComponentProps<typeof StatusInspectorPanel>,

@@ -1,17 +1,18 @@
-import type { ComponentProps } from 'react'
+import { Suspense, lazy, type ComponentProps } from 'react'
 
 import AppChromeShell from './AppChromeShell'
-import AlertsWorkspaceContainer from './AlertsWorkspaceContainer'
-import AuditWorkspaceContainer from './AuditWorkspaceContainer'
-import BacktestWorkspaceContainer from './BacktestWorkspaceContainer'
-import MarketWorkspaceContainer from './MarketWorkspaceContainer'
-import NewsWorkspaceContainer from './NewsWorkspaceContainer'
 import OverviewWorkspaceContainer from './OverviewWorkspaceContainer'
-import ReplayWorkspaceContainer from './ReplayWorkspaceContainer'
-import SchedulerWorkspaceContainer from './SchedulerWorkspaceContainer'
-import SettingsWorkspaceContainer from './SettingsWorkspaceContainer'
-import StrategyWorkspaceContainer from './StrategyWorkspaceContainer'
-import TradesWorkspaceContainer from './TradesWorkspaceContainer'
+
+const AlertsWorkspaceContainer = lazy(() => import('./AlertsWorkspaceContainer'))
+const AuditWorkspaceContainer = lazy(() => import('./AuditWorkspaceContainer'))
+const BacktestWorkspaceContainer = lazy(() => import('./BacktestWorkspaceContainer'))
+const MarketWorkspaceContainer = lazy(() => import('./MarketWorkspaceContainer'))
+const NewsWorkspaceContainer = lazy(() => import('./NewsWorkspaceContainer'))
+const ReplayWorkspaceContainer = lazy(() => import('./ReplayWorkspaceContainer'))
+const SchedulerWorkspaceContainer = lazy(() => import('./SchedulerWorkspaceContainer'))
+const SettingsWorkspaceContainer = lazy(() => import('./SettingsWorkspaceContainer'))
+const StrategyWorkspaceContainer = lazy(() => import('./StrategyWorkspaceContainer'))
+const TradesWorkspaceContainer = lazy(() => import('./TradesWorkspaceContainer'))
 
 type ChromeProps = ComponentProps<typeof AppChromeShell>
 
@@ -28,6 +29,8 @@ export type AppWorkspaceSectionOutletProps = Pick<ChromeProps, 'activeSection'> 
   replayWorkspaceProps: ComponentProps<typeof ReplayWorkspaceContainer>
   auditWorkspaceProps: ComponentProps<typeof AuditWorkspaceContainer>
 }
+
+const workspaceFallback = <div className="empty-state empty-state--inline">工作台加载中...</div>
 
 export default function AppWorkspaceSectionOutlet({
   activeSection,
@@ -50,43 +53,63 @@ export default function AppWorkspaceSectionOutlet({
       )}
 
       {activeSection === 'settings' && (
-        <SettingsWorkspaceContainer {...settingsWorkspaceProps} />
+        <Suspense fallback={workspaceFallback}>
+          <SettingsWorkspaceContainer {...settingsWorkspaceProps} />
+        </Suspense>
       )}
 
       {activeSection === 'market' && (
-        <MarketWorkspaceContainer {...marketWorkspaceProps} />
+        <Suspense fallback={workspaceFallback}>
+          <MarketWorkspaceContainer {...marketWorkspaceProps} />
+        </Suspense>
       )}
 
       {activeSection === 'strategy' && (
-        <StrategyWorkspaceContainer {...strategyWorkspaceProps} />
+        <Suspense fallback={workspaceFallback}>
+          <StrategyWorkspaceContainer {...strategyWorkspaceProps} />
+        </Suspense>
       )}
 
       {activeSection === 'backtest' && (
-        <BacktestWorkspaceContainer {...backtestWorkspaceProps} />
+        <Suspense fallback={workspaceFallback}>
+          <BacktestWorkspaceContainer {...backtestWorkspaceProps} />
+        </Suspense>
       )}
 
       {activeSection === 'scheduler' && (
-        <SchedulerWorkspaceContainer {...schedulerWorkspaceProps} />
+        <Suspense fallback={workspaceFallback}>
+          <SchedulerWorkspaceContainer {...schedulerWorkspaceProps} />
+        </Suspense>
       )}
 
       {activeSection === 'news' && (
-        <NewsWorkspaceContainer {...newsWorkspaceProps} />
+        <Suspense fallback={workspaceFallback}>
+          <NewsWorkspaceContainer {...newsWorkspaceProps} />
+        </Suspense>
       )}
 
       {activeSection === 'alerts' && (
-        <AlertsWorkspaceContainer {...alertsWorkspaceProps} />
+        <Suspense fallback={workspaceFallback}>
+          <AlertsWorkspaceContainer {...alertsWorkspaceProps} />
+        </Suspense>
       )}
 
       {activeSection === 'trades' && (
-        <TradesWorkspaceContainer {...tradesWorkspaceProps} />
+        <Suspense fallback={workspaceFallback}>
+          <TradesWorkspaceContainer {...tradesWorkspaceProps} />
+        </Suspense>
       )}
 
       {activeSection === 'replay' && (
-        <ReplayWorkspaceContainer {...replayWorkspaceProps} />
+        <Suspense fallback={workspaceFallback}>
+          <ReplayWorkspaceContainer {...replayWorkspaceProps} />
+        </Suspense>
       )}
 
       {activeSection === 'audit' && (
-        <AuditWorkspaceContainer {...auditWorkspaceProps} />
+        <Suspense fallback={workspaceFallback}>
+          <AuditWorkspaceContainer {...auditWorkspaceProps} />
+        </Suspense>
       )}
     </>
   )
