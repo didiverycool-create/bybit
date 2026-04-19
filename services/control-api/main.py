@@ -5456,8 +5456,42 @@ def build_review_document_from_text(text: str, context: Dict[str, Any], source: 
     )
 
 
+def _merge_strategy_tracking_structured_parse(
+    text: str, job_type: str, fallback: Dict[str, Any]
+) -> Dict[str, Any]:
+    if job_type == "review_strategy_issue":
+        structured = OpenClawGatewayClient.parse_strategy_issue_review_response(text)
+        summary_prefix = f"[{structured['severity']}] " if structured.get("severity") else ""
+        highlights = [str(item) for item in structured.get("root_causes") or []]
+        risks = [str(item) for item in structured.get("mitigations") or []]
+        risks.extend(str(item) for item in structured.get("follow_ups") or [])
+    elif job_type == "review_strategy_change":
+        structured = OpenClawGatewayClient.parse_strategy_change_review_response(text)
+        verdict = structured.get("verdict") or ""
+        confidence = structured.get("confidence") or ""
+        summary_prefix = f"[{verdict}/{confidence}] " if verdict or confidence else ""
+        highlights = [str(item) for item in structured.get("highlights") or []]
+        risks = [str(item) for item in structured.get("risks") or []]
+        risks.extend(str(item) for item in structured.get("required_adjustments") or [])
+    else:
+        return fallback
+
+    if not highlights and not risks:
+        return fallback
+    summary = str(structured.get("summary") or "").strip()
+    if not summary:
+        summary = str(fallback.get("summary") or "")
+    return {
+        "summary": f"{summary_prefix}{summary}".strip(),
+        "highlights": highlights or [str(item) for item in fallback.get("highlights") or []],
+        "risks": risks or [str(item) for item in fallback.get("risks") or []],
+        "proposals": fallback.get("proposals") or [],
+    }
+
+
 def build_strategy_tracking_review_document(text: str, context: Dict[str, Any], job_type: str) -> ReviewDocument:
-    parsed = parse_review_text(text)
+    fallback = parse_review_text(text)
+    parsed = _merge_strategy_tracking_structured_parse(text, job_type, fallback)
     now = datetime.now(timezone.utc).astimezone()
     period = "strategy_issue" if job_type == "review_strategy_issue" else "strategy_change"
     title = (

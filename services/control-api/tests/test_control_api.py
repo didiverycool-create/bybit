@@ -3794,6 +3794,54 @@ class StrategyTrackingReviewResponseUnitTests(unittest.TestCase):
         self.assertIn("needs_attention", prompt)
         self.assertIn("escalate", prompt)
 
+    def test_build_strategy_tracking_review_document_applies_change_verdict_prefix_and_highlights(self) -> None:
+        raw = (
+            '{"summary": "参数调整已落地",'
+            ' "verdict": "approve",'
+            ' "confidence": "high",'
+            ' "highlights": ["快速均线按预期切换"],'
+            ' "risks": ["下一次变更需等待窗口"],'
+            ' "required_adjustments": ["记录本次变更的回归观察窗口"]}'
+        )
+        review = control_main.build_strategy_tracking_review_document(
+            raw,
+            {"strategy_id": "trend-btc-01", "change_request_id": "cr-unit-structured"},
+            "review_strategy_change",
+        )
+        self.assertTrue(review.summary.startswith("[approve/high] "))
+        self.assertIn("参数调整已落地", review.summary)
+        self.assertIn("快速均线按预期切换", review.highlights)
+        self.assertIn("下一次变更需等待窗口", review.risks)
+        self.assertIn("记录本次变更的回归观察窗口", review.risks)
+
+    def test_build_strategy_tracking_review_document_applies_issue_severity_prefix(self) -> None:
+        raw = (
+            '{"summary": "运行线程心跳持续丢失",'
+            ' "severity": "critical",'
+            ' "root_causes": ["心跳线程阻塞"],'
+            ' "mitigations": ["重启运行线程"],'
+            ' "follow_ups": ["跟踪 30 分钟心跳"]}'
+        )
+        review = control_main.build_strategy_tracking_review_document(
+            raw,
+            {"strategy_id": "trend-btc-01"},
+            "review_strategy_issue",
+        )
+        self.assertTrue(review.summary.startswith("[critical] "))
+        self.assertIn("运行线程心跳持续丢失", review.summary)
+        self.assertIn("心跳线程阻塞", review.highlights)
+        self.assertIn("重启运行线程", review.risks)
+        self.assertIn("跟踪 30 分钟心跳", review.risks)
+
+    def test_build_strategy_tracking_review_document_plain_text_does_not_get_structured_prefix(self) -> None:
+        review = control_main.build_strategy_tracking_review_document(
+            "策略变更已落实，建议继续观察执行健康。",
+            {"strategy_id": "trend-btc-01"},
+            "review_strategy_change",
+        )
+        self.assertFalse(review.summary.startswith("["))
+        self.assertIn("策略变更已落实", review.summary)
+
 
 class ControlApiHelperUnitTests(unittest.TestCase):
     def test_load_private_positions_snapshot_fetches_and_seeds_realtime_cache(self) -> None:
