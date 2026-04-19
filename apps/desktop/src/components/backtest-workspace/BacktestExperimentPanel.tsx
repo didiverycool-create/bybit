@@ -181,6 +181,22 @@ export default function BacktestExperimentPanel({
             </span>
           </div>
         )}
+        {selectedBacktest.order_flow_stats && (
+          <div className="stack-row">
+            <strong>订单流</strong>
+            <span>
+              持仓 {selectedBacktest.order_flow_stats.avg_holding_bars.toFixed(1)} bar
+              {' · '}
+              日频 {selectedBacktest.order_flow_stats.trade_frequency_per_day.toFixed(2)}
+              {' · '}
+              换手 {selectedBacktest.order_flow_stats.turnover_rate_pct.toFixed(1)}%
+              {' · '}
+              在场 {selectedBacktest.order_flow_stats.active_bar_ratio_pct.toFixed(1)}%
+              {' · '}
+              单笔 {selectedBacktest.order_flow_stats.avg_trade_notional.toFixed(0)}
+            </span>
+          </div>
+        )}
         <div className="stack-row">
           <strong>样本质量</strong>
           <span>{selectedBacktestSampleMeta?.description ?? '未标注'}</span>

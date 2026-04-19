@@ -726,6 +726,14 @@ export interface BacktestTailRiskStats {
   gain_to_pain_ratio: number
 }
 
+export interface BacktestOrderFlowStats {
+  avg_holding_bars: number
+  trade_frequency_per_day: number
+  turnover_rate_pct: number
+  active_bar_ratio_pct: number
+  avg_trade_notional: number
+}
+
 export interface BacktestRun {
   id: string
   strategy_id: string
@@ -782,6 +790,7 @@ export interface BacktestRun {
   benchmark_stats?: BacktestBenchmarkStats | null
   exposure_stats?: BacktestExposureStats | null
   tail_risk_stats?: BacktestTailRiskStats | null
+  order_flow_stats?: BacktestOrderFlowStats | null
   notes: string
 }
 
