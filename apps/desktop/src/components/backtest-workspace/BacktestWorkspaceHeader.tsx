@@ -134,6 +134,24 @@ export default function BacktestWorkspaceHeader({
               </span>
             </>
           ) : null}
+          {selectedBacktest?.order_flow_stats ? (
+            <>
+              <span className="chip chip--muted">
+                日频 {selectedBacktest.order_flow_stats.trade_frequency_per_day.toFixed(2)}
+              </span>
+              <span
+                className={
+                  selectedBacktest.order_flow_stats.active_bar_ratio_pct >= 80
+                    ? 'chip chip--warning'
+                    : selectedBacktest.order_flow_stats.active_bar_ratio_pct >= 20
+                      ? 'chip'
+                      : 'chip chip--muted'
+                }
+              >
+                在场 {selectedBacktest.order_flow_stats.active_bar_ratio_pct.toFixed(1)}%
+              </span>
+            </>
+          ) : null}
         </div>
       </div>
       <div className="console-strip console-strip--compact backtest-summary-strip">
