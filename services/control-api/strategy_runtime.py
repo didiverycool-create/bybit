@@ -346,6 +346,61 @@ def _breakout_risk_hint(strategy: StrategySummary, closes: List[float]) -> Dict[
     }
 
 
+def _exit_tool_hint(strategy: StrategySummary) -> Dict[str, Any]:
+    """Surface opt-in exit tooling (trailing stop / break-even / partial TP)
+    onto the runtime risk-hint payload so downstream consumers can render the
+    extra exit rungs without re-loading the strategy parameters.
+
+    Every field is optional and ``None`` by default, so strategies that have
+    not opted in produce ``{"trailing_stop_pct": None, ...}`` and existing
+    consumers that key on the legacy ``stop_price`` / ``target_price`` fields
+    keep working without change.
+    """
+
+    trailing_stop_pct = getattr(strategy, "trailing_stop_pct", None)
+    break_even_trigger_pct = getattr(strategy, "break_even_trigger_pct", None)
+    raw_rungs = getattr(strategy, "partial_take_profits", None) or []
+
+    rungs: List[Dict[str, float]] = []
+    for rung in raw_rungs:
+        try:
+            trigger = float(rung.trigger_pct)
+            exit_ratio = float(rung.exit_ratio)
+        except (TypeError, ValueError):
+            continue
+        if exit_ratio <= 0.0:
+            continue
+        rungs.append(
+            {
+                "trigger_pct": round(trigger, 4),
+                "exit_ratio": round(exit_ratio, 4),
+            }
+        )
+    # Sort ascending so the hint ladder visits rungs in the same order the
+    # backtest runner fires them — makes panel rendering match simulation.
+    rungs.sort(key=lambda row: row["trigger_pct"])
+
+    hint: Dict[str, Any] = {
+        "trailing_stop_pct": (
+            round(float(trailing_stop_pct), 4)
+            if trailing_stop_pct is not None
+            else None
+        ),
+        "break_even_trigger_pct": (
+            round(float(break_even_trigger_pct), 4)
+            if break_even_trigger_pct is not None
+            else None
+        ),
+        "partial_take_profits": rungs,
+        "exit_tools_enabled": bool(
+            trailing_stop_pct is not None
+            or break_even_trigger_pct is not None
+            or rungs
+        ),
+    }
+    return hint
+
+
 def compute_strategy_runtime_risk_hints(
     strategy: StrategySummary,
     detail: Any,
@@ -371,6 +426,10 @@ def compute_strategy_runtime_risk_hints(
         "last_price": round(last_price, 6),
         "generated_at": generated_at,
     }
+    # The exit-tool hint is additive and safe to compute regardless of bias /
+    # candle count, so we always attach it — callers that do not understand
+    # the new keys can keep reading the legacy stop/target fields unchanged.
+    base.update(_exit_tool_hint(strategy))
 
     if strategy.status == "paused":
         base.update(

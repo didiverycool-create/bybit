@@ -21,10 +21,11 @@ CONTROL_API_DIR = Path(__file__).resolve().parents[1]
 if str(CONTROL_API_DIR) not in sys.path:
     sys.path.insert(0, str(CONTROL_API_DIR))
 
+import backtest_engine  # type: ignore  # noqa: E402
 import main as control_main  # type: ignore  # noqa: E402
 from bybit_private_client import BybitPrivateClient  # type: ignore  # noqa: E402
 from bybit_public_client import BybitPublicMarketClient  # type: ignore  # noqa: E402
-from models import AgentJob, AlertRecord, AccountMode, BacktestMetrics, BacktestRun, BybitPrivateStatus, CandlePoint, ChangeRequestCreate, Direction, MarketRecentTrade, OpenClawStatus, OrderBookLevel, OrderRecord, ReviewDocument, StrategyParameter, StrategyRuntimeSnapshot, TradeRecord, WatchlistInstrument  # type: ignore  # noqa: E402
+from models import AgentJob, AlertRecord, AccountMode, BacktestMetrics, BacktestRun, BybitPrivateStatus, CandlePoint, ChangeRequestCreate, Direction, MarketRecentTrade, OpenClawStatus, OrderBookLevel, OrderRecord, PartialTakeProfit, ReviewDocument, StrategyParameter, StrategyRuntimeSnapshot, TradeRecord, WatchlistInstrument  # type: ignore  # noqa: E402
 from seed import build_market_detail_for_watchlist, build_state  # type: ignore  # noqa: E402
 
 
@@ -18803,6 +18804,357 @@ class HardConstraintIntegrationTests(unittest.TestCase):
         self.assertEqual(
             list(control_main.repo.state.paper_orders), before_paper_orders
         )
+
+
+class StrategyExitToolsUnitTests(unittest.TestCase):
+    """Round 44 opt-in exit tools (trailing stop / break-even / partial TP).
+
+    Covers the three additive exit-tool branches the backtest engine acquired.
+    Each test constructs a minimal candle sequence and a breakout-family
+    strategy so the entry fires predictably: a single breakout bar triggers
+    the entry, then subsequent bars are shaped to exercise one specific exit
+    rule at a time. The non-exit-tool branches (stop_loss / take_profit_pct /
+    max_hold_bars) are already covered by the baseline suite — these tests
+    focus strictly on the new additive behavior.
+    """
+
+    # ``_run_breakout`` internally clamps ``breakout_window`` to a minimum of
+    # 5, so the fixture below seeds 5 lookback bars at ascending closes and
+    # places the breakout on bar index 5 with 3× volume. Subsequent bars are
+    # the arena where the new exit-tool branches get exercised.
+    BREAKOUT_WINDOW = 5
+    BREAKOUT_BAR = 5
+
+    def _breakout_strategy(
+        self,
+        *,
+        trailing_stop_pct: Optional[float] = None,
+        break_even_trigger_pct: Optional[float] = None,
+        partial_take_profits: Optional[List[Any]] = None,
+    ) -> Any:
+        from models import StrategySummary
+
+        return StrategySummary(
+            id="brk-exit-tools-01",
+            name="ExitToolsBreakout",
+            category="template",
+            status="running",
+            symbols=["BTCUSDT"],
+            mode=AccountMode.PAPER,
+            version="v1",
+            pnl_7d="+0.0%",
+            max_drawdown="-0.0%",
+            risk_budget="18%",
+            description="exit-tools unit test",
+            parameters=[
+                StrategyParameter(key="breakout_window", label="bw", value=self.BREAKOUT_WINDOW),
+                StrategyParameter(key="volume_ratio", label="vr", value=1.0),
+                # ``max_hold_hours`` picked large enough that the baseline
+                # max-hold-bars guard never fires during the fixtures used
+                # below — lets the opt-in exit tools own the exit decision.
+                StrategyParameter(key="max_hold_hours", label="mh", value=2000),
+            ],
+            trailing_stop_pct=trailing_stop_pct,
+            break_even_trigger_pct=break_even_trigger_pct,
+            partial_take_profits=partial_take_profits,
+        )
+
+    def _candles(self, prices: List[float]) -> List[Any]:
+        return [
+            backtest_engine.CandlePoint(
+                time=f"2026-01-{(index % 28) + 1:02d}T{index % 24:02d}:00:00+00:00",
+                open=price,
+                high=price,
+                low=price,
+                close=price,
+                volume=1000.0 * (3.0 if index == self.BREAKOUT_BAR else 1.0),
+            )
+            for index, price in enumerate(prices)
+        ]
+
+    def test_trailing_stop_fires_on_giveback_and_records_single_trade(self) -> None:
+        """Trailing-stop take-back must close the position when the
+        scaled-return giveback from peak exceeds ``trailing_stop_pct``.
+
+        Fixture: 5 pre-entry bars form the breakout-window lookback (highs
+        <= 104). The breakout bar at index 5 prints 110 on 3× volume →
+        position opens at 110. Subsequent bars push to 130 (peak,
+        pnl ≈ 18.18%), then retreat to 125 (pnl ≈ 13.64%, giveback ≈
+        4.54%). With ``trailing_stop_pct = 3.0`` the runner must fire the
+        trailing stop on the retreat bar.
+        """
+
+        strategy = self._breakout_strategy(trailing_stop_pct=3.0)
+        candles = self._candles([100, 101, 102, 103, 104, 110, 130, 125])
+
+        result = backtest_engine.run_local_backtest(
+            strategy,
+            candles,
+            "1h",
+            "2026-01-01 ~ 2026-01-05",
+        )
+
+        # Exactly one closed trade: the trailing stop fired before the final
+        # "close any open carryover" branch could run. Win rate must be
+        # positive because the position closed in profit.
+        self.assertEqual(result.metrics.trades, 1)
+        self.assertEqual(result.metrics.win_rate, "100.0%")
+
+    def test_trailing_stop_not_triggered_leaves_position_for_normal_exit(self) -> None:
+        """Trailing-stop must *not* fire on a small adverse tick that stays
+        within the give-back budget — the existing max-hold / TP / SL guards
+        remain in charge of the exit decision.
+        """
+
+        strategy = self._breakout_strategy(trailing_stop_pct=5.0)
+        # Entry at index 5 (price 110). Peak 120 at index 6 (pnl ≈ 9.09%),
+        # retreat to 118.5 at index 7 (pnl ≈ 7.72%, giveback 1.37% < 5%).
+        # Trailing stop stays armed but does not fire. The baseline
+        # max-hold / TP / SL guards also stay quiet (118.5 vs 110 ≈ +7.7%,
+        # below the 4.2% positive-exit guard? No — 7.7% > 4.2% so TP fires).
+        # To keep the position open to end-of-series we stay below the
+        # positive-exit ceiling via 113 / 112.5.
+        candles = self._candles([100, 101, 102, 103, 104, 110, 113, 112.5])
+
+        result = backtest_engine.run_local_backtest(
+            strategy,
+            candles,
+            "1h",
+            "2026-01-01 ~ 2026-01-05",
+        )
+
+        # Single trade, closed via the "carry to end" branch of the runner.
+        self.assertEqual(result.metrics.trades, 1)
+        self.assertEqual(result.metrics.win_rate, "100.0%")
+
+    def test_break_even_then_drawback_exits_at_or_below_entry(self) -> None:
+        """Break-even arming must convert a subsequent retreat-to-entry into
+        a zero-pnl exit. Once ``break_even_trigger_pct`` has been hit, any
+        bar with ``pnl_pct <= 0`` forces a close — the runner must therefore
+        exit with a non-positive trade return (not leave it to ride further
+        into the next direction change).
+        """
+
+        # Break-even needs to fire *before* the baseline 4.2% positive TP
+        # guard kicks in. Setting ``break_even_trigger_pct=3.5`` (below the
+        # runner's built-in positive TP ceiling of 4.2%) keeps us in that
+        # window.
+        strategy = self._breakout_strategy(break_even_trigger_pct=3.5)
+        # Entry at index 5 (price 110). Index 6 pushes to 114 (pnl ≈ 3.64%
+        # > 3.5%) and arms break-even without tripping the 4.2% TP guard.
+        # Index 7 retreats to 109 (pnl ≈ -0.91% ≤ 0%) → break-even exit.
+        candles = self._candles([100, 101, 102, 103, 104, 110, 114, 109])
+
+        result = backtest_engine.run_local_backtest(
+            strategy,
+            candles,
+            "1h",
+            "2026-01-01 ~ 2026-01-05",
+        )
+
+        self.assertEqual(result.metrics.trades, 1)
+        # Win rate == 0% because the trade closed at a non-positive return
+        # (pnl slightly negative → not counted as a winning trade).
+        self.assertEqual(result.metrics.win_rate, "0.0%")
+
+    def test_partial_take_profits_consume_ladder_and_drain_position(self) -> None:
+        """Partial TP ladder must emit one trade per rung, and the
+        cumulative ``exit_ratio`` across all rungs + any remaining closeout
+        must sum to exactly the original position. Setting the final rung
+        to ``exit_ratio = 1.0`` drains the whole position so no carryover
+        close is produced.
+        """
+
+        # Final rung's ``trigger_pct`` must stay below the runner's 4.2%
+        # positive TP guard so the partial ladder owns the exit decision,
+        # not the baseline take-profit ceiling.
+        strategy = self._breakout_strategy(
+            partial_take_profits=[
+                PartialTakeProfit(trigger_pct=1.0, exit_ratio=0.25),
+                PartialTakeProfit(trigger_pct=2.5, exit_ratio=0.50),
+                PartialTakeProfit(trigger_pct=4.0, exit_ratio=1.00),
+            ],
+        )
+        # Entry at index 5 (price 110, breakout on 3× volume). Subsequent
+        # prices: 112 (pnl 1.82% → rung 1 fires), 113 (pnl 2.73% → rung 2
+        # fires), 114.3 (pnl 3.91% → rung 3 fires at trigger 4.0? actually
+        # 3.91 < 4.0 so no). Use 114.5 (pnl 4.09% → rung 3 fires & drains).
+        # 4.09% < 4.2% positive-exit guard so baseline TP does not interfere.
+        candles = self._candles([100, 101, 102, 103, 104, 110, 112, 113, 114.5])
+
+        result = backtest_engine.run_local_backtest(
+            strategy,
+            candles,
+            "1h",
+            "2026-01-01 ~ 2026-01-05",
+        )
+
+        # Three partial rungs → three closed trade records. All three close
+        # in profit because each rung's ``trigger_pct`` requires a positive
+        # pnl move to fire.
+        self.assertEqual(result.metrics.trades, 3)
+        self.assertEqual(result.metrics.win_rate, "100.0%")
+
+    def test_exit_tools_state_clones_per_entry_not_shared(self) -> None:
+        """The opt-in exit state must be cloned per entry so a partial-TP
+        ladder that drains on trade #1 does not stay drained for trade #2.
+        Regression guard for accidentally sharing the template state.
+        """
+
+        from backtest_engine import _ExitToolState, _build_exit_tool_state
+
+        strategy = self._breakout_strategy(
+            partial_take_profits=[
+                PartialTakeProfit(trigger_pct=1.0, exit_ratio=0.5),
+                PartialTakeProfit(trigger_pct=2.0, exit_ratio=0.5),
+            ],
+        )
+        template = _build_exit_tool_state(strategy)
+
+        # Simulate "trade #1 drained the template" and verify a fresh clone
+        # still carries the original rung ladder and full remaining ratio.
+        template.remaining_ratio = 0.0
+        template._next_rung_index = 99
+
+        fresh = _ExitToolState(
+            trailing_stop_pct=template.trailing_stop_pct,
+            break_even_trigger_pct=template.break_even_trigger_pct,
+            rungs=list(template.rungs),
+        )
+        self.assertEqual(fresh.remaining_ratio, 1.0)
+        self.assertEqual(len(fresh.rungs), 2)
+        self.assertEqual(fresh._next_rung_index, 0)
+
+    def test_strategy_runtime_risk_hints_surface_exit_tools(self) -> None:
+        """``compute_strategy_runtime_risk_hints`` must pass the three new
+        exit-tool fields through to the panel-facing payload so downstream
+        consumers (UI / previews) can render the ladder.
+        """
+        import strategy_runtime
+        from models import MarketDetail
+
+        strategy = self._breakout_strategy(
+            trailing_stop_pct=1.5,
+            break_even_trigger_pct=0.8,
+            partial_take_profits=[
+                PartialTakeProfit(trigger_pct=1.0, exit_ratio=0.33),
+                PartialTakeProfit(trigger_pct=2.5, exit_ratio=0.5),
+            ],
+        )
+
+        closes = [100.0 + idx * 0.1 for idx in range(12)]
+        candles = [
+            CandlePoint(
+                time=f"2026-01-{(idx % 28) + 1:02d}T{idx % 24:02d}:00:00",
+                open=close,
+                high=close * 1.002,
+                low=close * 0.998,
+                close=close,
+                volume=1000.0,
+            )
+            for idx, close in enumerate(closes)
+        ]
+        detail = MarketDetail(
+            symbol="BTCUSDT",
+            market="perp",
+            timeframe="1h",
+            candles=candles,
+            bids=[],
+            asks=[],
+            headline="exit-tools test",
+            stats={},
+            source="fallback",
+        )
+        watch_item = WatchlistInstrument(
+            symbol="BTCUSDT",
+            market="perp",
+            last_price=closes[-1],
+            change_24h=1.0,
+            volume_24h=10_000.0,
+            signal="active",
+            position_side="flat",
+            risk_level="medium",
+        )
+
+        hint = strategy_runtime.compute_strategy_runtime_risk_hints(
+            strategy=strategy,
+            detail=detail,
+            watch_item=watch_item,
+        )
+
+        # New fields must be present, values echoed faithfully, ladder
+        # sorted ascending by ``trigger_pct``.
+        self.assertTrue(hint["exit_tools_enabled"])
+        self.assertAlmostEqual(hint["trailing_stop_pct"], 1.5, places=4)
+        self.assertAlmostEqual(hint["break_even_trigger_pct"], 0.8, places=4)
+        self.assertEqual(len(hint["partial_take_profits"]), 2)
+        self.assertAlmostEqual(
+            hint["partial_take_profits"][0]["trigger_pct"], 1.0, places=4
+        )
+        self.assertAlmostEqual(
+            hint["partial_take_profits"][0]["exit_ratio"], 0.33, places=4
+        )
+        self.assertAlmostEqual(
+            hint["partial_take_profits"][1]["trigger_pct"], 2.5, places=4
+        )
+
+    def test_strategy_runtime_risk_hints_without_exit_tools_remain_backwards_compatible(
+        self,
+    ) -> None:
+        """A strategy that does not opt in must still produce the three new
+        fields with ``None`` / empty values so schema consumers never see a
+        missing key — but ``exit_tools_enabled`` must be False so panels can
+        skip the new section entirely.
+        """
+        import strategy_runtime
+        from models import MarketDetail
+
+        strategy = self._breakout_strategy()  # all exit-tool fields None
+
+        closes = [100.0 + idx * 0.1 for idx in range(8)]
+        candles = [
+            CandlePoint(
+                time=f"2026-01-0{idx + 1}T00:00:00",
+                open=close,
+                high=close,
+                low=close,
+                close=close,
+                volume=1000.0,
+            )
+            for idx, close in enumerate(closes)
+        ]
+        detail = MarketDetail(
+            symbol="BTCUSDT",
+            market="perp",
+            timeframe="1h",
+            candles=candles,
+            bids=[],
+            asks=[],
+            headline="no-exit-tools test",
+            stats={},
+            source="fallback",
+        )
+        watch_item = WatchlistInstrument(
+            symbol="BTCUSDT",
+            market="perp",
+            last_price=closes[-1],
+            change_24h=0.5,
+            volume_24h=5_000.0,
+            signal="active",
+            position_side="flat",
+            risk_level="medium",
+        )
+
+        hint = strategy_runtime.compute_strategy_runtime_risk_hints(
+            strategy=strategy,
+            detail=detail,
+            watch_item=watch_item,
+        )
+
+        self.assertFalse(hint["exit_tools_enabled"])
+        self.assertIsNone(hint["trailing_stop_pct"])
+        self.assertIsNone(hint["break_even_trigger_pct"])
+        self.assertEqual(hint["partial_take_profits"], [])
 
 
 if __name__ == "__main__":

@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 from statistics import mean, median, pstdev
 from typing import Dict, List, Optional
 
-from models import BacktestMetrics, CandlePoint, StrategySummary, derive_backtest_sample_quality
+from models import BacktestMetrics, CandlePoint, PartialTakeProfit, StrategySummary, derive_backtest_sample_quality
 
 BACKTEST_ENGINE_MAX_CANDLES = 20_000
 
@@ -978,14 +978,256 @@ def _candle_time_bounds(candles: List[CandlePoint]) -> tuple[Optional[str], Opti
     return candles[0].time, candles[-1].time
 
 
+@dataclass
+class _ExitToolRung:
+    """Snapshot of a fired partial take-profit rung.
+
+    ``fraction_of_original`` is the portion of the *original* position size
+    consumed by this rung, so ``sum(fraction_of_original)`` must never exceed
+    1.0. ``pnl_pct`` is the realized pnl for the base asset on the trigger bar
+    (no sizing multiplier applied — the runner scales it for equity updates).
+    """
+
+    trigger_pct: float
+    exit_ratio: float
+    fraction_of_original: float
+    pnl_pct: float
+    bar_index: int
+    exit_price: float
+
+
+@dataclass
+class _ExitToolState:
+    """Opt-in exit-tool state machine attached to a single open position.
+
+    Tracks just enough history to drive trailing stops, break-even arming, and
+    a monotonic partial-take-profit ladder. All three tools are *additive*:
+    when the corresponding field on the strategy is ``None`` the helper is a
+    no-op and existing runner behavior is preserved bit-for-bit.
+    """
+
+    trailing_stop_pct: Optional[float]
+    break_even_trigger_pct: Optional[float]
+    rungs: List[PartialTakeProfit]
+    max_favorable_pct: float = 0.0
+    break_even_armed: bool = False
+    remaining_ratio: float = 1.0
+    consumed_rungs: List[_ExitToolRung] = None  # type: ignore[assignment]
+    _next_rung_index: int = 0
+
+    def __post_init__(self) -> None:
+        if self.consumed_rungs is None:
+            self.consumed_rungs = []
+
+    @property
+    def any_enabled(self) -> bool:
+        return (
+            self.trailing_stop_pct is not None
+            or self.break_even_trigger_pct is not None
+            or bool(self.rungs)
+        )
+
+    def update_favorable(self, pnl_pct: float) -> None:
+        if pnl_pct > self.max_favorable_pct:
+            self.max_favorable_pct = pnl_pct
+        if (
+            not self.break_even_armed
+            and self.break_even_trigger_pct is not None
+            and pnl_pct >= self.break_even_trigger_pct
+        ):
+            self.break_even_armed = True
+
+    def trailing_stop_hit(self, pnl_pct: float) -> bool:
+        if self.trailing_stop_pct is None:
+            return False
+        if self.max_favorable_pct <= 0.0:
+            return False
+        giveback = self.max_favorable_pct - pnl_pct
+        return giveback >= self.trailing_stop_pct
+
+    def break_even_hit(self, pnl_pct: float) -> bool:
+        return self.break_even_armed and pnl_pct <= 0.0
+
+    def next_partial(self, pnl_pct: float) -> Optional[PartialTakeProfit]:
+        if self._next_rung_index >= len(self.rungs):
+            return None
+        rung = self.rungs[self._next_rung_index]
+        if pnl_pct >= rung.trigger_pct and self.remaining_ratio > 0.0:
+            return rung
+        return None
+
+    def consume_partial(
+        self,
+        rung: PartialTakeProfit,
+        pnl_pct: float,
+        bar_index: int,
+        exit_price: float,
+    ) -> float:
+        """Commit a partial-take-profit trigger and return the fraction of the
+        *original* position that is being liquidated on this bar.
+
+        The fraction is clamped so ``sum(fraction_of_original) <= 1.0`` even if
+        a rung is misconfigured with ``exit_ratio >= 1`` or the ladder asks for
+        more than what is still open.
+        """
+
+        ratio = max(float(rung.exit_ratio), 0.0)
+        fraction = min(ratio, self.remaining_ratio)
+        if fraction > 0.0:
+            self.remaining_ratio -= fraction
+            if self.remaining_ratio < 0.0:
+                self.remaining_ratio = 0.0
+            self.consumed_rungs.append(
+                _ExitToolRung(
+                    trigger_pct=float(rung.trigger_pct),
+                    exit_ratio=ratio,
+                    fraction_of_original=fraction,
+                    pnl_pct=pnl_pct,
+                    bar_index=bar_index,
+                    exit_price=exit_price,
+                )
+            )
+        self._next_rung_index += 1
+        return fraction
+
+    def drained(self) -> bool:
+        return self.remaining_ratio <= 1e-9
+
+
+def _build_exit_tool_state(strategy: StrategySummary) -> _ExitToolState:
+    trailing_stop_pct: Optional[float] = None
+    if getattr(strategy, "trailing_stop_pct", None) is not None:
+        try:
+            value = float(strategy.trailing_stop_pct)  # type: ignore[arg-type]
+            if value > 0.0:
+                trailing_stop_pct = value
+        except (TypeError, ValueError):
+            trailing_stop_pct = None
+
+    break_even_trigger_pct: Optional[float] = None
+    if getattr(strategy, "break_even_trigger_pct", None) is not None:
+        try:
+            value = float(strategy.break_even_trigger_pct)  # type: ignore[arg-type]
+            if value > 0.0:
+                break_even_trigger_pct = value
+        except (TypeError, ValueError):
+            break_even_trigger_pct = None
+
+    rungs: List[PartialTakeProfit] = []
+    raw_rungs = getattr(strategy, "partial_take_profits", None) or []
+    # Sort ascending by ``trigger_pct`` so the state machine can simply walk
+    # the ladder monotonically without re-checking earlier rungs. Rungs with
+    # non-positive ``exit_ratio`` are dropped; they would contribute zero
+    # fraction and leave ``_next_rung_index`` in a confusing state otherwise.
+    for rung in raw_rungs:
+        try:
+            trigger = float(rung.trigger_pct)
+            exit_ratio = float(rung.exit_ratio)
+        except (TypeError, ValueError):
+            continue
+        if exit_ratio <= 0.0:
+            continue
+        rungs.append(PartialTakeProfit(trigger_pct=trigger, exit_ratio=exit_ratio))
+    rungs.sort(key=lambda row: row.trigger_pct)
+
+    return _ExitToolState(
+        trailing_stop_pct=trailing_stop_pct,
+        break_even_trigger_pct=break_even_trigger_pct,
+        rungs=rungs,
+    )
+
+
+def _apply_exit_tools_on_bar(
+    state: _ExitToolState,
+    *,
+    pnl_pct: float,
+    bar_index: int,
+    exit_price: float,
+    position_entry: float,
+    position_entry_equity: float,
+    sizing_multiplier: float,
+    trades: List["BacktestTrade"],
+    trade_returns: List[float],
+) -> tuple[bool, float, List[_ExitToolRung]]:
+    """Advance the opt-in exit state machine for one bar.
+
+    Returns ``(forced_close, realized_return_pct, consumed_rungs_this_bar)``.
+
+    - ``forced_close``: ``True`` when trailing / break-even / the final partial
+      rung drained the position. The caller must close out with the standard
+      bookkeeping pattern (record the remaining-fraction trade, flip back to
+      flat, etc.).
+    - ``realized_return_pct``: portion of the scaled ``pnl_pct * sizing``
+      return already realized by the partial rungs fired on this bar. The
+      caller applies this delta to equity before any full-close handling.
+    - ``consumed_rungs_this_bar``: ordered list of rungs consumed on this bar
+      (may be empty). Each entry maps one-to-one to a ``BacktestTrade`` this
+      helper already appended to ``trades`` / ``trade_returns``.
+    """
+
+    consumed: List[_ExitToolRung] = []
+    realized_return_pct = 0.0
+
+    if not state.any_enabled:
+        return False, 0.0, consumed
+
+    state.update_favorable(pnl_pct)
+
+    # Step 1 — partial take-profit ladder. Multiple rungs can fire on the same
+    # bar if the price move is large enough; we iterate until either (a) the
+    # next rung's ``trigger_pct`` has not been met, or (b) the position has
+    # been fully liquidated.
+    while True:
+        rung = state.next_partial(pnl_pct)
+        if rung is None:
+            break
+        fraction = state.consume_partial(
+            rung,
+            pnl_pct=pnl_pct,
+            bar_index=bar_index,
+            exit_price=exit_price,
+        )
+        if fraction <= 0.0:
+            continue
+        scaled_return = pnl_pct * sizing_multiplier
+        rung_return = scaled_return * fraction
+        realized_return_pct += rung_return
+        trade_returns.append(rung_return)
+        notional = position_entry_equity * sizing_multiplier * fraction
+        quantity = notional / position_entry if position_entry > 0 else 0.0
+        trades.append(
+            BacktestTrade(
+                entry_bar_index=bar_index,
+                exit_bar_index=bar_index,
+                entry_price=position_entry,
+                exit_price=exit_price,
+                quantity=quantity,
+            )
+        )
+        consumed.append(state.consumed_rungs[-1])
+
+    forced_close = state.drained()
+    if forced_close:
+        return True, realized_return_pct, consumed
+
+    # Step 2 — trailing stop / break-even both force a full close on the
+    # *remaining* ratio. The caller handles emitting the closing trade record.
+    if state.trailing_stop_hit(pnl_pct) or state.break_even_hit(pnl_pct):
+        forced_close = True
+
+    return forced_close, realized_return_pct, consumed
+
+
 def _run_trend_follow(
     candles: List[CandlePoint],
     params: Dict[str, object],
     timeframe: str,
+    exit_tools: Optional[_ExitToolState] = None,
 ) -> tuple[BacktestMetrics, bool, List[float], List[BacktestTrade]]:
     fast = max(int(float(params.get("fast_ma", 21))), 2)
     slow = max(int(float(params.get("slow_ma", 55))), fast + 1)
     risk_per_trade = max(float(params.get("risk_per_trade", 1.0)), 0.2) / 100.0
+    sizing_multiplier = risk_per_trade * 10.0
     starting_equity = 100000.0
     equity = starting_equity
     equity_curve = [equity]
@@ -994,6 +1236,7 @@ def _run_trend_follow(
     position_entry: Optional[float] = None
     position_entry_equity = equity
     position_entry_index: Optional[int] = None
+    state: Optional[_ExitToolState] = None
 
     closes = [candle.close for candle in candles]
     for index in range(slow, len(closes)):
@@ -1004,34 +1247,65 @@ def _run_trend_follow(
             position_entry = price
             position_entry_equity = equity
             position_entry_index = index
+            # Clone the configured exit-tool state so partial-ratio / trailing
+            # bookkeeping restarts with every fresh entry. ``exit_tools`` is
+            # immutable template-only — we never mutate the caller's copy.
+            state = (
+                _ExitToolState(
+                    trailing_stop_pct=exit_tools.trailing_stop_pct,
+                    break_even_trigger_pct=exit_tools.break_even_trigger_pct,
+                    rungs=list(exit_tools.rungs),
+                )
+                if exit_tools is not None
+                else None
+            )
             equity_curve.append(equity)
             continue
         if position_entry is not None:
-            trade_return = ((price - position_entry) / position_entry) * (risk_per_trade * 10.0) * 100.0
+            pnl_pct = (price - position_entry) / position_entry * 100.0
+            trade_return = pnl_pct * sizing_multiplier
             marked_equity = _mark_to_market_equity(position_entry_equity, trade_return)
-            if fast_ma < slow_ma:
-                trade_returns.append(trade_return)
-                # Effective notional stake: ``risk_per_trade * 10`` is the
-                # sizing multiplier the runner applies to the price move, so
-                # the committed exposure equals ``position_entry_equity *
-                # risk_per_trade * 10``. Deriving ``quantity`` from the
-                # notional keeps ``entry_price * quantity == notional``.
-                notional = position_entry_equity * risk_per_trade * 10.0
-                quantity = notional / position_entry if position_entry > 0 else 0.0
-                trades.append(
-                    BacktestTrade(
-                        entry_bar_index=position_entry_index if position_entry_index is not None else index,
-                        exit_bar_index=index,
-                        entry_price=position_entry,
-                        exit_price=price,
-                        quantity=quantity,
-                    )
+            forced_close = False
+            partial_return_pct = 0.0
+            if state is not None and state.any_enabled:
+                forced_close, partial_return_pct, _rungs = _apply_exit_tools_on_bar(
+                    state,
+                    pnl_pct=pnl_pct,
+                    bar_index=index,
+                    exit_price=price,
+                    position_entry=position_entry,
+                    position_entry_equity=position_entry_equity,
+                    sizing_multiplier=sizing_multiplier,
+                    trades=trades,
+                    trade_returns=trade_returns,
                 )
-                equity = marked_equity
+                if partial_return_pct:
+                    equity = _mark_to_market_equity(position_entry_equity, partial_return_pct)
+                    marked_equity = equity
+            if forced_close or fast_ma < slow_ma:
+                remaining_ratio = state.remaining_ratio if state is not None else 1.0
+                if remaining_ratio > 0.0:
+                    remaining_return = pnl_pct * sizing_multiplier * remaining_ratio
+                    trade_returns.append(remaining_return)
+                    notional = position_entry_equity * sizing_multiplier * remaining_ratio
+                    quantity = notional / position_entry if position_entry > 0 else 0.0
+                    trades.append(
+                        BacktestTrade(
+                            entry_bar_index=position_entry_index if position_entry_index is not None else index,
+                            exit_bar_index=index,
+                            entry_price=position_entry,
+                            exit_price=price,
+                            quantity=quantity,
+                        )
+                    )
+                    equity = _mark_to_market_equity(position_entry_equity, partial_return_pct + remaining_return)
+                else:
+                    equity = marked_equity
                 equity_curve.append(equity)
                 position_entry = None
                 position_entry_equity = equity
                 position_entry_index = None
+                state = None
                 continue
             equity_curve.append(marked_equity)
             continue
@@ -1039,9 +1313,20 @@ def _run_trend_follow(
 
     if position_entry is not None:
         price = closes[-1]
-        trade_return = ((price - position_entry) / position_entry) * (risk_per_trade * 10.0) * 100.0
+        pnl_pct = (price - position_entry) / position_entry * 100.0
+        remaining_ratio = state.remaining_ratio if state is not None else 1.0
+        partial_return_pct = 0.0
+        if state is not None:
+            # Realized-from-partials slice already bubbled into ``trade_returns``
+            # during the main loop; replay it only to mark equity correctly on
+            # the final carried bar.
+            partial_return_pct = sum(
+                rung.pnl_pct * sizing_multiplier * rung.fraction_of_original
+                for rung in state.consumed_rungs
+            )
+        trade_return = pnl_pct * sizing_multiplier * remaining_ratio
         trade_returns.append(trade_return)
-        notional = position_entry_equity * risk_per_trade * 10.0
+        notional = position_entry_equity * sizing_multiplier * remaining_ratio
         quantity = notional / position_entry if position_entry > 0 else 0.0
         trades.append(
             BacktestTrade(
@@ -1052,7 +1337,7 @@ def _run_trend_follow(
                 quantity=quantity,
             )
         )
-        equity = _mark_to_market_equity(position_entry_equity, trade_return)
+        equity = _mark_to_market_equity(position_entry_equity, partial_return_pct + trade_return)
         equity_curve[-1] = equity
 
     used_reference_path = False
@@ -1081,10 +1366,12 @@ def _run_mean_reversion(
     candles: List[CandlePoint],
     params: Dict[str, object],
     timeframe: str,
+    exit_tools: Optional[_ExitToolState] = None,
 ) -> tuple[BacktestMetrics, bool, List[float], List[BacktestTrade]]:
     entry = max(float(params.get("zscore_entry", 2.0)), 0.5)
     exit_value = max(float(params.get("zscore_exit", 0.5)), 0.1)
     stop_loss_pct = max(float(params.get("stop_loss_pct", 1.0)), 0.2)
+    sizing_multiplier = 0.9
     lookback = 20
     starting_equity = 100000.0
     equity = starting_equity
@@ -1094,6 +1381,7 @@ def _run_mean_reversion(
     position_entry: Optional[float] = None
     position_entry_equity = equity
     position_entry_index: Optional[int] = None
+    state: Optional[_ExitToolState] = None
 
     closes = [candle.close for candle in candles]
     for index in range(lookback, len(closes)):
@@ -1106,32 +1394,64 @@ def _run_mean_reversion(
             position_entry = price
             position_entry_equity = equity
             position_entry_index = index
+            state = (
+                _ExitToolState(
+                    trailing_stop_pct=exit_tools.trailing_stop_pct,
+                    break_even_trigger_pct=exit_tools.break_even_trigger_pct,
+                    rungs=list(exit_tools.rungs),
+                )
+                if exit_tools is not None
+                else None
+            )
             equity_curve.append(equity)
             continue
         if position_entry is not None:
             pnl_pct = (price - position_entry) / position_entry * 100.0
-            adjusted_return = pnl_pct * 0.9
+            adjusted_return = pnl_pct * sizing_multiplier
             marked_equity = _mark_to_market_equity(position_entry_equity, adjusted_return)
-            if zscore >= -exit_value or pnl_pct <= -stop_loss_pct:
-                trade_returns.append(adjusted_return)
-                # Effective notional stake: runner scales raw pnl_pct by 0.9
-                # so the committed exposure is 90% of the entry equity.
-                notional = position_entry_equity * 0.9
-                quantity = notional / position_entry if position_entry > 0 else 0.0
-                trades.append(
-                    BacktestTrade(
-                        entry_bar_index=position_entry_index if position_entry_index is not None else index,
-                        exit_bar_index=index,
-                        entry_price=position_entry,
-                        exit_price=price,
-                        quantity=quantity,
-                    )
+            forced_close = False
+            partial_return_pct = 0.0
+            if state is not None and state.any_enabled:
+                forced_close, partial_return_pct, _rungs = _apply_exit_tools_on_bar(
+                    state,
+                    pnl_pct=pnl_pct,
+                    bar_index=index,
+                    exit_price=price,
+                    position_entry=position_entry,
+                    position_entry_equity=position_entry_equity,
+                    sizing_multiplier=sizing_multiplier,
+                    trades=trades,
+                    trade_returns=trade_returns,
                 )
-                equity = marked_equity
+                if partial_return_pct:
+                    equity = _mark_to_market_equity(position_entry_equity, partial_return_pct)
+                    marked_equity = equity
+            if forced_close or zscore >= -exit_value or pnl_pct <= -stop_loss_pct:
+                remaining_ratio = state.remaining_ratio if state is not None else 1.0
+                if remaining_ratio > 0.0:
+                    remaining_return = pnl_pct * sizing_multiplier * remaining_ratio
+                    trade_returns.append(remaining_return)
+                    # Effective notional stake: runner scales raw pnl_pct by 0.9
+                    # so the committed exposure is 90% of the entry equity.
+                    notional = position_entry_equity * sizing_multiplier * remaining_ratio
+                    quantity = notional / position_entry if position_entry > 0 else 0.0
+                    trades.append(
+                        BacktestTrade(
+                            entry_bar_index=position_entry_index if position_entry_index is not None else index,
+                            exit_bar_index=index,
+                            entry_price=position_entry,
+                            exit_price=price,
+                            quantity=quantity,
+                        )
+                    )
+                    equity = _mark_to_market_equity(position_entry_equity, partial_return_pct + remaining_return)
+                else:
+                    equity = marked_equity
                 equity_curve.append(equity)
                 position_entry = None
                 position_entry_equity = equity
                 position_entry_index = None
+                state = None
                 continue
             equity_curve.append(marked_equity)
             continue
@@ -1139,9 +1459,16 @@ def _run_mean_reversion(
 
     if position_entry is not None:
         pnl_pct = (closes[-1] - position_entry) / position_entry * 100.0
-        adjusted_return = pnl_pct * 0.9
+        remaining_ratio = state.remaining_ratio if state is not None else 1.0
+        partial_return_pct = 0.0
+        if state is not None:
+            partial_return_pct = sum(
+                rung.pnl_pct * sizing_multiplier * rung.fraction_of_original
+                for rung in state.consumed_rungs
+            )
+        adjusted_return = pnl_pct * sizing_multiplier * remaining_ratio
         trade_returns.append(adjusted_return)
-        notional = position_entry_equity * 0.9
+        notional = position_entry_equity * sizing_multiplier * remaining_ratio
         quantity = notional / position_entry if position_entry > 0 else 0.0
         trades.append(
             BacktestTrade(
@@ -1152,7 +1479,7 @@ def _run_mean_reversion(
                 quantity=quantity,
             )
         )
-        equity = _mark_to_market_equity(position_entry_equity, adjusted_return)
+        equity = _mark_to_market_equity(position_entry_equity, partial_return_pct + adjusted_return)
         equity_curve[-1] = equity
 
     used_reference_path = False
@@ -1181,11 +1508,13 @@ def _run_breakout(
     candles: List[CandlePoint],
     params: Dict[str, object],
     timeframe: str,
+    exit_tools: Optional[_ExitToolState] = None,
 ) -> tuple[BacktestMetrics, bool, List[float], List[BacktestTrade]]:
     breakout_window = max(int(float(params.get("breakout_window", 18))), 5)
     volume_ratio = max(float(params.get("volume_ratio", 1.2)), 1.0)
     max_hold_hours = max(float(params.get("max_hold_hours", 6)), 1.0)
     max_hold_bars = max(1, int(max_hold_hours / _timeframe_hours(timeframe)))
+    sizing_multiplier = 0.85
     starting_equity = 100000.0
     equity = starting_equity
     equity_curve = [equity]
@@ -1195,6 +1524,7 @@ def _run_breakout(
     position_entry_equity = equity
     position_entry_index: Optional[int] = None
     hold_bars = 0
+    state: Optional[_ExitToolState] = None
 
     for index in range(breakout_window, len(candles)):
         history = candles[index - breakout_window:index]
@@ -1207,6 +1537,15 @@ def _run_breakout(
                 position_entry_equity = equity
                 position_entry_index = index
                 hold_bars = 0
+                state = (
+                    _ExitToolState(
+                        trailing_stop_pct=exit_tools.trailing_stop_pct,
+                        break_even_trigger_pct=exit_tools.break_even_trigger_pct,
+                        rungs=list(exit_tools.rungs),
+                    )
+                    if exit_tools is not None
+                    else None
+                )
                 equity_curve.append(equity)
                 continue
             equity_curve.append(equity)
@@ -1214,38 +1553,68 @@ def _run_breakout(
 
         hold_bars += 1
         pnl_pct = (candle.close - position_entry) / position_entry * 100.0
-        adjusted = pnl_pct * 0.85
+        adjusted = pnl_pct * sizing_multiplier
         marked_equity = _mark_to_market_equity(position_entry_equity, adjusted)
-        if hold_bars >= max_hold_bars or pnl_pct <= -1.8 or pnl_pct >= 4.2:
-            trade_returns.append(adjusted)
-            # Runner scales raw pnl_pct by 0.85, so committed exposure is
-            # 85% of the entry equity. Deriving ``quantity`` from the
-            # notional keeps ``entry_price * quantity == notional``.
-            notional = position_entry_equity * 0.85
-            quantity = notional / position_entry if position_entry > 0 else 0.0
-            trades.append(
-                BacktestTrade(
-                    entry_bar_index=position_entry_index if position_entry_index is not None else index,
-                    exit_bar_index=index,
-                    entry_price=position_entry,
-                    exit_price=candle.close,
-                    quantity=quantity,
-                )
+        forced_close = False
+        partial_return_pct = 0.0
+        if state is not None and state.any_enabled:
+            forced_close, partial_return_pct, _rungs = _apply_exit_tools_on_bar(
+                state,
+                pnl_pct=pnl_pct,
+                bar_index=index,
+                exit_price=candle.close,
+                position_entry=position_entry,
+                position_entry_equity=position_entry_equity,
+                sizing_multiplier=sizing_multiplier,
+                trades=trades,
+                trade_returns=trade_returns,
             )
-            equity = marked_equity
+            if partial_return_pct:
+                equity = _mark_to_market_equity(position_entry_equity, partial_return_pct)
+                marked_equity = equity
+        if forced_close or hold_bars >= max_hold_bars or pnl_pct <= -1.8 or pnl_pct >= 4.2:
+            remaining_ratio = state.remaining_ratio if state is not None else 1.0
+            if remaining_ratio > 0.0:
+                remaining_return = pnl_pct * sizing_multiplier * remaining_ratio
+                trade_returns.append(remaining_return)
+                # Runner scales raw pnl_pct by 0.85, so committed exposure is
+                # 85% of the entry equity. Deriving ``quantity`` from the
+                # notional keeps ``entry_price * quantity == notional``.
+                notional = position_entry_equity * sizing_multiplier * remaining_ratio
+                quantity = notional / position_entry if position_entry > 0 else 0.0
+                trades.append(
+                    BacktestTrade(
+                        entry_bar_index=position_entry_index if position_entry_index is not None else index,
+                        exit_bar_index=index,
+                        entry_price=position_entry,
+                        exit_price=candle.close,
+                        quantity=quantity,
+                    )
+                )
+                equity = _mark_to_market_equity(position_entry_equity, partial_return_pct + remaining_return)
+            else:
+                equity = marked_equity
             equity_curve.append(equity)
             position_entry = None
             position_entry_equity = equity
             position_entry_index = None
             hold_bars = 0
+            state = None
             continue
         equity_curve.append(marked_equity)
 
     if position_entry is not None:
         pnl_pct = (candles[-1].close - position_entry) / position_entry * 100.0
-        adjusted = pnl_pct * 0.85
+        remaining_ratio = state.remaining_ratio if state is not None else 1.0
+        partial_return_pct = 0.0
+        if state is not None:
+            partial_return_pct = sum(
+                rung.pnl_pct * sizing_multiplier * rung.fraction_of_original
+                for rung in state.consumed_rungs
+            )
+        adjusted = pnl_pct * sizing_multiplier * remaining_ratio
         trade_returns.append(adjusted)
-        notional = position_entry_equity * 0.85
+        notional = position_entry_equity * sizing_multiplier * remaining_ratio
         quantity = notional / position_entry if position_entry > 0 else 0.0
         trades.append(
             BacktestTrade(
@@ -1256,7 +1625,7 @@ def _run_breakout(
                 quantity=quantity,
             )
         )
-        equity = _mark_to_market_equity(position_entry_equity, adjusted)
+        equity = _mark_to_market_equity(position_entry_equity, partial_return_pct + adjusted)
         equity_curve[-1] = equity
 
     used_reference_path = False
@@ -1290,12 +1659,17 @@ def run_local_backtest(strategy: StrategySummary, candles: List[CandlePoint], ti
     used_candle_count = len(effective_candles)
     retrieved_range_start, retrieved_range_end = _candle_time_bounds(candles)
     used_range_start, used_range_end = _candle_time_bounds(effective_candles)
+    # Round 44 opt-in exit tooling: build the template once; the runners clone
+    # it per entry so trailing / break-even / partial-ladder state restarts
+    # cleanly for every new trade. ``None`` fields on the strategy collapse to
+    # a fully inert template — existing behavior stays bit-exact.
+    exit_tools = _build_exit_tool_state(strategy)
     if strategy.id.startswith("trend-"):
-        metrics, used_reference_path, final_equity_curve, final_trades = _run_trend_follow(effective_candles, params, timeframe)
+        metrics, used_reference_path, final_equity_curve, final_trades = _run_trend_follow(effective_candles, params, timeframe, exit_tools)
     elif strategy.id.startswith("eth-revert") or "均值回归" in strategy.name:
-        metrics, used_reference_path, final_equity_curve, final_trades = _run_mean_reversion(effective_candles, params, timeframe)
+        metrics, used_reference_path, final_equity_curve, final_trades = _run_mean_reversion(effective_candles, params, timeframe, exit_tools)
     else:
-        metrics, used_reference_path, final_equity_curve, final_trades = _run_breakout(effective_candles, params, timeframe)
+        metrics, used_reference_path, final_equity_curve, final_trades = _run_breakout(effective_candles, params, timeframe, exit_tools)
     bars_per_year = 365 * 24 / _timeframe_hours(timeframe)
     volatility_stats = _compute_volatility_stats(
         final_equity_curve,

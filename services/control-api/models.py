@@ -294,6 +294,20 @@ class StrategyParameter(BaseModel):
     unit: Optional[str] = None
 
 
+class PartialTakeProfit(BaseModel):
+    """Single rung of a scaled take-profit ladder.
+
+    ``trigger_pct`` is the unrealized pnl (percentage points, e.g. ``1.0`` ==
+    1%) that must be reached before the rung activates. ``exit_ratio`` is the
+    fraction of the *original* position size that should be liquidated on the
+    triggering bar (``0.5`` == half the original exposure). Engines must
+    enforce the cumulative sum of ``exit_ratio`` never exceeding ``1.0``.
+    """
+
+    trigger_pct: float
+    exit_ratio: float
+
+
 class StrategySummary(BaseModel):
     id: str
     name: str
@@ -307,6 +321,12 @@ class StrategySummary(BaseModel):
     risk_budget: str
     description: str
     parameters: List[StrategyParameter]
+    # Round 44 additive exit tooling. All three fields are ``None`` by default
+    # so existing strategy payloads keep their current single-stop / single-
+    # take-profit behavior; opt-in happens purely by populating these fields.
+    trailing_stop_pct: Optional[float] = None
+    break_even_trigger_pct: Optional[float] = None
+    partial_take_profits: Optional[List[PartialTakeProfit]] = None
 
 
 class StrategyRuntimeSnapshot(BaseModel):
