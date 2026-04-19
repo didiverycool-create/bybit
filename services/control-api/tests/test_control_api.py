@@ -3759,6 +3759,62 @@ class StrategyTrackingReviewResponseUnitTests(unittest.TestCase):
         self.assertEqual(parsed["summary"], "结果不明")
         self.assertIsNone(parsed["status"])
 
+    def test_build_backtest_review_prompt_includes_new_stat_sections(self) -> None:
+        prompt = control_main.build_agent_job_prompt(
+            "generate_backtest_review",
+            {
+                "strategy_name": "Trend BTC",
+                "strategy_id": "trend-btc-01",
+                "data_range": "最近 90 天",
+                "timeframe": "1h",
+                "metrics": {"sharpe": "1.8"},
+                "parameter_snapshot": {"fast_ma": 15},
+                "volatility_stats": {
+                    "return_volatility_pct": 0.8,
+                    "annualized_volatility_pct": 12.4,
+                    "max_drawdown_duration_bars": 14,
+                    "max_run_up_pct": 6.2,
+                    "positive_bar_ratio_pct": 52.0,
+                },
+                "risk_ratios": {
+                    "sortino_ratio": 2.1,
+                    "calmar_ratio": 1.5,
+                    "profit_factor": 1.8,
+                    "expectancy_pct": 0.12,
+                    "worst_bar_return_pct": -1.2,
+                    "best_bar_return_pct": 1.5,
+                },
+                "trade_rhythm_stats": {
+                    "total_bars": 100,
+                    "positive_bars": 55,
+                    "negative_bars": 40,
+                    "flat_bars": 5,
+                    "win_loss_bar_ratio": 1.375,
+                    "longest_winning_streak_bars": 6,
+                    "longest_losing_streak_bars": 4,
+                    "avg_positive_bar_return_pct": 0.8,
+                    "avg_negative_bar_return_pct": -0.7,
+                    "median_bar_return_pct": 0.05,
+                },
+                "benchmark_stats": {
+                    "buy_hold_return_pct": 5.4,
+                    "buy_hold_max_drawdown_pct": -8.1,
+                    "strategy_over_buy_hold_pct": 2.3,
+                    "alpha_pct": 3.1,
+                    "correlation": 0.65,
+                    "tracking_error_pct": 4.2,
+                },
+            },
+        )
+        self.assertIn("波动统计", prompt)
+        self.assertIn("annualized_volatility_pct", prompt)
+        self.assertIn("风险比率", prompt)
+        self.assertIn("sortino_ratio", prompt)
+        self.assertIn("节奏统计", prompt)
+        self.assertIn("longest_winning_streak_bars", prompt)
+        self.assertIn("对比基准", prompt)
+        self.assertIn("buy_hold_return_pct", prompt)
+
     def test_build_review_strategy_change_prompt_requests_structured_status_fields(self) -> None:
         prompt = control_main.build_agent_job_prompt(
             "review_strategy_change",
