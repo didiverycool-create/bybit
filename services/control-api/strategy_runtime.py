@@ -401,6 +401,76 @@ def _exit_tool_hint(strategy: StrategySummary) -> Dict[str, Any]:
     return hint
 
 
+def _volatility_sizing_hint(strategy: StrategySummary) -> Dict[str, Any]:
+    """Surface opt-in ATR-based volatility regime sizing onto the runtime
+    risk-hint payload so downstream consumers can render the regime ladder
+    and currently-applied multipliers without re-loading the strategy
+    parameters.
+
+    All fields are always present (even when the strategy has not opted in)
+    to keep the panel schema stable; ``volatility_sizing_enabled`` carries
+    the opt-in flag so panels can choose to hide the new section entirely
+    when the strategy is running on legacy fixed sizing. Thresholds /
+    multipliers fall back to ``None`` when not configured so the renderer
+    can display an explicit "using defaults" note rather than silently
+    echoing whatever the engine picked.
+    """
+
+    enabled = bool(getattr(strategy, "volatility_sizing_enabled", False))
+    raw_lookback = getattr(strategy, "volatility_lookback", None)
+    if raw_lookback is None:
+        lookback: Optional[int] = None
+    else:
+        try:
+            lookback = max(int(raw_lookback), 1)
+        except (TypeError, ValueError):
+            lookback = None
+
+    raw_target = getattr(strategy, "volatility_target_pct", None)
+    if raw_target is None:
+        target_pct: Optional[float] = None
+    else:
+        try:
+            target_pct = round(float(raw_target), 6)
+        except (TypeError, ValueError):
+            target_pct = None
+
+    thresholds = getattr(strategy, "volatility_regime_thresholds", None)
+    regime_thresholds: Optional[Dict[str, float]]
+    if thresholds is None:
+        regime_thresholds = None
+    else:
+        try:
+            regime_thresholds = {
+                "low_pct": round(float(thresholds.low_pct), 6),
+                "high_pct": round(float(thresholds.high_pct), 6),
+            }
+        except (AttributeError, TypeError, ValueError):
+            regime_thresholds = None
+
+    multipliers = getattr(strategy, "regime_exposure_multipliers", None)
+    regime_multipliers: Optional[Dict[str, float]]
+    if multipliers is None:
+        regime_multipliers = None
+    else:
+        try:
+            regime_multipliers = {
+                "low": round(float(multipliers.low), 6),
+                "normal": round(float(multipliers.normal), 6),
+                "high": round(float(multipliers.high), 6),
+            }
+        except (AttributeError, TypeError, ValueError):
+            regime_multipliers = None
+
+    return {
+        "volatility_sizing_enabled": enabled,
+        "volatility_lookback": lookback,
+        "volatility_target_pct": target_pct,
+        "regime_thresholds": regime_thresholds,
+        "regime_multipliers": regime_multipliers,
+    }
+
+
 def compute_strategy_runtime_risk_hints(
     strategy: StrategySummary,
     detail: Any,
@@ -430,6 +500,11 @@ def compute_strategy_runtime_risk_hints(
     # candle count, so we always attach it — callers that do not understand
     # the new keys can keep reading the legacy stop/target fields unchanged.
     base.update(_exit_tool_hint(strategy))
+    # Round 45 volatility sizing hint: always attached so schema consumers
+    # never see a missing key. ``volatility_sizing_enabled`` carries the
+    # opt-in flag; legacy strategies produce ``False`` with all remaining
+    # fields explicitly ``None`` so panels can short-circuit the new section.
+    base.update(_volatility_sizing_hint(strategy))
 
     if strategy.status == "paused":
         base.update(

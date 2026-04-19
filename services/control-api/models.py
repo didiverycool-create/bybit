@@ -308,6 +308,40 @@ class PartialTakeProfit(BaseModel):
     exit_ratio: float
 
 
+class VolatilityRegimeThresholds(BaseModel):
+    """Round 45 opt-in ATR%-based regime classifier thresholds.
+
+    ``low_pct`` and ``high_pct`` are expressed as ATR-as-percent-of-price
+    values (e.g. ``0.5`` == ``0.5%``). A bar whose ATR/price ratio lies strictly
+    below ``low_pct`` is classified as ``low`` volatility, strictly above
+    ``high_pct`` as ``high`` volatility, and everything in between (inclusive
+    of both boundaries) as ``normal``. ``low_pct`` must be less than or equal
+    to ``high_pct``; when they coincide the ``normal`` band collapses to a
+    single point which is acceptable for the classifier.
+    """
+
+    low_pct: float
+    high_pct: float
+
+
+class RegimeExposureMultipliers(BaseModel):
+    """Round 45 opt-in per-regime multipliers applied to ``risk_per_trade``.
+
+    When ``volatility_sizing_enabled`` is true each runner consults the
+    classifier below and scales its baseline risk budget by the matching
+    multiplier. Defaults favour slightly more exposure in calm markets and
+    trim exposure when ATR expands — consistent with classic volatility
+    targeting playbooks — but callers may override any of the three slots to
+    fit strategy-specific risk appetites. The multipliers are always non-
+    negative; a runner that receives ``0`` simply trades with zero sizing for
+    that regime (a hard block without breaking the data contract).
+    """
+
+    low: float = 1.2
+    normal: float = 1.0
+    high: float = 0.6
+
+
 class StrategySummary(BaseModel):
     id: str
     name: str
@@ -327,6 +361,16 @@ class StrategySummary(BaseModel):
     trailing_stop_pct: Optional[float] = None
     break_even_trigger_pct: Optional[float] = None
     partial_take_profits: Optional[List[PartialTakeProfit]] = None
+    # Round 45 additive volatility-regime-aware position sizing. All five
+    # fields default to ``None`` / ``False`` so existing payloads continue to
+    # use the legacy fixed ``risk_per_trade`` constants; opt-in happens purely
+    # by flipping ``volatility_sizing_enabled`` and optionally overriding the
+    # classifier thresholds / per-regime multipliers.
+    volatility_sizing_enabled: bool = False
+    volatility_lookback: Optional[int] = 14
+    volatility_target_pct: Optional[float] = None
+    volatility_regime_thresholds: Optional[VolatilityRegimeThresholds] = None
+    regime_exposure_multipliers: Optional[RegimeExposureMultipliers] = None
 
 
 class StrategyRuntimeSnapshot(BaseModel):

@@ -5,9 +5,23 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from statistics import mean, median, pstdev
-from typing import Dict, List, Optional
+from typing import Dict, List, Literal, Optional
 
-from models import BacktestMetrics, CandlePoint, PartialTakeProfit, StrategySummary, derive_backtest_sample_quality
+from models import (
+    BacktestMetrics,
+    CandlePoint,
+    PartialTakeProfit,
+    RegimeExposureMultipliers,
+    StrategySummary,
+    VolatilityRegimeThresholds,
+    derive_backtest_sample_quality,
+)
+
+# Round 45 typing alias for the three volatility regimes used by the opt-in
+# ATR-based position sizer. Narrowed to a literal so downstream consumers can
+# exhaustively pattern-match — an unknown regime is never emitted by the
+# classifier below.
+VolatilityRegime = Literal["low", "normal", "high"]
 
 BACKTEST_ENGINE_MAX_CANDLES = 20_000
 
@@ -224,6 +238,12 @@ class BacktestTrade:
     exit_price: float
     quantity: float
     side: str = "long"
+    # Round 45 opt-in volatility-regime-aware sizing metadata. Both fields
+    # default to ``None`` so pre-R45 callers and legacy fixtures continue to
+    # round-trip unchanged. Populated whenever a runner applies the ATR% /
+    # regime classifier at entry time.
+    volatility_regime: Optional[str] = None
+    applied_risk_per_trade: Optional[float] = None
 
 
 @dataclass
@@ -1218,16 +1238,233 @@ def _apply_exit_tools_on_bar(
     return forced_close, realized_return_pct, consumed
 
 
+# ---------------------------------------------------------------------------
+# Round 45: opt-in volatility-regime-aware position sizing
+# ---------------------------------------------------------------------------
+#
+# The three helpers below implement a minimal ATR-percent regime classifier
+# plus a risk-per-trade dynamic scaler. The classifier intentionally keeps the
+# "low / normal / high" decision pure-Python and side-effect-free so the unit
+# tests can pin down exact numeric behaviour without priming any runner state.
+# The runners consult these helpers only when ``volatility_sizing_enabled``
+# is true on the strategy summary — otherwise legacy fixed ``risk_per_trade``
+# constants stay bit-exact.
+
+# Default thresholds / multipliers picked so a strategy that opts in without
+# overriding anything still produces a sensible three-bucket split. Values
+# mirror the defaults documented on ``VolatilityRegimeThresholds`` and
+# ``RegimeExposureMultipliers`` in ``models.py``.
+_DEFAULT_REGIME_THRESHOLDS = VolatilityRegimeThresholds(low_pct=0.5, high_pct=1.5)
+_DEFAULT_REGIME_MULTIPLIERS = RegimeExposureMultipliers()
+
+
+def _compute_bar_atr(candles: List[CandlePoint], lookback: int) -> List[float]:
+    """Rolling ATR (average true range) over a candle sequence.
+
+    Returns a list of the same length as ``candles``; entries before enough
+    history is available are filled with ``0.0`` so callers can index by bar
+    without branching on ``None``. True range uses the classic Welles Wilder
+    definition: ``max(high - low, abs(high - prev_close), abs(low -
+    prev_close))``. The running mean is a simple rolling window average over
+    the most recent ``lookback`` true-range values — cheap, deterministic, and
+    small-sample-safe.
+    """
+
+    if not candles or lookback <= 0:
+        return [0.0] * len(candles)
+
+    true_ranges: List[float] = []
+    previous_close: Optional[float] = None
+    for candle in candles:
+        high = float(candle.high)
+        low = float(candle.low)
+        close = float(candle.close)
+        if previous_close is None:
+            # First bar has no previous close — fall back to ``high - low``.
+            tr = max(high - low, 0.0)
+        else:
+            tr = max(
+                high - low,
+                abs(high - previous_close),
+                abs(low - previous_close),
+            )
+        true_ranges.append(tr)
+        previous_close = close
+
+    atrs: List[float] = []
+    effective_lookback = max(int(lookback), 1)
+    for index in range(len(true_ranges)):
+        if index + 1 < effective_lookback:
+            atrs.append(0.0)
+            continue
+        window = true_ranges[index + 1 - effective_lookback : index + 1]
+        atrs.append(sum(window) / effective_lookback)
+    return atrs
+
+
+def _classify_volatility_regime(
+    atr_pct: float,
+    thresholds: Optional[VolatilityRegimeThresholds],
+) -> VolatilityRegime:
+    """Classify a single ATR-as-percent-of-price ratio into low / normal / high.
+
+    ``atr_pct`` is expressed as a percentage (``1.0`` == 1%); callers must
+    scale the raw ``atr / price`` ratio by 100 before passing it in. Returns
+    ``"normal"`` whenever ``atr_pct`` lies inside the inclusive band
+    ``[low_pct, high_pct]``; values strictly below ``low_pct`` map to
+    ``"low"`` and values strictly above ``high_pct`` map to ``"high"``.
+    Degenerate / ``None`` threshold payloads fall back to the Round 45
+    defaults.
+    """
+
+    config = thresholds if thresholds is not None else _DEFAULT_REGIME_THRESHOLDS
+    try:
+        low_pct = float(config.low_pct)
+        high_pct = float(config.high_pct)
+    except (TypeError, ValueError):
+        low_pct = float(_DEFAULT_REGIME_THRESHOLDS.low_pct)
+        high_pct = float(_DEFAULT_REGIME_THRESHOLDS.high_pct)
+    if low_pct > high_pct:
+        low_pct, high_pct = high_pct, low_pct
+    if atr_pct < low_pct:
+        return "low"
+    if atr_pct > high_pct:
+        return "high"
+    return "normal"
+
+
+def _resolve_dynamic_risk_per_trade(
+    base_risk: float,
+    regime: VolatilityRegime,
+    multipliers: Optional[RegimeExposureMultipliers],
+) -> float:
+    """Scale the runner's base ``risk_per_trade`` by the regime multiplier.
+
+    Returns a non-negative float. When ``multipliers`` is ``None`` the Round
+    45 defaults apply. Callers pass ``base_risk`` in the same units they use
+    downstream (usually a plain fraction like ``0.01`` for 1%); the helper
+    performs a pure multiplication so no additional unit conversion is
+    required. Negative ``base_risk`` / multiplier values are clamped to zero
+    so a misconfigured strategy never flips the effective side of a position.
+    """
+
+    config = multipliers if multipliers is not None else _DEFAULT_REGIME_MULTIPLIERS
+    try:
+        low_mult = float(config.low)
+        normal_mult = float(config.normal)
+        high_mult = float(config.high)
+    except (TypeError, ValueError):
+        low_mult = float(_DEFAULT_REGIME_MULTIPLIERS.low)
+        normal_mult = float(_DEFAULT_REGIME_MULTIPLIERS.normal)
+        high_mult = float(_DEFAULT_REGIME_MULTIPLIERS.high)
+    mapping: Dict[str, float] = {
+        "low": low_mult,
+        "normal": normal_mult,
+        "high": high_mult,
+    }
+    multiplier = mapping.get(regime, normal_mult)
+    scaled = float(base_risk) * multiplier
+    if scaled < 0.0:
+        return 0.0
+    return scaled
+
+
+@dataclass
+class _VolatilitySizingConfig:
+    """Resolved opt-in volatility sizing configuration for a single runner.
+
+    Mirrors the subset of ``StrategySummary`` fields the runners actually
+    consult during ``entry``. Built once per ``run_local_backtest`` invocation
+    via ``_build_volatility_sizing_config`` and then passed down to each
+    runner so the classifier thresholds / multipliers do not have to be
+    re-parsed for every bar. ``enabled`` is explicitly carried as a flag so
+    runners can short-circuit the ATR lookup entirely on legacy strategies.
+    """
+
+    enabled: bool
+    lookback: int
+    thresholds: VolatilityRegimeThresholds
+    multipliers: RegimeExposureMultipliers
+
+
+def _build_volatility_sizing_config(strategy: StrategySummary) -> _VolatilitySizingConfig:
+    """Resolve the opt-in volatility sizing configuration for ``strategy``.
+
+    Returns a fully-populated ``_VolatilitySizingConfig`` regardless of
+    whether the strategy opted in — ``enabled`` carries the opt-in flag. When
+    ``volatility_sizing_enabled`` is false the remaining fields still hold
+    the Round 45 defaults so any runner branch that (incorrectly) tries to
+    consult them still receives a well-defined payload.
+    """
+
+    enabled = bool(getattr(strategy, "volatility_sizing_enabled", False))
+    raw_lookback = getattr(strategy, "volatility_lookback", 14)
+    try:
+        lookback = max(int(raw_lookback if raw_lookback is not None else 14), 1)
+    except (TypeError, ValueError):
+        lookback = 14
+    thresholds = (
+        getattr(strategy, "volatility_regime_thresholds", None)
+        or _DEFAULT_REGIME_THRESHOLDS
+    )
+    multipliers = (
+        getattr(strategy, "regime_exposure_multipliers", None)
+        or _DEFAULT_REGIME_MULTIPLIERS
+    )
+    return _VolatilitySizingConfig(
+        enabled=enabled,
+        lookback=lookback,
+        thresholds=thresholds,
+        multipliers=multipliers,
+    )
+
+
+def _resolve_entry_regime_and_risk(
+    config: _VolatilitySizingConfig,
+    atr_series: List[float],
+    entry_index: int,
+    entry_price: float,
+    base_risk_per_trade: float,
+) -> tuple[Optional[VolatilityRegime], float]:
+    """Resolve the (regime, applied_risk_per_trade) pair for a single entry.
+
+    When ``config.enabled`` is false the helper returns
+    ``(None, base_risk_per_trade)`` so the calling runner stays bit-exact
+    with pre-R45 behaviour. When enabled, the ATR at ``entry_index`` is
+    divided by the entry price and scaled to percent units, fed through
+    ``_classify_volatility_regime``, and then the base risk budget is scaled
+    via ``_resolve_dynamic_risk_per_trade``.
+    """
+
+    if not config.enabled:
+        return None, float(base_risk_per_trade)
+    if entry_price <= 0 or entry_index < 0 or entry_index >= len(atr_series):
+        # Not enough data to classify — fall back to the base risk so the
+        # runner still makes forward progress. We still return ``"normal"``
+        # so the downstream trade record carries an explicit regime tag.
+        return "normal", float(base_risk_per_trade)
+    atr_value = float(atr_series[entry_index])
+    if atr_value <= 0.0:
+        return "normal", float(base_risk_per_trade)
+    atr_pct = atr_value / entry_price * 100.0
+    regime = _classify_volatility_regime(atr_pct, config.thresholds)
+    applied = _resolve_dynamic_risk_per_trade(
+        base_risk_per_trade, regime, config.multipliers
+    )
+    return regime, applied
+
+
 def _run_trend_follow(
     candles: List[CandlePoint],
     params: Dict[str, object],
     timeframe: str,
     exit_tools: Optional[_ExitToolState] = None,
+    volatility_sizing: Optional[_VolatilitySizingConfig] = None,
 ) -> tuple[BacktestMetrics, bool, List[float], List[BacktestTrade]]:
     fast = max(int(float(params.get("fast_ma", 21))), 2)
     slow = max(int(float(params.get("slow_ma", 55))), fast + 1)
-    risk_per_trade = max(float(params.get("risk_per_trade", 1.0)), 0.2) / 100.0
-    sizing_multiplier = risk_per_trade * 10.0
+    base_risk_per_trade = max(float(params.get("risk_per_trade", 1.0)), 0.2) / 100.0
+    default_sizing_multiplier = base_risk_per_trade * 10.0
     starting_equity = 100000.0
     equity = starting_equity
     equity_curve = [equity]
@@ -1237,6 +1474,16 @@ def _run_trend_follow(
     position_entry_equity = equity
     position_entry_index: Optional[int] = None
     state: Optional[_ExitToolState] = None
+    # Per-entry volatility-regime bookkeeping. Starts as the baseline fixed
+    # risk budget so the pre-R45 path stays bit-exact — the values are
+    # overwritten on every entry when ``volatility_sizing.enabled`` is true.
+    current_sizing_multiplier = default_sizing_multiplier
+    current_applied_risk = base_risk_per_trade
+    current_regime: Optional[VolatilityRegime] = None
+    # Pre-compute the ATR series once so every entry inside the main loop can
+    # index straight into it without reshuffling the candle history.
+    atr_lookback = volatility_sizing.lookback if volatility_sizing else 14
+    atr_series = _compute_bar_atr(candles, atr_lookback)
 
     closes = [candle.close for candle in candles]
     for index in range(slow, len(closes)):
@@ -1247,6 +1494,23 @@ def _run_trend_follow(
             position_entry = price
             position_entry_equity = equity
             position_entry_index = index
+            # Resolve the volatility regime + applied risk for this entry.
+            # When the opt-in flag is false the helper returns the base risk
+            # unchanged and ``regime`` stays ``None`` so trade metadata keeps
+            # the pre-R45 shape.
+            if volatility_sizing is not None and volatility_sizing.enabled:
+                current_regime, current_applied_risk = _resolve_entry_regime_and_risk(
+                    volatility_sizing,
+                    atr_series,
+                    index,
+                    price,
+                    base_risk_per_trade,
+                )
+                current_sizing_multiplier = current_applied_risk * 10.0
+            else:
+                current_regime = None
+                current_applied_risk = base_risk_per_trade
+                current_sizing_multiplier = default_sizing_multiplier
             # Clone the configured exit-tool state so partial-ratio / trailing
             # bookkeeping restarts with every fresh entry. ``exit_tools`` is
             # immutable template-only — we never mutate the caller's copy.
@@ -1263,7 +1527,7 @@ def _run_trend_follow(
             continue
         if position_entry is not None:
             pnl_pct = (price - position_entry) / position_entry * 100.0
-            trade_return = pnl_pct * sizing_multiplier
+            trade_return = pnl_pct * current_sizing_multiplier
             marked_equity = _mark_to_market_equity(position_entry_equity, trade_return)
             forced_close = False
             partial_return_pct = 0.0
@@ -1275,7 +1539,7 @@ def _run_trend_follow(
                     exit_price=price,
                     position_entry=position_entry,
                     position_entry_equity=position_entry_equity,
-                    sizing_multiplier=sizing_multiplier,
+                    sizing_multiplier=current_sizing_multiplier,
                     trades=trades,
                     trade_returns=trade_returns,
                 )
@@ -1285,9 +1549,9 @@ def _run_trend_follow(
             if forced_close or fast_ma < slow_ma:
                 remaining_ratio = state.remaining_ratio if state is not None else 1.0
                 if remaining_ratio > 0.0:
-                    remaining_return = pnl_pct * sizing_multiplier * remaining_ratio
+                    remaining_return = pnl_pct * current_sizing_multiplier * remaining_ratio
                     trade_returns.append(remaining_return)
-                    notional = position_entry_equity * sizing_multiplier * remaining_ratio
+                    notional = position_entry_equity * current_sizing_multiplier * remaining_ratio
                     quantity = notional / position_entry if position_entry > 0 else 0.0
                     trades.append(
                         BacktestTrade(
@@ -1296,6 +1560,8 @@ def _run_trend_follow(
                             entry_price=position_entry,
                             exit_price=price,
                             quantity=quantity,
+                            volatility_regime=current_regime,
+                            applied_risk_per_trade=current_applied_risk,
                         )
                     )
                     equity = _mark_to_market_equity(position_entry_equity, partial_return_pct + remaining_return)
@@ -1321,12 +1587,12 @@ def _run_trend_follow(
             # during the main loop; replay it only to mark equity correctly on
             # the final carried bar.
             partial_return_pct = sum(
-                rung.pnl_pct * sizing_multiplier * rung.fraction_of_original
+                rung.pnl_pct * current_sizing_multiplier * rung.fraction_of_original
                 for rung in state.consumed_rungs
             )
-        trade_return = pnl_pct * sizing_multiplier * remaining_ratio
+        trade_return = pnl_pct * current_sizing_multiplier * remaining_ratio
         trade_returns.append(trade_return)
-        notional = position_entry_equity * sizing_multiplier * remaining_ratio
+        notional = position_entry_equity * current_sizing_multiplier * remaining_ratio
         quantity = notional / position_entry if position_entry > 0 else 0.0
         trades.append(
             BacktestTrade(
@@ -1335,6 +1601,8 @@ def _run_trend_follow(
                 entry_price=position_entry,
                 exit_price=price,
                 quantity=quantity,
+                volatility_regime=current_regime,
+                applied_risk_per_trade=current_applied_risk,
             )
         )
         equity = _mark_to_market_equity(position_entry_equity, partial_return_pct + trade_return)
@@ -1346,7 +1614,7 @@ def _run_trend_follow(
             equity_curve,
             equity,
             closes,
-            max(risk_per_trade * 8.0, 0.6),
+            max(base_risk_per_trade * 8.0, 0.6),
         )
         used_reference_path = True
 
@@ -1367,11 +1635,18 @@ def _run_mean_reversion(
     params: Dict[str, object],
     timeframe: str,
     exit_tools: Optional[_ExitToolState] = None,
+    volatility_sizing: Optional[_VolatilitySizingConfig] = None,
 ) -> tuple[BacktestMetrics, bool, List[float], List[BacktestTrade]]:
     entry = max(float(params.get("zscore_entry", 2.0)), 0.5)
     exit_value = max(float(params.get("zscore_exit", 0.5)), 0.1)
     stop_loss_pct = max(float(params.get("stop_loss_pct", 1.0)), 0.2)
-    sizing_multiplier = 0.9
+    # Mean-reversion runner's baseline exposure: 0.9 (== 90% of equity per
+    # trade). We name it ``base_risk_per_trade`` so the volatility sizer can
+    # scale it consistently with the trend/breakout runners. The default
+    # sizing multiplier *is* the base risk — this runner already uses the
+    # fraction directly rather than multiplying by 10 like trend-follow.
+    base_risk_per_trade = 0.9
+    default_sizing_multiplier = base_risk_per_trade
     lookback = 20
     starting_equity = 100000.0
     equity = starting_equity
@@ -1382,6 +1657,11 @@ def _run_mean_reversion(
     position_entry_equity = equity
     position_entry_index: Optional[int] = None
     state: Optional[_ExitToolState] = None
+    current_sizing_multiplier = default_sizing_multiplier
+    current_applied_risk = base_risk_per_trade
+    current_regime: Optional[VolatilityRegime] = None
+    atr_lookback = volatility_sizing.lookback if volatility_sizing else 14
+    atr_series = _compute_bar_atr(candles, atr_lookback)
 
     closes = [candle.close for candle in candles]
     for index in range(lookback, len(closes)):
@@ -1394,6 +1674,19 @@ def _run_mean_reversion(
             position_entry = price
             position_entry_equity = equity
             position_entry_index = index
+            if volatility_sizing is not None and volatility_sizing.enabled:
+                current_regime, current_applied_risk = _resolve_entry_regime_and_risk(
+                    volatility_sizing,
+                    atr_series,
+                    index,
+                    price,
+                    base_risk_per_trade,
+                )
+                current_sizing_multiplier = current_applied_risk
+            else:
+                current_regime = None
+                current_applied_risk = base_risk_per_trade
+                current_sizing_multiplier = default_sizing_multiplier
             state = (
                 _ExitToolState(
                     trailing_stop_pct=exit_tools.trailing_stop_pct,
@@ -1407,7 +1700,7 @@ def _run_mean_reversion(
             continue
         if position_entry is not None:
             pnl_pct = (price - position_entry) / position_entry * 100.0
-            adjusted_return = pnl_pct * sizing_multiplier
+            adjusted_return = pnl_pct * current_sizing_multiplier
             marked_equity = _mark_to_market_equity(position_entry_equity, adjusted_return)
             forced_close = False
             partial_return_pct = 0.0
@@ -1419,7 +1712,7 @@ def _run_mean_reversion(
                     exit_price=price,
                     position_entry=position_entry,
                     position_entry_equity=position_entry_equity,
-                    sizing_multiplier=sizing_multiplier,
+                    sizing_multiplier=current_sizing_multiplier,
                     trades=trades,
                     trade_returns=trade_returns,
                 )
@@ -1429,11 +1722,12 @@ def _run_mean_reversion(
             if forced_close or zscore >= -exit_value or pnl_pct <= -stop_loss_pct:
                 remaining_ratio = state.remaining_ratio if state is not None else 1.0
                 if remaining_ratio > 0.0:
-                    remaining_return = pnl_pct * sizing_multiplier * remaining_ratio
+                    remaining_return = pnl_pct * current_sizing_multiplier * remaining_ratio
                     trade_returns.append(remaining_return)
-                    # Effective notional stake: runner scales raw pnl_pct by 0.9
-                    # so the committed exposure is 90% of the entry equity.
-                    notional = position_entry_equity * sizing_multiplier * remaining_ratio
+                    # Effective notional stake: runner scales raw pnl_pct by the
+                    # dynamic sizing multiplier so the committed exposure is
+                    # a regime-scaled fraction of the entry equity.
+                    notional = position_entry_equity * current_sizing_multiplier * remaining_ratio
                     quantity = notional / position_entry if position_entry > 0 else 0.0
                     trades.append(
                         BacktestTrade(
@@ -1442,6 +1736,8 @@ def _run_mean_reversion(
                             entry_price=position_entry,
                             exit_price=price,
                             quantity=quantity,
+                            volatility_regime=current_regime,
+                            applied_risk_per_trade=current_applied_risk,
                         )
                     )
                     equity = _mark_to_market_equity(position_entry_equity, partial_return_pct + remaining_return)
@@ -1463,12 +1759,12 @@ def _run_mean_reversion(
         partial_return_pct = 0.0
         if state is not None:
             partial_return_pct = sum(
-                rung.pnl_pct * sizing_multiplier * rung.fraction_of_original
+                rung.pnl_pct * current_sizing_multiplier * rung.fraction_of_original
                 for rung in state.consumed_rungs
             )
-        adjusted_return = pnl_pct * sizing_multiplier * remaining_ratio
+        adjusted_return = pnl_pct * current_sizing_multiplier * remaining_ratio
         trade_returns.append(adjusted_return)
-        notional = position_entry_equity * sizing_multiplier * remaining_ratio
+        notional = position_entry_equity * current_sizing_multiplier * remaining_ratio
         quantity = notional / position_entry if position_entry > 0 else 0.0
         trades.append(
             BacktestTrade(
@@ -1477,6 +1773,8 @@ def _run_mean_reversion(
                 entry_price=position_entry,
                 exit_price=closes[-1],
                 quantity=quantity,
+                volatility_regime=current_regime,
+                applied_risk_per_trade=current_applied_risk,
             )
         )
         equity = _mark_to_market_equity(position_entry_equity, partial_return_pct + adjusted_return)
@@ -1509,12 +1807,19 @@ def _run_breakout(
     params: Dict[str, object],
     timeframe: str,
     exit_tools: Optional[_ExitToolState] = None,
+    volatility_sizing: Optional[_VolatilitySizingConfig] = None,
 ) -> tuple[BacktestMetrics, bool, List[float], List[BacktestTrade]]:
     breakout_window = max(int(float(params.get("breakout_window", 18))), 5)
     volume_ratio = max(float(params.get("volume_ratio", 1.2)), 1.0)
     max_hold_hours = max(float(params.get("max_hold_hours", 6)), 1.0)
     max_hold_bars = max(1, int(max_hold_hours / _timeframe_hours(timeframe)))
-    sizing_multiplier = 0.85
+    # Breakout runner's baseline exposure: 0.85 (== 85% of equity per trade).
+    # Named ``base_risk_per_trade`` so the volatility sizer can scale it
+    # consistently with the trend/mean-revert runners. The default sizing
+    # multiplier *is* the base risk — this runner applies it directly like
+    # the mean-reversion runner.
+    base_risk_per_trade = 0.85
+    default_sizing_multiplier = base_risk_per_trade
     starting_equity = 100000.0
     equity = starting_equity
     equity_curve = [equity]
@@ -1525,6 +1830,11 @@ def _run_breakout(
     position_entry_index: Optional[int] = None
     hold_bars = 0
     state: Optional[_ExitToolState] = None
+    current_sizing_multiplier = default_sizing_multiplier
+    current_applied_risk = base_risk_per_trade
+    current_regime: Optional[VolatilityRegime] = None
+    atr_lookback = volatility_sizing.lookback if volatility_sizing else 14
+    atr_series = _compute_bar_atr(candles, atr_lookback)
 
     for index in range(breakout_window, len(candles)):
         history = candles[index - breakout_window:index]
@@ -1537,6 +1847,19 @@ def _run_breakout(
                 position_entry_equity = equity
                 position_entry_index = index
                 hold_bars = 0
+                if volatility_sizing is not None and volatility_sizing.enabled:
+                    current_regime, current_applied_risk = _resolve_entry_regime_and_risk(
+                        volatility_sizing,
+                        atr_series,
+                        index,
+                        candle.close,
+                        base_risk_per_trade,
+                    )
+                    current_sizing_multiplier = current_applied_risk
+                else:
+                    current_regime = None
+                    current_applied_risk = base_risk_per_trade
+                    current_sizing_multiplier = default_sizing_multiplier
                 state = (
                     _ExitToolState(
                         trailing_stop_pct=exit_tools.trailing_stop_pct,
@@ -1553,7 +1876,7 @@ def _run_breakout(
 
         hold_bars += 1
         pnl_pct = (candle.close - position_entry) / position_entry * 100.0
-        adjusted = pnl_pct * sizing_multiplier
+        adjusted = pnl_pct * current_sizing_multiplier
         marked_equity = _mark_to_market_equity(position_entry_equity, adjusted)
         forced_close = False
         partial_return_pct = 0.0
@@ -1565,7 +1888,7 @@ def _run_breakout(
                 exit_price=candle.close,
                 position_entry=position_entry,
                 position_entry_equity=position_entry_equity,
-                sizing_multiplier=sizing_multiplier,
+                sizing_multiplier=current_sizing_multiplier,
                 trades=trades,
                 trade_returns=trade_returns,
             )
@@ -1575,12 +1898,13 @@ def _run_breakout(
         if forced_close or hold_bars >= max_hold_bars or pnl_pct <= -1.8 or pnl_pct >= 4.2:
             remaining_ratio = state.remaining_ratio if state is not None else 1.0
             if remaining_ratio > 0.0:
-                remaining_return = pnl_pct * sizing_multiplier * remaining_ratio
+                remaining_return = pnl_pct * current_sizing_multiplier * remaining_ratio
                 trade_returns.append(remaining_return)
-                # Runner scales raw pnl_pct by 0.85, so committed exposure is
-                # 85% of the entry equity. Deriving ``quantity`` from the
-                # notional keeps ``entry_price * quantity == notional``.
-                notional = position_entry_equity * sizing_multiplier * remaining_ratio
+                # Runner scales raw pnl_pct by the dynamic sizing multiplier,
+                # so committed exposure is a regime-scaled fraction of the
+                # entry equity. Deriving ``quantity`` from the notional keeps
+                # ``entry_price * quantity == notional``.
+                notional = position_entry_equity * current_sizing_multiplier * remaining_ratio
                 quantity = notional / position_entry if position_entry > 0 else 0.0
                 trades.append(
                     BacktestTrade(
@@ -1589,6 +1913,8 @@ def _run_breakout(
                         entry_price=position_entry,
                         exit_price=candle.close,
                         quantity=quantity,
+                        volatility_regime=current_regime,
+                        applied_risk_per_trade=current_applied_risk,
                     )
                 )
                 equity = _mark_to_market_equity(position_entry_equity, partial_return_pct + remaining_return)
@@ -1609,12 +1935,12 @@ def _run_breakout(
         partial_return_pct = 0.0
         if state is not None:
             partial_return_pct = sum(
-                rung.pnl_pct * sizing_multiplier * rung.fraction_of_original
+                rung.pnl_pct * current_sizing_multiplier * rung.fraction_of_original
                 for rung in state.consumed_rungs
             )
-        adjusted = pnl_pct * sizing_multiplier * remaining_ratio
+        adjusted = pnl_pct * current_sizing_multiplier * remaining_ratio
         trade_returns.append(adjusted)
-        notional = position_entry_equity * sizing_multiplier * remaining_ratio
+        notional = position_entry_equity * current_sizing_multiplier * remaining_ratio
         quantity = notional / position_entry if position_entry > 0 else 0.0
         trades.append(
             BacktestTrade(
@@ -1623,6 +1949,8 @@ def _run_breakout(
                 entry_price=position_entry,
                 exit_price=candles[-1].close,
                 quantity=quantity,
+                volatility_regime=current_regime,
+                applied_risk_per_trade=current_applied_risk,
             )
         )
         equity = _mark_to_market_equity(position_entry_equity, partial_return_pct + adjusted)
@@ -1664,12 +1992,24 @@ def run_local_backtest(strategy: StrategySummary, candles: List[CandlePoint], ti
     # cleanly for every new trade. ``None`` fields on the strategy collapse to
     # a fully inert template — existing behavior stays bit-exact.
     exit_tools = _build_exit_tool_state(strategy)
+    # Round 45 opt-in volatility-regime-aware sizing: resolved once per run so
+    # the runners can cheaply classify each entry's ATR% bucket and scale
+    # their baseline risk_per_trade. When ``volatility_sizing_enabled`` is
+    # false the config's ``enabled`` flag is also false and the runners take
+    # the legacy fixed-sizing path bit-exact.
+    volatility_sizing = _build_volatility_sizing_config(strategy)
     if strategy.id.startswith("trend-"):
-        metrics, used_reference_path, final_equity_curve, final_trades = _run_trend_follow(effective_candles, params, timeframe, exit_tools)
+        metrics, used_reference_path, final_equity_curve, final_trades = _run_trend_follow(
+            effective_candles, params, timeframe, exit_tools, volatility_sizing
+        )
     elif strategy.id.startswith("eth-revert") or "均值回归" in strategy.name:
-        metrics, used_reference_path, final_equity_curve, final_trades = _run_mean_reversion(effective_candles, params, timeframe, exit_tools)
+        metrics, used_reference_path, final_equity_curve, final_trades = _run_mean_reversion(
+            effective_candles, params, timeframe, exit_tools, volatility_sizing
+        )
     else:
-        metrics, used_reference_path, final_equity_curve, final_trades = _run_breakout(effective_candles, params, timeframe, exit_tools)
+        metrics, used_reference_path, final_equity_curve, final_trades = _run_breakout(
+            effective_candles, params, timeframe, exit_tools, volatility_sizing
+        )
     bars_per_year = 365 * 24 / _timeframe_hours(timeframe)
     volatility_stats = _compute_volatility_stats(
         final_equity_curve,

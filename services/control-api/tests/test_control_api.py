@@ -19157,5 +19157,524 @@ class StrategyExitToolsUnitTests(unittest.TestCase):
         self.assertEqual(hint["partial_take_profits"], [])
 
 
+class VolatilityRegimeSizingUnitTests(unittest.TestCase):
+    """Round 45 opt-in ATR-based volatility regime sizing.
+
+    Covers the four additive pieces the engine acquired: ``_compute_bar_atr``,
+    ``_classify_volatility_regime``, ``_resolve_dynamic_risk_per_trade`` and
+    the wiring through the breakout runner + strategy-runtime hint layer.
+    Tests stay tightly focused on the new behaviour — the classic fixed-
+    sizing path is already exercised by ``StrategyExitToolsUnitTests`` and
+    the main backtest test suites, so the fixtures here only reshape the
+    candle stream as far as is needed to pin down a specific regime branch.
+    """
+
+    # Lookback window matches ``_run_breakout``'s clamped minimum. A 5-bar
+    # lookback keeps the fixtures compact while still giving the ATR / regime
+    # helpers enough data to produce a stable classification on the breakout
+    # bar (index 5).
+    BREAKOUT_WINDOW = 5
+    BREAKOUT_BAR = 5
+
+    def _breakout_strategy(
+        self,
+        *,
+        volatility_sizing_enabled: bool = False,
+        volatility_lookback: Optional[int] = 14,
+        volatility_target_pct: Optional[float] = None,
+        thresholds: Optional[Any] = None,
+        multipliers: Optional[Any] = None,
+    ) -> Any:
+        from models import StrategySummary
+
+        return StrategySummary(
+            id="brk-vol-sizing-01",
+            name="VolatilitySizingBreakout",
+            category="template",
+            status="running",
+            symbols=["BTCUSDT"],
+            mode=AccountMode.PAPER,
+            version="v1",
+            pnl_7d="+0.0%",
+            max_drawdown="-0.0%",
+            risk_budget="18%",
+            description="volatility-sizing unit test",
+            parameters=[
+                StrategyParameter(key="breakout_window", label="bw", value=self.BREAKOUT_WINDOW),
+                StrategyParameter(key="volume_ratio", label="vr", value=1.0),
+                # Large max-hold so the position carries to end-of-series and
+                # the single-trade regime metadata is stable.
+                StrategyParameter(key="max_hold_hours", label="mh", value=2000),
+            ],
+            volatility_sizing_enabled=volatility_sizing_enabled,
+            volatility_lookback=volatility_lookback,
+            volatility_target_pct=volatility_target_pct,
+            volatility_regime_thresholds=thresholds,
+            regime_exposure_multipliers=multipliers,
+        )
+
+    def _candles(
+        self,
+        prices: List[float],
+        *,
+        bar_range_pct: float = 0.001,
+    ) -> List[Any]:
+        """Build CandlePoints where each bar has a ``close = price`` and a
+        symmetric ``high / low`` wrapper scaled by ``bar_range_pct``.
+
+        The wrapper is the only knob the ATR helper reacts to, so shrinking
+        ``bar_range_pct`` produces a "calm" regime and inflating it produces
+        a "volatile" regime without affecting the breakout-signal logic
+        (which only keys on closes / volumes).
+        """
+
+        candles: List[Any] = []
+        for index, price in enumerate(prices):
+            spread = price * bar_range_pct
+            candles.append(
+                backtest_engine.CandlePoint(
+                    time=f"2026-02-{(index % 28) + 1:02d}T{index % 24:02d}:00:00+00:00",
+                    open=price,
+                    high=price + spread,
+                    low=price - spread,
+                    close=price,
+                    volume=1000.0 * (3.0 if index == self.BREAKOUT_BAR else 1.0),
+                )
+            )
+        return candles
+
+    # ------------------------------------------------------------------
+    # _compute_bar_atr
+    # ------------------------------------------------------------------
+
+    def test_compute_bar_atr_returns_zero_for_bars_before_lookback_warmup(self) -> None:
+        """Rolling ATR must emit ``0.0`` for bars that do not yet have
+        ``lookback`` true ranges behind them. First bar's TR collapses to
+        ``high - low`` because there is no previous close.
+        """
+
+        candles = [
+            backtest_engine.CandlePoint(
+                time=f"2026-01-0{idx + 1}T00:00:00+00:00",
+                open=100.0,
+                high=101.0,
+                low=99.0,
+                close=100.0,
+                volume=1.0,
+            )
+            for idx in range(3)
+        ]
+        atrs = backtest_engine._compute_bar_atr(candles, lookback=3)
+        # Indices 0 and 1 warm up the window; index 2 is the first fully-
+        # populated bar. With uniform TR == 2.0 across all bars the first
+        # full-window average is exactly 2.0.
+        self.assertEqual(atrs[0], 0.0)
+        self.assertEqual(atrs[1], 0.0)
+        self.assertAlmostEqual(atrs[2], 2.0, places=6)
+
+    def test_compute_bar_atr_uses_previous_close_for_true_range_gap(self) -> None:
+        """True range must incorporate ``abs(high - prev_close)`` so an
+        overnight gap is reflected even when the intra-bar ``high - low``
+        spread is small.
+        """
+
+        # Bar 1: high=102, low=98, close=100 -> TR = 4 (high - low)
+        # Bar 2: high=110, low=109, close=110, prev_close=100 ->
+        #        TR = max(1, |110 - 100|, |109 - 100|) = 10 (gap dominates)
+        candles = [
+            backtest_engine.CandlePoint(
+                time="2026-01-01T00:00:00+00:00",
+                open=100.0,
+                high=102.0,
+                low=98.0,
+                close=100.0,
+                volume=1.0,
+            ),
+            backtest_engine.CandlePoint(
+                time="2026-01-02T00:00:00+00:00",
+                open=110.0,
+                high=110.0,
+                low=109.0,
+                close=110.0,
+                volume=1.0,
+            ),
+        ]
+        atrs = backtest_engine._compute_bar_atr(candles, lookback=2)
+        # Index 1 is the first bar where the rolling window is fully
+        # populated: mean([4.0, 10.0]) == 7.0.
+        self.assertEqual(atrs[0], 0.0)
+        self.assertAlmostEqual(atrs[1], 7.0, places=6)
+
+    def test_compute_bar_atr_empty_candles_or_non_positive_lookback(self) -> None:
+        """Degenerate inputs must short-circuit to an all-zero list of the
+        same length as ``candles`` — callers rely on len-preservation so the
+        ATR series can be indexed by bar directly.
+        """
+
+        empty = backtest_engine._compute_bar_atr([], lookback=14)
+        self.assertEqual(empty, [])
+        candles = [
+            backtest_engine.CandlePoint(
+                time="2026-01-01T00:00:00+00:00",
+                open=100.0,
+                high=101.0,
+                low=99.0,
+                close=100.0,
+                volume=1.0,
+            )
+        ]
+        self.assertEqual(
+            backtest_engine._compute_bar_atr(candles, lookback=0),
+            [0.0],
+        )
+
+    # ------------------------------------------------------------------
+    # _classify_volatility_regime
+    # ------------------------------------------------------------------
+
+    def test_classify_volatility_regime_three_way_split(self) -> None:
+        """``atr_pct < low_pct`` -> ``"low"``, ``atr_pct > high_pct`` ->
+        ``"high"``, boundary band inclusive -> ``"normal"``.
+        """
+
+        from models import VolatilityRegimeThresholds
+
+        thresholds = VolatilityRegimeThresholds(low_pct=0.5, high_pct=1.5)
+        self.assertEqual(
+            backtest_engine._classify_volatility_regime(0.25, thresholds),
+            "low",
+        )
+        self.assertEqual(
+            backtest_engine._classify_volatility_regime(1.0, thresholds),
+            "normal",
+        )
+        self.assertEqual(
+            backtest_engine._classify_volatility_regime(2.5, thresholds),
+            "high",
+        )
+        # Boundaries are inclusive of the normal band — exactly ``low_pct``
+        # and ``high_pct`` must not classify as low / high respectively.
+        self.assertEqual(
+            backtest_engine._classify_volatility_regime(0.5, thresholds),
+            "normal",
+        )
+        self.assertEqual(
+            backtest_engine._classify_volatility_regime(1.5, thresholds),
+            "normal",
+        )
+
+    def test_classify_volatility_regime_handles_none_thresholds_via_defaults(self) -> None:
+        """``None`` thresholds must trigger the Round 45 default split rather
+        than raising. Default low / high are 0.5 / 1.5 in percent units.
+        """
+
+        self.assertEqual(
+            backtest_engine._classify_volatility_regime(0.1, None),
+            "low",
+        )
+        self.assertEqual(
+            backtest_engine._classify_volatility_regime(3.0, None),
+            "high",
+        )
+
+    # ------------------------------------------------------------------
+    # _resolve_dynamic_risk_per_trade
+    # ------------------------------------------------------------------
+
+    def test_resolve_dynamic_risk_per_trade_applies_multiplier(self) -> None:
+        """``base_risk * multiplier[regime]`` with the classic 1.2 / 1.0 /
+        0.6 defaults. Negative results clamp to zero so a misconfigured
+        multiplier can never flip the effective side of a position.
+        """
+
+        from models import RegimeExposureMultipliers
+
+        multipliers = RegimeExposureMultipliers(low=1.2, normal=1.0, high=0.6)
+        self.assertAlmostEqual(
+            backtest_engine._resolve_dynamic_risk_per_trade(0.01, "low", multipliers),
+            0.012,
+            places=6,
+        )
+        self.assertAlmostEqual(
+            backtest_engine._resolve_dynamic_risk_per_trade(0.01, "normal", multipliers),
+            0.01,
+            places=6,
+        )
+        self.assertAlmostEqual(
+            backtest_engine._resolve_dynamic_risk_per_trade(0.01, "high", multipliers),
+            0.006,
+            places=6,
+        )
+
+    def test_resolve_dynamic_risk_per_trade_clamps_negative_inputs_to_zero(self) -> None:
+        from models import RegimeExposureMultipliers
+
+        multipliers = RegimeExposureMultipliers(low=1.0, normal=1.0, high=-0.5)
+        self.assertEqual(
+            backtest_engine._resolve_dynamic_risk_per_trade(0.02, "high", multipliers),
+            0.0,
+        )
+
+    # ------------------------------------------------------------------
+    # Runner wiring + trade metadata
+    # ------------------------------------------------------------------
+
+    def test_backtest_high_volatility_entry_reduces_applied_risk_per_trade(self) -> None:
+        """High-volatility ATR% should drop ``applied_risk_per_trade`` below
+        the breakout runner's baseline (0.85) when the opt-in flag is true.
+        """
+
+        from models import RegimeExposureMultipliers, VolatilityRegimeThresholds
+
+        thresholds = VolatilityRegimeThresholds(low_pct=0.5, high_pct=1.5)
+        multipliers = RegimeExposureMultipliers(low=1.2, normal=1.0, high=0.6)
+        strategy = self._breakout_strategy(
+            volatility_sizing_enabled=True,
+            volatility_lookback=3,
+            thresholds=thresholds,
+            multipliers=multipliers,
+        )
+
+        # Pre-entry lookback bars carry a 4% bar range so the ATR at the
+        # breakout bar comfortably exceeds ``high_pct = 1.5%`` of the entry
+        # price. Breakout price jumps modestly above the prior high so the
+        # signal fires exactly once.
+        candles = self._candles(
+            [100, 101, 102, 103, 104, 110, 112, 113],
+            bar_range_pct=0.04,
+        )
+
+        result = backtest_engine.run_local_backtest(
+            strategy,
+            candles,
+            "1h",
+            "2026-02-01 ~ 2026-02-05",
+        )
+
+        # Reach into the engine for the raw trade records — the public
+        # metrics payload only carries aggregates so we have to go through
+        # the runner to inspect the new metadata fields.
+        effective = candles
+        params = backtest_engine._parameter_map(strategy)
+        exit_tools = backtest_engine._build_exit_tool_state(strategy)
+        sizing_config = backtest_engine._build_volatility_sizing_config(strategy)
+        _metrics, _used_ref, _equity, trades = backtest_engine._run_breakout(
+            effective, params, "1h", exit_tools, sizing_config
+        )
+
+        self.assertGreaterEqual(len(trades), 1)
+        first_trade = trades[0]
+        self.assertEqual(first_trade.volatility_regime, "high")
+        self.assertIsNotNone(first_trade.applied_risk_per_trade)
+        # Baseline breakout ``risk_per_trade`` is 0.85. High regime scales by
+        # 0.6 so the applied risk must land around 0.51.
+        self.assertAlmostEqual(first_trade.applied_risk_per_trade, 0.85 * 0.6, places=4)
+        # Sanity check: result metrics still round-trip despite the smaller
+        # exposure (no division-by-zero / NaN slipping through).
+        self.assertGreaterEqual(result.metrics.trades, 1)
+
+    def test_backtest_without_opt_in_preserves_baseline_risk_per_trade(self) -> None:
+        """With ``volatility_sizing_enabled=False`` the applied risk must
+        exactly equal the runner's baseline and ``volatility_regime`` must
+        stay ``None`` — pre-R45 bit-exact behaviour.
+        """
+
+        strategy = self._breakout_strategy(volatility_sizing_enabled=False)
+        candles = self._candles(
+            [100, 101, 102, 103, 104, 110, 112, 113],
+            bar_range_pct=0.001,
+        )
+
+        effective = candles
+        params = backtest_engine._parameter_map(strategy)
+        exit_tools = backtest_engine._build_exit_tool_state(strategy)
+        sizing_config = backtest_engine._build_volatility_sizing_config(strategy)
+        _metrics, _used_ref, _equity, trades = backtest_engine._run_breakout(
+            effective, params, "1h", exit_tools, sizing_config
+        )
+
+        self.assertGreaterEqual(len(trades), 1)
+        first_trade = trades[0]
+        self.assertIsNone(first_trade.volatility_regime)
+        # Baseline ``risk_per_trade`` for the breakout runner is 0.85 when
+        # volatility sizing is off — the trade metadata must echo it.
+        self.assertAlmostEqual(first_trade.applied_risk_per_trade, 0.85, places=4)
+
+    def test_backtest_low_volatility_entry_scales_up_applied_risk_per_trade(self) -> None:
+        """Low-volatility ATR% should push ``applied_risk_per_trade`` above
+        the breakout runner's baseline (0.85 × 1.2 == 1.02).
+        """
+
+        from models import RegimeExposureMultipliers, VolatilityRegimeThresholds
+
+        thresholds = VolatilityRegimeThresholds(low_pct=0.5, high_pct=1.5)
+        multipliers = RegimeExposureMultipliers(low=1.2, normal=1.0, high=0.6)
+        strategy = self._breakout_strategy(
+            volatility_sizing_enabled=True,
+            volatility_lookback=3,
+            thresholds=thresholds,
+            multipliers=multipliers,
+        )
+
+        # Very tight intra-bar ranges AND a very small breakout jump so the
+        # ATR at the breakout bar stays below the ``low_pct = 0.5%`` band.
+        # Bar prices: 100, 100.1, 100.2, 100.3, 100.4, 100.5 (breakout),
+        # then 100.7, 100.9 — the breakout of 0.1 over the prior max (100.4)
+        # is just enough to trigger the signal without inflating the ATR.
+        candles = self._candles(
+            [100.0, 100.1, 100.2, 100.3, 100.4, 100.5, 100.7, 100.9],
+            bar_range_pct=0.0001,
+        )
+
+        effective = candles
+        params = backtest_engine._parameter_map(strategy)
+        exit_tools = backtest_engine._build_exit_tool_state(strategy)
+        sizing_config = backtest_engine._build_volatility_sizing_config(strategy)
+        _metrics, _used_ref, _equity, trades = backtest_engine._run_breakout(
+            effective, params, "1h", exit_tools, sizing_config
+        )
+
+        self.assertGreaterEqual(len(trades), 1)
+        first_trade = trades[0]
+        self.assertEqual(first_trade.volatility_regime, "low")
+        self.assertAlmostEqual(first_trade.applied_risk_per_trade, 0.85 * 1.2, places=4)
+
+    # ------------------------------------------------------------------
+    # strategy_runtime hint wiring
+    # ------------------------------------------------------------------
+
+    def test_strategy_runtime_hints_surface_volatility_sizing_when_enabled(self) -> None:
+        """``compute_strategy_runtime_risk_hints`` must pass the volatility
+        sizing opt-in fields through to the panel-facing payload.
+        """
+        import strategy_runtime
+        from models import (
+            MarketDetail,
+            RegimeExposureMultipliers,
+            VolatilityRegimeThresholds,
+        )
+
+        strategy = self._breakout_strategy(
+            volatility_sizing_enabled=True,
+            volatility_lookback=21,
+            volatility_target_pct=1.25,
+            thresholds=VolatilityRegimeThresholds(low_pct=0.3, high_pct=1.7),
+            multipliers=RegimeExposureMultipliers(low=1.4, normal=1.0, high=0.5),
+        )
+
+        closes = [100.0 + idx * 0.1 for idx in range(12)]
+        candles = [
+            CandlePoint(
+                time=f"2026-02-{(idx % 28) + 1:02d}T{idx % 24:02d}:00:00",
+                open=close,
+                high=close * 1.002,
+                low=close * 0.998,
+                close=close,
+                volume=1000.0,
+            )
+            for idx, close in enumerate(closes)
+        ]
+        detail = MarketDetail(
+            symbol="BTCUSDT",
+            market="perp",
+            timeframe="1h",
+            candles=candles,
+            bids=[],
+            asks=[],
+            headline="vol-sizing test",
+            stats={},
+            source="fallback",
+        )
+        watch_item = WatchlistInstrument(
+            symbol="BTCUSDT",
+            market="perp",
+            last_price=closes[-1],
+            change_24h=0.5,
+            volume_24h=5_000.0,
+            signal="active",
+            position_side="flat",
+            risk_level="medium",
+        )
+
+        hint = strategy_runtime.compute_strategy_runtime_risk_hints(
+            strategy=strategy,
+            detail=detail,
+            watch_item=watch_item,
+        )
+
+        self.assertTrue(hint["volatility_sizing_enabled"])
+        self.assertEqual(hint["volatility_lookback"], 21)
+        self.assertAlmostEqual(hint["volatility_target_pct"], 1.25, places=4)
+        self.assertIsInstance(hint["regime_thresholds"], dict)
+        self.assertAlmostEqual(hint["regime_thresholds"]["low_pct"], 0.3, places=4)
+        self.assertAlmostEqual(hint["regime_thresholds"]["high_pct"], 1.7, places=4)
+        self.assertIsInstance(hint["regime_multipliers"], dict)
+        self.assertAlmostEqual(hint["regime_multipliers"]["low"], 1.4, places=4)
+        self.assertAlmostEqual(hint["regime_multipliers"]["normal"], 1.0, places=4)
+        self.assertAlmostEqual(hint["regime_multipliers"]["high"], 0.5, places=4)
+
+    def test_strategy_runtime_hints_without_volatility_sizing_remain_backwards_compatible(
+        self,
+    ) -> None:
+        """Legacy strategies (no opt-in) still expose the five new keys so
+        schema consumers never see a missing field — but
+        ``volatility_sizing_enabled`` must be False and override fields must
+        be ``None`` so panels can short-circuit the new section.
+        """
+        import strategy_runtime
+        from models import MarketDetail
+
+        strategy = self._breakout_strategy()  # all vol-sizing fields default
+        closes = [100.0 + idx * 0.1 for idx in range(8)]
+        candles = [
+            CandlePoint(
+                time=f"2026-02-0{idx + 1}T00:00:00",
+                open=close,
+                high=close,
+                low=close,
+                close=close,
+                volume=1000.0,
+            )
+            for idx, close in enumerate(closes)
+        ]
+        detail = MarketDetail(
+            symbol="BTCUSDT",
+            market="perp",
+            timeframe="1h",
+            candles=candles,
+            bids=[],
+            asks=[],
+            headline="no-vol-sizing test",
+            stats={},
+            source="fallback",
+        )
+        watch_item = WatchlistInstrument(
+            symbol="BTCUSDT",
+            market="perp",
+            last_price=closes[-1],
+            change_24h=0.5,
+            volume_24h=5_000.0,
+            signal="active",
+            position_side="flat",
+            risk_level="medium",
+        )
+
+        hint = strategy_runtime.compute_strategy_runtime_risk_hints(
+            strategy=strategy,
+            detail=detail,
+            watch_item=watch_item,
+        )
+
+        self.assertFalse(hint["volatility_sizing_enabled"])
+        # ``volatility_lookback`` defaults to 14 on ``StrategySummary`` so the
+        # hint echoes that default even when the opt-in flag is false — this
+        # is explicit so panels can preview the lookback they would use if
+        # the strategy later flips the flag on.
+        self.assertEqual(hint["volatility_lookback"], 14)
+        self.assertIsNone(hint["volatility_target_pct"])
+        self.assertIsNone(hint["regime_thresholds"])
+        self.assertIsNone(hint["regime_multipliers"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
