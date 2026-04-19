@@ -5,6 +5,9 @@ export type BuildAuditWorkspaceSurfaceArgsInput = {
   source: BuildAppPresentationModelsArgs
 }
 
+const defaultOpenClawGatewayUrl =
+  (import.meta.env.VITE_OPENCLAW_GATEWAY_URL as string | undefined) ?? 'ws://127.0.0.1:18789'
+
 export function buildAuditWorkspaceSurfaceArgs({
   source,
 }: BuildAuditWorkspaceSurfaceArgsInput): BuildAppWorkspaceModelsArgsInput['auditWorkspace'] {
@@ -27,7 +30,7 @@ export function buildAuditWorkspaceSurfaceArgs({
       filteredAuditEvents,
       configWebEntry: settings?.bybit_web_entry ?? 'https://www.bybit-global.com/',
       configApiBaseUrl: settings?.api_base_url ?? 'https://api.bybit.com',
-      configGatewayUrl: openClawStatus?.gateway_url ?? settings?.openclaw_gateway_url ?? 'ws://127.0.0.1:18789',
+      configGatewayUrl: openClawStatus?.gateway_url ?? settings?.openclaw_gateway_url ?? defaultOpenClawGatewayUrl,
     },
   }
 }

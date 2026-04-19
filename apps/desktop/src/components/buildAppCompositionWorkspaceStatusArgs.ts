@@ -1,6 +1,9 @@
 import { formatTime, schedulerLabel } from '../utils/app-helpers'
 import type { BuildAppCompositionModelArgs, BuildAppCompositionModelArgsInput } from './buildAppCompositionModelArgTypes'
 
+const defaultOpenClawGatewayUrl =
+  (import.meta.env.VITE_OPENCLAW_GATEWAY_URL as string | undefined) ?? 'ws://127.0.0.1:18789'
+
 export function buildAppCompositionWorkspaceStatusArgs({
   actionFeedback,
   headlineAlert,
@@ -35,7 +38,7 @@ export function buildAppCompositionWorkspaceStatusArgs({
     schedulerFreezePublish: Boolean(snapshot?.scheduler.freeze_publish),
     openClawReachable: Boolean(openClawStatus?.reachable),
     openClawGatewayUrl:
-      openClawStatus?.gateway_url ?? settings?.openclaw_gateway_url ?? 'ws://127.0.0.1:18789',
+      openClawStatus?.gateway_url ?? settings?.openclaw_gateway_url ?? defaultOpenClawGatewayUrl,
     workspaceUpdatedAt: workspacePreferences?.updated_at,
   }
 }

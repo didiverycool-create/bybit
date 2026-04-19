@@ -478,10 +478,13 @@ const fallbackAudit: ExecutionEvent[] = [
   },
 ]
 
+const fallbackOpenClawGatewayUrl =
+  (import.meta.env.VITE_OPENCLAW_GATEWAY_URL as string | undefined) ?? 'ws://127.0.0.1:18789'
+
 const fallbackSettings: SettingsPayload = {
   bybit_web_entry: 'https://www.bybit-global.com/',
   api_base_url: 'https://api.bybit.com',
-  openclaw_gateway_url: 'ws://127.0.0.1:18789',
+  openclaw_gateway_url: fallbackOpenClawGatewayUrl,
   openclaw_agent: 'codex',
   default_mode: 'paper',
   notification_channels: ['desktop', 'telegram', 'email'],
@@ -548,7 +551,7 @@ const fallbackOpenClawStatus: OpenClawStatus = {
   config_path: '~/.openclaw/openclaw.json',
   config_exists: false,
   command_available: false,
-  gateway_url: 'ws://127.0.0.1:18789',
+  gateway_url: fallbackOpenClawGatewayUrl,
   auth_mode: 'token',
   default_agent: 'codex',
   heartbeat: '30m',

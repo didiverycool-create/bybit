@@ -26,6 +26,10 @@ const controlApiBase =
   process.env.BYBIT_CONTROL_API_BASE ??
   process.env.VITE_CONTROL_API_BASE ??
   "http://127.0.0.1:8787";
+const devServerUrl =
+  process.env.BYBIT_DEV_SERVER_URL ??
+  process.env.VITE_DEV_SERVER_URL ??
+  "http://localhost:5173";
 
 app.disableHardwareAcceleration();
 
@@ -118,7 +122,7 @@ function createWindow() {
     backgroundColor: "#0b1220",
     preloadPath: defaultPreloadPath(__dirname),
     isDev,
-    devServerUrl: "http://localhost:5173",
+    devServerUrl,
     productionIndexPath: defaultProductionIndexPath(__dirname),
     shouldOpenDevTools,
     shouldRunRequestedSmoke,
