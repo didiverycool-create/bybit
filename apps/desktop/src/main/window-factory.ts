@@ -130,15 +130,44 @@ export function createMainWindow(options: CreateMainWindowOptions): BrowserWindo
     }
   });
 
-  win.on("move", () => onPersistBounds(win));
-  win.on("resize", () => onPersistBounds(win));
-  win.on("maximize", () => onPersistBounds(win));
-  win.on("unmaximize", () => onPersistBounds(win));
+  // Debounce move/resize persistence: these events fire continuously while the user
+  // drags the title bar or resize handle, and syncing the JSON file on every pixel
+  // would thrash the disk. maximize/unmaximize/close remain immediate because they
+  // are discrete/terminal and we must not lose the latest state on exit.
+  const persistDebounceMs = 500;
+  let persistTimer: NodeJS.Timeout | null = null;
+  const cancelPendingPersist = () => {
+    if (persistTimer) {
+      clearTimeout(persistTimer);
+      persistTimer = null;
+    }
+  };
+  const schedulePersist = () => {
+    cancelPendingPersist();
+    persistTimer = setTimeout(() => {
+      persistTimer = null;
+      if (!win.isDestroyed()) {
+        onPersistBounds(win);
+      }
+    }, persistDebounceMs);
+  };
+  const flushPersist = () => {
+    cancelPendingPersist();
+    if (!win.isDestroyed()) {
+      onPersistBounds(win);
+    }
+  };
+
+  win.on("move", () => schedulePersist());
+  win.on("resize", () => schedulePersist());
+  win.on("maximize", () => flushPersist());
+  win.on("unmaximize", () => flushPersist());
   win.on("show", () => onTrayMenuShouldUpdate());
   win.on("hide", () => onTrayMenuShouldUpdate());
   win.on("focus", () => onTrayMenuShouldUpdate());
-  win.on("close", () => onPersistBounds(win));
+  win.on("close", () => flushPersist());
   win.on("closed", () => {
+    cancelPendingPersist();
     onClosed(win);
     onTrayMenuShouldUpdate();
   });
