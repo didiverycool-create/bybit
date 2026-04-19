@@ -5,7 +5,7 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import RLock
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
 from uuid import uuid4
 
 from models import (
@@ -3461,6 +3461,59 @@ class AppRepository:
         )
         return job
 
+    def _queue_summarize_execution_impact(
+        self,
+        *,
+        strategy_id: str,
+        strategy_name: str,
+        window_start: str,
+        window_end: str,
+        order_count: int,
+        fill_count: int,
+        total_notional: float,
+        slippage_bps: float,
+        expected_pnl: float,
+        realized_pnl: float,
+        anomalies: Optional[List[Dict[str, Any]]] = None,
+        requested_by: Optional[str] = None,
+    ) -> str:
+        """Queue a ``summarize_execution_impact`` AgentJob and return its id.
+
+        Mirrors the other ``_queue_*_locked`` helpers: the caller must already
+        hold ``self._lock``. The context dict is populated verbatim from the
+        keyword arguments so ``build_agent_job_prompt`` in ``main.py`` can
+        pick the values up with the same keys. ``anomalies`` defaults to an
+        empty list rather than ``None`` to keep the downstream JSON prompt
+        stable.
+        """
+
+        context: Dict[str, Any] = {
+            "strategy_id": strategy_id,
+            "strategy_name": strategy_name,
+            "window_start": window_start,
+            "window_end": window_end,
+            "order_count": order_count,
+            "fill_count": fill_count,
+            "total_notional": total_notional,
+            "slippage_bps": slippage_bps,
+            "expected_pnl": expected_pnl,
+            "realized_pnl": realized_pnl,
+            "anomalies": list(anomalies) if anomalies else [],
+            "requested_by": requested_by,
+        }
+        payload = AgentJobCreate(
+            job_type="summarize_execution_impact",
+            context=context,
+            allowed_actions=["summarize_execution_impact"],
+            timeout=60,
+            idempotency_key=(
+                f"summarize-execution-impact-{strategy_id}-{window_start}-{window_end}"
+            ),
+            writeback_target="strategy_activity",
+        )
+        job = self._create_agent_job_locked(payload, source="quant-core")
+        return job.id
+
     def _find_proposal(self, proposal_id: str) -> StrategyProposal:
         for review in self.state.reviews:
             for proposal in review.proposals:
@@ -3621,6 +3674,47 @@ class AppRepository:
             self._refresh_derived_state()
             self._persist()
             return record
+
+    def queue_summarize_execution_impact(
+        self,
+        *,
+        strategy_id: str,
+        strategy_name: str,
+        window_start: str,
+        window_end: str,
+        order_count: int,
+        fill_count: int,
+        total_notional: float,
+        slippage_bps: float,
+        expected_pnl: float,
+        realized_pnl: float,
+        anomalies: Optional[List[Dict[str, Any]]] = None,
+        requested_by: Optional[str] = None,
+    ) -> str:
+        """Public wrapper around :meth:`_queue_summarize_execution_impact`.
+
+        Acquires ``self._lock`` and persists the mutated state before returning
+        the new AgentJob id so callers outside the locked helpers can trigger
+        execution-impact summarization without threading concerns.
+        """
+
+        with self._lock:
+            job_id = self._queue_summarize_execution_impact(
+                strategy_id=strategy_id,
+                strategy_name=strategy_name,
+                window_start=window_start,
+                window_end=window_end,
+                order_count=order_count,
+                fill_count=fill_count,
+                total_notional=total_notional,
+                slippage_bps=slippage_bps,
+                expected_pnl=expected_pnl,
+                realized_pnl=realized_pnl,
+                anomalies=anomalies,
+                requested_by=requested_by,
+            )
+            self._persist()
+            return job_id
 
     def update_settings(self, payload: SettingsUpdatePayload) -> SettingsPayload:
         with self._lock:

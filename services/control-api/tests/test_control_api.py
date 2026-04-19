@@ -17546,6 +17546,84 @@ class BacktestReviewResponseUnitTests(unittest.TestCase):
         )
 
 
+class QueueSummarizeExecutionImpactUnitTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._agent_jobs_backup = copy.deepcopy(control_main.repo.state.agent_jobs)
+        self.addCleanup(self._restore_agent_jobs)
+
+    def _restore_agent_jobs(self) -> None:
+        control_main.repo.state.agent_jobs = self._agent_jobs_backup
+
+    def test_queue_summarize_execution_impact_enqueues_agent_job_with_full_context(self) -> None:
+        anomalies = [
+            {"type": "slippage_spike", "detail": "滑点突增至 18bps"},
+            {"type": "fill_rate_drop", "detail": "成交率从 92% 跌至 78%"},
+        ]
+
+        job_id = control_main.repo.queue_summarize_execution_impact(
+            strategy_id="trend-btc-01",
+            strategy_name="Trend BTC",
+            window_start="2026-04-19T08:00:00+08:00",
+            window_end="2026-04-19T09:00:00+08:00",
+            order_count=12,
+            fill_count=10,
+            total_notional=125_400.5,
+            slippage_bps=4.8,
+            expected_pnl=820.0,
+            realized_pnl=745.2,
+            anomalies=anomalies,
+            requested_by="desktop_operator",
+        )
+
+        self.assertIsInstance(job_id, str)
+        self.assertTrue(job_id)
+
+        job = next(
+            (item for item in control_main.repo.state.agent_jobs if item.id == job_id),
+            None,
+        )
+        self.assertIsNotNone(job, "新入队的 AgentJob 应能在 repo.state.agent_jobs 中找到")
+        assert job is not None  # for type narrowing
+        self.assertEqual(job.job_type, "summarize_execution_impact")
+        self.assertEqual(job.context["strategy_id"], "trend-btc-01")
+        self.assertEqual(job.context["strategy_name"], "Trend BTC")
+        self.assertEqual(job.context["window_start"], "2026-04-19T08:00:00+08:00")
+        self.assertEqual(job.context["window_end"], "2026-04-19T09:00:00+08:00")
+        self.assertEqual(job.context["order_count"], 12)
+        self.assertEqual(job.context["fill_count"], 10)
+        self.assertEqual(job.context["total_notional"], 125_400.5)
+        self.assertEqual(job.context["slippage_bps"], 4.8)
+        self.assertEqual(job.context["expected_pnl"], 820.0)
+        self.assertEqual(job.context["realized_pnl"], 745.2)
+        self.assertEqual(job.context["requested_by"], "desktop_operator")
+        self.assertIsInstance(job.context["anomalies"], list)
+        self.assertEqual(job.context["anomalies"], anomalies)
+
+    def test_queue_summarize_execution_impact_empty_anomalies_becomes_list(self) -> None:
+        job_id = control_main.repo.queue_summarize_execution_impact(
+            strategy_id="eth-revert-02",
+            strategy_name="Revert ETH",
+            window_start="2026-04-19T10:00:00+08:00",
+            window_end="2026-04-19T11:00:00+08:00",
+            order_count=3,
+            fill_count=3,
+            total_notional=12_340.0,
+            slippage_bps=1.1,
+            expected_pnl=42.0,
+            realized_pnl=40.5,
+            anomalies=None,
+        )
+
+        job = next(
+            (item for item in control_main.repo.state.agent_jobs if item.id == job_id),
+            None,
+        )
+        self.assertIsNotNone(job)
+        assert job is not None
+        self.assertEqual(job.context["anomalies"], [])
+        self.assertIsInstance(job.context["anomalies"], list)
+
+
 class ExecutionImpactResponseUnitTests(unittest.TestCase):
     def test_parses_structured_json_payload(self) -> None:
         from openclaw_client import OpenClawGatewayClient  # type: ignore
