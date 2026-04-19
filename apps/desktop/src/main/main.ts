@@ -1,4 +1,5 @@
 import { app, BrowserWindow, Tray, screen } from "electron";
+import { applyAppMenu } from "./app-menu";
 import { registerDesktopIpcHandlers } from "./ipc-handlers";
 import { applyTrayMenu, createTray as createTrayInstance, createTrayIcon } from "./tray";
 import {
@@ -140,6 +141,14 @@ app.whenReady().then(() => {
   registerDesktopIpcHandlers({ fallbackNotificationTitle: appTitle });
   createWindow();
   createTray();
+  applyAppMenu({
+    appTitle,
+    isDev,
+    onToggleMainWindow: () => toggleMainWindow(),
+    onReload: () => mainWindow?.webContents.reload(),
+    onToggleDevTools: () => mainWindow?.webContents.toggleDevTools(),
+    onQuit: () => app.quit(),
+  });
 
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) {

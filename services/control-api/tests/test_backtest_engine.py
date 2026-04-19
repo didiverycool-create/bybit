@@ -554,5 +554,149 @@ class BacktestEngineUnitTests(unittest.TestCase):
         self.assertLessEqual(rhythm.longest_losing_streak_bars, rhythm.negative_bars)
 
 
+    def test_compute_benchmark_stats_returns_zeroed_on_empty_inputs(self) -> None:
+        # Any degenerate input (empty, single-point, or one-side-only) must
+        # collapse to the all-zero default payload rather than raising —
+        # downstream consumers treat zero-fill as "unavailable".
+        for equity, path in (
+            ([], []),
+            ([], [100.0, 110.0]),
+            ([100_000.0, 101_000.0], []),
+            ([100_000.0], [100.0]),
+            ([100_000.0], [100.0, 110.0]),
+        ):
+            stats = backtest_engine._compute_benchmark_stats(equity, path, bars_per_year=365.0)
+            self.assertIsInstance(stats, backtest_engine.BacktestBenchmarkStats)
+            self.assertEqual(stats.buy_hold_return_pct, 0.0)
+            self.assertEqual(stats.buy_hold_max_drawdown_pct, 0.0)
+            self.assertEqual(stats.strategy_over_buy_hold_pct, 0.0)
+            self.assertEqual(stats.alpha_pct, 0.0)
+            self.assertEqual(stats.correlation, 0.0)
+            self.assertEqual(stats.tracking_error_pct, 0.0)
+
+    def test_compute_benchmark_stats_handles_mismatched_lengths_by_truncation(self) -> None:
+        # Feed a longer equity curve than price path — the helper must align
+        # both series to the shorter length before computing returns, so the
+        # resulting stats depend only on the overlapping prefix.
+        long_equity = [100_000.0, 101_000.0, 102_010.0, 103_030.1, 104_060.4]
+        short_path = [100.0, 101.0, 102.01]
+        truncated_stats = backtest_engine._compute_benchmark_stats(
+            long_equity,
+            short_path,
+            bars_per_year=365.0,
+        )
+
+        # Reference computation: truncate equity to ``len(short_path)``.
+        reference_stats = backtest_engine._compute_benchmark_stats(
+            long_equity[: len(short_path)],
+            short_path,
+            bars_per_year=365.0,
+        )
+        self.assertEqual(truncated_stats, reference_stats)
+        # Sanity-check: the buy-and-hold return derives solely from the
+        # price-path endpoints (102.01 / 100.0 - 1 ≈ 2.01%).
+        self.assertAlmostEqual(truncated_stats.buy_hold_return_pct, round(2.01, 4), places=4)
+
+    def test_compute_benchmark_stats_measures_strategy_outperformance(self) -> None:
+        # Strategy equity curve grows significantly faster than the price
+        # path over the same window → ``strategy_over_buy_hold_pct`` must be
+        # strictly positive and equal to the realized return gap.
+        equity_curve = [100_000.0, 110_000.0, 121_000.0, 133_100.0]
+        price_path = [100.0, 101.0, 102.01, 103.0301]
+        stats = backtest_engine._compute_benchmark_stats(
+            equity_curve,
+            price_path,
+            bars_per_year=365.0,
+        )
+
+        strategy_total_return = (equity_curve[-1] / equity_curve[0] - 1.0) * 100.0
+        buy_hold_return = (price_path[-1] / price_path[0] - 1.0) * 100.0
+        expected_gap = strategy_total_return - buy_hold_return
+        self.assertAlmostEqual(
+            stats.strategy_over_buy_hold_pct,
+            round(expected_gap, 4),
+            places=4,
+        )
+        self.assertGreater(stats.strategy_over_buy_hold_pct, 0.0)
+        # Alpha is the annualized gap; with a positive gap and a positive
+        # annualization multiplier it must itself be strictly positive.
+        self.assertGreater(stats.alpha_pct, 0.0)
+        self.assertAlmostEqual(
+            stats.buy_hold_return_pct,
+            round(buy_hold_return, 4),
+            places=4,
+        )
+
+    def test_compute_benchmark_stats_correlation_near_one_for_identical_paths(self) -> None:
+        # When the strategy equity curve mirrors the reference price path
+        # (same per-bar return shape), Pearson correlation must saturate at
+        # 1.0 and the tracking error collapses to zero.
+        price_path = [100.0, 101.0, 99.5, 102.0, 98.0, 103.5]
+        equity_curve = [value * 1_000.0 for value in price_path]
+        stats = backtest_engine._compute_benchmark_stats(
+            equity_curve,
+            price_path,
+            bars_per_year=365.0,
+        )
+
+        self.assertAlmostEqual(stats.correlation, 1.0, places=4)
+        self.assertAlmostEqual(stats.tracking_error_pct, 0.0, places=4)
+
+    def test_compute_benchmark_stats_correlation_zero_when_price_path_is_flat(self) -> None:
+        # Flat price path ⇒ zero-variance price returns ⇒ Pearson correlation
+        # is undefined; the helper must emit 0.0 rather than raising or
+        # propagating a division-by-zero NaN.
+        equity_curve = [100_000.0, 101_000.0, 99_500.0, 102_300.0]
+        flat_path = [100.0, 100.0, 100.0, 100.0]
+        stats = backtest_engine._compute_benchmark_stats(
+            equity_curve,
+            flat_path,
+            bars_per_year=365.0,
+        )
+
+        self.assertEqual(stats.correlation, 0.0)
+        # Buy-and-hold on a flat path produces zero return and zero drawdown.
+        self.assertEqual(stats.buy_hold_return_pct, 0.0)
+        self.assertEqual(stats.buy_hold_max_drawdown_pct, 0.0)
+
+    def test_run_local_backtest_attaches_benchmark_stats_to_computation(self) -> None:
+        strategy = StrategySummary(
+            id="trend-btc-01",
+            name="BTC 趋势跟随",
+            category="template",
+            status="running",
+            symbols=["BTCUSDT"],
+            mode="paper",
+            version="v1",
+            pnl_7d="+0.0%",
+            max_drawdown="-0.0%",
+            risk_budget="18%",
+            description="test",
+            parameters=[
+                StrategyParameter(key="fast_ma", label="Fast", value=2),
+                StrategyParameter(key="slow_ma", label="Slow", value=3),
+                StrategyParameter(key="risk_per_trade", label="Risk", value=1.0),
+            ],
+        )
+        candles = [
+            backtest_engine.CandlePoint(time=f"2026-03-31T0{index}:00:00+08:00", open=price, high=price, low=price, close=price, volume=1000)
+            for index, price in enumerate([100.0, 101.0, 102.0, 103.0, 90.0, 106.0])
+        ]
+
+        result = backtest_engine.run_local_backtest(strategy, candles, "1h", "2026-03-01 ~ 2026-03-31")
+
+        self.assertIsNotNone(result.benchmark_stats)
+        benchmark = result.benchmark_stats
+        self.assertIsInstance(benchmark, backtest_engine.BacktestBenchmarkStats)
+        # End-to-end wiring sanity check: correlation must be a finite float
+        # in [-1.0, 1.0] and the other descriptors must also be floats.
+        self.assertIsInstance(benchmark.correlation, float)
+        self.assertGreaterEqual(benchmark.correlation, -1.0)
+        self.assertLessEqual(benchmark.correlation, 1.0)
+        self.assertIsInstance(benchmark.buy_hold_return_pct, float)
+        self.assertIsInstance(benchmark.strategy_over_buy_hold_pct, float)
+        self.assertIsInstance(benchmark.tracking_error_pct, float)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1079,6 +1079,197 @@ class OpenClawGatewayClient:
             "raw_text": raw_text,
         }
 
+    # ------------------------------------------------------------------
+    # Execution impact (``summarize_execution_impact``)
+    # ------------------------------------------------------------------
+    # Canonical impact-level vocabulary for the post-decision execution
+    # impact summary. Prompt emits one of ``negligible`` / ``moderate`` /
+    # ``significant`` but agents frequently echo Chinese synonyms or
+    # adjacent English terms; we normalize those here. Unknown values
+    # degrade to ``"moderate"`` via
+    # ``parse_execution_impact_response`` — the conservative middle
+    # ground so downstream renderers neither under- nor over-sell an
+    # ambiguous change.
+    _EXECUTION_IMPACT_LEVEL_ALIASES: Dict[str, str] = {
+        "negligible": "negligible",
+        "small": "negligible",
+        "tiny": "negligible",
+        "minor": "negligible",
+        "可忽略": "negligible",
+        "忽略": "negligible",
+        "轻微": "negligible",
+        "moderate": "moderate",
+        "normal": "moderate",
+        "mid": "moderate",
+        "medium": "moderate",
+        "中等": "moderate",
+        "一般": "moderate",
+        "significant": "significant",
+        "major": "significant",
+        "large": "significant",
+        "high": "significant",
+        "critical": "significant",
+        "显著": "significant",
+        "重大": "significant",
+    }
+
+    # Canonical direction vocabulary (how the decision moved execution
+    # quality / PnL). Unknown values degrade to ``"neutral"``.
+    _EXECUTION_IMPACT_DIRECTION_ALIASES: Dict[str, str] = {
+        "improved": "improved",
+        "better": "improved",
+        "positive": "improved",
+        "up": "improved",
+        "改善": "improved",
+        "提升": "improved",
+        "neutral": "neutral",
+        "unchanged": "neutral",
+        "flat": "neutral",
+        "持平": "neutral",
+        "中性": "neutral",
+        "worsened": "worsened",
+        "worse": "worsened",
+        "negative": "worsened",
+        "down": "worsened",
+        "degraded": "worsened",
+        "恶化": "worsened",
+        "下降": "worsened",
+    }
+
+    @classmethod
+    def _coerce_execution_impact_level(cls, value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            return None
+        token = str(value).strip().lower()
+        if not token:
+            return None
+        if token in cls._EXECUTION_IMPACT_LEVEL_ALIASES:
+            return cls._EXECUTION_IMPACT_LEVEL_ALIASES[token]
+        for alias, canonical in cls._EXECUTION_IMPACT_LEVEL_ALIASES.items():
+            if alias in token:
+                return canonical
+        return None
+
+    @classmethod
+    def _coerce_execution_impact_direction(cls, value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            return None
+        token = str(value).strip().lower()
+        if not token:
+            return None
+        if token in cls._EXECUTION_IMPACT_DIRECTION_ALIASES:
+            return cls._EXECUTION_IMPACT_DIRECTION_ALIASES[token]
+        for alias, canonical in cls._EXECUTION_IMPACT_DIRECTION_ALIASES.items():
+            if alias in token:
+                return canonical
+        return None
+
+    @classmethod
+    def parse_execution_impact_response(cls, text: Optional[str]) -> Dict[str, Any]:
+        """Parse the structured response for a ``summarize_execution_impact`` agent job.
+
+        Accepts either a JSON object of the form
+        ``{"summary", "impact_level", "direction", "affected_orders",
+        "affected_positions", "metrics_deltas", "follow_up_checks"}`` or
+        a plain-text fallback. ``impact_level`` is normalized to one of
+        ``negligible`` / ``moderate`` / ``significant`` and ``direction``
+        to one of ``improved`` / ``neutral`` / ``worsened``; unknown
+        values degrade to ``"moderate"`` and ``"neutral"`` respectively
+        so downstream renderers never have to substitute a default
+        themselves.
+
+        The returned dict always contains ``summary``, ``impact_level``,
+        ``direction``, ``affected_orders``, ``affected_positions``,
+        ``metrics_deltas``, ``follow_up_checks`` and ``raw_text`` so the
+        worker loop never has to branch on whether OpenClaw produced
+        JSON.
+        """
+
+        raw_text = text if isinstance(text, str) else ""
+        stripped = raw_text.strip()
+        if not stripped:
+            return {
+                "summary": "",
+                "impact_level": "moderate",
+                "direction": "neutral",
+                "affected_orders": [],
+                "affected_positions": [],
+                "metrics_deltas": [],
+                "follow_up_checks": [],
+                "raw_text": raw_text,
+            }
+
+        parsed = cls._extract_first_json_object(stripped)
+        summary: str
+        impact_level: Optional[str]
+        direction: Optional[str]
+        affected_orders: List[str]
+        affected_positions: List[str]
+        metrics_deltas: List[str]
+        follow_up_checks: List[str]
+        if isinstance(parsed, dict):
+            summary = str(parsed.get("summary") or "").strip()
+            impact_level = cls._coerce_execution_impact_level(
+                parsed.get("impact_level")
+                if parsed.get("impact_level") is not None
+                else parsed.get("level")
+            )
+            direction = cls._coerce_execution_impact_direction(parsed.get("direction"))
+            affected_orders_raw = parsed.get("affected_orders")
+            if affected_orders_raw is None:
+                affected_orders_raw = parsed.get("orders")
+            if affected_orders_raw is None:
+                affected_orders_raw = parsed.get("order_ids")
+            affected_orders = cls._coerce_newline_string_list(affected_orders_raw)
+            affected_positions_raw = parsed.get("affected_positions")
+            if affected_positions_raw is None:
+                affected_positions_raw = parsed.get("positions")
+            if affected_positions_raw is None:
+                affected_positions_raw = parsed.get("position_ids")
+            affected_positions = cls._coerce_newline_string_list(affected_positions_raw)
+            metrics_deltas_raw = parsed.get("metrics_deltas")
+            if metrics_deltas_raw is None:
+                metrics_deltas_raw = parsed.get("deltas")
+            if metrics_deltas_raw is None:
+                metrics_deltas_raw = parsed.get("metric_deltas")
+            metrics_deltas = cls._coerce_newline_string_list(metrics_deltas_raw)
+            follow_up_checks_raw = parsed.get("follow_up_checks")
+            if follow_up_checks_raw is None:
+                follow_up_checks_raw = parsed.get("checks")
+            if follow_up_checks_raw is None:
+                follow_up_checks_raw = parsed.get("follow_ups")
+            follow_up_checks = cls._coerce_newline_string_list(follow_up_checks_raw)
+        else:
+            summary = stripped
+            impact_level = None
+            direction = None
+            affected_orders = []
+            affected_positions = []
+            metrics_deltas = []
+            follow_up_checks = []
+
+        if not summary:
+            summary = "OpenClaw 已返回执行影响摘要。"
+
+        return {
+            "summary": summary,
+            "impact_level": impact_level or "moderate",
+            "direction": direction or "neutral",
+            "affected_orders": affected_orders,
+            "affected_positions": affected_positions,
+            "metrics_deltas": metrics_deltas,
+            "follow_up_checks": follow_up_checks,
+            "raw_text": raw_text,
+        }
+
     def get_status(self, worker_state: Optional[Dict[str, Any]] = None) -> OpenClawStatus:
         config = self._load_config()
         gateway = config.get("gateway", {})

@@ -91,6 +91,38 @@ class BacktestTradeRhythmStats:
 
 
 @dataclass
+class BacktestBenchmarkStats:
+    """Compare the simulated strategy equity curve against a passive buy-and-hold
+    of the reference price path (close-of-candles sequence).
+
+    All percentage fields are plain numbers (``1.23`` == 1.23%). Fields default
+    to ``0.0`` so degenerate inputs (empty curve / flat price path / mismatched
+    lengths) yield a fully populated payload instead of raising — downstream
+    consumers can treat missing data as "unavailable" rather than "error".
+
+    - ``buy_hold_return_pct``: ``(final / initial - 1) × 100`` for the price
+      path; represents the passive holder's total return over the window.
+    - ``buy_hold_max_drawdown_pct``: the deepest drawdown of the price path
+      itself (already a negative percent, matching ``_compute_max_drawdown``).
+    - ``strategy_over_buy_hold_pct``: ``(strategy_total_return − buy_hold_return)
+      × 100`` in percent units; positive == strategy outperforms passive hold.
+    - ``alpha_pct``: ``strategy_over_buy_hold_pct`` annualized by
+      ``bars_per_year / max(len(equity_curve) − 1, 1)``.
+    - ``correlation``: Pearson correlation between strategy and price-path
+      period returns; zero when either series has zero variance.
+    - ``tracking_error_pct``: population stdev of the per-bar return
+      differences, already expressed in percent units.
+    """
+
+    buy_hold_return_pct: float = 0.0
+    buy_hold_max_drawdown_pct: float = 0.0
+    strategy_over_buy_hold_pct: float = 0.0
+    alpha_pct: float = 0.0
+    correlation: float = 0.0
+    tracking_error_pct: float = 0.0
+
+
+@dataclass
 class BacktestComputation:
     metrics: BacktestMetrics
     notes: str
@@ -109,6 +141,7 @@ class BacktestComputation:
     volatility_stats: Optional[BacktestVolatilityStats] = None
     risk_ratios: Optional[BacktestRiskRatios] = None
     trade_rhythm_stats: Optional[BacktestTradeRhythmStats] = None
+    benchmark_stats: Optional[BacktestBenchmarkStats] = None
 
 
 def _parameter_map(strategy: StrategySummary) -> Dict[str, object]:
@@ -416,6 +449,94 @@ def _compute_trade_rhythm_stats(period_returns: List[float]) -> BacktestTradeRhy
         avg_positive_bar_return_pct=round(avg_positive, 4),
         avg_negative_bar_return_pct=round(avg_negative, 4),
         median_bar_return_pct=round(median_return, 4),
+    )
+
+
+def _compute_benchmark_stats(
+    equity_curve: List[float],
+    reference_path: List[float],
+    bars_per_year: float,
+) -> BacktestBenchmarkStats:
+    """Compare the simulated equity curve against a passive buy-and-hold of the
+    reference price path.
+
+    Degenerate inputs (empty / single-point series) yield an all-zero
+    ``BacktestBenchmarkStats`` rather than raising, so downstream consumers can
+    treat missing data as "unavailable" without branching on ``None``. When the
+    two series have different lengths we truncate to the shorter tail so the
+    per-bar return diffs always line up index-for-index.
+    """
+
+    if len(equity_curve) < 2 or len(reference_path) < 2:
+        return BacktestBenchmarkStats()
+
+    # Align lengths by truncating from the right — strategy runners always
+    # extend the equity curve in lock-step with the candle index, so trimming
+    # the longer tail keeps both series anchored at the same starting point.
+    trimmed_length = min(len(equity_curve), len(reference_path))
+    aligned_equity = equity_curve[:trimmed_length]
+    aligned_path = reference_path[:trimmed_length]
+
+    strategy_returns = _compute_period_returns(aligned_equity)
+    price_returns = _compute_period_returns(aligned_path)
+    # ``_compute_period_returns`` skips bars whose previous equity is
+    # non-positive; realign by truncating to the shorter return series so the
+    # per-bar diffs below never run off the end.
+    paired_length = min(len(strategy_returns), len(price_returns))
+    strategy_returns = strategy_returns[:paired_length]
+    price_returns = price_returns[:paired_length]
+
+    if aligned_path[0] > 0:
+        buy_hold_return_pct = (aligned_path[-1] / aligned_path[0] - 1.0) * 100.0
+    else:
+        buy_hold_return_pct = 0.0
+    buy_hold_max_drawdown_pct = _compute_max_drawdown(aligned_path)
+
+    if aligned_equity[0] > 0:
+        strategy_total_return_pct = (aligned_equity[-1] / aligned_equity[0] - 1.0) * 100.0
+    else:
+        strategy_total_return_pct = 0.0
+    strategy_over_buy_hold_pct = strategy_total_return_pct - buy_hold_return_pct
+
+    span_bars = max(len(aligned_equity) - 1, 1)
+    if bars_per_year > 0:
+        alpha_pct = strategy_over_buy_hold_pct * bars_per_year / span_bars
+    else:
+        alpha_pct = 0.0
+
+    # Pearson correlation with a zero-variance guard: if either leg is flat
+    # (``pstdev == 0``) the correlation is undefined, so we emit 0.0 rather
+    # than propagating a division by zero. Mirrors the defensive posture of
+    # ``_compute_sharpe`` / ``_compute_risk_ratios``.
+    correlation = 0.0
+    if len(strategy_returns) >= 2 and len(price_returns) >= 2:
+        strategy_std = pstdev(strategy_returns)
+        price_std = pstdev(price_returns)
+        if strategy_std > 0 and price_std > 0:
+            strategy_mean = mean(strategy_returns)
+            price_mean = mean(price_returns)
+            covariance = sum(
+                (s - strategy_mean) * (p - price_mean)
+                for s, p in zip(strategy_returns, price_returns)
+            ) / len(strategy_returns)
+            correlation = covariance / (strategy_std * price_std)
+
+    # Tracking error: population stdev of the per-bar return differences.
+    # ``_compute_period_returns`` already emits values in percent units, so
+    # the diffs are percent-in-percent-out — no additional scaling required.
+    if len(strategy_returns) >= 2:
+        return_diffs = [s - p for s, p in zip(strategy_returns, price_returns)]
+        tracking_error_pct = pstdev(return_diffs)
+    else:
+        tracking_error_pct = 0.0
+
+    return BacktestBenchmarkStats(
+        buy_hold_return_pct=round(buy_hold_return_pct, 4),
+        buy_hold_max_drawdown_pct=round(buy_hold_max_drawdown_pct, 4),
+        strategy_over_buy_hold_pct=round(strategy_over_buy_hold_pct, 4),
+        alpha_pct=round(alpha_pct, 4),
+        correlation=round(correlation, 4),
+        tracking_error_pct=round(tracking_error_pct, 4),
     )
 
 
@@ -727,6 +848,17 @@ def run_local_backtest(strategy: StrategySummary, candles: List[CandlePoint], ti
         bars_per_year,
     )
     trade_rhythm_stats = _compute_trade_rhythm_stats(period_returns)
+    # Benchmark stats compare the realized strategy equity curve against a
+    # passive buy-and-hold of the reference price path. The strategy runners
+    # do not export the path explicitly, so we reconstruct it here from the
+    # effective-candle closes — these are the exact prices the runners
+    # consumed when building ``final_equity_curve``.
+    reference_price_path = [candle.close for candle in effective_candles]
+    benchmark_stats = _compute_benchmark_stats(
+        final_equity_curve,
+        reference_price_path,
+        bars_per_year,
+    )
 
     notes = (
         f"由本地回测引擎基于 Bybit 历史 {timeframe} K 线生成，区间 {data_range}，"
@@ -754,4 +886,5 @@ def run_local_backtest(strategy: StrategySummary, candles: List[CandlePoint], ti
         volatility_stats=volatility_stats,
         risk_ratios=risk_ratios,
         trade_rhythm_stats=trade_rhythm_stats,
+        benchmark_stats=benchmark_stats,
     )

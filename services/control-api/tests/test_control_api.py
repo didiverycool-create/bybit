@@ -17321,5 +17321,229 @@ class BacktestReviewResponseUnitTests(unittest.TestCase):
         )
 
 
+class ExecutionImpactResponseUnitTests(unittest.TestCase):
+    def test_parses_structured_json_payload(self) -> None:
+        from openclaw_client import OpenClawGatewayClient  # type: ignore
+
+        raw = (
+            '{"summary": "调仓后整体执行质量小幅提升",'
+            ' "impact_level": "moderate",'
+            ' "direction": "improved",'
+            ' "affected_orders": ["ORD-101", "ORD-102"],'
+            ' "affected_positions": ["BTCUSDT-LONG"],'
+            ' "metrics_deltas": ["slippage +3bps", "fill rate -12%"],'
+            ' "follow_up_checks": ["观察明日滑点", "复核撤单率"]}'
+        )
+        parsed = OpenClawGatewayClient.parse_execution_impact_response(raw)
+        self.assertEqual(parsed["summary"], "调仓后整体执行质量小幅提升")
+        self.assertEqual(parsed["impact_level"], "moderate")
+        self.assertEqual(parsed["direction"], "improved")
+        self.assertEqual(parsed["affected_orders"], ["ORD-101", "ORD-102"])
+        self.assertEqual(parsed["affected_positions"], ["BTCUSDT-LONG"])
+        self.assertEqual(
+            parsed["metrics_deltas"],
+            ["slippage +3bps", "fill rate -12%"],
+        )
+        self.assertEqual(
+            parsed["follow_up_checks"],
+            ["观察明日滑点", "复核撤单率"],
+        )
+        self.assertEqual(parsed["raw_text"], raw)
+
+    def test_parses_from_fenced_code_block(self) -> None:
+        from openclaw_client import OpenClawGatewayClient  # type: ignore
+
+        raw = (
+            "Impact follows:\n"
+            "```json\n"
+            '{"summary": "加仓决策触发后市场滑点恶化",'
+            ' "impact_level": "significant",'
+            ' "direction": "worsened",'
+            ' "affected_orders": "ORD-501\\nORD-502",'
+            ' "affected_positions": ["ETHUSDT-SHORT"],'
+            ' "metrics_deltas": "slippage +12bps\\nfill rate -20%",'
+            ' "follow_up_checks": "复盘撮合链路\\n评估对冲策略"}\n'
+            "```"
+        )
+        parsed = OpenClawGatewayClient.parse_execution_impact_response(raw)
+        self.assertEqual(parsed["summary"], "加仓决策触发后市场滑点恶化")
+        self.assertEqual(parsed["impact_level"], "significant")
+        self.assertEqual(parsed["direction"], "worsened")
+        self.assertEqual(parsed["affected_orders"], ["ORD-501", "ORD-502"])
+        self.assertEqual(parsed["affected_positions"], ["ETHUSDT-SHORT"])
+        self.assertEqual(
+            parsed["metrics_deltas"],
+            ["slippage +12bps", "fill rate -20%"],
+        )
+        self.assertEqual(
+            parsed["follow_up_checks"],
+            ["复盘撮合链路", "评估对冲策略"],
+        )
+
+    def test_coerces_level_aliases(self) -> None:
+        from openclaw_client import OpenClawGatewayClient  # type: ignore
+
+        negligible_chinese = '{"summary": "可忽略的影响", "impact_level": "可忽略"}'
+        self.assertEqual(
+            OpenClawGatewayClient.parse_execution_impact_response(negligible_chinese)["impact_level"],
+            "negligible",
+        )
+
+        negligible_english = '{"summary": "tiny change", "impact_level": "tiny"}'
+        self.assertEqual(
+            OpenClawGatewayClient.parse_execution_impact_response(negligible_english)["impact_level"],
+            "negligible",
+        )
+
+        moderate_chinese = '{"summary": "一般影响", "impact_level": "一般"}'
+        self.assertEqual(
+            OpenClawGatewayClient.parse_execution_impact_response(moderate_chinese)["impact_level"],
+            "moderate",
+        )
+
+        moderate_english = '{"summary": "normal impact", "impact_level": "medium"}'
+        self.assertEqual(
+            OpenClawGatewayClient.parse_execution_impact_response(moderate_english)["impact_level"],
+            "moderate",
+        )
+
+        significant_chinese = '{"summary": "重大影响", "impact_level": "重大"}'
+        self.assertEqual(
+            OpenClawGatewayClient.parse_execution_impact_response(significant_chinese)["impact_level"],
+            "significant",
+        )
+
+        significant_english = '{"summary": "critical shift", "impact_level": "critical"}'
+        self.assertEqual(
+            OpenClawGatewayClient.parse_execution_impact_response(significant_english)["impact_level"],
+            "significant",
+        )
+
+        unknown_raw = '{"summary": "未定级", "impact_level": "unspecified"}'
+        # Unknown level degrades to the conservative default ``moderate``.
+        self.assertEqual(
+            OpenClawGatewayClient.parse_execution_impact_response(unknown_raw)["impact_level"],
+            "moderate",
+        )
+
+    def test_coerces_direction_aliases(self) -> None:
+        from openclaw_client import OpenClawGatewayClient  # type: ignore
+
+        improved_chinese = '{"summary": "执行改善", "direction": "改善"}'
+        self.assertEqual(
+            OpenClawGatewayClient.parse_execution_impact_response(improved_chinese)["direction"],
+            "improved",
+        )
+
+        improved_english = '{"summary": "better quality", "direction": "positive"}'
+        self.assertEqual(
+            OpenClawGatewayClient.parse_execution_impact_response(improved_english)["direction"],
+            "improved",
+        )
+
+        neutral_chinese = '{"summary": "持平", "direction": "持平"}'
+        self.assertEqual(
+            OpenClawGatewayClient.parse_execution_impact_response(neutral_chinese)["direction"],
+            "neutral",
+        )
+
+        neutral_english = '{"summary": "flat shift", "direction": "unchanged"}'
+        self.assertEqual(
+            OpenClawGatewayClient.parse_execution_impact_response(neutral_english)["direction"],
+            "neutral",
+        )
+
+        worsened_chinese = '{"summary": "恶化", "direction": "恶化"}'
+        self.assertEqual(
+            OpenClawGatewayClient.parse_execution_impact_response(worsened_chinese)["direction"],
+            "worsened",
+        )
+
+        worsened_english = '{"summary": "degraded quality", "direction": "degraded"}'
+        self.assertEqual(
+            OpenClawGatewayClient.parse_execution_impact_response(worsened_english)["direction"],
+            "worsened",
+        )
+
+        unknown_raw = '{"summary": "未知", "direction": "unspecified"}'
+        # Unknown direction degrades to the conservative default ``neutral``.
+        self.assertEqual(
+            OpenClawGatewayClient.parse_execution_impact_response(unknown_raw)["direction"],
+            "neutral",
+        )
+
+    def test_returns_defaults_on_empty_input(self) -> None:
+        from openclaw_client import OpenClawGatewayClient  # type: ignore
+
+        parsed_none = OpenClawGatewayClient.parse_execution_impact_response(None)
+        self.assertEqual(parsed_none["summary"], "")
+        self.assertEqual(parsed_none["impact_level"], "moderate")
+        self.assertEqual(parsed_none["direction"], "neutral")
+        self.assertEqual(parsed_none["affected_orders"], [])
+        self.assertEqual(parsed_none["affected_positions"], [])
+        self.assertEqual(parsed_none["metrics_deltas"], [])
+        self.assertEqual(parsed_none["follow_up_checks"], [])
+        self.assertEqual(parsed_none["raw_text"], "")
+
+        parsed_blank = OpenClawGatewayClient.parse_execution_impact_response("   \n \t ")
+        self.assertEqual(parsed_blank["summary"], "")
+        self.assertEqual(parsed_blank["impact_level"], "moderate")
+        self.assertEqual(parsed_blank["direction"], "neutral")
+        self.assertEqual(parsed_blank["affected_orders"], [])
+
+    def test_falls_back_to_heuristic_summary_when_plain_text(self) -> None:
+        from openclaw_client import OpenClawGatewayClient  # type: ignore
+
+        raw = "策略调整对未平仓订单影响有限，建议继续观察滑点表现。"
+        parsed = OpenClawGatewayClient.parse_execution_impact_response(raw)
+        self.assertEqual(parsed["summary"], raw)
+        # Plain-text falls back to the conservative defaults.
+        self.assertEqual(parsed["impact_level"], "moderate")
+        self.assertEqual(parsed["direction"], "neutral")
+        self.assertEqual(parsed["affected_orders"], [])
+        self.assertEqual(parsed["affected_positions"], [])
+        self.assertEqual(parsed["metrics_deltas"], [])
+        self.assertEqual(parsed["follow_up_checks"], [])
+        self.assertEqual(parsed["raw_text"], raw)
+
+    def test_accepts_alternate_keys_for_order_and_position_lists(self) -> None:
+        from openclaw_client import OpenClawGatewayClient  # type: ignore
+
+        raw = (
+            '{"summary": "使用备用键的影响摘要",'
+            ' "level": "significant",'
+            ' "direction": "worsened",'
+            ' "orders": ["ORD-A", "ORD-B"],'
+            ' "positions": ["POS-1"],'
+            ' "deltas": ["slippage +5bps"],'
+            ' "follow_ups": ["复核执行路径"]}'
+        )
+        parsed = OpenClawGatewayClient.parse_execution_impact_response(raw)
+        self.assertEqual(parsed["summary"], "使用备用键的影响摘要")
+        self.assertEqual(parsed["impact_level"], "significant")
+        self.assertEqual(parsed["direction"], "worsened")
+        self.assertEqual(parsed["affected_orders"], ["ORD-A", "ORD-B"])
+        self.assertEqual(parsed["affected_positions"], ["POS-1"])
+        self.assertEqual(parsed["metrics_deltas"], ["slippage +5bps"])
+        self.assertEqual(parsed["follow_up_checks"], ["复核执行路径"])
+
+        raw_alt = (
+            '{"summary": "使用另一组备用键",'
+            ' "impact_level": "negligible",'
+            ' "direction": "improved",'
+            ' "order_ids": "ORD-X\\nORD-Y",'
+            ' "position_ids": "POS-Z",'
+            ' "metric_deltas": "fill rate +4%",'
+            ' "checks": "monitor next hour"}'
+        )
+        parsed_alt = OpenClawGatewayClient.parse_execution_impact_response(raw_alt)
+        self.assertEqual(parsed_alt["impact_level"], "negligible")
+        self.assertEqual(parsed_alt["direction"], "improved")
+        self.assertEqual(parsed_alt["affected_orders"], ["ORD-X", "ORD-Y"])
+        self.assertEqual(parsed_alt["affected_positions"], ["POS-Z"])
+        self.assertEqual(parsed_alt["metrics_deltas"], ["fill rate +4%"])
+        self.assertEqual(parsed_alt["follow_up_checks"], ["monitor next hour"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
