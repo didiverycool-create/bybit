@@ -110,6 +110,30 @@ export default function BacktestWorkspaceHeader({
               </span>
             </>
           ) : null}
+          {selectedBacktest?.tail_risk_stats ? (
+            <>
+              <span
+                className={
+                  selectedBacktest.tail_risk_stats.var_95_pct >= 5
+                    ? 'chip chip--warning'
+                    : 'chip'
+                }
+              >
+                VaR95 {selectedBacktest.tail_risk_stats.var_95_pct.toFixed(2)}%
+              </span>
+              <span
+                className={
+                  selectedBacktest.tail_risk_stats.gain_to_pain_ratio >= 1
+                    ? 'chip chip--success'
+                    : selectedBacktest.tail_risk_stats.gain_to_pain_ratio > 0
+                      ? 'chip'
+                      : 'chip chip--warning'
+                }
+              >
+                痛苦比 {selectedBacktest.tail_risk_stats.gain_to_pain_ratio.toFixed(2)}
+              </span>
+            </>
+          ) : null}
         </div>
       </div>
       <div className="console-strip console-strip--compact backtest-summary-strip">

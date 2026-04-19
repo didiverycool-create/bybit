@@ -719,6 +719,13 @@ export interface BacktestExposureStats {
   downside_deviation_pct: number
 }
 
+export interface BacktestTailRiskStats {
+  var_95_pct: number
+  cvar_95_pct: number
+  tail_ratio: number
+  gain_to_pain_ratio: number
+}
+
 export interface BacktestRun {
   id: string
   strategy_id: string
@@ -774,6 +781,7 @@ export interface BacktestRun {
   trade_rhythm_stats?: BacktestTradeRhythmStats | null
   benchmark_stats?: BacktestBenchmarkStats | null
   exposure_stats?: BacktestExposureStats | null
+  tail_risk_stats?: BacktestTailRiskStats | null
   notes: string
 }
 

@@ -167,6 +167,20 @@ export default function BacktestExperimentPanel({
             </span>
           </div>
         )}
+        {selectedBacktest.tail_risk_stats && (
+          <div className="stack-row">
+            <strong>尾部风险</strong>
+            <span>
+              VaR95 {selectedBacktest.tail_risk_stats.var_95_pct.toFixed(2)}%
+              {' · '}
+              CVaR95 {selectedBacktest.tail_risk_stats.cvar_95_pct.toFixed(2)}%
+              {' · '}
+              尾比 {selectedBacktest.tail_risk_stats.tail_ratio.toFixed(2)}
+              {' · '}
+              收益痛苦比 {selectedBacktest.tail_risk_stats.gain_to_pain_ratio.toFixed(2)}
+            </span>
+          </div>
+        )}
         <div className="stack-row">
           <strong>样本质量</strong>
           <span>{selectedBacktestSampleMeta?.description ?? '未标注'}</span>
