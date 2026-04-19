@@ -1,5 +1,6 @@
 import type { StrategySummary } from '../types'
 import { strategyStatusLabel } from '../utils/app-helpers'
+import ExecutionImpactSection from './ExecutionImpactSection'
 import StrategyCurrentPanel, { type StrategyCurrentPanelProps } from './StrategyCurrentPanel'
 
 type StrategyWorkspaceSectionProps = {
@@ -64,6 +65,8 @@ export default function StrategyWorkspaceSection({
       <article className="panel">
         {currentPanelProps ? <StrategyCurrentPanel {...currentPanelProps} /> : <div className="empty-state">暂无策略数据</div>}
       </article>
+
+      <ExecutionImpactSection />
     </section>
   )
 }
