@@ -81,6 +81,35 @@ export default function BacktestWorkspaceHeader({
         <div className="chip-row">
           <span className="chip chip--muted">{backtestFilter === 'selected' ? '仅当前策略' : '全策略'}</span>
           <span className="chip chip--muted">{selectedStrategy?.name ?? '等待策略'}</span>
+          {selectedBacktest?.benchmark_stats ? (
+            <>
+              <span
+                className={
+                  selectedBacktest.benchmark_stats.strategy_over_buy_hold_pct > 0
+                    ? 'chip chip--success'
+                    : selectedBacktest.benchmark_stats.strategy_over_buy_hold_pct < 0
+                      ? 'chip chip--warning'
+                      : 'chip'
+                }
+              >
+                超额 {selectedBacktest.benchmark_stats.strategy_over_buy_hold_pct.toFixed(2)}%
+              </span>
+              <span
+                className={
+                  selectedBacktest.benchmark_stats.alpha_pct > 0
+                    ? 'chip chip--success'
+                    : selectedBacktest.benchmark_stats.alpha_pct < 0
+                      ? 'chip chip--warning'
+                      : 'chip'
+                }
+              >
+                Alpha {selectedBacktest.benchmark_stats.alpha_pct.toFixed(2)}%
+              </span>
+              <span className="chip">
+                相关性 {selectedBacktest.benchmark_stats.correlation.toFixed(2)}
+              </span>
+            </>
+          ) : null}
         </div>
       </div>
       <div className="console-strip console-strip--compact backtest-summary-strip">
