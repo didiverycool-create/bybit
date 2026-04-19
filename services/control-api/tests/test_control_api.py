@@ -19676,5 +19676,547 @@ class VolatilityRegimeSizingUnitTests(unittest.TestCase):
         self.assertIsNone(hint["regime_multipliers"])
 
 
+class SignalConfidenceCalibrationUnitTests(unittest.TestCase):
+    """Round 46 opt-in dynamic confidence calibration.
+
+    ``apply_confidence_calibration`` layers three orthogonal adjustments
+    onto the raw kernel confidence: a regime multiplier, a parameter-drift
+    penalty and a multi-timeframe alignment bonus / discount. The tests
+    below exercise each knob in isolation plus a full-stack combination to
+    pin down the clamp behaviour, and then verify the three kernels
+    (``trend`` / ``mean_revert`` / ``breakout``) route through calibration
+    at evaluation time. Finally the risk-hint wiring is covered so the
+    opt-in state surfaces faithfully on the panel payload.
+    """
+
+    def _strategy(
+        self,
+        *,
+        strategy_id: str = "trend-calib-01",
+        name: str = "趋势跟踪",
+        enabled: bool = False,
+        regime_adjustments: Optional[Any] = None,
+        drift_penalty: Optional[float] = 0.0,
+        multi_tf: Optional[bool] = False,
+        parameters: Optional[List[Any]] = None,
+    ) -> Any:
+        from models import StrategySummary
+
+        return StrategySummary(
+            id=strategy_id,
+            name=name,
+            category="template",
+            status="running",
+            symbols=["BTCUSDT"],
+            mode=AccountMode.PAPER,
+            version="v1",
+            pnl_7d="+0.0%",
+            max_drawdown="-0.0%",
+            risk_budget="18%",
+            description="confidence-calibration unit test",
+            parameters=parameters or [],
+            confidence_calibration_enabled=enabled,
+            confidence_regime_adjustments=regime_adjustments,
+            confidence_parameter_drift_penalty=drift_penalty,
+            confidence_multi_timeframe_alignment=multi_tf,
+        )
+
+    # ------------------------------------------------------------------
+    # apply_confidence_calibration — individual knobs
+    # ------------------------------------------------------------------
+
+    def test_calibration_opt_in_off_returns_base_confidence_unchanged(self) -> None:
+        """With ``confidence_calibration_enabled=False`` every other knob
+        must be ignored — the helper returns the input value untouched so
+        legacy strategies retain bit-exact Round 45 confidences.
+        """
+        import strategy_runtime
+        from models import ConfidenceRegimeAdjustments
+
+        strategy = self._strategy(
+            enabled=False,
+            regime_adjustments=ConfidenceRegimeAdjustments(low=2.0, normal=2.0, high=2.0),
+            drift_penalty=99.0,
+            multi_tf=True,
+        )
+        # Regime / drift / multi-tf supplied but all should be ignored.
+        result = strategy_runtime.apply_confidence_calibration(
+            60.0,
+            strategy=strategy,
+            regime="high",
+            parameter_drift_score=1.5,
+            multi_timeframe_aligned=True,
+        )
+        self.assertAlmostEqual(result, 60.0, places=6)
+
+    def test_calibration_regime_low_amplifies_confidence(self) -> None:
+        """``regime='low'`` must multiply confidence by ``adjustments.low``."""
+        import strategy_runtime
+        from models import ConfidenceRegimeAdjustments
+
+        strategy = self._strategy(
+            enabled=True,
+            regime_adjustments=ConfidenceRegimeAdjustments(low=1.1, normal=1.0, high=0.75),
+        )
+        result = strategy_runtime.apply_confidence_calibration(
+            60.0,
+            strategy=strategy,
+            regime="low",
+        )
+        self.assertAlmostEqual(result, 66.0, places=6)
+
+    def test_calibration_regime_high_discounts_confidence(self) -> None:
+        """``regime='high'`` must multiply confidence by ``adjustments.high``
+        which defaults below 1.0 and therefore shrinks the confidence.
+        """
+        import strategy_runtime
+        from models import ConfidenceRegimeAdjustments
+
+        strategy = self._strategy(
+            enabled=True,
+            regime_adjustments=ConfidenceRegimeAdjustments(low=1.1, normal=1.0, high=0.75),
+        )
+        result = strategy_runtime.apply_confidence_calibration(
+            60.0,
+            strategy=strategy,
+            regime="high",
+        )
+        self.assertAlmostEqual(result, 45.0, places=6)
+
+    def test_calibration_regime_normal_and_unknown_are_pass_through(self) -> None:
+        """Normal regime carries a 1.0 multiplier by default so the output is
+        unchanged. Unknown / ``None`` regimes skip the multiplier entirely —
+        guards against surprises when a future regime label lands upstream
+        without a matching adjustments slot.
+        """
+        import strategy_runtime
+        from models import ConfidenceRegimeAdjustments
+
+        strategy = self._strategy(
+            enabled=True,
+            regime_adjustments=ConfidenceRegimeAdjustments(),
+        )
+        normal = strategy_runtime.apply_confidence_calibration(
+            60.0, strategy=strategy, regime="normal"
+        )
+        unknown = strategy_runtime.apply_confidence_calibration(
+            60.0, strategy=strategy, regime="unknown"
+        )
+        none_regime = strategy_runtime.apply_confidence_calibration(
+            60.0, strategy=strategy, regime=None
+        )
+        self.assertAlmostEqual(normal, 60.0, places=6)
+        self.assertAlmostEqual(unknown, 60.0, places=6)
+        self.assertAlmostEqual(none_regime, 60.0, places=6)
+
+    def test_calibration_parameter_drift_penalty_is_linear(self) -> None:
+        """The drift penalty should subtract ``drift_score * penalty`` in
+        confidence points. Scaling the drift score by 2× must exactly double
+        the subtraction.
+        """
+        import strategy_runtime
+
+        strategy = self._strategy(enabled=True, drift_penalty=10.0)
+        single = strategy_runtime.apply_confidence_calibration(
+            60.0, strategy=strategy, parameter_drift_score=0.5
+        )
+        double = strategy_runtime.apply_confidence_calibration(
+            60.0, strategy=strategy, parameter_drift_score=1.0
+        )
+        self.assertAlmostEqual(single, 60.0 - 0.5 * 10.0, places=6)
+        self.assertAlmostEqual(double, 60.0 - 1.0 * 10.0, places=6)
+
+    def test_calibration_multi_timeframe_aligned_true_applies_bonus(self) -> None:
+        """Explicit ``multi_timeframe_aligned=True`` multiplies the running
+        confidence by ``1.1``.
+        """
+        import strategy_runtime
+
+        strategy = self._strategy(enabled=True, multi_tf=True)
+        result = strategy_runtime.apply_confidence_calibration(
+            60.0, strategy=strategy, multi_timeframe_aligned=True
+        )
+        self.assertAlmostEqual(result, 66.0, places=6)
+
+    def test_calibration_multi_timeframe_aligned_false_applies_discount(self) -> None:
+        """Explicit ``multi_timeframe_aligned=False`` multiplies the running
+        confidence by ``0.85`` — higher-timeframe disagreement must discount
+        the signal even when other inputs are neutral.
+        """
+        import strategy_runtime
+
+        strategy = self._strategy(enabled=True, multi_tf=True)
+        result = strategy_runtime.apply_confidence_calibration(
+            60.0, strategy=strategy, multi_timeframe_aligned=False
+        )
+        self.assertAlmostEqual(result, 51.0, places=6)
+
+    def test_calibration_multi_timeframe_none_is_neutral(self) -> None:
+        """``multi_timeframe_aligned=None`` must leave the confidence
+        untouched — the sentinel means the caller has no higher-TF data to
+        offer so neither bonus nor discount should apply.
+        """
+        import strategy_runtime
+
+        strategy = self._strategy(enabled=True, multi_tf=True)
+        result = strategy_runtime.apply_confidence_calibration(
+            60.0, strategy=strategy, multi_timeframe_aligned=None
+        )
+        self.assertAlmostEqual(result, 60.0, places=6)
+
+    def test_calibration_stacks_all_three_knobs_and_clamps_to_range(self) -> None:
+        """All three adjustments must layer in order and the final value must
+        sit inside the widened ``[0, 99]`` clamp range.
+        """
+        import strategy_runtime
+        from models import ConfidenceRegimeAdjustments
+
+        strategy = self._strategy(
+            enabled=True,
+            regime_adjustments=ConfidenceRegimeAdjustments(low=1.1, normal=1.0, high=0.75),
+            drift_penalty=4.0,
+            multi_tf=True,
+        )
+        # 60 * 1.1 (low)      => 66
+        # 66 - 2.0 * 4.0      => 58
+        # 58 * 1.1 (aligned)  => 63.8
+        result = strategy_runtime.apply_confidence_calibration(
+            60.0,
+            strategy=strategy,
+            regime="low",
+            parameter_drift_score=2.0,
+            multi_timeframe_aligned=True,
+        )
+        self.assertAlmostEqual(result, 63.8, places=6)
+        # Range sanity — the widened clamp is [0, 99] so a stacked result
+        # must always fit inside the new range.
+        self.assertGreaterEqual(result, 0.0)
+        self.assertLessEqual(result, 99.0)
+
+    def test_calibration_clamps_to_zero_floor_under_aggressive_discounts(self) -> None:
+        """Pathological multipliers that would drive confidence below zero
+        must be clamped at ``0`` — no sign flips are allowed even when the
+        combined multiplier pushes the value deep into negative territory.
+        """
+        import strategy_runtime
+        from models import ConfidenceRegimeAdjustments
+
+        strategy = self._strategy(
+            enabled=True,
+            regime_adjustments=ConfidenceRegimeAdjustments(low=1.0, normal=1.0, high=0.0),
+            drift_penalty=100.0,
+        )
+        result = strategy_runtime.apply_confidence_calibration(
+            60.0,
+            strategy=strategy,
+            regime="high",
+            parameter_drift_score=5.0,
+        )
+        self.assertEqual(result, 0.0)
+
+    def test_calibration_clamps_to_99_ceiling_under_aggressive_boost(self) -> None:
+        """Equally, the widened ceiling is ``99`` — over-boosted values must
+        not leak above it so downstream percent-style renderers keep working.
+        """
+        import strategy_runtime
+        from models import ConfidenceRegimeAdjustments
+
+        strategy = self._strategy(
+            enabled=True,
+            regime_adjustments=ConfidenceRegimeAdjustments(low=5.0, normal=1.0, high=1.0),
+            multi_tf=True,
+        )
+        result = strategy_runtime.apply_confidence_calibration(
+            72.0,
+            strategy=strategy,
+            regime="low",
+            multi_timeframe_aligned=True,
+        )
+        # 72 * 5 = 360, * 1.1 = 396 -> clamps at 99.
+        self.assertEqual(result, 99.0)
+
+    # ------------------------------------------------------------------
+    # Regression: evaluate_strategy_runtime without opt-in is bit-exact
+    # ------------------------------------------------------------------
+
+    def _build_detail(self, closes: List[float]) -> Any:
+        from models import MarketDetail
+
+        candles = [
+            CandlePoint(
+                time=f"2026-03-{(idx % 28) + 1:02d}T{idx % 24:02d}:00:00+00:00",
+                open=close,
+                high=close * 1.005,
+                low=close * 0.995,
+                close=close,
+                volume=1_000.0,
+            )
+            for idx, close in enumerate(closes)
+        ]
+        return MarketDetail(
+            symbol="BTCUSDT",
+            market="perp",
+            timeframe="1h",
+            candles=candles,
+            bids=[],
+            asks=[],
+            headline="calibration test",
+            stats={},
+            source="fallback",
+        )
+
+    def _build_watch_item(self, last_price: float, change_24h: float = 1.2) -> Any:
+        return WatchlistInstrument(
+            symbol="BTCUSDT",
+            market="perp",
+            last_price=last_price,
+            change_24h=change_24h,
+            volume_24h=10_000.0,
+            signal="active",
+            position_side="flat",
+            risk_level="medium",
+        )
+
+    def test_evaluate_strategy_runtime_without_opt_in_preserves_baseline(self) -> None:
+        """A strategy that has NOT opted in must produce the exact same
+        confidence ``evaluate_strategy_runtime`` emitted in Round 45 — bit-
+        exact regression guard. We stand in two strategies side-by-side: one
+        with the four new fields explicitly defaulted, one without any of
+        them touched. Their confidences must match.
+        """
+        import strategy_runtime
+        from models import StrategySummary
+
+        parameters = [
+            StrategyParameter(key="fast_ma", label="fast", value=3),
+            StrategyParameter(key="slow_ma", label="slow", value=6),
+            StrategyParameter(key="stop_loss_pct", label="stop", value=1.5),
+            StrategyParameter(key="take_profit_pct", label="target", value=3.0),
+        ]
+        detail = self._build_detail([100.0, 101.0, 102.0, 103.0, 104.0, 105.0, 106.0, 107.0])
+        watch = self._build_watch_item(107.0)
+
+        legacy = StrategySummary(
+            id="trend-legacy",
+            name="趋势跟踪",
+            category="template",
+            status="running",
+            symbols=["BTCUSDT"],
+            mode=AccountMode.PAPER,
+            version="v1",
+            pnl_7d="+0%",
+            max_drawdown="-0%",
+            risk_budget="low",
+            description="legacy",
+            parameters=parameters,
+        )
+        opted_out = self._strategy(
+            strategy_id="trend-optout",
+            name="趋势跟踪",
+            enabled=False,
+            parameters=parameters,
+        )
+        legacy_snap = strategy_runtime.evaluate_strategy_runtime(
+            legacy, detail, watch, evaluated_at="2026-03-01T00:00:00+00:00"
+        )
+        opt_snap = strategy_runtime.evaluate_strategy_runtime(
+            opted_out, detail, watch, evaluated_at="2026-03-01T00:00:00+00:00"
+        )
+        # Same kernel, same candles, same parameters -> identical confidence.
+        self.assertAlmostEqual(legacy_snap.confidence, opt_snap.confidence, places=6)
+
+    # ------------------------------------------------------------------
+    # Kernel routing — trend / mean-revert / breakout all use calibration
+    # ------------------------------------------------------------------
+
+    def test_trend_kernel_routes_through_calibration(self) -> None:
+        """With calibration on and ``regime_adjustments.normal=0.5``, the
+        trend-kernel confidence must be visibly scaled versus the opt-out
+        baseline — proving ``_evaluate_trend`` threads through
+        ``apply_confidence_calibration`` at signal time.
+        """
+        import strategy_runtime
+        from models import ConfidenceRegimeAdjustments, VolatilityRegimeThresholds
+
+        parameters = [
+            StrategyParameter(key="fast_ma", label="fast", value=3),
+            StrategyParameter(key="slow_ma", label="slow", value=6),
+        ]
+        baseline = self._strategy(
+            strategy_id="trend-base",
+            name="趋势跟踪",
+            enabled=False,
+            parameters=parameters,
+        )
+        boosted = self._strategy(
+            strategy_id="trend-calib",
+            name="趋势跟踪",
+            enabled=True,
+            regime_adjustments=ConfidenceRegimeAdjustments(low=0.5, normal=0.5, high=0.5),
+            parameters=parameters,
+        )
+        # Populate thresholds so the runtime can actually classify a regime —
+        # otherwise the regime helper returns None and the multiplier skips.
+        boosted.volatility_regime_thresholds = VolatilityRegimeThresholds(
+            low_pct=0.3, high_pct=1.5
+        )
+
+        detail = self._build_detail([100.0, 101.0, 102.0, 103.0, 104.0, 105.0, 106.0, 107.0])
+        watch = self._build_watch_item(107.0)
+        base_snap = strategy_runtime.evaluate_strategy_runtime(baseline, detail, watch)
+        boost_snap = strategy_runtime.evaluate_strategy_runtime(boosted, detail, watch)
+
+        # Baseline trend-long confidence is clamped to 72 (the original kernel
+        # clamp). The calibrated version must be strictly lower because every
+        # regime multiplier is 0.5.
+        self.assertGreater(base_snap.confidence, boost_snap.confidence)
+        self.assertAlmostEqual(boost_snap.confidence, base_snap.confidence * 0.5, places=1)
+
+    def test_mean_revert_kernel_routes_through_calibration(self) -> None:
+        """Mean-reversion kernel must also pass through calibration — a
+        non-unit regime multiplier scales the outgoing confidence by the
+        same factor as the apply-helper.
+        """
+        import strategy_runtime
+        from models import ConfidenceRegimeAdjustments, VolatilityRegimeThresholds
+
+        parameters = [
+            StrategyParameter(key="zscore_entry", label="z_in", value=2.0),
+            StrategyParameter(key="zscore_exit", label="z_out", value=0.5),
+        ]
+        baseline = self._strategy(
+            strategy_id="eth-revert-base",
+            name="均值回归",
+            enabled=False,
+            parameters=parameters,
+        )
+        calibrated = self._strategy(
+            strategy_id="eth-revert-calib",
+            name="均值回归",
+            enabled=True,
+            regime_adjustments=ConfidenceRegimeAdjustments(low=0.5, normal=0.5, high=0.5),
+            parameters=parameters,
+        )
+        calibrated.volatility_regime_thresholds = VolatilityRegimeThresholds(
+            low_pct=0.3, high_pct=1.5
+        )
+
+        # Stable history + sharp spike -> zscore >= entry -> "short" branch.
+        detail = self._build_detail([100.0] * 20 + [125.0])
+        watch = self._build_watch_item(125.0)
+
+        base_snap = strategy_runtime.evaluate_strategy_runtime(baseline, detail, watch)
+        calib_snap = strategy_runtime.evaluate_strategy_runtime(calibrated, detail, watch)
+        self.assertGreater(base_snap.confidence, calib_snap.confidence)
+        self.assertAlmostEqual(calib_snap.confidence, base_snap.confidence * 0.5, places=1)
+
+    def test_breakout_kernel_routes_through_calibration(self) -> None:
+        """Breakout kernel's confidence must also be post-processed by
+        ``apply_confidence_calibration`` — completes the three-kernel wiring
+        proof.
+        """
+        import strategy_runtime
+        from models import ConfidenceRegimeAdjustments, VolatilityRegimeThresholds
+
+        parameters = [
+            StrategyParameter(key="breakout_window", label="bw", value=4),
+        ]
+        baseline = self._strategy(
+            strategy_id="brk-base",
+            name="突破策略",
+            enabled=False,
+            parameters=parameters,
+        )
+        calibrated = self._strategy(
+            strategy_id="brk-calib",
+            name="突破策略",
+            enabled=True,
+            regime_adjustments=ConfidenceRegimeAdjustments(low=0.5, normal=0.5, high=0.5),
+            parameters=parameters,
+        )
+        calibrated.volatility_regime_thresholds = VolatilityRegimeThresholds(
+            low_pct=0.3, high_pct=1.5
+        )
+
+        # Clear upward breakout: flat 100s then a jump to 130.
+        detail = self._build_detail([100.0] * 6 + [130.0])
+        watch = self._build_watch_item(130.0, change_24h=5.0)
+        base_snap = strategy_runtime.evaluate_strategy_runtime(baseline, detail, watch)
+        calib_snap = strategy_runtime.evaluate_strategy_runtime(calibrated, detail, watch)
+        self.assertGreater(base_snap.confidence, calib_snap.confidence)
+        self.assertAlmostEqual(calib_snap.confidence, base_snap.confidence * 0.5, places=1)
+
+    # ------------------------------------------------------------------
+    # compute_strategy_runtime_risk_hints wiring
+    # ------------------------------------------------------------------
+
+    def test_risk_hints_surface_calibration_when_opted_in(self) -> None:
+        """Opted-in strategies must surface the four new calibration fields
+        on ``compute_strategy_runtime_risk_hints`` so panels can render the
+        regime-adjustment ladder and drift penalty.
+        """
+        import strategy_runtime
+        from models import ConfidenceRegimeAdjustments
+
+        parameters = [
+            StrategyParameter(key="breakout_window", label="bw", value=4),
+        ]
+        strategy = self._strategy(
+            strategy_id="brk-hints-calib",
+            name="突破策略",
+            enabled=True,
+            regime_adjustments=ConfidenceRegimeAdjustments(low=1.3, normal=1.0, high=0.6),
+            drift_penalty=5.0,
+            multi_tf=True,
+            parameters=parameters,
+        )
+        detail = self._build_detail([100.0 + idx * 0.1 for idx in range(10)])
+        watch = self._build_watch_item(101.0)
+
+        hint = strategy_runtime.compute_strategy_runtime_risk_hints(
+            strategy=strategy, detail=detail, watch_item=watch
+        )
+        self.assertTrue(hint["confidence_calibration_enabled"])
+        self.assertIsInstance(hint["confidence_regime_adjustments"], dict)
+        self.assertAlmostEqual(
+            hint["confidence_regime_adjustments"]["low"], 1.3, places=4
+        )
+        self.assertAlmostEqual(
+            hint["confidence_regime_adjustments"]["normal"], 1.0, places=4
+        )
+        self.assertAlmostEqual(
+            hint["confidence_regime_adjustments"]["high"], 0.6, places=4
+        )
+        self.assertAlmostEqual(
+            hint["confidence_parameter_drift_penalty"], 5.0, places=4
+        )
+        self.assertTrue(hint["confidence_multi_timeframe_alignment"])
+
+    def test_risk_hints_without_opt_in_remain_backwards_compatible(self) -> None:
+        """Legacy strategies still expose the four new keys (schema stability)
+        with the opt-in flag False and the override fields at their neutral
+        defaults so panels can short-circuit the new section entirely.
+        """
+        import strategy_runtime
+
+        strategy = self._strategy(
+            strategy_id="brk-hints-legacy",
+            name="突破策略",
+            enabled=False,
+            parameters=[StrategyParameter(key="breakout_window", label="bw", value=4)],
+        )
+        detail = self._build_detail([100.0 + idx * 0.1 for idx in range(10)])
+        watch = self._build_watch_item(101.0)
+
+        hint = strategy_runtime.compute_strategy_runtime_risk_hints(
+            strategy=strategy, detail=detail, watch_item=watch
+        )
+        self.assertIn("confidence_calibration_enabled", hint)
+        self.assertFalse(hint["confidence_calibration_enabled"])
+        self.assertIsNone(hint["confidence_regime_adjustments"])
+        self.assertAlmostEqual(hint["confidence_parameter_drift_penalty"], 0.0, places=6)
+        self.assertFalse(hint["confidence_multi_timeframe_alignment"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

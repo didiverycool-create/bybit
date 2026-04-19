@@ -342,6 +342,24 @@ class RegimeExposureMultipliers(BaseModel):
     high: float = 0.6
 
 
+class ConfidenceRegimeAdjustments(BaseModel):
+    """Round 46 opt-in per-regime multipliers applied to signal confidence.
+
+    When ``confidence_calibration_enabled`` is true, the runtime pipeline
+    multiplies the raw kernel confidence by the matching regime multiplier
+    before clamping. Defaults mildly boost confidence when ATR is calm and
+    penalise it when ATR is elevated — a hedge against over-trusting signal
+    fidelity during hectic regimes. Operators can override any of the three
+    slots without breaking the ``confidence_calibration_enabled`` contract;
+    the numbers are always non-negative so a misconfigured multiplier cannot
+    flip the sign of the calibrated confidence.
+    """
+
+    low: float = 1.1
+    normal: float = 1.0
+    high: float = 0.75
+
+
 class StrategySummary(BaseModel):
     id: str
     name: str
@@ -371,6 +389,15 @@ class StrategySummary(BaseModel):
     volatility_target_pct: Optional[float] = None
     volatility_regime_thresholds: Optional[VolatilityRegimeThresholds] = None
     regime_exposure_multipliers: Optional[RegimeExposureMultipliers] = None
+    # Round 46 additive signal-confidence calibration. All four fields default
+    # to ``None`` / ``False`` / ``0.0`` so legacy strategies keep producing
+    # bit-exact confidences. Opt-in happens by flipping
+    # ``confidence_calibration_enabled`` and optionally tuning the regime
+    # multipliers / drift penalty / multi-timeframe alignment toggle.
+    confidence_calibration_enabled: bool = False
+    confidence_regime_adjustments: Optional[ConfidenceRegimeAdjustments] = None
+    confidence_parameter_drift_penalty: Optional[float] = 0.0
+    confidence_multi_timeframe_alignment: Optional[bool] = False
 
 
 class StrategyRuntimeSnapshot(BaseModel):
