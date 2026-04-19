@@ -123,6 +123,42 @@ class BacktestBenchmarkStats:
 
 
 @dataclass
+class BacktestExposureStats:
+    """High-order and robustness descriptors of the simulated equity curve.
+
+    Complements ``BacktestVolatilityStats`` / ``BacktestRiskRatios`` with tail
+    and drawdown-shape statistics that help reviewers gauge distributional
+    asymmetry and recovery behaviour. Every field defaults to ``0.0`` so
+    degenerate inputs (empty curve, flat returns, zero drawdown) still yield a
+    fully populated payload instead of raising — downstream consumers should
+    treat zero-fill as "unavailable" rather than "error".
+
+    - ``return_skew``: Fisher-Pearson adjusted sample skewness of
+      ``period_returns``. Returns ``0.0`` when the sample has fewer than 3
+      observations or the sample stdev collapses to zero.
+    - ``return_kurtosis``: sample excess kurtosis of ``period_returns`` (raw
+      kurtosis minus 3, so a normal distribution maps to ``0.0``). Returns
+      ``0.0`` when the sample has fewer than 4 observations or the sample
+      stdev collapses to zero.
+    - ``ulcer_index_pct``: root-mean-square of the per-bar drawdown percentages
+      measured against the running peak of the equity curve. Expressed as a
+      positive percentage (``1.23`` == 1.23%); ``0.0`` when the curve is empty.
+    - ``recovery_factor``: ``total_return_pct / abs(max_drawdown_pct)``. Returns
+      ``0.0`` when ``max_drawdown_pct`` is ``None`` or exactly zero (no
+      drawdown on record — ratio would otherwise diverge).
+    - ``downside_deviation_pct``: population stdev of the strictly-negative
+      tail of ``period_returns``, already multiplied by 100 so it reads as a
+      percentage. Returns ``0.0`` when no negative returns exist.
+    """
+
+    return_skew: float = 0.0
+    return_kurtosis: float = 0.0
+    ulcer_index_pct: float = 0.0
+    recovery_factor: float = 0.0
+    downside_deviation_pct: float = 0.0
+
+
+@dataclass
 class BacktestComputation:
     metrics: BacktestMetrics
     notes: str
@@ -142,6 +178,7 @@ class BacktestComputation:
     risk_ratios: Optional[BacktestRiskRatios] = None
     trade_rhythm_stats: Optional[BacktestTradeRhythmStats] = None
     benchmark_stats: Optional[BacktestBenchmarkStats] = None
+    exposure_stats: Optional[BacktestExposureStats] = None
 
 
 def _parameter_map(strategy: StrategySummary) -> Dict[str, object]:
@@ -540,6 +577,79 @@ def _compute_benchmark_stats(
     )
 
 
+def _compute_exposure_stats(
+    equity_curve: List[float],
+    period_returns: List[float],
+    total_return_pct: float,
+    max_drawdown_pct: float,
+) -> BacktestExposureStats:
+    """Derive higher-moment and drawdown-shape descriptors.
+
+    Every branch short-circuits to the relevant default when its inputs are
+    degenerate (empty series, flat returns, missing drawdown). The helper
+    therefore never raises — an all-zero payload signals "not enough data" to
+    downstream consumers without forcing them to guard against ``None``.
+
+    Skew uses the Fisher-Pearson adjusted formula
+    ``n * Σ(x_i - μ)^3 / ((n-1)(n-2) σ^3)``; excess kurtosis uses the unbiased
+    correction ``n(n+1)/((n-1)(n-2)(n-3)) · Σ((x-μ)/σ)^4 − 3(n-1)^2/((n-2)(n-3))``
+    so a normal distribution maps to ``0.0``. Both require a non-zero sample
+    stdev to avoid division by zero.
+    """
+
+    skew = 0.0
+    kurtosis = 0.0
+    if period_returns is not None and len(period_returns) >= 3:
+        n = len(period_returns)
+        mean_value = mean(period_returns)
+        # Sample stdev (ddof=1) lines up with the Fisher-Pearson adjustment.
+        variance = sum((value - mean_value) ** 2 for value in period_returns) / (n - 1)
+        if variance > 0:
+            std = math.sqrt(variance)
+            third_moment = sum((value - mean_value) ** 3 for value in period_returns)
+            skew = (n / ((n - 1) * (n - 2))) * (third_moment / (std ** 3))
+            if n >= 4:
+                fourth_sum = sum(((value - mean_value) / std) ** 4 for value in period_returns)
+                leading = (n * (n + 1)) / ((n - 1) * (n - 2) * (n - 3))
+                trailing = (3 * (n - 1) ** 2) / ((n - 2) * (n - 3))
+                kurtosis = leading * fourth_sum - trailing
+
+    ulcer_index_pct = 0.0
+    if equity_curve:
+        squared_drawdowns: List[float] = []
+        running_peak = equity_curve[0]
+        for value in equity_curve:
+            if value > running_peak:
+                running_peak = value
+            if running_peak <= 0:
+                # Non-positive peak means no meaningful drawdown reference —
+                # skip rather than emit noise.
+                continue
+            drawdown_pct = max(0.0, (running_peak - value) / running_peak * 100.0)
+            squared_drawdowns.append(drawdown_pct ** 2)
+        if squared_drawdowns:
+            ulcer_index_pct = math.sqrt(sum(squared_drawdowns) / len(squared_drawdowns))
+
+    if max_drawdown_pct is None or max_drawdown_pct == 0:
+        recovery_factor = 0.0
+    else:
+        recovery_factor = total_return_pct / abs(max_drawdown_pct)
+
+    downside_deviation_pct = 0.0
+    if period_returns:
+        negatives = [value for value in period_returns if value < 0]
+        if negatives:
+            downside_deviation_pct = pstdev(negatives) * 100.0 if len(negatives) >= 1 else 0.0
+
+    return BacktestExposureStats(
+        return_skew=round(skew, 6),
+        return_kurtosis=round(kurtosis, 6),
+        ulcer_index_pct=round(ulcer_index_pct, 4),
+        recovery_factor=round(recovery_factor, 4),
+        downside_deviation_pct=round(downside_deviation_pct, 4),
+    )
+
+
 def _mark_to_market_equity(entry_equity: float, trade_return_pct: float) -> float:
     return entry_equity * (1.0 + trade_return_pct / 100.0)
 
@@ -859,6 +969,16 @@ def run_local_backtest(strategy: StrategySummary, candles: List[CandlePoint], ti
         reference_price_path,
         bars_per_year,
     )
+    # Exposure stats reuse the already-realized equity curve, its period
+    # returns, and the drawdown produced by ``_compute_max_drawdown`` so the
+    # higher-order descriptors line up with the other stat payloads.
+    max_drawdown_pct = _compute_max_drawdown(final_equity_curve)
+    exposure_stats = _compute_exposure_stats(
+        final_equity_curve,
+        period_returns,
+        total_return_pct,
+        max_drawdown_pct,
+    )
 
     notes = (
         f"由本地回测引擎基于 Bybit 历史 {timeframe} K 线生成，区间 {data_range}，"
@@ -887,4 +1007,5 @@ def run_local_backtest(strategy: StrategySummary, candles: List[CandlePoint], ti
         risk_ratios=risk_ratios,
         trade_rhythm_stats=trade_rhythm_stats,
         benchmark_stats=benchmark_stats,
+        exposure_stats=exposure_stats,
     )

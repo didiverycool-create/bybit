@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import sys
 import unittest
 from datetime import datetime, timezone
@@ -658,6 +659,94 @@ class BacktestEngineUnitTests(unittest.TestCase):
         # Buy-and-hold on a flat path produces zero return and zero drawdown.
         self.assertEqual(stats.buy_hold_return_pct, 0.0)
         self.assertEqual(stats.buy_hold_max_drawdown_pct, 0.0)
+
+    def test_compute_exposure_stats_returns_zero_defaults_for_empty_inputs(self) -> None:
+        # Degenerate inputs (empty curve, empty returns, missing drawdown) must
+        # collapse to ``BacktestExposureStats()`` rather than raising so the
+        # downstream payload is always fully populated.
+        for equity, returns, total_return, max_drawdown in (
+            ([], [], 0.0, 0.0),
+            ([], [0.5], 1.0, -2.0),
+            ([100_000.0, 101_000.0], [], 1.0, -0.5),
+            ([100_000.0, 101_000.0], [1.0, -0.5], 1.0, 0.0),
+        ):
+            stats = backtest_engine._compute_exposure_stats(
+                equity,
+                returns,
+                total_return,
+                max_drawdown,
+            )
+            self.assertIsInstance(stats, backtest_engine.BacktestExposureStats)
+            if not equity:
+                self.assertEqual(stats.ulcer_index_pct, 0.0)
+            if len(returns) < 3:
+                self.assertEqual(stats.return_skew, 0.0)
+                self.assertEqual(stats.return_kurtosis, 0.0)
+            if max_drawdown == 0:
+                self.assertEqual(stats.recovery_factor, 0.0)
+
+    def test_compute_exposure_stats_matches_known_skew_kurtosis_on_symmetric_sample(self) -> None:
+        # ``[+0.01, -0.01, +0.01, -0.01]`` is perfectly symmetric around zero,
+        # so Fisher-Pearson skew must vanish and excess kurtosis lands on the
+        # closed-form value ``20/6 * 2.25 - 13.5 = -6.0`` for the unbiased
+        # estimator.
+        returns = [0.01, -0.01, 0.01, -0.01]
+        stats = backtest_engine._compute_exposure_stats(
+            equity_curve=[100.0, 100.01, 99.0099, 99.99999, 99.00000099],
+            period_returns=returns,
+            total_return_pct=0.0,
+            max_drawdown_pct=-1.0,
+        )
+
+        self.assertAlmostEqual(stats.return_skew, 0.0, delta=1e-6)
+        self.assertAlmostEqual(stats.return_kurtosis, -6.0, delta=1e-6)
+        # Only negative tail matters for downside deviation — two of the four
+        # returns are negative and identical in magnitude, so pstdev is zero
+        # and the final percentage is zero.
+        self.assertAlmostEqual(stats.downside_deviation_pct, 0.0, delta=1e-6)
+
+    def test_compute_exposure_stats_ulcer_index_reflects_drawdown_magnitude(self) -> None:
+        # Hand-rolled curve hits a 110 peak at index 1 and never recovers; the
+        # ulcer index should therefore reflect the RMS of the subsequent
+        # drawdown magnitudes (10/110, 20/110, 15/110 in percent).
+        equity_curve = [100.0, 110.0, 100.0, 90.0, 95.0]
+        squared = [
+            0.0,
+            0.0,
+            (10.0 / 110.0 * 100.0) ** 2,
+            (20.0 / 110.0 * 100.0) ** 2,
+            (15.0 / 110.0 * 100.0) ** 2,
+        ]
+        expected_ulcer = math.sqrt(sum(squared) / len(squared))
+        stats = backtest_engine._compute_exposure_stats(
+            equity_curve=equity_curve,
+            period_returns=[],
+            total_return_pct=-5.0,
+            max_drawdown_pct=-18.18,
+        )
+
+        self.assertAlmostEqual(stats.ulcer_index_pct, round(expected_ulcer, 4), delta=1e-4)
+        # Recovery factor here = total_return / |max_drawdown| = -5 / 18.18.
+        self.assertAlmostEqual(stats.recovery_factor, round(-5.0 / 18.18, 4), delta=1e-4)
+
+    def test_compute_exposure_stats_recovery_factor_guards_zero_drawdown(self) -> None:
+        # Zero / ``None`` drawdown means the ratio would diverge — the helper
+        # must short-circuit to 0.0 rather than propagating a division error.
+        zero_drawdown = backtest_engine._compute_exposure_stats(
+            equity_curve=[100.0, 101.0, 102.0],
+            period_returns=[1.0, 0.99],
+            total_return_pct=2.0,
+            max_drawdown_pct=0.0,
+        )
+        self.assertEqual(zero_drawdown.recovery_factor, 0.0)
+
+        none_drawdown = backtest_engine._compute_exposure_stats(
+            equity_curve=[100.0, 101.0, 102.0],
+            period_returns=[1.0, 0.99],
+            total_return_pct=2.0,
+            max_drawdown_pct=None,  # type: ignore[arg-type]
+        )
+        self.assertEqual(none_drawdown.recovery_factor, 0.0)
 
     def test_run_local_backtest_attaches_benchmark_stats_to_computation(self) -> None:
         strategy = StrategySummary(
