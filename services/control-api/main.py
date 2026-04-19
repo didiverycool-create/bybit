@@ -5382,8 +5382,44 @@ def _merge_backtest_review_risks(risks: List[str], context: Dict[str, Any]) -> L
     return _merge_execution_health_review_risks(merged, context)
 
 
+def _merge_review_structured_parse(
+    text: str, job_type: str, fallback: Dict[str, Any]
+) -> Dict[str, Any]:
+    if job_type == "generate_daily_review":
+        structured = OpenClawGatewayClient.parse_daily_review_response(text)
+        highlights = [str(item) for item in structured.get("key_wins") or []]
+        risks = [str(item) for item in structured.get("key_losses") or []]
+        risks.extend(str(item) for item in structured.get("market_observations") or [])
+        risks.extend(str(item) for item in structured.get("next_day_priorities") or [])
+        sentiment = structured.get("sentiment") or ""
+        summary_prefix = f"[{sentiment}] " if sentiment and sentiment != "neutral" else ""
+    elif job_type == "generate_backtest_review":
+        structured = OpenClawGatewayClient.parse_backtest_review_response(text)
+        highlights = [str(item) for item in structured.get("strengths") or []]
+        risks = [str(item) for item in structured.get("weaknesses") or []]
+        risks.extend(str(item) for item in structured.get("risk_flags") or [])
+        risks.extend(str(item) for item in structured.get("recommended_actions") or [])
+        rating = structured.get("overall_rating") or ""
+        summary_prefix = f"[{rating}] " if rating and rating != "acceptable" else ""
+    else:
+        return fallback
+
+    if not highlights and not risks:
+        return fallback
+    summary = str(structured.get("summary") or "").strip()
+    if not summary:
+        summary = str(fallback.get("summary") or "")
+    return {
+        "summary": f"{summary_prefix}{summary}".strip(),
+        "highlights": highlights or [str(item) for item in fallback.get("highlights") or []],
+        "risks": risks or [str(item) for item in fallback.get("risks") or []],
+        "proposals": fallback.get("proposals") or [],
+    }
+
+
 def build_review_document_from_text(text: str, context: Dict[str, Any], source: str, job_type: str) -> ReviewDocument:
-    parsed = parse_review_text(text)
+    fallback = parse_review_text(text)
+    parsed = _merge_review_structured_parse(text, job_type, fallback)
     now = datetime.now(timezone.utc).astimezone()
     now_iso = now.isoformat()
     sample_quality_guarded = (

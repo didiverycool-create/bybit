@@ -3842,6 +3842,60 @@ class StrategyTrackingReviewResponseUnitTests(unittest.TestCase):
         self.assertFalse(review.summary.startswith("["))
         self.assertIn("策略变更已落实", review.summary)
 
+    def test_build_review_document_from_text_merges_daily_review_structured_payload(self) -> None:
+        raw = (
+            '{"summary": "今日策略稳定运行",'
+            ' "sentiment": "bullish",'
+            ' "key_wins": ["Trend BTC 盈利 120 USDT"],'
+            ' "key_losses": ["MeanRevert ETH 触发止损"],'
+            ' "market_observations": ["BTC 夜间波动放大"],'
+            ' "next_day_priorities": ["复核 MeanRevert 参数"]}'
+        )
+        review = control_main.build_review_document_from_text(
+            raw,
+            {"strategy_id": "trend-btc-01"},
+            source="openclaw",
+            job_type="generate_daily_review",
+        )
+        self.assertTrue(review.summary.startswith("[bullish] "))
+        self.assertIn("今日策略稳定运行", review.summary)
+        self.assertIn("Trend BTC 盈利 120 USDT", review.highlights)
+        self.assertIn("MeanRevert ETH 触发止损", review.risks)
+        self.assertIn("BTC 夜间波动放大", review.risks)
+        self.assertIn("复核 MeanRevert 参数", review.risks)
+
+    def test_build_review_document_from_text_merges_backtest_review_structured_payload(self) -> None:
+        raw = (
+            '{"summary": "回测整体可用",'
+            ' "overall_rating": "strong",'
+            ' "strengths": ["Sharpe 1.8", "回撤可控"],'
+            ' "weaknesses": ["最近一段样本偏少"],'
+            ' "risk_flags": ["样本窗口提示"],'
+            ' "recommended_actions": ["扩展到最近 180 天再跑一次"]}'
+        )
+        review = control_main.build_review_document_from_text(
+            raw,
+            {"strategy_id": "trend-btc-01", "backtest_id": "bt-001"},
+            source="openclaw",
+            job_type="generate_backtest_review",
+        )
+        self.assertTrue(review.summary.startswith("[strong] "))
+        self.assertIn("回测整体可用", review.summary)
+        self.assertIn("Sharpe 1.8", review.highlights)
+        self.assertIn("回撤可控", review.highlights)
+        self.assertIn("最近一段样本偏少", review.risks)
+        self.assertIn("扩展到最近 180 天再跑一次", review.risks)
+
+    def test_build_review_document_from_text_plain_text_does_not_get_structured_prefix(self) -> None:
+        review = control_main.build_review_document_from_text(
+            "策略运行整体平稳。",
+            {"strategy_id": "trend-btc-01"},
+            source="openclaw",
+            job_type="generate_daily_review",
+        )
+        self.assertFalse(review.summary.startswith("["))
+        self.assertIn("策略运行整体平稳", review.summary)
+
 
 class ControlApiHelperUnitTests(unittest.TestCase):
     def test_load_private_positions_snapshot_fetches_and_seeds_realtime_cache(self) -> None:
