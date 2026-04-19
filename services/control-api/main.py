@@ -4503,6 +4503,33 @@ def build_agent_job_prompt(job_type: str, context: Dict[str, Any]) -> str:
             "如果你无法稳定输出 JSON，请退回为一段 120 字以内的中文总结。\n"
             f"上下文：{json.dumps(review_context, ensure_ascii=False)}"
         )
+    if job_type == "summarize_execution_impact":
+        anomalies_text = json.dumps(
+            review_context.get("anomalies") or [],
+            ensure_ascii=False,
+        )
+        return (
+            "你是一个量化执行评估专家。请基于以下执行回放数据，生成一份结构化的执行影响摘要。\n"
+            f"- 策略：{review_context.get('strategy_name', '未提供')}（{review_context.get('strategy_id', '未提供')}）\n"
+            f"- 时间窗口：{review_context.get('window_start', '未提供')} -> {review_context.get('window_end', '未提供')}\n"
+            f"- 订单总数：{review_context.get('order_count', '未提供')}\n"
+            f"- 成交笔数：{review_context.get('fill_count', '未提供')}\n"
+            f"- 总成交金额：{review_context.get('total_notional', '未提供')}\n"
+            f"- 滑点（bps）：{review_context.get('slippage_bps', '未提供')}\n"
+            f"- 预期 vs 实际 PnL：{review_context.get('expected_pnl', '未提供')} / {review_context.get('realized_pnl', '未提供')}\n"
+            f"- 异常事件：{anomalies_text}\n"
+            "请按如下 JSON 结构输出（与 parse_execution_impact_response 对齐）：\n"
+            "{\n"
+            '  "summary": "200 字以内的执行质量综述",\n'
+            '  "impact_level": "negligible|moderate|significant",\n'
+            '  "direction": "improved|neutral|worsened",\n'
+            '  "affected_orders": ["受影响的订单 ID 或描述"],\n'
+            '  "affected_positions": ["受影响的仓位 ID 或描述"],\n'
+            '  "metrics_deltas": ["关键指标差异，例如 滑点+3bps、成交率-12%"],\n'
+            '  "follow_up_checks": ["需要人工复核或后续跟踪的动作"]\n'
+            "}\n"
+            "如果你无法稳定输出 JSON，请退回为一段 120 字以内的中文总结。"
+        )
     return (
         "请用中文简短总结当前任务执行结果，并给出一句下一步建议。"
         f"上下文：{json.dumps(review_context, ensure_ascii=False)}"

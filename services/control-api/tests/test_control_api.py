@@ -2560,6 +2560,38 @@ class ReviewParsingUnitTests(unittest.TestCase):
         self.assertIn('"strategy_id": "eth-revert-02"', prompt)
         self.assertIn('"recent_alerts"', prompt)
 
+    def test_build_agent_job_prompt_handles_summarize_execution_impact(self) -> None:
+        prompt = control_main.build_agent_job_prompt(
+            "summarize_execution_impact",
+            {
+                "strategy_id": "eth-revert-02",
+                "strategy_name": "ETH 均值回归",
+                "window_start": "2026-04-18T00:00:00+08:00",
+                "window_end": "2026-04-19T00:00:00+08:00",
+                "order_count": 42,
+                "fill_count": 37,
+                "total_notional": "125000.50",
+                "slippage_bps": "4.2",
+                "expected_pnl": "+320.10",
+                "realized_pnl": "+285.64",
+                "anomalies": [
+                    {"type": "partial_fill_spike", "detail": "ETHUSDT 单笔低于 50% 成交"},
+                ],
+            },
+        )
+        self.assertIn("执行质量综述", prompt)
+        self.assertIn("ETH 均值回归", prompt)
+        self.assertIn("订单总数：42", prompt)
+        self.assertIn("impact_level", prompt)
+        self.assertIn("follow_up_checks", prompt)
+
+    def test_build_agent_job_prompt_summarize_execution_impact_handles_missing_fields(self) -> None:
+        prompt = control_main.build_agent_job_prompt(
+            "summarize_execution_impact",
+            {"strategy_id": "eth-revert-02"},
+        )
+        self.assertIn("未提供", prompt)
+
     def test_parse_review_text_supports_json_payload(self) -> None:
         parsed = control_main.parse_review_text(
             json.dumps(
