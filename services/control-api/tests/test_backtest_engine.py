@@ -448,6 +448,111 @@ class BacktestEngineUnitTests(unittest.TestCase):
         # Worst bar should never exceed best bar.
         self.assertLessEqual(ratios.worst_bar_return_pct, ratios.best_bar_return_pct)
 
+    def test_compute_trade_rhythm_stats_handles_empty_input(self) -> None:
+        # Empty period-return series must never raise; every field should be
+        # the zero value of its declared type (int → 0, float → 0.0).
+        stats = backtest_engine._compute_trade_rhythm_stats([])
+
+        self.assertIsInstance(stats, backtest_engine.BacktestTradeRhythmStats)
+        self.assertEqual(stats.total_bars, 0)
+        self.assertEqual(stats.positive_bars, 0)
+        self.assertEqual(stats.negative_bars, 0)
+        self.assertEqual(stats.flat_bars, 0)
+        self.assertEqual(stats.win_loss_bar_ratio, 0.0)
+        self.assertEqual(stats.longest_winning_streak_bars, 0)
+        self.assertEqual(stats.longest_losing_streak_bars, 0)
+        self.assertEqual(stats.avg_positive_bar_return_pct, 0.0)
+        self.assertEqual(stats.avg_negative_bar_return_pct, 0.0)
+        self.assertEqual(stats.median_bar_return_pct, 0.0)
+
+    def test_compute_trade_rhythm_stats_counts_positive_negative_flat_bars(self) -> None:
+        # Mix of strictly positive, strictly negative, and zero bars — each
+        # counter must bucket the corresponding sign and win/loss ratio should
+        # divide positives by negatives.
+        period_returns = [1.0, -0.5, 0.0, 2.0, -1.0, 0.0, 0.5]
+        stats = backtest_engine._compute_trade_rhythm_stats(period_returns)
+
+        self.assertEqual(stats.total_bars, 7)
+        self.assertEqual(stats.positive_bars, 3)
+        self.assertEqual(stats.negative_bars, 2)
+        self.assertEqual(stats.flat_bars, 2)
+        self.assertAlmostEqual(stats.win_loss_bar_ratio, round(3 / 2, 4), places=4)
+
+        # A run of only-positive bars must produce a zero win/loss ratio (the
+        # "no losses observed" guard rather than a division by zero).
+        only_positive = backtest_engine._compute_trade_rhythm_stats([1.0, 2.0, 0.5])
+        self.assertEqual(only_positive.negative_bars, 0)
+        self.assertEqual(only_positive.win_loss_bar_ratio, 0.0)
+
+    def test_compute_trade_rhythm_stats_tracks_longest_streaks(self) -> None:
+        # +,+,+,-,-,+ → longest winning streak = 3 (first three bars); longest
+        # losing streak = 2 (bars 4–5). A trailing positive bar must not
+        # extend the losing streak.
+        stats = backtest_engine._compute_trade_rhythm_stats([1.0, 0.5, 0.25, -0.5, -0.25, 0.75])
+
+        self.assertEqual(stats.longest_winning_streak_bars, 3)
+        self.assertEqual(stats.longest_losing_streak_bars, 2)
+
+        # A flat bar in the middle of a winning run must break the streak so
+        # the two sub-runs do not merge into a longer single streak.
+        broken_by_zero = backtest_engine._compute_trade_rhythm_stats([1.0, 1.0, 0.0, 1.0, 1.0, 1.0])
+        self.assertEqual(broken_by_zero.longest_winning_streak_bars, 3)
+        self.assertEqual(broken_by_zero.longest_losing_streak_bars, 0)
+
+    def test_compute_trade_rhythm_stats_averages_positive_and_negative_bars(self) -> None:
+        # Hand-picked returns let us check averages / median against an exact
+        # expected value rather than a fuzzy bound.
+        period_returns = [1.0, 2.0, 3.0, -1.0, -3.0]
+        stats = backtest_engine._compute_trade_rhythm_stats(period_returns)
+
+        self.assertAlmostEqual(stats.avg_positive_bar_return_pct, round((1.0 + 2.0 + 3.0) / 3, 4), places=4)
+        self.assertAlmostEqual(stats.avg_negative_bar_return_pct, round((-1.0 + -3.0) / 2, 4), places=4)
+        # Negative-tail average must itself be a negative number.
+        self.assertLess(stats.avg_negative_bar_return_pct, 0.0)
+        # Median of [-3, -1, 1, 2, 3] is 1.0.
+        self.assertAlmostEqual(stats.median_bar_return_pct, 1.0, places=4)
+
+    def test_run_local_backtest_attaches_trade_rhythm_stats_to_computation(self) -> None:
+        strategy = StrategySummary(
+            id="trend-btc-01",
+            name="BTC 趋势跟随",
+            category="template",
+            status="running",
+            symbols=["BTCUSDT"],
+            mode="paper",
+            version="v1",
+            pnl_7d="+0.0%",
+            max_drawdown="-0.0%",
+            risk_budget="18%",
+            description="test",
+            parameters=[
+                StrategyParameter(key="fast_ma", label="Fast", value=2),
+                StrategyParameter(key="slow_ma", label="Slow", value=3),
+                StrategyParameter(key="risk_per_trade", label="Risk", value=1.0),
+            ],
+        )
+        candles = [
+            backtest_engine.CandlePoint(time=f"2026-03-31T0{index}:00:00+08:00", open=price, high=price, low=price, close=price, volume=1000)
+            for index, price in enumerate([100.0, 101.0, 102.0, 103.0, 90.0, 106.0])
+        ]
+
+        result = backtest_engine.run_local_backtest(strategy, candles, "1h", "2026-03-01 ~ 2026-03-31")
+
+        self.assertIsNotNone(result.trade_rhythm_stats)
+        rhythm = result.trade_rhythm_stats
+        self.assertIsInstance(rhythm, backtest_engine.BacktestTradeRhythmStats)
+        # Bucket counts must reconcile with total bars and stay non-negative.
+        self.assertGreaterEqual(rhythm.total_bars, 0)
+        self.assertEqual(
+            rhythm.positive_bars + rhythm.negative_bars + rhythm.flat_bars,
+            rhythm.total_bars,
+        )
+        self.assertGreaterEqual(rhythm.longest_winning_streak_bars, 0)
+        self.assertGreaterEqual(rhythm.longest_losing_streak_bars, 0)
+        # Streaks can never exceed the corresponding bucket counts.
+        self.assertLessEqual(rhythm.longest_winning_streak_bars, rhythm.positive_bars)
+        self.assertLessEqual(rhythm.longest_losing_streak_bars, rhythm.negative_bars)
+
 
 if __name__ == "__main__":
     unittest.main()

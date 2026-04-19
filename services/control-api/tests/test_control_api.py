@@ -17020,5 +17020,306 @@ class StrategyIssueReviewResponseUnitTests(unittest.TestCase):
         self.assertEqual(parsed["raw_text"], raw)
 
 
+class DailyReviewResponseUnitTests(unittest.TestCase):
+    def test_parses_structured_json_payload(self) -> None:
+        from openclaw_client import OpenClawGatewayClient  # type: ignore
+
+        raw = (
+            '{"summary": "今日整体运行稳定，净收益小幅为正",'
+            ' "sentiment": "bullish",'
+            ' "key_wins": ["趋势策略抓到早盘突破", "滑点控制达标"],'
+            ' "key_losses": ["套利策略触及止损一次"],'
+            ' "market_observations": ["BTC 放量上行", "资金费率持续为正"],'
+            ' "next_day_priorities": ["复盘套利止损", "扩大趋势策略仓位"]}'
+        )
+        parsed = OpenClawGatewayClient.parse_daily_review_response(raw)
+        self.assertEqual(parsed["summary"], "今日整体运行稳定，净收益小幅为正")
+        self.assertEqual(parsed["sentiment"], "bullish")
+        self.assertEqual(parsed["key_wins"], ["趋势策略抓到早盘突破", "滑点控制达标"])
+        self.assertEqual(parsed["key_losses"], ["套利策略触及止损一次"])
+        self.assertEqual(
+            parsed["market_observations"],
+            ["BTC 放量上行", "资金费率持续为正"],
+        )
+        self.assertEqual(
+            parsed["next_day_priorities"],
+            ["复盘套利止损", "扩大趋势策略仓位"],
+        )
+        self.assertEqual(parsed["raw_text"], raw)
+
+    def test_parses_from_fenced_code_block(self) -> None:
+        from openclaw_client import OpenClawGatewayClient  # type: ignore
+
+        raw = (
+            "Daily summary follows:\n"
+            "```json\n"
+            '{"summary": "整体表现中规中矩",'
+            ' "sentiment": "neutral",'
+            ' "key_wins": ["执行路径稳定"],'
+            ' "key_losses": [],'
+            ' "market_observations": ["行情震荡"],'
+            ' "next_day_priorities": ["继续观察"]}\n'
+            "```"
+        )
+        parsed = OpenClawGatewayClient.parse_daily_review_response(raw)
+        self.assertEqual(parsed["summary"], "整体表现中规中矩")
+        self.assertEqual(parsed["sentiment"], "neutral")
+        self.assertEqual(parsed["key_wins"], ["执行路径稳定"])
+        self.assertEqual(parsed["key_losses"], [])
+        self.assertEqual(parsed["market_observations"], ["行情震荡"])
+        self.assertEqual(parsed["next_day_priorities"], ["继续观察"])
+
+    def test_coerces_sentiment_aliases(self) -> None:
+        from openclaw_client import OpenClawGatewayClient  # type: ignore
+
+        bullish_chinese = '{"summary": "表现积极", "sentiment": "看多"}'
+        self.assertEqual(
+            OpenClawGatewayClient.parse_daily_review_response(bullish_chinese)["sentiment"],
+            "bullish",
+        )
+
+        bullish_english = '{"summary": "upbeat", "sentiment": "positive"}'
+        self.assertEqual(
+            OpenClawGatewayClient.parse_daily_review_response(bullish_english)["sentiment"],
+            "bullish",
+        )
+
+        neutral_chinese = '{"summary": "中性", "sentiment": "中性"}'
+        self.assertEqual(
+            OpenClawGatewayClient.parse_daily_review_response(neutral_chinese)["sentiment"],
+            "neutral",
+        )
+
+        neutral_english = '{"summary": "flat day", "sentiment": "flat"}'
+        self.assertEqual(
+            OpenClawGatewayClient.parse_daily_review_response(neutral_english)["sentiment"],
+            "neutral",
+        )
+
+        bearish_chinese = '{"summary": "偏弱", "sentiment": "看空"}'
+        self.assertEqual(
+            OpenClawGatewayClient.parse_daily_review_response(bearish_chinese)["sentiment"],
+            "bearish",
+        )
+
+        bearish_english = '{"summary": "down day", "sentiment": "negative"}'
+        self.assertEqual(
+            OpenClawGatewayClient.parse_daily_review_response(bearish_english)["sentiment"],
+            "bearish",
+        )
+
+        unknown_raw = '{"summary": "未定", "sentiment": "unspecified"}'
+        # Unknown sentiment degrades to the conservative default ``neutral``.
+        self.assertEqual(
+            OpenClawGatewayClient.parse_daily_review_response(unknown_raw)["sentiment"],
+            "neutral",
+        )
+
+    def test_returns_defaults_on_empty_input(self) -> None:
+        from openclaw_client import OpenClawGatewayClient  # type: ignore
+
+        parsed_none = OpenClawGatewayClient.parse_daily_review_response(None)
+        self.assertEqual(parsed_none["summary"], "")
+        self.assertEqual(parsed_none["sentiment"], "neutral")
+        self.assertEqual(parsed_none["key_wins"], [])
+        self.assertEqual(parsed_none["key_losses"], [])
+        self.assertEqual(parsed_none["market_observations"], [])
+        self.assertEqual(parsed_none["next_day_priorities"], [])
+        self.assertEqual(parsed_none["raw_text"], "")
+
+        parsed_blank = OpenClawGatewayClient.parse_daily_review_response("   \n \t ")
+        self.assertEqual(parsed_blank["summary"], "")
+        self.assertEqual(parsed_blank["sentiment"], "neutral")
+        self.assertEqual(parsed_blank["key_wins"], [])
+
+    def test_falls_back_to_heuristic_when_not_json(self) -> None:
+        from openclaw_client import OpenClawGatewayClient  # type: ignore
+
+        raw = "今日整体净收益微正，建议明日继续保持仓位结构。"
+        parsed = OpenClawGatewayClient.parse_daily_review_response(raw)
+        self.assertEqual(parsed["summary"], raw)
+        # Plain-text falls back to the conservative defaults.
+        self.assertEqual(parsed["sentiment"], "neutral")
+        self.assertEqual(parsed["key_wins"], [])
+        self.assertEqual(parsed["key_losses"], [])
+        self.assertEqual(parsed["market_observations"], [])
+        self.assertEqual(parsed["next_day_priorities"], [])
+        self.assertEqual(parsed["raw_text"], raw)
+
+    def test_accepts_newline_separated_lists_in_fields(self) -> None:
+        from openclaw_client import OpenClawGatewayClient  # type: ignore
+
+        raw = (
+            '{"summary": "整体偏稳",'
+            ' "sentiment": "neutral",'
+            ' "key_wins": "趋势策略小幅盈利\\n执行链路稳定",'
+            ' "key_losses": "- 套利单次止损\\n- 手续费略增",'
+            ' "market_observations": "BTC 横盘\\n成交量缩量",'
+            ' "next_day_priorities": "复盘止损\\n评估手续费\\n"}'
+        )
+        parsed = OpenClawGatewayClient.parse_daily_review_response(raw)
+        self.assertEqual(parsed["key_wins"], ["趋势策略小幅盈利", "执行链路稳定"])
+        self.assertEqual(parsed["key_losses"], ["套利单次止损", "手续费略增"])
+        self.assertEqual(parsed["market_observations"], ["BTC 横盘", "成交量缩量"])
+        self.assertEqual(parsed["next_day_priorities"], ["复盘止损", "评估手续费"])
+
+
+class BacktestReviewResponseUnitTests(unittest.TestCase):
+    def test_parses_structured_backtest_payload(self) -> None:
+        from openclaw_client import OpenClawGatewayClient  # type: ignore
+
+        raw = (
+            '{"summary": "回测整体收益稳定，夏普满足上线标准",'
+            ' "overall_rating": "strong",'
+            ' "strengths": ["夏普 2.1", "最大回撤低于预算"],'
+            ' "weaknesses": ["样本覆盖偏短"],'
+            ' "risk_flags": ["缺少熊市样本", "滑点假设偏乐观"],'
+            ' "recommended_actions": ["补充 2022 年熊市回测", "提高滑点模型置信度"]}'
+        )
+        parsed = OpenClawGatewayClient.parse_backtest_review_response(raw)
+        self.assertEqual(parsed["summary"], "回测整体收益稳定，夏普满足上线标准")
+        self.assertEqual(parsed["overall_rating"], "strong")
+        self.assertEqual(parsed["strengths"], ["夏普 2.1", "最大回撤低于预算"])
+        self.assertEqual(parsed["weaknesses"], ["样本覆盖偏短"])
+        self.assertEqual(parsed["risk_flags"], ["缺少熊市样本", "滑点假设偏乐观"])
+        self.assertEqual(
+            parsed["recommended_actions"],
+            ["补充 2022 年熊市回测", "提高滑点模型置信度"],
+        )
+        self.assertEqual(parsed["raw_text"], raw)
+
+    def test_coerces_rating_aliases(self) -> None:
+        from openclaw_client import OpenClawGatewayClient  # type: ignore
+
+        strong_chinese = '{"summary": "表现出色", "overall_rating": "优秀"}'
+        self.assertEqual(
+            OpenClawGatewayClient.parse_backtest_review_response(strong_chinese)["overall_rating"],
+            "strong",
+        )
+
+        strong_english = '{"summary": "solid run", "overall_rating": "excellent"}'
+        self.assertEqual(
+            OpenClawGatewayClient.parse_backtest_review_response(strong_english)["overall_rating"],
+            "strong",
+        )
+
+        acceptable_chinese = '{"summary": "尚可", "overall_rating": "合格"}'
+        self.assertEqual(
+            OpenClawGatewayClient.parse_backtest_review_response(acceptable_chinese)["overall_rating"],
+            "acceptable",
+        )
+
+        acceptable_english = '{"summary": "meets bar", "overall_rating": "fair"}'
+        self.assertEqual(
+            OpenClawGatewayClient.parse_backtest_review_response(acceptable_english)["overall_rating"],
+            "acceptable",
+        )
+
+        weak_chinese = '{"summary": "不建议上线", "overall_rating": "偏弱"}'
+        self.assertEqual(
+            OpenClawGatewayClient.parse_backtest_review_response(weak_chinese)["overall_rating"],
+            "weak",
+        )
+
+        weak_english = '{"summary": "needs work", "overall_rating": "poor"}'
+        self.assertEqual(
+            OpenClawGatewayClient.parse_backtest_review_response(weak_english)["overall_rating"],
+            "weak",
+        )
+
+        unknown_raw = '{"summary": "未定级", "overall_rating": "unspecified"}'
+        # Unknown rating degrades to the conservative default ``acceptable``.
+        self.assertEqual(
+            OpenClawGatewayClient.parse_backtest_review_response(unknown_raw)["overall_rating"],
+            "acceptable",
+        )
+
+    def test_returns_defaults_on_empty_input(self) -> None:
+        from openclaw_client import OpenClawGatewayClient  # type: ignore
+
+        parsed_none = OpenClawGatewayClient.parse_backtest_review_response(None)
+        self.assertEqual(parsed_none["summary"], "")
+        self.assertEqual(parsed_none["overall_rating"], "acceptable")
+        self.assertEqual(parsed_none["strengths"], [])
+        self.assertEqual(parsed_none["weaknesses"], [])
+        self.assertEqual(parsed_none["risk_flags"], [])
+        self.assertEqual(parsed_none["recommended_actions"], [])
+        self.assertEqual(parsed_none["raw_text"], "")
+
+        parsed_blank = OpenClawGatewayClient.parse_backtest_review_response("   \n \t ")
+        self.assertEqual(parsed_blank["summary"], "")
+        self.assertEqual(parsed_blank["overall_rating"], "acceptable")
+        self.assertEqual(parsed_blank["strengths"], [])
+
+    def test_parses_from_fenced_block(self) -> None:
+        from openclaw_client import OpenClawGatewayClient  # type: ignore
+
+        raw = (
+            "Review below:\n"
+            "```json\n"
+            '{"summary": "回测收益略低于预期",'
+            ' "overall_rating": "合格",'
+            ' "strengths": "胜率稳定\\n回撤可控",'
+            ' "weaknesses": ["样本时间段偏短"],'
+            ' "risk_flags": "缺少极端行情覆盖\\n手续费假设偏乐观",'
+            ' "recommended_actions": "拓展样本区间\\n复核手续费模型"}\n'
+            "```"
+        )
+        parsed = OpenClawGatewayClient.parse_backtest_review_response(raw)
+        self.assertEqual(parsed["summary"], "回测收益略低于预期")
+        self.assertEqual(parsed["overall_rating"], "acceptable")
+        self.assertEqual(parsed["strengths"], ["胜率稳定", "回撤可控"])
+        self.assertEqual(parsed["weaknesses"], ["样本时间段偏短"])
+        self.assertEqual(
+            parsed["risk_flags"],
+            ["缺少极端行情覆盖", "手续费假设偏乐观"],
+        )
+        self.assertEqual(
+            parsed["recommended_actions"],
+            ["拓展样本区间", "复核手续费模型"],
+        )
+
+    def test_falls_back_to_heuristic_summary(self) -> None:
+        from openclaw_client import OpenClawGatewayClient  # type: ignore
+
+        raw = "回测整体收益与夏普达标，建议再补一次压力测试后再推上线。"
+        parsed = OpenClawGatewayClient.parse_backtest_review_response(raw)
+        self.assertEqual(parsed["summary"], raw)
+        # Plain-text falls back to the conservative defaults.
+        self.assertEqual(parsed["overall_rating"], "acceptable")
+        self.assertEqual(parsed["strengths"], [])
+        self.assertEqual(parsed["weaknesses"], [])
+        self.assertEqual(parsed["risk_flags"], [])
+        self.assertEqual(parsed["recommended_actions"], [])
+        self.assertEqual(parsed["raw_text"], raw)
+
+    def test_accepts_mixed_case_rating_aliases(self) -> None:
+        from openclaw_client import OpenClawGatewayClient  # type: ignore
+
+        mixed_strong = '{"summary": "great run", "overall_rating": "STRONG"}'
+        self.assertEqual(
+            OpenClawGatewayClient.parse_backtest_review_response(mixed_strong)["overall_rating"],
+            "strong",
+        )
+
+        mixed_acceptable = '{"summary": "ok run", "overall_rating": "Acceptable"}'
+        self.assertEqual(
+            OpenClawGatewayClient.parse_backtest_review_response(mixed_acceptable)["overall_rating"],
+            "acceptable",
+        )
+
+        mixed_weak = '{"summary": "weak run", "overall_rating": "Weak"}'
+        self.assertEqual(
+            OpenClawGatewayClient.parse_backtest_review_response(mixed_weak)["overall_rating"],
+            "weak",
+        )
+
+        mixed_ok = '{"summary": "passable", "overall_rating": "OK"}'
+        self.assertEqual(
+            OpenClawGatewayClient.parse_backtest_review_response(mixed_ok)["overall_rating"],
+            "acceptable",
+        )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

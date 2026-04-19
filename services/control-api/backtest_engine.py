@@ -4,7 +4,7 @@ import math
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from statistics import mean, pstdev
+from statistics import mean, median, pstdev
 from typing import Dict, List, Optional
 
 from models import BacktestMetrics, CandlePoint, StrategySummary, derive_backtest_sample_quality
@@ -56,6 +56,41 @@ class BacktestRiskRatios:
 
 
 @dataclass
+class BacktestTradeRhythmStats:
+    """Bar-level rhythm descriptors derived from the simulated equity curve.
+
+    Companion to ``BacktestVolatilityStats`` / ``BacktestRiskRatios`` — focuses
+    on the *cadence* of winning and losing bars rather than their magnitudes.
+    All fields default to zero so a degenerate curve (empty / flat / single
+    point) produces a fully populated payload instead of raising.
+
+    - ``total_bars``: number of period returns observed (``len(period_returns)``).
+    - ``positive_bars`` / ``negative_bars`` / ``flat_bars``: counts of strictly
+      positive, strictly negative, and exactly-zero period returns.
+    - ``win_loss_bar_ratio``: ``positive_bars / negative_bars``; zero when no
+      negative bars exist (avoids div-by-zero while signalling "no losses").
+    - ``longest_winning_streak_bars`` / ``longest_losing_streak_bars``: longest
+      run of consecutive strictly-positive / strictly-negative period returns.
+      Zero entries break both streaks.
+    - ``avg_positive_bar_return_pct`` / ``avg_negative_bar_return_pct``: mean of
+      the positive / negative tails, already multiplied by 100 (so they read as
+      percentages). Negative tail mean is a negative number.
+    - ``median_bar_return_pct``: median of all period returns × 100.
+    """
+
+    total_bars: int = 0
+    positive_bars: int = 0
+    negative_bars: int = 0
+    flat_bars: int = 0
+    win_loss_bar_ratio: float = 0.0
+    longest_winning_streak_bars: int = 0
+    longest_losing_streak_bars: int = 0
+    avg_positive_bar_return_pct: float = 0.0
+    avg_negative_bar_return_pct: float = 0.0
+    median_bar_return_pct: float = 0.0
+
+
+@dataclass
 class BacktestComputation:
     metrics: BacktestMetrics
     notes: str
@@ -73,6 +108,7 @@ class BacktestComputation:
     history_truncated: bool
     volatility_stats: Optional[BacktestVolatilityStats] = None
     risk_ratios: Optional[BacktestRiskRatios] = None
+    trade_rhythm_stats: Optional[BacktestTradeRhythmStats] = None
 
 
 def _parameter_map(strategy: StrategySummary) -> Dict[str, object]:
@@ -317,6 +353,69 @@ def _compute_risk_ratios(
         expectancy_pct=round(expectancy_pct, 4),
         worst_bar_return_pct=round(worst_bar, 4),
         best_bar_return_pct=round(best_bar, 4),
+    )
+
+
+def _compute_trade_rhythm_stats(period_returns: List[float]) -> BacktestTradeRhythmStats:
+    """Derive bar-level rhythm statistics from already-computed period returns.
+
+    Period returns are reused from the volatility / risk-ratio pipeline so this
+    helper does no redundant equity-curve walking. Degenerate inputs (empty
+    series) yield an all-zero ``BacktestTradeRhythmStats`` rather than raising,
+    so downstream consumers can treat the payload as "unavailable" without
+    branching on ``None``.
+    """
+
+    if not period_returns:
+        return BacktestTradeRhythmStats()
+
+    positives = [value for value in period_returns if value > 0]
+    negatives = [value for value in period_returns if value < 0]
+    flats = [value for value in period_returns if value == 0]
+
+    # Streak walk: a strictly positive bar extends the winning run and breaks
+    # the losing run; a strictly negative bar does the reverse; a zero bar
+    # breaks both runs. Tracking both counters in a single pass keeps the
+    # helper O(n) in the period-return length.
+    longest_win = 0
+    longest_loss = 0
+    current_win = 0
+    current_loss = 0
+    for value in period_returns:
+        if value > 0:
+            current_win += 1
+            current_loss = 0
+            if current_win > longest_win:
+                longest_win = current_win
+        elif value < 0:
+            current_loss += 1
+            current_win = 0
+            if current_loss > longest_loss:
+                longest_loss = current_loss
+        else:
+            current_win = 0
+            current_loss = 0
+
+    if negatives:
+        win_loss_bar_ratio = len(positives) / len(negatives)
+    else:
+        win_loss_bar_ratio = 0.0
+
+    avg_positive = mean(positives) if positives else 0.0
+    avg_negative = mean(negatives) if negatives else 0.0
+    median_return = median(period_returns)
+
+    return BacktestTradeRhythmStats(
+        total_bars=len(period_returns),
+        positive_bars=len(positives),
+        negative_bars=len(negatives),
+        flat_bars=len(flats),
+        win_loss_bar_ratio=round(win_loss_bar_ratio, 4),
+        longest_winning_streak_bars=longest_win,
+        longest_losing_streak_bars=longest_loss,
+        avg_positive_bar_return_pct=round(avg_positive, 4),
+        avg_negative_bar_return_pct=round(avg_negative, 4),
+        median_bar_return_pct=round(median_return, 4),
     )
 
 
@@ -627,6 +726,7 @@ def run_local_backtest(strategy: StrategySummary, candles: List[CandlePoint], ti
         annualized_return_pct,
         bars_per_year,
     )
+    trade_rhythm_stats = _compute_trade_rhythm_stats(period_returns)
 
     notes = (
         f"由本地回测引擎基于 Bybit 历史 {timeframe} K 线生成，区间 {data_range}，"
@@ -653,4 +753,5 @@ def run_local_backtest(strategy: StrategySummary, candles: List[CandlePoint], ti
         history_truncated=history_truncated,
         volatility_stats=volatility_stats,
         risk_ratios=risk_ratios,
+        trade_rhythm_stats=trade_rhythm_stats,
     )

@@ -827,6 +827,258 @@ class OpenClawGatewayClient:
             "raw_text": raw_text,
         }
 
+    # ------------------------------------------------------------------
+    # Daily review (``generate_daily_review``)
+    # ------------------------------------------------------------------
+    # Canonical sentiment vocabulary for the daily operations review.
+    # Prompt emits one of ``bullish`` / ``neutral`` / ``bearish`` but the
+    # agent may echo Chinese synonyms or adjacent English terms; we
+    # normalize those here. Unknown values degrade to ``"neutral"`` via
+    # ``parse_daily_review_response`` — the conservative middle ground
+    # matches the pattern used by the strategy-change and issue parsers.
+    _DAILY_REVIEW_SENTIMENT_ALIASES: Dict[str, str] = {
+        "bullish": "bullish",
+        "positive": "bullish",
+        "up": "bullish",
+        "看多": "bullish",
+        "积极": "bullish",
+        "neutral": "neutral",
+        "normal": "neutral",
+        "flat": "neutral",
+        "中性": "neutral",
+        "bearish": "bearish",
+        "negative": "bearish",
+        "down": "bearish",
+        "看空": "bearish",
+        "消极": "bearish",
+    }
+
+    @classmethod
+    def _coerce_daily_review_sentiment(cls, value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            return None
+        token = str(value).strip().lower()
+        if not token:
+            return None
+        if token in cls._DAILY_REVIEW_SENTIMENT_ALIASES:
+            return cls._DAILY_REVIEW_SENTIMENT_ALIASES[token]
+        for alias, canonical in cls._DAILY_REVIEW_SENTIMENT_ALIASES.items():
+            if alias in token:
+                return canonical
+        return None
+
+    @classmethod
+    def parse_daily_review_response(cls, text: Optional[str]) -> Dict[str, Any]:
+        """Parse the structured response for a ``generate_daily_review`` agent job.
+
+        Accepts either a JSON object of the form
+        ``{"summary", "sentiment", "key_wins", "key_losses",
+        "market_observations", "next_day_priorities"}`` or a plain-text
+        fallback. Sentiment is normalized to one of ``bullish`` /
+        ``neutral`` / ``bearish``; unknown values degrade to
+        ``"neutral"`` so downstream renderers never have to substitute a
+        default themselves.
+
+        The returned dict always contains ``summary``, ``sentiment``,
+        ``key_wins``, ``key_losses``, ``market_observations``,
+        ``next_day_priorities`` and ``raw_text`` so the worker loop never
+        has to branch on whether OpenClaw produced JSON.
+        """
+
+        raw_text = text if isinstance(text, str) else ""
+        stripped = raw_text.strip()
+        if not stripped:
+            return {
+                "summary": "",
+                "sentiment": "neutral",
+                "key_wins": [],
+                "key_losses": [],
+                "market_observations": [],
+                "next_day_priorities": [],
+                "raw_text": raw_text,
+            }
+
+        parsed = cls._extract_first_json_object(stripped)
+        summary: str
+        sentiment: Optional[str]
+        key_wins: List[str]
+        key_losses: List[str]
+        market_observations: List[str]
+        next_day_priorities: List[str]
+        if isinstance(parsed, dict):
+            summary = str(parsed.get("summary") or "").strip()
+            sentiment = cls._coerce_daily_review_sentiment(parsed.get("sentiment"))
+            key_wins = cls._coerce_newline_string_list(
+                parsed.get("key_wins")
+                if parsed.get("key_wins") is not None
+                else parsed.get("wins")
+            )
+            key_losses = cls._coerce_newline_string_list(
+                parsed.get("key_losses")
+                if parsed.get("key_losses") is not None
+                else parsed.get("losses")
+            )
+            market_observations = cls._coerce_newline_string_list(
+                parsed.get("market_observations")
+                if parsed.get("market_observations") is not None
+                else parsed.get("observations")
+            )
+            next_day_priorities = cls._coerce_newline_string_list(
+                parsed.get("next_day_priorities")
+                if parsed.get("next_day_priorities") is not None
+                else parsed.get("priorities")
+            )
+        else:
+            summary = stripped
+            sentiment = None
+            key_wins = []
+            key_losses = []
+            market_observations = []
+            next_day_priorities = []
+
+        if not summary:
+            summary = "OpenClaw 已返回每日策略运行复盘。"
+
+        return {
+            "summary": summary,
+            "sentiment": sentiment or "neutral",
+            "key_wins": key_wins,
+            "key_losses": key_losses,
+            "market_observations": market_observations,
+            "next_day_priorities": next_day_priorities,
+            "raw_text": raw_text,
+        }
+
+    # ------------------------------------------------------------------
+    # Backtest review (``generate_backtest_review``)
+    # ------------------------------------------------------------------
+    # Canonical overall-rating vocabulary for the backtest review job.
+    # Prompt emits one of ``strong`` / ``acceptable`` / ``weak`` but the
+    # agent may echo Chinese synonyms or adjacent English terms. Unknown
+    # values degrade to ``"acceptable"`` via
+    # ``parse_backtest_review_response`` — the conservative middle ground
+    # so we neither over-promote nor over-flag a backtest on ambiguous
+    # wording.
+    _BACKTEST_REVIEW_RATING_ALIASES: Dict[str, str] = {
+        "strong": "strong",
+        "excellent": "strong",
+        "good": "strong",
+        "优秀": "strong",
+        "推荐": "strong",
+        "acceptable": "acceptable",
+        "okay": "acceptable",
+        "ok": "acceptable",
+        "fair": "acceptable",
+        "合格": "acceptable",
+        "可用": "acceptable",
+        "weak": "weak",
+        "poor": "weak",
+        "bad": "weak",
+        "偏弱": "weak",
+        "不推荐": "weak",
+        "不合格": "weak",
+    }
+
+    @classmethod
+    def _coerce_backtest_review_rating(cls, value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            return None
+        token = str(value).strip().lower()
+        if not token:
+            return None
+        if token in cls._BACKTEST_REVIEW_RATING_ALIASES:
+            return cls._BACKTEST_REVIEW_RATING_ALIASES[token]
+        for alias, canonical in cls._BACKTEST_REVIEW_RATING_ALIASES.items():
+            if alias in token:
+                return canonical
+        return None
+
+    @classmethod
+    def parse_backtest_review_response(cls, text: Optional[str]) -> Dict[str, Any]:
+        """Parse the structured response for a ``generate_backtest_review`` agent job.
+
+        Accepts either a JSON object of the form
+        ``{"summary", "overall_rating", "strengths", "weaknesses",
+        "risk_flags", "recommended_actions"}`` or a plain-text fallback.
+        ``overall_rating`` is normalized to one of ``strong`` /
+        ``acceptable`` / ``weak``; unknown values degrade to
+        ``"acceptable"`` so callers always receive a defined rating
+        without having to substitute a default themselves.
+
+        The returned dict always contains ``summary``, ``overall_rating``,
+        ``strengths``, ``weaknesses``, ``risk_flags``,
+        ``recommended_actions`` and ``raw_text`` so the worker loop never
+        has to branch on whether OpenClaw produced JSON.
+        """
+
+        raw_text = text if isinstance(text, str) else ""
+        stripped = raw_text.strip()
+        if not stripped:
+            return {
+                "summary": "",
+                "overall_rating": "acceptable",
+                "strengths": [],
+                "weaknesses": [],
+                "risk_flags": [],
+                "recommended_actions": [],
+                "raw_text": raw_text,
+            }
+
+        parsed = cls._extract_first_json_object(stripped)
+        summary: str
+        overall_rating: Optional[str]
+        strengths: List[str]
+        weaknesses: List[str]
+        risk_flags: List[str]
+        recommended_actions: List[str]
+        if isinstance(parsed, dict):
+            summary = str(parsed.get("summary") or "").strip()
+            overall_rating = cls._coerce_backtest_review_rating(
+                parsed.get("overall_rating")
+                if parsed.get("overall_rating") is not None
+                else parsed.get("rating")
+            )
+            strengths = cls._coerce_newline_string_list(parsed.get("strengths"))
+            weaknesses = cls._coerce_newline_string_list(parsed.get("weaknesses"))
+            risk_flags = cls._coerce_newline_string_list(
+                parsed.get("risk_flags")
+                if parsed.get("risk_flags") is not None
+                else parsed.get("risks")
+            )
+            recommended_actions = cls._coerce_newline_string_list(
+                parsed.get("recommended_actions")
+                if parsed.get("recommended_actions") is not None
+                else parsed.get("actions")
+            )
+        else:
+            summary = stripped
+            overall_rating = None
+            strengths = []
+            weaknesses = []
+            risk_flags = []
+            recommended_actions = []
+
+        if not summary:
+            summary = "OpenClaw 已返回回测评审结果。"
+
+        return {
+            "summary": summary,
+            "overall_rating": overall_rating or "acceptable",
+            "strengths": strengths,
+            "weaknesses": weaknesses,
+            "risk_flags": risk_flags,
+            "recommended_actions": recommended_actions,
+            "raw_text": raw_text,
+        }
+
     def get_status(self, worker_state: Optional[Dict[str, Any]] = None) -> OpenClawStatus:
         config = self._load_config()
         gateway = config.get("gateway", {})
