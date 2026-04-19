@@ -10,7 +10,7 @@ import unittest
 from unittest.mock import patch
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
@@ -18605,6 +18605,204 @@ class ExecutionHealthModuleUnitTests(unittest.TestCase):
             self.assertEqual(issue, health["issue"])
         finally:
             control_main.market_data.realtime = original_realtime
+
+
+class HardConstraintIntegrationTests(unittest.TestCase):
+    """Round 37 硬约束回归测试。
+
+    三条硬约束：
+    1. OpenClaw / AgentJob 的完成路径只产生 review / execution_impact record，
+       永远不直接生成 order / manual trade。
+    2. 统一执行预检 ``POST /api/trades/preview`` 走的是与真正下单相同的风控闸门，
+       触发风控时必须返回 ``allowed=False`` + 非空 ``blocked_reason``。
+    3. 手动本地下单 ``POST /api/account/paper/orders`` 在风控 block 时以 409 拒绝，
+       不会凭空新增 ``state.paper_orders`` 记录。
+    """
+
+    def setUp(self) -> None:
+        repo_state = control_main.repo.state
+        self._records_backup = copy.deepcopy(repo_state.execution_impact_records)
+        self._jobs_backup = copy.deepcopy(repo_state.agent_jobs)
+        self._events_backup = copy.deepcopy(repo_state.audit_events)
+        self._reviews_backup = copy.deepcopy(repo_state.reviews)
+        self._paper_orders_backup = copy.deepcopy(repo_state.paper_orders)
+        self._trades_backup = copy.deepcopy(repo_state.trades)
+        scheduler = repo_state.control_snapshot.scheduler
+        self._scheduler_current = scheduler.current_job_id
+        self._scheduler_status = scheduler.status
+        repo_state.agent_jobs = []
+        repo_state.execution_impact_records = []
+        scheduler.current_job_id = None
+        scheduler.status = "running"
+        self.addCleanup(self._restore)
+
+    def _restore(self) -> None:
+        repo_state = control_main.repo.state
+        repo_state.execution_impact_records = self._records_backup
+        repo_state.agent_jobs = self._jobs_backup
+        repo_state.audit_events = self._events_backup
+        repo_state.reviews = self._reviews_backup
+        repo_state.paper_orders = self._paper_orders_backup
+        repo_state.trades = self._trades_backup
+        scheduler = repo_state.control_snapshot.scheduler
+        scheduler.current_job_id = self._scheduler_current
+        scheduler.status = self._scheduler_status
+
+    def _count_manual_trades(self) -> int:
+        return sum(
+            1
+            for trade in control_main.repo.state.trades
+            if trade.origin == "manual"
+        )
+
+    def test_openclaw_job_completion_creates_review_record_but_no_orders(
+        self,
+    ) -> None:
+        """硬约束 1：AgentJob 完成不会直接下单 / 产生 manual trade。
+
+        走 ``queue_summarize_execution_impact`` -> ``claim_next_agent_job`` ->
+        ``build_execution_impact_record_from_text`` -> ``complete_agent_job``
+        这条正常回路，快照对比订单 / 成交集合，确保 AI 输出只走 review / impact
+        通道，不会绕过风控直接变成一笔订单或成交。
+        """
+
+        before_paper_orders: List[OrderRecord] = list(
+            control_main.repo.state.paper_orders
+        )
+        before_trades_total = len(control_main.repo.state.trades)
+        before_manual_trades = self._count_manual_trades()
+        before_impact_records = len(
+            control_main.repo.state.execution_impact_records
+        )
+
+        job_id = control_main.repo.queue_summarize_execution_impact(
+            strategy_id="trend-btc-01",
+            strategy_name="Trend BTC",
+            window_start="2026-04-20T08:00:00+08:00",
+            window_end="2026-04-20T09:00:00+08:00",
+            order_count=6,
+            fill_count=6,
+            total_notional=120_000.0,
+            slippage_bps=2.4,
+            expected_pnl=180.0,
+            realized_pnl=172.0,
+        )
+        claimed = control_main.repo.claim_next_agent_job()
+        self.assertIsNotNone(claimed)
+        assert claimed is not None
+        self.assertEqual(claimed.id, job_id)
+
+        gateway_text = (
+            '{"summary": "本窗口整体执行稳定",'
+            ' "impact_level": "minor",'
+            ' "direction": "neutral",'
+            ' "metrics_deltas": ["slippage -1bps"],'
+            ' "follow_up_checks": ["继续观察下一窗口"]}'
+        )
+        record = control_main.build_execution_impact_record_from_text(
+            gateway_text,
+            claimed.context,
+            source="openclaw",
+            job_id=claimed.id,
+        )
+
+        completed = control_main.repo.complete_agent_job(
+            claimed.id,
+            result_summary=record.summary[:160],
+            review=None,
+            source="openclaw",
+            execution_impact_record=record,
+        )
+        self.assertEqual(completed.status.value, "completed")
+
+        # 订单/成交集合必须完全不变 —— OpenClaw 绝不直接下单。
+        self.assertEqual(
+            list(control_main.repo.state.paper_orders), before_paper_orders
+        )
+        self.assertEqual(
+            len(control_main.repo.state.trades), before_trades_total
+        )
+        self.assertEqual(self._count_manual_trades(), before_manual_trades)
+
+        # AI 产出必须走 review / execution_impact 通道 —— 本次至少多出一条 impact 记录。
+        self.assertEqual(
+            len(control_main.repo.state.execution_impact_records),
+            before_impact_records + 1,
+        )
+        self.assertEqual(
+            control_main.repo.state.execution_impact_records[0].id, record.id
+        )
+        self.assertEqual(
+            completed.context.get("linked_execution_impact_id"), record.id
+        )
+
+    def test_preview_trade_endpoint_surfaces_risk_guard_blocked_reason(
+        self,
+    ) -> None:
+        """硬约束 2：``POST /api/trades/preview`` 必经风控守卫。
+
+        触发 block 的具体手段：在 Paper 模式下请求 BUY 10 BTCUSDT @ 65000
+        （名义价值 650,000 USDT），超过 ``PAPER_STARTING_CASH`` = 250,000，
+        命中 ``_evaluate_paper_order_risk_locked`` 里的
+        ``Paper 可用余额不足`` 分支 —— 这与 ``create_paper_order`` 走的是
+        同一套闸门，因此这条预检必然返回非空 ``blocked_reason``。
+        """
+
+        request = control_main.ExecutionPreviewRequest(
+            symbol="BTCUSDT",
+            market="perp",
+            mode=AccountMode.PAPER,
+            side=Direction.BUY,
+            quantity=10.0,
+            price=65_000.0,
+            origin="manual",
+        )
+
+        preview = control_main.preview_trade(request)
+
+        self.assertFalse(preview.allowed)
+        self.assertIsInstance(preview.blocked_reason, str)
+        assert preview.blocked_reason is not None
+        self.assertTrue(preview.blocked_reason.strip())
+        self.assertIn("可用余额不足", preview.blocked_reason)
+
+    def test_manual_paper_order_rejects_with_409_when_risk_guard_blocks(
+        self,
+    ) -> None:
+        """硬约束 3：手动下单必经预览闸门，命中风控时 409 拒绝且不生成订单。
+
+        构造与硬约束 2 同一条过量 BUY，直接调用 ``control_main.create_paper_order``
+        路由函数 —— 其内部会调 ``repo.create_paper_order`` 命中风控抛出 ValueError，
+        再被路由层转成 HTTP 409；任何情况下 ``state.paper_orders`` 都不应被写入。
+        """
+
+        from fastapi import HTTPException  # type: ignore
+
+        before_paper_orders: List[OrderRecord] = list(
+            control_main.repo.state.paper_orders
+        )
+
+        payload = control_main.ManualOrderRequest(
+            symbol="BTCUSDT",
+            market="perp",
+            mode=AccountMode.PAPER,
+            side=Direction.BUY,
+            quantity=10.0,
+            price=65_000.0,
+            note="oversized buy for hard-constraint test",
+        )
+
+        with self.assertRaises(HTTPException) as ctx:
+            control_main.create_paper_order(payload)
+
+        self.assertEqual(ctx.exception.status_code, 409)
+        self.assertIsInstance(ctx.exception.detail, str)
+        self.assertTrue(str(ctx.exception.detail).strip())
+
+        # 不能凭空多出订单 —— 即便 risk 事件被记录了，订单集合必须保持不变。
+        self.assertEqual(
+            list(control_main.repo.state.paper_orders), before_paper_orders
+        )
 
 
 if __name__ == "__main__":
