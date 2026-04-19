@@ -29,6 +29,33 @@ class BacktestVolatilityStats:
 
 
 @dataclass
+class BacktestRiskRatios:
+    """Risk-adjusted ratios derived from the simulated equity curve.
+
+    Companion to ``BacktestVolatilityStats``. Fields default to ``0.0`` so a
+    degenerate curve (empty / single-point / all-zero returns) never raises and
+    downstream consumers always receive a fully populated object.
+
+    - ``sortino_ratio``: Sharpe-style ratio using only downside deviation of
+      period returns, annualized with ``sqrt(bars_per_year)``.
+    - ``calmar_ratio``: annualized return divided by absolute max drawdown pct.
+      Zero when ``max_drawdown_pct`` is zero (no drawdown on record).
+    - ``profit_factor``: sum of positive period returns divided by the absolute
+      sum of negative period returns; zero when either leg is empty.
+    - ``expectancy_pct``: mean period return expressed as a percent.
+    - ``worst_bar_return_pct`` / ``best_bar_return_pct``: minimum / maximum
+      period return, expressed as a percent.
+    """
+
+    sortino_ratio: float = 0.0
+    calmar_ratio: float = 0.0
+    profit_factor: float = 0.0
+    expectancy_pct: float = 0.0
+    worst_bar_return_pct: float = 0.0
+    best_bar_return_pct: float = 0.0
+
+
+@dataclass
 class BacktestComputation:
     metrics: BacktestMetrics
     notes: str
@@ -45,6 +72,7 @@ class BacktestComputation:
     used_range_end: Optional[str]
     history_truncated: bool
     volatility_stats: Optional[BacktestVolatilityStats] = None
+    risk_ratios: Optional[BacktestRiskRatios] = None
 
 
 def _parameter_map(strategy: StrategySummary) -> Dict[str, object]:
@@ -228,6 +256,67 @@ def _compute_volatility_stats(
         max_drawdown_duration_bars=_max_drawdown_duration_bars(equity_curve),
         max_run_up_pct=round(_max_run_up_pct(equity_curve), 4),
         positive_bar_ratio_pct=round(positive_ratio, 2),
+    )
+
+
+def _compute_risk_ratios(
+    equity_curve: List[float],
+    period_returns: List[float],
+    annualized_return_pct: float,
+    bars_per_year: float,
+) -> BacktestRiskRatios:
+    """Derive risk-adjusted ratios from the simulated equity curve.
+
+    All inputs are reused from the volatility pipeline to avoid duplicating
+    ``_compute_period_returns`` / ``_compute_max_drawdown`` work. Degenerate
+    inputs (empty curve / empty period returns / non-positive denominators)
+    yield an all-zero ``BacktestRiskRatios`` instead of raising so downstream
+    consumers can treat missing data as "unavailable" rather than "error".
+    """
+
+    if not period_returns:
+        return BacktestRiskRatios()
+
+    positives = [value for value in period_returns if value > 0]
+    negatives = [value for value in period_returns if value < 0]
+
+    # Sortino uses only the downside deviation of period returns. Population
+    # stdev matches ``_compute_sharpe``'s choice so the two ratios are
+    # directly comparable.
+    if len(negatives) >= 2 and bars_per_year > 0:
+        downside_std = pstdev(negatives)
+        avg = mean(period_returns)
+        if downside_std > 0:
+            sortino = avg / downside_std * math.sqrt(bars_per_year)
+        else:
+            sortino = 0.0
+    else:
+        sortino = 0.0
+
+    max_drawdown_pct = _compute_max_drawdown(equity_curve)
+    if max_drawdown_pct < 0:
+        calmar = annualized_return_pct / abs(max_drawdown_pct)
+    else:
+        calmar = 0.0
+
+    sum_positive = sum(positives)
+    sum_negative_abs = abs(sum(negatives))
+    if sum_negative_abs > 0 and sum_positive > 0:
+        profit_factor = sum_positive / sum_negative_abs
+    else:
+        profit_factor = 0.0
+
+    expectancy_pct = mean(period_returns)
+    worst_bar = min(period_returns)
+    best_bar = max(period_returns)
+
+    return BacktestRiskRatios(
+        sortino_ratio=round(sortino, 4),
+        calmar_ratio=round(calmar, 4),
+        profit_factor=round(profit_factor, 4),
+        expectancy_pct=round(expectancy_pct, 4),
+        worst_bar_return_pct=round(worst_bar, 4),
+        best_bar_return_pct=round(best_bar, 4),
     )
 
 
@@ -516,9 +605,27 @@ def run_local_backtest(strategy: StrategySummary, candles: List[CandlePoint], ti
         metrics, used_reference_path, final_equity_curve = _run_mean_reversion(effective_candles, params, timeframe)
     else:
         metrics, used_reference_path, final_equity_curve = _run_breakout(effective_candles, params, timeframe)
+    bars_per_year = 365 * 24 / _timeframe_hours(timeframe)
     volatility_stats = _compute_volatility_stats(
         final_equity_curve,
-        365 * 24 / _timeframe_hours(timeframe),
+        bars_per_year,
+    )
+    # Derive the realized total return directly from the equity curve (the
+    # pydantic ``BacktestMetrics`` only carries formatted strings). Short spans
+    # produce unstable annualizations, but ``_compute_risk_ratios`` falls back
+    # to zero when denominators collapse.
+    if final_equity_curve and final_equity_curve[0] > 0:
+        total_return_pct = (final_equity_curve[-1] / final_equity_curve[0] - 1.0) * 100.0
+    else:
+        total_return_pct = 0.0
+    span_bars = max(len(final_equity_curve) - 1, 1)
+    annualized_return_pct = total_return_pct * (bars_per_year / span_bars)
+    period_returns = _compute_period_returns(final_equity_curve)
+    risk_ratios = _compute_risk_ratios(
+        final_equity_curve,
+        period_returns,
+        annualized_return_pct,
+        bars_per_year,
     )
 
     notes = (
@@ -545,4 +652,5 @@ def run_local_backtest(strategy: StrategySummary, candles: List[CandlePoint], ti
         used_range_end=used_range_end,
         history_truncated=history_truncated,
         volatility_stats=volatility_stats,
+        risk_ratios=risk_ratios,
     )

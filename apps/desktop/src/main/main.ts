@@ -1,7 +1,12 @@
-import { app, BrowserWindow, ipcMain, Menu, Notification, Tray, nativeImage, screen, shell } from "electron";
+import { app, BrowserWindow, ipcMain, Notification, Tray, screen, shell } from "electron";
 import fs from "node:fs";
 import path from "node:path";
-import { runRequestedSmokeOnLoad, shouldCloseRequestedSmokeOnLogMessage } from "./runRequestedSmokeOnLoad";
+import { applyTrayMenu, createTray as createTrayInstance, createTrayIcon } from "./tray";
+import {
+  createMainWindow,
+  defaultPreloadPath,
+  defaultProductionIndexPath,
+} from "./window-factory";
 import {
   persistWindowBoundsState as persistWindowBoundsStateToFile,
   readWindowBoundsState as readWindowBoundsStateFromFile,
@@ -50,6 +55,7 @@ const defaultWindowHeight = 1020;
 const minWindowWidth = 1280;
 const minWindowHeight = 820;
 const windowStateFileName = "window-state.json";
+const appTitle = "Bybit 量化交易控制端";
 
 function windowStateFilePath() {
   return windowStateFilePathFor(app.getPath("userData"), windowStateFileName);
@@ -75,19 +81,6 @@ function persistWindowBoundsState(win: BrowserWindow) {
   persistWindowBoundsStateToFile(win, windowStateFilePath());
 }
 
-function createTrayIcon() {
-  const svg = `
-    <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 18 18">
-      <path d="M2 11.5h2.1l1.4-4 2.2 7 2.2-9 1.8 6h3.3" fill="none" stroke="#111827" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
-    </svg>
-  `.trim();
-  const image = nativeImage.createFromDataURL(
-    `data:image/svg+xml;base64,${Buffer.from(svg).toString("base64")}`,
-  );
-  image.setTemplateImage(true);
-  return image;
-}
-
 function toggleMainWindow() {
   if (!mainWindow) {
     createWindow();
@@ -110,21 +103,12 @@ function updateTrayMenu() {
   if (!appTray) {
     return;
   }
-
-  const isVisible = Boolean(mainWindow?.isVisible());
-  const contextMenu = Menu.buildFromTemplate([
-    {
-      label: isVisible ? "隐藏窗口" : "显示窗口",
-      click: () => toggleMainWindow(),
-    },
-    {
-      label: "退出",
-      click: () => app.quit(),
-    },
-  ]);
-
-  appTray.setContextMenu(contextMenu);
-  appTray.setToolTip("Bybit 量化交易控制端");
+  applyTrayMenu(appTray, {
+    isMainWindowVisible: Boolean(mainWindow?.isVisible()),
+    tooltip: appTitle,
+    onToggle: () => toggleMainWindow(),
+    onQuit: () => app.quit(),
+  });
 }
 
 function createTray() {
@@ -133,103 +117,42 @@ function createTray() {
     return;
   }
 
-  appTray = new Tray(createTrayIcon());
-  appTray.on("click", () => toggleMainWindow());
+  appTray = createTrayInstance({
+    image: createTrayIcon(),
+    tooltip: appTitle,
+    onClick: () => toggleMainWindow(),
+  });
   updateTrayMenu();
 }
 
 function createWindow() {
   const initialWindowState = resolveWindowBoundsState();
-  let requestedSmokeStarted = false;
-  let didFinishLoad = false;
-  let readyForRequestedSmoke = false;
-  const win = new BrowserWindow({
-    ...initialWindowState.bounds,
+  const win = createMainWindow({
+    initialBounds: initialWindowState.bounds,
+    initialMaximized: initialWindowState.maximized,
     minWidth: minWindowWidth,
     minHeight: minWindowHeight,
-    show: false,
+    title: appTitle,
     backgroundColor: "#0b1220",
-    title: "Bybit 量化交易控制端",
-    webPreferences: {
-      preload: path.join(__dirname, "../preload.js"),
-      contextIsolation: true,
-      nodeIntegration: false
-    }
+    preloadPath: defaultPreloadPath(__dirname),
+    isDev,
+    devServerUrl: "http://localhost:5173",
+    productionIndexPath: defaultProductionIndexPath(__dirname),
+    shouldOpenDevTools,
+    shouldRunRequestedSmoke,
+    shouldRunStrategyActivitySmoke,
+    shouldRunMarketSwitchSmoke,
+    controlApiBase,
+    strategyActivitySmokeRenderBudgetMs,
+    onPersistBounds: (target) => persistWindowBoundsState(target),
+    onTrayMenuShouldUpdate: () => updateTrayMenu(),
+    onClosed: (target) => {
+      if (mainWindow === target) {
+        mainWindow = null;
+      }
+    },
   });
   mainWindow = win;
-
-  const maybeStartRequestedSmoke = async () => {
-    if (!isDev || !shouldRunRequestedSmoke || requestedSmokeStarted || !didFinishLoad || !readyForRequestedSmoke) {
-      return;
-    }
-    requestedSmokeStarted = true;
-    await runRequestedSmokeOnLoad(win, {
-      shouldRunStrategyActivitySmoke,
-      shouldRunMarketSwitchSmoke,
-      controlApiBase,
-      strategyActivitySmokeRenderBudgetMs,
-    });
-  };
-
-  if (isDev) {
-    win.loadURL("http://localhost:5173");
-    if (shouldOpenDevTools) {
-      win.webContents.openDevTools({ mode: "detach" });
-    }
-    win.webContents.on("console-message", (_event, level, message, line, sourceId) => {
-      console.log(`[renderer:${level}] ${sourceId}:${line} ${message}`);
-      if (
-        shouldCloseRequestedSmokeOnLogMessage(message, {
-          shouldRunStrategyActivitySmoke,
-          shouldRunMarketSwitchSmoke,
-        })
-      ) {
-        setTimeout(() => {
-          if (!win.isDestroyed()) {
-            win.close();
-          }
-        }, 100);
-      }
-    });
-    win.webContents.on("did-fail-load", (_event, errorCode, errorDescription, validatedURL) => {
-      console.error(`[renderer:load-failed] ${errorCode} ${errorDescription} ${validatedURL}`);
-    });
-    win.webContents.on("did-finish-load", async () => {
-      didFinishLoad = true;
-      await maybeStartRequestedSmoke();
-    });
-  } else {
-    win.loadFile(path.join(__dirname, "../../dist/index.html"));
-  } 
-
-  win.once("ready-to-show", () => {
-    if (initialWindowState.maximized) {
-      win.maximize();
-    }
-    win.show();
-    win.focus();
-    persistWindowBoundsState(win);
-    updateTrayMenu();
-    if (isDev) {
-      readyForRequestedSmoke = true;
-      void maybeStartRequestedSmoke();
-    }
-  });
-
-  win.on("move", () => persistWindowBoundsState(win));
-  win.on("resize", () => persistWindowBoundsState(win));
-  win.on("maximize", () => persistWindowBoundsState(win));
-  win.on("unmaximize", () => persistWindowBoundsState(win));
-  win.on("show", () => updateTrayMenu());
-  win.on("hide", () => updateTrayMenu());
-  win.on("focus", () => updateTrayMenu());
-  win.on("close", () => persistWindowBoundsState(win));
-  win.on("closed", () => {
-    if (mainWindow === win) {
-      mainWindow = null;
-    }
-    updateTrayMenu();
-  });
 }
 
 ipcMain.handle("desktop-notification:show", (_event, payload: DesktopNotificationPayload) => {
@@ -239,10 +162,10 @@ ipcMain.handle("desktop-notification:show", (_event, payload: DesktopNotificatio
 
   const title = typeof payload?.title === "string" && payload.title.trim()
     ? payload.title.trim()
-    : "Bybit 量化交易控制端";
+    : appTitle;
   const body = typeof payload?.body === "string" ? payload.body.trim() : "";
 
-  if (!body && title === "Bybit 量化交易控制端") {
+  if (!body && title === appTitle) {
     return false;
   }
 

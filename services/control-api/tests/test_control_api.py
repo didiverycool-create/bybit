@@ -16750,5 +16750,275 @@ class ControlApiIntegrationTests(unittest.TestCase):
         self.assertTrue(any(item["event_type"] == "strategy.runtime.worker.restart_failed_resolved" for item in audit_events))
 
 
+class StrategyChangeReviewResponseUnitTests(unittest.TestCase):
+    def test_parses_structured_json_payload(self) -> None:
+        from openclaw_client import OpenClawGatewayClient  # type: ignore
+
+        raw = (
+            '{"summary": "参数更新方向合理，但缺少回测对照",'
+            ' "verdict": "request_changes",'
+            ' "confidence": "medium",'
+            ' "highlights": ["参数与当前趋势一致", "风险敞口未显著扩大"],'
+            ' "risks": ["缺少对比回测", "未覆盖极端行情"],'
+            ' "required_adjustments": ["补充对照回测", "增加最大回撤护栏"]}'
+        )
+        parsed = OpenClawGatewayClient.parse_strategy_change_review_response(raw)
+        self.assertEqual(parsed["summary"], "参数更新方向合理，但缺少回测对照")
+        self.assertEqual(parsed["verdict"], "request_changes")
+        self.assertEqual(parsed["confidence"], "medium")
+        self.assertEqual(parsed["highlights"], ["参数与当前趋势一致", "风险敞口未显著扩大"])
+        self.assertEqual(parsed["risks"], ["缺少对比回测", "未覆盖极端行情"])
+        self.assertEqual(
+            parsed["required_adjustments"],
+            ["补充对照回测", "增加最大回撤护栏"],
+        )
+        self.assertEqual(parsed["raw_text"], raw)
+
+    def test_parses_json_from_fenced_code_block(self) -> None:
+        from openclaw_client import OpenClawGatewayClient  # type: ignore
+
+        raw = (
+            "Here is the review:\n"
+            "```json\n"
+            '{"summary": "变更已通过", "verdict": "approve",'
+            ' "confidence": "high", "highlights": ["逻辑清晰"],'
+            ' "risks": [], "required_adjustments": []}\n'
+            "```"
+        )
+        parsed = OpenClawGatewayClient.parse_strategy_change_review_response(raw)
+        self.assertEqual(parsed["verdict"], "approve")
+        self.assertEqual(parsed["confidence"], "high")
+        self.assertEqual(parsed["summary"], "变更已通过")
+        self.assertEqual(parsed["highlights"], ["逻辑清晰"])
+        self.assertEqual(parsed["risks"], [])
+        self.assertEqual(parsed["required_adjustments"], [])
+
+    def test_coerces_chinese_verdict_aliases(self) -> None:
+        from openclaw_client import OpenClawGatewayClient  # type: ignore
+
+        approve_raw = '{"summary": "方案可行", "verdict": "通过"}'
+        self.assertEqual(
+            OpenClawGatewayClient.parse_strategy_change_review_response(approve_raw)["verdict"],
+            "approve",
+        )
+
+        needs_raw = '{"summary": "需要调整", "verdict": "待调整"}'
+        self.assertEqual(
+            OpenClawGatewayClient.parse_strategy_change_review_response(needs_raw)["verdict"],
+            "request_changes",
+        )
+
+        reject_raw = '{"summary": "不建议上线", "verdict": "拒绝"}'
+        self.assertEqual(
+            OpenClawGatewayClient.parse_strategy_change_review_response(reject_raw)["verdict"],
+            "reject",
+        )
+
+        english_hyphen_raw = '{"summary": "fix first", "verdict": "needs-changes"}'
+        self.assertEqual(
+            OpenClawGatewayClient.parse_strategy_change_review_response(english_hyphen_raw)["verdict"],
+            "request_changes",
+        )
+
+        blocked_raw = '{"summary": "blocked", "verdict": "blocked"}'
+        self.assertEqual(
+            OpenClawGatewayClient.parse_strategy_change_review_response(blocked_raw)["verdict"],
+            "reject",
+        )
+
+    def test_falls_back_to_heuristic_when_not_json(self) -> None:
+        from openclaw_client import OpenClawGatewayClient  # type: ignore
+
+        raw = "建议补充一次对照回测后再落地此变更。"
+        parsed = OpenClawGatewayClient.parse_strategy_change_review_response(raw)
+        self.assertEqual(parsed["summary"], raw)
+        # Plain-text falls back to the conservative defaults.
+        self.assertEqual(parsed["verdict"], "request_changes")
+        self.assertEqual(parsed["confidence"], "medium")
+        self.assertEqual(parsed["highlights"], [])
+        self.assertEqual(parsed["risks"], [])
+        self.assertEqual(parsed["required_adjustments"], [])
+        self.assertEqual(parsed["raw_text"], raw)
+
+    def test_returns_defaults_on_empty_input(self) -> None:
+        from openclaw_client import OpenClawGatewayClient  # type: ignore
+
+        parsed_none = OpenClawGatewayClient.parse_strategy_change_review_response(None)
+        self.assertEqual(parsed_none["summary"], "")
+        self.assertEqual(parsed_none["verdict"], "request_changes")
+        self.assertEqual(parsed_none["confidence"], "medium")
+        self.assertEqual(parsed_none["highlights"], [])
+        self.assertEqual(parsed_none["risks"], [])
+        self.assertEqual(parsed_none["required_adjustments"], [])
+        self.assertEqual(parsed_none["raw_text"], "")
+
+        parsed_blank = OpenClawGatewayClient.parse_strategy_change_review_response("   \n  ")
+        self.assertEqual(parsed_blank["summary"], "")
+        self.assertEqual(parsed_blank["verdict"], "request_changes")
+        self.assertEqual(parsed_blank["confidence"], "medium")
+
+    def test_coerces_confidence_aliases(self) -> None:
+        from openclaw_client import OpenClawGatewayClient  # type: ignore
+
+        low_raw = '{"summary": "需更多信息", "verdict": "request_changes", "confidence": "低"}'
+        self.assertEqual(
+            OpenClawGatewayClient.parse_strategy_change_review_response(low_raw)["confidence"],
+            "low",
+        )
+
+        high_raw = '{"summary": "完全同意", "verdict": "approve", "confidence": "高"}'
+        self.assertEqual(
+            OpenClawGatewayClient.parse_strategy_change_review_response(high_raw)["confidence"],
+            "high",
+        )
+
+        mid_raw = '{"summary": "基本可行", "verdict": "approve", "confidence": "mid"}'
+        self.assertEqual(
+            OpenClawGatewayClient.parse_strategy_change_review_response(mid_raw)["confidence"],
+            "medium",
+        )
+
+        unknown_raw = '{"summary": "不确定", "verdict": "approve", "confidence": "unspecified"}'
+        # Unknown confidence degrades to the default ``medium``.
+        self.assertEqual(
+            OpenClawGatewayClient.parse_strategy_change_review_response(unknown_raw)["confidence"],
+            "medium",
+        )
+
+    def test_accepts_newline_separated_lists(self) -> None:
+        from openclaw_client import OpenClawGatewayClient  # type: ignore
+
+        raw = (
+            '{"summary": "方向正确，但需完善风控",'
+            ' "verdict": "request_changes",'
+            ' "confidence": "medium",'
+            ' "highlights": "参数方向合理\\n风险敞口可控",'
+            ' "risks": "- 缺少极端行情覆盖\\n- 未接入回放集",'
+            ' "required_adjustments": "补充回放集验证\\n增加最大回撤护栏\\n"}'
+        )
+        parsed = OpenClawGatewayClient.parse_strategy_change_review_response(raw)
+        self.assertEqual(parsed["highlights"], ["参数方向合理", "风险敞口可控"])
+        self.assertEqual(parsed["risks"], ["缺少极端行情覆盖", "未接入回放集"])
+        self.assertEqual(
+            parsed["required_adjustments"],
+            ["补充回放集验证", "增加最大回撤护栏"],
+        )
+
+
+class StrategyIssueReviewResponseUnitTests(unittest.TestCase):
+    def test_parses_structured_issue_payload(self) -> None:
+        from openclaw_client import OpenClawGatewayClient  # type: ignore
+
+        raw = (
+            '{"summary": "运行线程因心跳丢失自动退出",'
+            ' "severity": "critical",'
+            ' "root_causes": ["网关心跳丢失", "策略线程未设置守护"],'
+            ' "mitigations": ["立即重启运行线程", "通知值班工程师"],'
+            ' "follow_ups": ["观察 30 分钟无再触发", "记录到运行周报"]}'
+        )
+        parsed = OpenClawGatewayClient.parse_strategy_issue_review_response(raw)
+        self.assertEqual(parsed["summary"], "运行线程因心跳丢失自动退出")
+        self.assertEqual(parsed["severity"], "critical")
+        self.assertEqual(parsed["root_causes"], ["网关心跳丢失", "策略线程未设置守护"])
+        self.assertEqual(parsed["mitigations"], ["立即重启运行线程", "通知值班工程师"])
+        self.assertEqual(parsed["follow_ups"], ["观察 30 分钟无再触发", "记录到运行周报"])
+        self.assertEqual(parsed["raw_text"], raw)
+
+    def test_coerces_severity_aliases(self) -> None:
+        from openclaw_client import OpenClawGatewayClient  # type: ignore
+
+        info_chinese = '{"summary": "一切正常", "severity": "信息"}'
+        self.assertEqual(
+            OpenClawGatewayClient.parse_strategy_issue_review_response(info_chinese)["severity"],
+            "info",
+        )
+
+        info_english = '{"summary": "no action", "severity": "normal"}'
+        self.assertEqual(
+            OpenClawGatewayClient.parse_strategy_issue_review_response(info_english)["severity"],
+            "info",
+        )
+
+        warning_chinese = '{"summary": "建议关注", "severity": "注意"}'
+        self.assertEqual(
+            OpenClawGatewayClient.parse_strategy_issue_review_response(warning_chinese)["severity"],
+            "warning",
+        )
+
+        warning_english = '{"summary": "watch closely", "severity": "warn"}'
+        self.assertEqual(
+            OpenClawGatewayClient.parse_strategy_issue_review_response(warning_english)["severity"],
+            "warning",
+        )
+
+        critical_chinese = '{"summary": "必须人工介入", "severity": "严重"}'
+        self.assertEqual(
+            OpenClawGatewayClient.parse_strategy_issue_review_response(critical_chinese)["severity"],
+            "critical",
+        )
+
+        critical_english = '{"summary": "escalate", "severity": "blocker"}'
+        self.assertEqual(
+            OpenClawGatewayClient.parse_strategy_issue_review_response(critical_english)["severity"],
+            "critical",
+        )
+
+        unknown_raw = '{"summary": "未知严重度", "severity": "unspecified"}'
+        # Unknown severity degrades to the conservative default ``warning``.
+        self.assertEqual(
+            OpenClawGatewayClient.parse_strategy_issue_review_response(unknown_raw)["severity"],
+            "warning",
+        )
+
+    def test_returns_defaults_on_empty_input(self) -> None:
+        from openclaw_client import OpenClawGatewayClient  # type: ignore
+
+        parsed_none = OpenClawGatewayClient.parse_strategy_issue_review_response(None)
+        self.assertEqual(parsed_none["summary"], "")
+        self.assertEqual(parsed_none["severity"], "warning")
+        self.assertEqual(parsed_none["root_causes"], [])
+        self.assertEqual(parsed_none["mitigations"], [])
+        self.assertEqual(parsed_none["follow_ups"], [])
+        self.assertEqual(parsed_none["raw_text"], "")
+
+        parsed_blank = OpenClawGatewayClient.parse_strategy_issue_review_response("   \n \t ")
+        self.assertEqual(parsed_blank["summary"], "")
+        self.assertEqual(parsed_blank["severity"], "warning")
+        self.assertEqual(parsed_blank["root_causes"], [])
+
+    def test_parses_from_fenced_block(self) -> None:
+        from openclaw_client import OpenClawGatewayClient  # type: ignore
+
+        raw = (
+            "Analysis:\n"
+            "```json\n"
+            '{"summary": "执行滑点偏高",'
+            ' "severity": "警告",'
+            ' "root_causes": "盘口深度不足\\n下单速率过快",'
+            ' "mitigations": ["降低下单速率", "切换到迭代限价"],'
+            ' "follow_ups": "观察 1 小时\\n汇报滑点指标"}\n'
+            "```"
+        )
+        parsed = OpenClawGatewayClient.parse_strategy_issue_review_response(raw)
+        self.assertEqual(parsed["summary"], "执行滑点偏高")
+        self.assertEqual(parsed["severity"], "warning")
+        self.assertEqual(parsed["root_causes"], ["盘口深度不足", "下单速率过快"])
+        self.assertEqual(parsed["mitigations"], ["降低下单速率", "切换到迭代限价"])
+        self.assertEqual(parsed["follow_ups"], ["观察 1 小时", "汇报滑点指标"])
+
+    def test_falls_back_to_heuristic_summary(self) -> None:
+        from openclaw_client import OpenClawGatewayClient  # type: ignore
+
+        raw = "运行线程偶发心跳丢失，建议重启并持续观察 30 分钟。"
+        parsed = OpenClawGatewayClient.parse_strategy_issue_review_response(raw)
+        self.assertEqual(parsed["summary"], raw)
+        # Plain-text falls back to the conservative defaults.
+        self.assertEqual(parsed["severity"], "warning")
+        self.assertEqual(parsed["root_causes"], [])
+        self.assertEqual(parsed["mitigations"], [])
+        self.assertEqual(parsed["follow_ups"], [])
+        self.assertEqual(parsed["raw_text"], raw)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

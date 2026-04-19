@@ -297,5 +297,157 @@ class BacktestEngineUnitTests(unittest.TestCase):
         self.assertIn(f"仅使用最近 {backtest_engine.BACKTEST_ENGINE_MAX_CANDLES} 根样本", result.notes)
 
 
+    def test_compute_risk_ratios_returns_zeroed_on_degenerate_curve(self) -> None:
+        # Empty curve → no period returns → all-zero defaults.
+        empty_stats = backtest_engine._compute_risk_ratios(
+            equity_curve=[],
+            period_returns=[],
+            annualized_return_pct=0.0,
+            bars_per_year=365.0,
+        )
+        self.assertIsInstance(empty_stats, backtest_engine.BacktestRiskRatios)
+        self.assertEqual(empty_stats.sortino_ratio, 0.0)
+        self.assertEqual(empty_stats.calmar_ratio, 0.0)
+        self.assertEqual(empty_stats.profit_factor, 0.0)
+        self.assertEqual(empty_stats.expectancy_pct, 0.0)
+        self.assertEqual(empty_stats.worst_bar_return_pct, 0.0)
+        self.assertEqual(empty_stats.best_bar_return_pct, 0.0)
+
+        # Single-point curve → ``_compute_period_returns`` yields [] as well.
+        single_stats = backtest_engine._compute_risk_ratios(
+            equity_curve=[100_000.0],
+            period_returns=backtest_engine._compute_period_returns([100_000.0]),
+            annualized_return_pct=0.0,
+            bars_per_year=365.0,
+        )
+        self.assertEqual(single_stats.sortino_ratio, 0.0)
+        self.assertEqual(single_stats.profit_factor, 0.0)
+        self.assertEqual(single_stats.expectancy_pct, 0.0)
+
+    def test_compute_risk_ratios_separates_positive_and_negative_bars(self) -> None:
+        # Construct an equity curve that produces known period returns with a
+        # clean positive/negative split so profit factor / expectancy / best /
+        # worst bar numbers can be checked exactly.
+        equity_curve = [100.0, 102.0, 99.96, 104.9580, 99.7101]
+        period_returns = backtest_engine._compute_period_returns(equity_curve)
+
+        ratios = backtest_engine._compute_risk_ratios(
+            equity_curve=equity_curve,
+            period_returns=period_returns,
+            annualized_return_pct=0.0,
+            bars_per_year=365.0,
+        )
+
+        sum_positive = sum(value for value in period_returns if value > 0)
+        sum_negative_abs = abs(sum(value for value in period_returns if value < 0))
+        expected_profit_factor = sum_positive / sum_negative_abs
+        self.assertAlmostEqual(ratios.profit_factor, round(expected_profit_factor, 4), places=4)
+        # Expectancy == mean of period returns (already in percent units).
+        self.assertAlmostEqual(
+            ratios.expectancy_pct,
+            round(sum(period_returns) / len(period_returns), 4),
+            places=4,
+        )
+        # Best / worst bars pick the tails of the period-return distribution.
+        self.assertAlmostEqual(ratios.best_bar_return_pct, round(max(period_returns), 4), places=4)
+        self.assertAlmostEqual(ratios.worst_bar_return_pct, round(min(period_returns), 4), places=4)
+        self.assertLess(ratios.worst_bar_return_pct, 0.0)
+        self.assertGreater(ratios.best_bar_return_pct, 0.0)
+
+    def test_compute_risk_ratios_sortino_uses_downside_deviation_only(self) -> None:
+        # Positive-only returns ⇒ no downside deviation ⇒ sortino stays 0 (the
+        # zero-denom guard protects against division by zero while still
+        # producing a meaningful "no downside risk" signal).
+        all_positive_curve = [100.0, 101.0, 102.01, 103.0301, 104.060401]
+        all_positive_returns = backtest_engine._compute_period_returns(all_positive_curve)
+        all_positive_ratios = backtest_engine._compute_risk_ratios(
+            equity_curve=all_positive_curve,
+            period_returns=all_positive_returns,
+            annualized_return_pct=0.0,
+            bars_per_year=365.0,
+        )
+        self.assertEqual(all_positive_ratios.sortino_ratio, 0.0)
+        self.assertGreater(all_positive_ratios.expectancy_pct, 0.0)
+
+        # A curve with a mix of positive and negative bars (with distinct
+        # negative magnitudes so ``pstdev`` of the negatives is non-zero) must
+        # produce a finite, positive sortino. Because sortino's denominator is
+        # the stdev of only the negative tail — which is strictly ≤ the stdev
+        # of the full distribution — sortino should equal or exceed sharpe
+        # when the mean period return is positive.
+        mixed_curve = [100.0, 101.0, 99.0, 102.0, 99.5, 103.0]
+        mixed_returns = backtest_engine._compute_period_returns(mixed_curve)
+        mixed_ratios = backtest_engine._compute_risk_ratios(
+            equity_curve=mixed_curve,
+            period_returns=mixed_returns,
+            annualized_return_pct=0.0,
+            bars_per_year=365.0,
+        )
+        sharpe = backtest_engine._compute_sharpe(mixed_returns, bars_per_year=365.0)
+        self.assertGreater(mixed_ratios.sortino_ratio, 0.0)
+        self.assertGreaterEqual(mixed_ratios.sortino_ratio, round(sharpe, 4) - 1e-6)
+
+    def test_compute_risk_ratios_calmar_zero_when_no_drawdown(self) -> None:
+        # A strictly ascending curve never draws down, so calmar must collapse
+        # to zero even when the annualized return is non-trivial.
+        ascending_curve = [100.0, 101.0, 102.0, 103.0, 104.0]
+        period_returns = backtest_engine._compute_period_returns(ascending_curve)
+        ratios = backtest_engine._compute_risk_ratios(
+            equity_curve=ascending_curve,
+            period_returns=period_returns,
+            annualized_return_pct=120.0,
+            bars_per_year=365.0,
+        )
+        self.assertEqual(ratios.calmar_ratio, 0.0)
+
+        # A flat curve likewise has no drawdown and no period returns, so the
+        # whole ratio payload is zeroed.
+        flat_ratios = backtest_engine._compute_risk_ratios(
+            equity_curve=[100.0, 100.0, 100.0],
+            period_returns=backtest_engine._compute_period_returns([100.0, 100.0, 100.0]),
+            annualized_return_pct=0.0,
+            bars_per_year=365.0,
+        )
+        self.assertEqual(flat_ratios.calmar_ratio, 0.0)
+        self.assertEqual(flat_ratios.profit_factor, 0.0)
+
+    def test_run_local_backtest_attaches_risk_ratios_to_computation(self) -> None:
+        strategy = StrategySummary(
+            id="trend-btc-01",
+            name="BTC 趋势跟随",
+            category="template",
+            status="running",
+            symbols=["BTCUSDT"],
+            mode="paper",
+            version="v1",
+            pnl_7d="+0.0%",
+            max_drawdown="-0.0%",
+            risk_budget="18%",
+            description="test",
+            parameters=[
+                StrategyParameter(key="fast_ma", label="Fast", value=2),
+                StrategyParameter(key="slow_ma", label="Slow", value=3),
+                StrategyParameter(key="risk_per_trade", label="Risk", value=1.0),
+            ],
+        )
+        candles = [
+            backtest_engine.CandlePoint(time=f"2026-03-31T0{index}:00:00+08:00", open=price, high=price, low=price, close=price, volume=1000)
+            for index, price in enumerate([100.0, 101.0, 102.0, 103.0, 90.0, 106.0])
+        ]
+
+        result = backtest_engine.run_local_backtest(strategy, candles, "1h", "2026-03-01 ~ 2026-03-31")
+
+        self.assertIsNotNone(result.risk_ratios)
+        ratios = result.risk_ratios
+        self.assertIsInstance(ratios, backtest_engine.BacktestRiskRatios)
+        # Values should be finite floats bounded by the round(_, 4) contract.
+        self.assertIsInstance(ratios.sortino_ratio, float)
+        self.assertIsInstance(ratios.calmar_ratio, float)
+        self.assertIsInstance(ratios.profit_factor, float)
+        self.assertIsInstance(ratios.expectancy_pct, float)
+        # Worst bar should never exceed best bar.
+        self.assertLessEqual(ratios.worst_bar_return_pct, ratios.best_bar_return_pct)
+
+
 if __name__ == "__main__":
     unittest.main()

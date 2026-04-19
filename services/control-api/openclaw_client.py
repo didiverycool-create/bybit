@@ -493,6 +493,340 @@ class OpenClawGatewayClient:
             "raw_text": raw_text,
         }
 
+    # ------------------------------------------------------------------
+    # Strategy change review (``review_strategy_change``)
+    # ------------------------------------------------------------------
+    # Canonical verdict vocabulary for LLM reviews of strategy change
+    # proposals. The prompt asks OpenClaw to emit one of ``approve`` /
+    # ``request_changes`` / ``reject`` but in practice the agent may echo
+    # Chinese synonyms or slight English variants, so we normalize those
+    # into the canonical tokens here. Unknown values degrade to
+    # ``"request_changes"`` (the conservative default) via
+    # ``_coerce_strategy_change_verdict``.
+    _STRATEGY_CHANGE_VERDICT_ALIASES: Dict[str, str] = {
+        "approve": "approve",
+        "approved": "approve",
+        "lgtm": "approve",
+        "ship": "approve",
+        "通过": "approve",
+        "同意": "approve",
+        "批准": "approve",
+        "request_changes": "request_changes",
+        "requests_changes": "request_changes",
+        "changes_requested": "request_changes",
+        "needs_changes": "request_changes",
+        "needs-changes": "request_changes",
+        "needs changes": "request_changes",
+        "调整": "request_changes",
+        "待调整": "request_changes",
+        "需调整": "request_changes",
+        "修改": "request_changes",
+        "reject": "reject",
+        "rejected": "reject",
+        "block": "reject",
+        "blocked": "reject",
+        "拒绝": "reject",
+        "否决": "reject",
+        "驳回": "reject",
+    }
+
+    # Confidence levels for strategy change reviews. Same pattern as the
+    # verdict alias map — we accept a handful of Chinese/English synonyms
+    # and normalize them, falling back to ``"medium"`` when we can't map
+    # the value.
+    _STRATEGY_CHANGE_CONFIDENCE_ALIASES: Dict[str, str] = {
+        "low": "low",
+        "lo": "low",
+        "weak": "low",
+        "低": "low",
+        "弱": "low",
+        "medium": "medium",
+        "mid": "medium",
+        "moderate": "medium",
+        "normal": "medium",
+        "中": "medium",
+        "一般": "medium",
+        "high": "high",
+        "hi": "high",
+        "strong": "high",
+        "高": "high",
+        "强": "high",
+    }
+
+    @classmethod
+    def _coerce_strategy_change_verdict(cls, value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            return None
+        token = str(value).strip().lower()
+        if not token:
+            return None
+        if token in cls._STRATEGY_CHANGE_VERDICT_ALIASES:
+            return cls._STRATEGY_CHANGE_VERDICT_ALIASES[token]
+        for alias, canonical in cls._STRATEGY_CHANGE_VERDICT_ALIASES.items():
+            if alias in token:
+                return canonical
+        return None
+
+    @classmethod
+    def _coerce_strategy_change_confidence(cls, value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            return None
+        token = str(value).strip().lower()
+        if not token:
+            return None
+        if token in cls._STRATEGY_CHANGE_CONFIDENCE_ALIASES:
+            return cls._STRATEGY_CHANGE_CONFIDENCE_ALIASES[token]
+        for alias, canonical in cls._STRATEGY_CHANGE_CONFIDENCE_ALIASES.items():
+            if alias in token:
+                return canonical
+        return None
+
+    @staticmethod
+    def _coerce_newline_string_list(value: Any, limit: int = 8) -> List[str]:
+        """Accept either a list of strings or a newline-separated string.
+
+        This is the list coercer used by the change/issue review parsers —
+        prompts sometimes emit bullet-style lists as a single string with
+        ``\\n`` separators, so we split on newlines and drop empty pieces.
+        Semicolon-separated strings are also accepted so callers stay
+        compatible with ``_coerce_string_list``.
+        """
+
+        out: List[str] = []
+        if isinstance(value, list):
+            items = value
+        elif isinstance(value, str):
+            normalized = value.replace("\r\n", "\n").replace("\r", "\n").replace("；", ";")
+            chunks: List[str] = []
+            for line in normalized.split("\n"):
+                for piece in line.split(";"):
+                    chunks.append(piece)
+            items = chunks
+        else:
+            items = []
+        for item in items:
+            text = str(item).strip()
+            # Drop leading bullet markers so ``"- item"`` becomes ``"item"``.
+            for marker in ("- ", "* ", "• "):
+                if text.startswith(marker):
+                    text = text[len(marker) :].strip()
+                    break
+            if text:
+                out.append(text)
+            if len(out) >= limit:
+                break
+        return out
+
+    @classmethod
+    def parse_strategy_change_review_response(cls, text: Optional[str]) -> Dict[str, Any]:
+        """Parse the structured response for a ``review_strategy_change`` agent job.
+
+        Accepts either a JSON object of the form
+        ``{"summary", "verdict", "confidence", "highlights", "risks",
+        "required_adjustments"}`` or a plain-text fallback. The verdict is
+        normalized to one of ``approve`` / ``request_changes`` / ``reject``
+        and confidence to one of ``low`` / ``medium`` / ``high``; unknown
+        values degrade to ``"request_changes"`` / ``"medium"`` so callers
+        always receive a defined verdict/confidence pair without having to
+        special-case missing fields.
+
+        The returned dict always contains ``summary``, ``verdict``,
+        ``confidence``, ``highlights``, ``risks``, ``required_adjustments``
+        and ``raw_text`` keys so the worker loop never has to branch on
+        whether OpenClaw produced JSON.
+        """
+
+        raw_text = text if isinstance(text, str) else ""
+        stripped = raw_text.strip()
+        if not stripped:
+            return {
+                "summary": "",
+                "verdict": "request_changes",
+                "confidence": "medium",
+                "highlights": [],
+                "risks": [],
+                "required_adjustments": [],
+                "raw_text": raw_text,
+            }
+
+        parsed = cls._extract_first_json_object(stripped)
+        summary: str
+        verdict: Optional[str]
+        confidence: Optional[str]
+        highlights: List[str]
+        risks: List[str]
+        required_adjustments: List[str]
+        if isinstance(parsed, dict):
+            summary = str(parsed.get("summary") or "").strip()
+            verdict = cls._coerce_strategy_change_verdict(
+                parsed.get("verdict")
+                if parsed.get("verdict") is not None
+                else parsed.get("decision")
+            )
+            confidence = cls._coerce_strategy_change_confidence(parsed.get("confidence"))
+            highlights = cls._coerce_newline_string_list(parsed.get("highlights"))
+            risks = cls._coerce_newline_string_list(parsed.get("risks"))
+            required_adjustments = cls._coerce_newline_string_list(
+                parsed.get("required_adjustments")
+                if parsed.get("required_adjustments") is not None
+                else parsed.get("adjustments")
+            )
+        else:
+            summary = stripped
+            verdict = None
+            confidence = None
+            highlights = []
+            risks = []
+            required_adjustments = []
+
+        if not summary:
+            summary = "OpenClaw 已返回策略变更评审结果。"
+
+        return {
+            "summary": summary,
+            "verdict": verdict or "request_changes",
+            "confidence": confidence or "medium",
+            "highlights": highlights,
+            "risks": risks,
+            "required_adjustments": required_adjustments,
+            "raw_text": raw_text,
+        }
+
+    # ------------------------------------------------------------------
+    # Strategy issue review (``review_strategy_issue``)
+    # ------------------------------------------------------------------
+    # Severity vocabulary for ongoing-issue triage reviews. Canonical
+    # tokens: ``info`` / ``warning`` / ``critical``. Unknown values degrade
+    # to ``"warning"`` via ``parse_strategy_issue_review_response`` —
+    # that's the conservative middle ground so we never silently hide a
+    # problem or over-escalate a routine observation.
+    _STRATEGY_ISSUE_SEVERITY_ALIASES: Dict[str, str] = {
+        "info": "info",
+        "informational": "info",
+        "normal": "info",
+        "ok": "info",
+        "low": "info",
+        "信息": "info",
+        "正常": "info",
+        "提示": "info",
+        "warning": "warning",
+        "warn": "warning",
+        "medium": "warning",
+        "moderate": "warning",
+        "attention": "warning",
+        "警告": "warning",
+        "注意": "warning",
+        "关注": "warning",
+        "critical": "critical",
+        "crit": "critical",
+        "blocker": "critical",
+        "escalate": "critical",
+        "severe": "critical",
+        "high": "critical",
+        "严重": "critical",
+        "高危": "critical",
+        "紧急": "critical",
+        "升级": "critical",
+    }
+
+    @classmethod
+    def _coerce_strategy_issue_severity(cls, value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            return None
+        token = str(value).strip().lower()
+        if not token:
+            return None
+        if token in cls._STRATEGY_ISSUE_SEVERITY_ALIASES:
+            return cls._STRATEGY_ISSUE_SEVERITY_ALIASES[token]
+        for alias, canonical in cls._STRATEGY_ISSUE_SEVERITY_ALIASES.items():
+            if alias in token:
+                return canonical
+        return None
+
+    @classmethod
+    def parse_strategy_issue_review_response(cls, text: Optional[str]) -> Dict[str, Any]:
+        """Parse the structured response for a ``review_strategy_issue`` agent job.
+
+        Accepts either a JSON object of the form
+        ``{"summary", "severity", "root_causes", "mitigations", "follow_ups"}``
+        or a plain-text fallback. Severity is normalized to one of
+        ``info`` / ``warning`` / ``critical`` — unknown values degrade to
+        ``"warning"`` so callers always receive a defined severity tier
+        without having to substitute a default themselves.
+
+        The returned dict always contains ``summary``, ``severity``,
+        ``root_causes``, ``mitigations``, ``follow_ups`` and ``raw_text``
+        so the worker loop never has to branch on whether OpenClaw
+        produced JSON.
+        """
+
+        raw_text = text if isinstance(text, str) else ""
+        stripped = raw_text.strip()
+        if not stripped:
+            return {
+                "summary": "",
+                "severity": "warning",
+                "root_causes": [],
+                "mitigations": [],
+                "follow_ups": [],
+                "raw_text": raw_text,
+            }
+
+        parsed = cls._extract_first_json_object(stripped)
+        summary: str
+        severity: Optional[str]
+        root_causes: List[str]
+        mitigations: List[str]
+        follow_ups: List[str]
+        if isinstance(parsed, dict):
+            summary = str(parsed.get("summary") or "").strip()
+            severity = cls._coerce_strategy_issue_severity(parsed.get("severity"))
+            root_causes = cls._coerce_newline_string_list(
+                parsed.get("root_causes")
+                if parsed.get("root_causes") is not None
+                else parsed.get("causes")
+            )
+            mitigations = cls._coerce_newline_string_list(
+                parsed.get("mitigations")
+                if parsed.get("mitigations") is not None
+                else parsed.get("actions")
+            )
+            follow_ups = cls._coerce_newline_string_list(
+                parsed.get("follow_ups")
+                if parsed.get("follow_ups") is not None
+                else parsed.get("followups")
+            )
+        else:
+            summary = stripped
+            severity = None
+            root_causes = []
+            mitigations = []
+            follow_ups = []
+
+        if not summary:
+            summary = "OpenClaw 已返回策略问题评审结果。"
+
+        return {
+            "summary": summary,
+            "severity": severity or "warning",
+            "root_causes": root_causes,
+            "mitigations": mitigations,
+            "follow_ups": follow_ups,
+            "raw_text": raw_text,
+        }
+
     def get_status(self, worker_state: Optional[Dict[str, Any]] = None) -> OpenClawStatus:
         config = self._load_config()
         gateway = config.get("gateway", {})
