@@ -26,6 +26,7 @@ from models import (
     ChangeRequestCreate,
     ChangeRequestStatus,
     Direction,
+    ExecutionImpactRecord,
     ExecutionPreview,
     ExecutionPreviewRequest,
     EventSeverity,
@@ -3513,6 +3514,102 @@ class AppRepository:
         )
         job = self._create_agent_job_locked(payload, source="quant-core")
         return job.id
+
+    def _persist_execution_impact_record_locked(
+        self, record: ExecutionImpactRecord
+    ) -> ExecutionImpactRecord:
+        """Insert or replace an :class:`ExecutionImpactRecord` in state.
+
+        Mirrors the ``_create_agent_job_locked`` convention: callers must
+        already hold ``self._lock``. Newest records are kept at the head of
+        ``self.state.execution_impact_records`` and any existing entry with
+        the same ``id`` is overwritten rather than duplicated so the callers
+        can treat this as an idempotent upsert. The shared public wrapper
+        (:meth:`persist_execution_impact_record`) takes care of calling
+        ``self._persist()`` — keeping this helper side-effect free here
+        follows the existing ``_queue_*_locked`` helpers.
+        """
+
+        existing_index = next(
+            (
+                index
+                for index, existing in enumerate(self.state.execution_impact_records)
+                if existing.id == record.id
+            ),
+            None,
+        )
+        if existing_index is not None:
+            self.state.execution_impact_records[existing_index] = record
+        else:
+            self.state.execution_impact_records.insert(0, record)
+        return record
+
+    def persist_execution_impact_record(
+        self,
+        *,
+        strategy_id: str,
+        strategy_name: str,
+        window_start: str,
+        window_end: str,
+        summary: str = "",
+        impact_level: str = "moderate",
+        direction: str = "neutral",
+        affected_orders: Optional[List[str]] = None,
+        affected_positions: Optional[List[str]] = None,
+        metrics_deltas: Optional[List[str]] = None,
+        follow_up_checks: Optional[List[str]] = None,
+        raw_text: str = "",
+        agent_job_id: Optional[str] = None,
+        source: str = "openclaw",
+        record_id: Optional[str] = None,
+    ) -> ExecutionImpactRecord:
+        """Public wrapper that builds + persists an :class:`ExecutionImpactRecord`.
+
+        ``record_id`` is optional: when omitted the repository generates a new
+        id using the same ``uuid4().hex[:12]`` shape as other records; when
+        supplied the method behaves as an upsert and replaces any existing
+        record carrying the same id (used by worker writeback to keep the
+        record stable across retries).
+        """
+
+        with self._lock:
+            timestamp = now_iso()
+            if record_id:
+                existing = next(
+                    (
+                        item
+                        for item in self.state.execution_impact_records
+                        if item.id == record_id
+                    ),
+                    None,
+                )
+                created_at = existing.created_at if existing is not None else timestamp
+                resolved_id = record_id
+            else:
+                created_at = timestamp
+                resolved_id = f"execution-impact-{uuid4().hex[:12]}"
+            record = ExecutionImpactRecord(
+                id=resolved_id,
+                strategy_id=strategy_id,
+                strategy_name=strategy_name,
+                window_start=window_start,
+                window_end=window_end,
+                summary=summary,
+                impact_level=impact_level,
+                direction=direction,
+                affected_orders=list(affected_orders) if affected_orders else [],
+                affected_positions=list(affected_positions) if affected_positions else [],
+                metrics_deltas=list(metrics_deltas) if metrics_deltas else [],
+                follow_up_checks=list(follow_up_checks) if follow_up_checks else [],
+                raw_text=raw_text,
+                agent_job_id=agent_job_id,
+                source=source,
+                created_at=created_at,
+                updated_at=timestamp,
+            )
+            stored = self._persist_execution_impact_record_locked(record)
+            self._persist()
+            return stored
 
     def _find_proposal(self, proposal_id: str) -> StrategyProposal:
         for review in self.state.reviews:

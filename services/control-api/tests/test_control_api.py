@@ -17624,6 +17624,138 @@ class QueueSummarizeExecutionImpactUnitTests(unittest.TestCase):
         self.assertIsInstance(job.context["anomalies"], list)
 
 
+class PersistExecutionImpactRecordUnitTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._records_backup = copy.deepcopy(
+            control_main.repo.state.execution_impact_records
+        )
+        self.addCleanup(self._restore_records)
+
+    def _restore_records(self) -> None:
+        control_main.repo.state.execution_impact_records = self._records_backup
+
+    def test_persist_execution_impact_record_creates_entry_with_generated_id(
+        self,
+    ) -> None:
+        record = control_main.repo.persist_execution_impact_record(
+            strategy_id="trend-btc-01",
+            strategy_name="Trend BTC",
+            window_start="2026-04-19T08:00:00+08:00",
+            window_end="2026-04-19T09:00:00+08:00",
+            summary="滑点飙升导致整体执行质量恶化",
+            impact_level="significant",
+            direction="worsened",
+            affected_orders=["O1", "O2"],
+            affected_positions=["BTCUSDT-LONG"],
+            metrics_deltas=["slippage +12bps", "fill rate -15%"],
+            follow_up_checks=["复核撮合链路", "监控下一小时滑点"],
+            raw_text="原始模型输出",
+            agent_job_id="job-abc123",
+            source="openclaw",
+        )
+
+        self.assertIsInstance(record.id, str)
+        self.assertTrue(record.id)
+        self.assertTrue(record.created_at)
+        self.assertTrue(record.updated_at)
+
+        stored = control_main.repo.state.execution_impact_records[0]
+        self.assertEqual(stored.id, record.id)
+        self.assertEqual(stored.strategy_id, "trend-btc-01")
+        self.assertEqual(stored.strategy_name, "Trend BTC")
+        self.assertEqual(stored.window_start, "2026-04-19T08:00:00+08:00")
+        self.assertEqual(stored.window_end, "2026-04-19T09:00:00+08:00")
+        self.assertEqual(stored.summary, "滑点飙升导致整体执行质量恶化")
+        self.assertEqual(stored.impact_level, "significant")
+        self.assertEqual(stored.direction, "worsened")
+        self.assertEqual(stored.affected_orders, ["O1", "O2"])
+        self.assertEqual(stored.affected_positions, ["BTCUSDT-LONG"])
+        self.assertEqual(
+            stored.metrics_deltas,
+            ["slippage +12bps", "fill rate -15%"],
+        )
+        self.assertEqual(
+            stored.follow_up_checks,
+            ["复核撮合链路", "监控下一小时滑点"],
+        )
+        self.assertEqual(stored.raw_text, "原始模型输出")
+        self.assertEqual(stored.agent_job_id, "job-abc123")
+        self.assertEqual(stored.source, "openclaw")
+        self.assertEqual(stored.created_at, record.created_at)
+        self.assertEqual(stored.updated_at, record.updated_at)
+
+    def test_persist_execution_impact_record_normalizes_optional_lists(self) -> None:
+        record = control_main.repo.persist_execution_impact_record(
+            strategy_id="eth-revert-02",
+            strategy_name="Revert ETH",
+            window_start="2026-04-19T10:00:00+08:00",
+            window_end="2026-04-19T11:00:00+08:00",
+            summary="调仓后影响可忽略",
+        )
+
+        self.assertEqual(record.affected_orders, [])
+        self.assertEqual(record.affected_positions, [])
+        self.assertEqual(record.metrics_deltas, [])
+        self.assertEqual(record.follow_up_checks, [])
+        self.assertIsInstance(record.affected_orders, list)
+        self.assertIsInstance(record.affected_positions, list)
+        self.assertIsInstance(record.metrics_deltas, list)
+        self.assertIsInstance(record.follow_up_checks, list)
+        # Defaults should also be applied when no level/direction is provided.
+        self.assertEqual(record.impact_level, "moderate")
+        self.assertEqual(record.direction, "neutral")
+        self.assertEqual(record.raw_text, "")
+        self.assertIsNone(record.agent_job_id)
+        self.assertEqual(record.source, "openclaw")
+
+    def test_persist_execution_impact_record_upsert_replaces_by_id(self) -> None:
+        first = control_main.repo.persist_execution_impact_record(
+            strategy_id="sol-breakout-03",
+            strategy_name="Breakout SOL",
+            window_start="2026-04-19T12:00:00+08:00",
+            window_end="2026-04-19T13:00:00+08:00",
+            summary="初稿摘要",
+            impact_level="moderate",
+            direction="neutral",
+            follow_up_checks=["原始检查项"],
+        )
+
+        length_before = len(control_main.repo.state.execution_impact_records)
+
+        updated = control_main.repo.persist_execution_impact_record(
+            strategy_id="sol-breakout-03",
+            strategy_name="Breakout SOL",
+            window_start="2026-04-19T12:00:00+08:00",
+            window_end="2026-04-19T13:00:00+08:00",
+            summary="修订后摘要",
+            impact_level="significant",
+            direction="worsened",
+            follow_up_checks=["新的检查项", "补充风控复核"],
+            record_id=first.id,
+        )
+
+        self.assertEqual(updated.id, first.id)
+        self.assertEqual(
+            len(control_main.repo.state.execution_impact_records),
+            length_before,
+        )
+        stored = next(
+            item
+            for item in control_main.repo.state.execution_impact_records
+            if item.id == first.id
+        )
+        self.assertEqual(stored.summary, "修订后摘要")
+        self.assertEqual(stored.impact_level, "significant")
+        self.assertEqual(stored.direction, "worsened")
+        self.assertEqual(
+            stored.follow_up_checks,
+            ["新的检查项", "补充风控复核"],
+        )
+        # Upsert should preserve the original created_at and bump updated_at.
+        self.assertEqual(stored.created_at, first.created_at)
+        self.assertNotEqual(stored.updated_at, first.updated_at)
+
+
 class ExecutionImpactResponseUnitTests(unittest.TestCase):
     def test_parses_structured_json_payload(self) -> None:
         from openclaw_client import OpenClawGatewayClient  # type: ignore

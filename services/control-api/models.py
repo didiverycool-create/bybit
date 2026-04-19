@@ -1010,6 +1010,26 @@ class ReviewDocument(BaseModel):
     created_at: str
 
 
+class ExecutionImpactRecord(BaseModel):
+    id: str
+    strategy_id: str
+    strategy_name: str
+    window_start: str
+    window_end: str
+    summary: str = ""
+    impact_level: str = "moderate"
+    direction: str = "neutral"
+    affected_orders: List[str] = Field(default_factory=list)
+    affected_positions: List[str] = Field(default_factory=list)
+    metrics_deltas: List[str] = Field(default_factory=list)
+    follow_up_checks: List[str] = Field(default_factory=list)
+    raw_text: str = ""
+    agent_job_id: Optional[str] = None
+    source: str = "openclaw"
+    created_at: str
+    updated_at: str
+
+
 class AlertRecord(BaseModel):
     id: str
     severity: Literal["P0", "P1", "P2"]
@@ -1511,6 +1531,7 @@ class AppState(BaseModel):
     change_requests: List[ChangeRequest]
     agent_jobs: List[AgentJob]
     reviews: List[ReviewDocument]
+    execution_impact_records: List[ExecutionImpactRecord] = Field(default_factory=list)
     alerts: List[AlertRecord]
     alert_rules: List[AlertRule] = Field(default_factory=list)
     news_events: List[NewsEvent]
