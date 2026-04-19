@@ -17966,6 +17966,134 @@ class CompleteAgentJobExecutionImpactUnitTests(unittest.TestCase):
         self.assertIsNone(latest_event.payload["execution_impact_direction"])
 
 
+class ExecutionImpactEndpointUnitTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._records_backup = copy.deepcopy(
+            control_main.repo.state.execution_impact_records
+        )
+        self._jobs_backup = copy.deepcopy(control_main.repo.state.agent_jobs)
+        scheduler = control_main.repo.state.control_snapshot.scheduler
+        self._scheduler_current = scheduler.current_job_id
+        self._scheduler_status = scheduler.status
+        control_main.repo.state.execution_impact_records = []
+        control_main.repo.state.agent_jobs = []
+        scheduler.current_job_id = None
+        scheduler.status = "running"
+        self.addCleanup(self._restore)
+
+    def _restore(self) -> None:
+        control_main.repo.state.execution_impact_records = self._records_backup
+        control_main.repo.state.agent_jobs = self._jobs_backup
+        scheduler = control_main.repo.state.control_snapshot.scheduler
+        scheduler.current_job_id = self._scheduler_current
+        scheduler.status = self._scheduler_status
+
+    def test_summarize_endpoint_enqueues_agent_job_with_expected_context(
+        self,
+    ) -> None:
+        payload = control_main.ExecutionImpactSummarizeRequest(
+            strategy_id="trend-btc-01",
+            strategy_name="Trend BTC",
+            window_start="2026-04-19T08:00:00+08:00",
+            window_end="2026-04-19T09:00:00+08:00",
+            order_count=5,
+            fill_count=5,
+            total_notional=100_000.0,
+            slippage_bps=3.2,
+            expected_pnl=150.0,
+            realized_pnl=138.0,
+            anomalies=[{"code": "slippage_spike", "detail": "第 3 单滑点超阈"}],
+            requested_by="desktop_operator",
+        )
+
+        response = control_main.summarize_execution_impact(payload)
+
+        self.assertIn("job_id", response)
+        self.assertIsInstance(response["job_id"], str)
+        self.assertTrue(response["job_id"])
+
+        self.assertEqual(len(control_main.repo.state.agent_jobs), 1)
+        job = control_main.repo.state.agent_jobs[0]
+        self.assertEqual(job.id, response["job_id"])
+        self.assertEqual(job.job_type, "summarize_execution_impact")
+        self.assertEqual(job.context["strategy_id"], "trend-btc-01")
+        self.assertEqual(job.context["strategy_name"], "Trend BTC")
+        self.assertEqual(
+            job.context["window_start"], "2026-04-19T08:00:00+08:00"
+        )
+        self.assertEqual(
+            job.context["window_end"], "2026-04-19T09:00:00+08:00"
+        )
+        self.assertEqual(job.context["order_count"], 5)
+        self.assertEqual(job.context["fill_count"], 5)
+        self.assertEqual(job.context["total_notional"], 100_000.0)
+        self.assertEqual(job.context["slippage_bps"], 3.2)
+        self.assertEqual(job.context["expected_pnl"], 150.0)
+        self.assertEqual(job.context["realized_pnl"], 138.0)
+        self.assertEqual(
+            job.context["anomalies"],
+            [{"code": "slippage_spike", "detail": "第 3 单滑点超阈"}],
+        )
+        self.assertEqual(job.context["requested_by"], "desktop_operator")
+
+    def test_summarize_endpoint_defaults_anomalies_to_empty_list_when_omitted(
+        self,
+    ) -> None:
+        payload = control_main.ExecutionImpactSummarizeRequest(
+            strategy_id="eth-revert-02",
+            strategy_name="Revert ETH",
+            window_start="2026-04-19T10:00:00+08:00",
+            window_end="2026-04-19T11:00:00+08:00",
+            order_count=3,
+            fill_count=3,
+            total_notional=12_340.0,
+            slippage_bps=1.1,
+            expected_pnl=42.0,
+            realized_pnl=40.5,
+        )
+
+        response = control_main.summarize_execution_impact(payload)
+
+        self.assertIn("job_id", response)
+        self.assertEqual(len(control_main.repo.state.agent_jobs), 1)
+        job = control_main.repo.state.agent_jobs[0]
+        self.assertEqual(job.context["anomalies"], [])
+        self.assertIsNone(job.context["requested_by"])
+
+    def test_records_endpoint_returns_records_newest_first(self) -> None:
+        first = control_main.repo.persist_execution_impact_record(
+            strategy_id="trend-btc-01",
+            strategy_name="Trend BTC",
+            window_start="2026-04-19T08:00:00+08:00",
+            window_end="2026-04-19T09:00:00+08:00",
+            summary="第一条记录",
+            impact_level="moderate",
+            direction="neutral",
+        )
+        second = control_main.repo.persist_execution_impact_record(
+            strategy_id="eth-revert-02",
+            strategy_name="Revert ETH",
+            window_start="2026-04-19T10:00:00+08:00",
+            window_end="2026-04-19T11:00:00+08:00",
+            summary="第二条记录",
+            impact_level="significant",
+            direction="worsened",
+        )
+
+        records = control_main.get_execution_impact_records()
+
+        self.assertEqual(len(records), 2)
+        self.assertEqual(records[0].id, second.id)
+        self.assertEqual(records[1].id, first.id)
+
+    def test_records_endpoint_returns_empty_list_when_no_records_exist(
+        self,
+    ) -> None:
+        records = control_main.get_execution_impact_records()
+
+        self.assertEqual(records, [])
+
+
 class ExecutionImpactResponseUnitTests(unittest.TestCase):
     def test_parses_structured_json_payload(self) -> None:
         from openclaw_client import OpenClawGatewayClient  # type: ignore

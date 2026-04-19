@@ -10462,6 +10462,45 @@ def retry_agent_job(job_id: str, payload: AgentJobRetryPayload):
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
+class ExecutionImpactSummarizeRequest(BaseModel):
+    strategy_id: str
+    strategy_name: str
+    window_start: str
+    window_end: str
+    order_count: int
+    fill_count: int
+    total_notional: float
+    slippage_bps: float
+    expected_pnl: float
+    realized_pnl: float
+    anomalies: Optional[List[Dict[str, Any]]] = None
+    requested_by: Optional[str] = None
+
+
+@app.post("/api/execution-impact/summarize")
+def summarize_execution_impact(payload: ExecutionImpactSummarizeRequest):
+    job_id = repo.queue_summarize_execution_impact(
+        strategy_id=payload.strategy_id,
+        strategy_name=payload.strategy_name,
+        window_start=payload.window_start,
+        window_end=payload.window_end,
+        order_count=payload.order_count,
+        fill_count=payload.fill_count,
+        total_notional=payload.total_notional,
+        slippage_bps=payload.slippage_bps,
+        expected_pnl=payload.expected_pnl,
+        realized_pnl=payload.realized_pnl,
+        anomalies=payload.anomalies,
+        requested_by=payload.requested_by,
+    )
+    return {"job_id": job_id}
+
+
+@app.get("/api/execution-impact/records", response_model=List[ExecutionImpactRecord])
+def get_execution_impact_records():
+    return repo.snapshot().execution_impact_records
+
+
 @app.get("/api/ai/reviews")
 def get_reviews(
     strategy_id: Optional[str] = None,
