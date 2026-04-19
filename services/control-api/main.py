@@ -120,6 +120,7 @@ from models import (
     ChangeRequestCreate,
     ClosePaperPositionPayload,
     Direction,
+    ExecutionImpactRecord,
     ExecutionPreview,
     ExecutionPreviewRequest,
     ExchangePositionBulkCloseResult,
@@ -5600,6 +5601,35 @@ def build_strategy_tracking_review_document(text: str, context: Dict[str, Any], 
     )
 
 
+def build_execution_impact_record_from_text(
+    text: str,
+    context: Dict[str, Any],
+    source: str,
+    job_id: str,
+) -> ExecutionImpactRecord:
+    parsed = OpenClawGatewayClient.parse_execution_impact_response(text)
+    strategy_id = str(context.get("strategy_id") or "").strip()
+    strategy_name = str(context.get("strategy_name") or "").strip() or strategy_id
+    window_start = str(context.get("window_start") or "").strip()
+    window_end = str(context.get("window_end") or "").strip()
+    return repo.persist_execution_impact_record(
+        strategy_id=strategy_id,
+        strategy_name=strategy_name,
+        window_start=window_start,
+        window_end=window_end,
+        summary=str(parsed.get("summary") or ""),
+        impact_level=str(parsed.get("impact_level") or "moderate"),
+        direction=str(parsed.get("direction") or "neutral"),
+        affected_orders=[str(item) for item in parsed.get("affected_orders") or []],
+        affected_positions=[str(item) for item in parsed.get("affected_positions") or []],
+        metrics_deltas=[str(item) for item in parsed.get("metrics_deltas") or []],
+        follow_up_checks=[str(item) for item in parsed.get("follow_up_checks") or []],
+        raw_text=str(parsed.get("raw_text") or text or ""),
+        agent_job_id=job_id,
+        source=source,
+    )
+
+
 def build_fallback_review_document(job_context: Dict[str, Any], job_type: str = "generate_daily_review") -> ReviewDocument:
     state = repo.snapshot()
     now = datetime.now(timezone.utc).astimezone()
@@ -5810,6 +5840,20 @@ def run_agent_worker_loop() -> None:
                         result_summary=outcome.get("summary", text[:160])[:160],
                         review=None,
                         source="openclaw",
+                    )
+                elif job.job_type == "summarize_execution_impact":
+                    record = build_execution_impact_record_from_text(
+                        text,
+                        job.context,
+                        source="openclaw",
+                        job_id=job.id,
+                    )
+                    repo.complete_agent_job(
+                        job.id,
+                        result_summary=(record.summary or text[:160])[:160],
+                        review=None,
+                        source="openclaw",
+                        execution_impact_record=record,
                     )
                 else:
                     repo.complete_agent_job(job.id, result_summary=text[:160], review=None, source="openclaw")

@@ -4032,6 +4032,7 @@ class AppRepository:
         result_summary: str,
         review: Optional[ReviewDocument] = None,
         source: str = "openclaw",
+        execution_impact_record: Optional[ExecutionImpactRecord] = None,
     ) -> AgentJob:
         with self._lock:
             job = next((item for item in self.state.agent_jobs if item.id == job_id), None)
@@ -4045,6 +4046,13 @@ class AppRepository:
             if scheduler.current_job_id == job.id:
                 scheduler.current_job_id = None
             scheduler.last_heartbeat_at = now_iso()
+            if execution_impact_record is not None:
+                job.context = {
+                    **job.context,
+                    "linked_execution_impact_id": execution_impact_record.id,
+                    "linked_execution_impact_level": execution_impact_record.impact_level,
+                    "linked_execution_impact_direction": execution_impact_record.direction,
+                }
             if review is not None:
                 review.source_job_id = job.id
                 review.source_job_type = job.job_type
@@ -4088,6 +4096,13 @@ class AppRepository:
                 "review_id": review.id if review else None,
                 "review_title": review.title if review else None,
                 "review_period": review.period if review else None,
+                "execution_impact_id": execution_impact_record.id if execution_impact_record else None,
+                "execution_impact_level": (
+                    execution_impact_record.impact_level if execution_impact_record else None
+                ),
+                "execution_impact_direction": (
+                    execution_impact_record.direction if execution_impact_record else None
+                ),
             }
             if job.job_type == "generate_backtest_review":
                 completed_event_payload.update(

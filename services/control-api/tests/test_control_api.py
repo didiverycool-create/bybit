@@ -17756,6 +17756,216 @@ class PersistExecutionImpactRecordUnitTests(unittest.TestCase):
         self.assertNotEqual(stored.updated_at, first.updated_at)
 
 
+class BuildExecutionImpactRecordFromTextUnitTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._records_backup = copy.deepcopy(
+            control_main.repo.state.execution_impact_records
+        )
+        self._jobs_backup = copy.deepcopy(control_main.repo.state.agent_jobs)
+        self._events_backup = copy.deepcopy(control_main.repo.state.audit_events)
+        self._scheduler_current = (
+            control_main.repo.state.control_snapshot.scheduler.current_job_id
+        )
+        self.addCleanup(self._restore)
+
+    def _restore(self) -> None:
+        control_main.repo.state.execution_impact_records = self._records_backup
+        control_main.repo.state.agent_jobs = self._jobs_backup
+        control_main.repo.state.audit_events = self._events_backup
+        control_main.repo.state.control_snapshot.scheduler.current_job_id = (
+            self._scheduler_current
+        )
+
+    def test_builds_record_from_structured_json_and_persists(self) -> None:
+        text = (
+            '{"summary": "滑点轻微上升",'
+            ' "impact_level": "moderate",'
+            ' "direction": "worsened",'
+            ' "affected_orders": ["ORD-1", "ORD-2"],'
+            ' "affected_positions": ["BTCUSDT-LONG"],'
+            ' "metrics_deltas": ["slippage +4bps"],'
+            ' "follow_up_checks": ["复核撮合链路"]}'
+        )
+        context = {
+            "strategy_id": "trend-btc-01",
+            "strategy_name": "Trend BTC",
+            "window_start": "2026-04-19T08:00:00+08:00",
+            "window_end": "2026-04-19T09:00:00+08:00",
+        }
+
+        record = control_main.build_execution_impact_record_from_text(
+            text,
+            context,
+            source="openclaw",
+            job_id="job-xyz-001",
+        )
+
+        self.assertEqual(record.strategy_id, "trend-btc-01")
+        self.assertEqual(record.strategy_name, "Trend BTC")
+        self.assertEqual(record.window_start, "2026-04-19T08:00:00+08:00")
+        self.assertEqual(record.window_end, "2026-04-19T09:00:00+08:00")
+        self.assertEqual(record.summary, "滑点轻微上升")
+        self.assertEqual(record.impact_level, "moderate")
+        self.assertEqual(record.direction, "worsened")
+        self.assertEqual(record.affected_orders, ["ORD-1", "ORD-2"])
+        self.assertEqual(record.affected_positions, ["BTCUSDT-LONG"])
+        self.assertEqual(record.metrics_deltas, ["slippage +4bps"])
+        self.assertEqual(record.follow_up_checks, ["复核撮合链路"])
+        self.assertEqual(record.raw_text, text)
+        self.assertEqual(record.agent_job_id, "job-xyz-001")
+        self.assertEqual(record.source, "openclaw")
+        stored = control_main.repo.state.execution_impact_records[0]
+        self.assertEqual(stored.id, record.id)
+
+    def test_plain_text_falls_back_to_moderate_neutral(self) -> None:
+        context = {
+            "strategy_id": "eth-revert-02",
+            "strategy_name": "Revert ETH",
+            "window_start": "2026-04-19T10:00:00+08:00",
+            "window_end": "2026-04-19T11:00:00+08:00",
+        }
+
+        record = control_main.build_execution_impact_record_from_text(
+            "执行整体稳定，没有显著异常。",
+            context,
+            source="openclaw",
+            job_id="job-xyz-002",
+        )
+
+        self.assertEqual(record.impact_level, "moderate")
+        self.assertEqual(record.direction, "neutral")
+        self.assertEqual(record.summary, "执行整体稳定，没有显著异常。")
+        self.assertEqual(record.affected_orders, [])
+        self.assertEqual(record.metrics_deltas, [])
+        self.assertEqual(record.agent_job_id, "job-xyz-002")
+
+
+class CompleteAgentJobExecutionImpactUnitTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._records_backup = copy.deepcopy(
+            control_main.repo.state.execution_impact_records
+        )
+        self._jobs_backup = copy.deepcopy(control_main.repo.state.agent_jobs)
+        self._events_backup = copy.deepcopy(control_main.repo.state.audit_events)
+        scheduler = control_main.repo.state.control_snapshot.scheduler
+        self._scheduler_current = scheduler.current_job_id
+        self._scheduler_status = scheduler.status
+        control_main.repo.state.agent_jobs = []
+        scheduler.current_job_id = None
+        scheduler.status = "running"
+        self.addCleanup(self._restore)
+
+    def _restore(self) -> None:
+        control_main.repo.state.execution_impact_records = self._records_backup
+        control_main.repo.state.agent_jobs = self._jobs_backup
+        control_main.repo.state.audit_events = self._events_backup
+        scheduler = control_main.repo.state.control_snapshot.scheduler
+        scheduler.current_job_id = self._scheduler_current
+        scheduler.status = self._scheduler_status
+
+    def test_complete_agent_job_with_execution_impact_record_updates_context_and_event(
+        self,
+    ) -> None:
+        job_id = control_main.repo.queue_summarize_execution_impact(
+            strategy_id="trend-btc-01",
+            strategy_name="Trend BTC",
+            window_start="2026-04-19T08:00:00+08:00",
+            window_end="2026-04-19T09:00:00+08:00",
+            order_count=5,
+            fill_count=5,
+            total_notional=100_000.0,
+            slippage_bps=3.2,
+            expected_pnl=150.0,
+            realized_pnl=138.0,
+        )
+        claimed = control_main.repo.claim_next_agent_job()
+        self.assertIsNotNone(claimed)
+        assert claimed is not None
+        self.assertEqual(claimed.id, job_id)
+
+        record = control_main.build_execution_impact_record_from_text(
+            '{"summary": "滑点轻微恶化",'
+            ' "impact_level": "significant",'
+            ' "direction": "worsened",'
+            ' "metrics_deltas": ["slippage +12bps"],'
+            ' "follow_up_checks": ["复核撮合"]}',
+            claimed.context,
+            source="openclaw",
+            job_id=claimed.id,
+        )
+
+        completed = control_main.repo.complete_agent_job(
+            claimed.id,
+            result_summary=record.summary[:160],
+            review=None,
+            source="openclaw",
+            execution_impact_record=record,
+        )
+
+        self.assertEqual(completed.status.value, "completed")
+        self.assertEqual(
+            completed.context["linked_execution_impact_id"], record.id
+        )
+        self.assertEqual(
+            completed.context["linked_execution_impact_level"], "significant"
+        )
+        self.assertEqual(
+            completed.context["linked_execution_impact_direction"], "worsened"
+        )
+
+        latest_event = next(
+            item
+            for item in control_main.repo.state.audit_events
+            if item.event_type == "openclaw.job.completed"
+            and item.payload.get("job_id") == claimed.id
+        )
+        self.assertEqual(
+            latest_event.payload["execution_impact_id"], record.id
+        )
+        self.assertEqual(
+            latest_event.payload["execution_impact_level"], "significant"
+        )
+        self.assertEqual(
+            latest_event.payload["execution_impact_direction"], "worsened"
+        )
+
+    def test_complete_agent_job_without_execution_impact_record_has_null_fields(
+        self,
+    ) -> None:
+        job_id = control_main.repo.queue_summarize_execution_impact(
+            strategy_id="eth-revert-02",
+            strategy_name="Revert ETH",
+            window_start="2026-04-19T10:00:00+08:00",
+            window_end="2026-04-19T11:00:00+08:00",
+            order_count=3,
+            fill_count=3,
+            total_notional=12_340.0,
+            slippage_bps=1.1,
+            expected_pnl=42.0,
+            realized_pnl=40.5,
+        )
+        claimed = control_main.repo.claim_next_agent_job()
+        assert claimed is not None
+
+        completed = control_main.repo.complete_agent_job(
+            claimed.id,
+            result_summary="本地回退总结",
+            review=None,
+            source="local_fallback",
+        )
+
+        self.assertNotIn("linked_execution_impact_id", completed.context)
+        latest_event = next(
+            item
+            for item in control_main.repo.state.audit_events
+            if item.event_type == "openclaw.job.completed"
+            and item.payload.get("job_id") == claimed.id
+        )
+        self.assertIsNone(latest_event.payload["execution_impact_id"])
+        self.assertIsNone(latest_event.payload["execution_impact_level"])
+        self.assertIsNone(latest_event.payload["execution_impact_direction"])
+
+
 class ExecutionImpactResponseUnitTests(unittest.TestCase):
     def test_parses_structured_json_payload(self) -> None:
         from openclaw_client import OpenClawGatewayClient  # type: ignore
