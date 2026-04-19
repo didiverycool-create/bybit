@@ -54,6 +54,7 @@ from models import (
     WorkspacePreferencesUpdate,
 )
 from datetime_utils import parse_optional_iso_datetime
+from risk_guards import evaluate_paper_order_risk
 from seed import build_market_detail_for_watchlist, build_state
 
 
@@ -2169,28 +2170,28 @@ class AppRepository:
         price: float,
         exclude_order_id: Optional[str] = None,
     ) -> Optional[str]:
+        # Cheap pre-check first so we avoid building the ledger snapshot for
+        # obviously invalid inputs; ``evaluate_paper_order_risk`` repeats the
+        # check but exits in O(1) with no snapshot touched.
         if quantity <= 0 or price <= 0:
             return "数量和价格必须大于 0。"
 
         ledger_snapshot = self._build_paper_ledger_locked()
-        cash_balance = float(ledger_snapshot["cash_balance"])
-        available_cash = cash_balance - self._paper_reserved_cash_locked(exclude_order_id)
-        ledger = dict(ledger_snapshot["positions"])
-        notional = quantity * price
-        symbol_state = ledger.get(symbol, {"qty": 0.0})
-        current_qty = float(symbol_state.get("qty") or 0.0)
+        reserved_cash = self._paper_reserved_cash_locked(exclude_order_id)
         reserved_spot_sell_qty = self._paper_reserved_sell_quantity_locked(symbol, exclude_order_id)
 
-        if side == Direction.BUY and notional > available_cash + 1e-9:
-            return f"Paper 可用余额不足，当前仅剩 {self._format_usdt(available_cash)}。"
-
-        if market == "spot" and side == Direction.SELL and current_qty - reserved_spot_sell_qty + 1e-9 < quantity:
-            return (
-                f"{symbol} 当前 Paper 现货可卖数量不足，"
-                f"最多可卖 {self._format_quantity(max(current_qty - reserved_spot_sell_qty, 0.0), 6)}。"
-            )
-
-        return None
+        return evaluate_paper_order_risk(
+            symbol,
+            market,
+            side,
+            quantity,
+            price,
+            ledger_snapshot=ledger_snapshot,
+            reserved_cash=reserved_cash,
+            reserved_spot_sell_qty=reserved_spot_sell_qty,
+            format_usdt=self._format_usdt,
+            format_quantity=self._format_quantity,
+        )
 
     def _build_paper_positions_locked(self) -> list[PositionRecord]:
         ledger_snapshot = self._build_paper_ledger_locked()
