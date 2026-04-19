@@ -3350,6 +3350,10 @@ class AppRepository:
                 else None
             ),
             notes=str(computed.get("notes")) if computed else "由控制端发起的即时回测，当前为 mock 结果用于联调。",
+            volatility_stats=computed.get("volatility_stats") if computed else None,
+            risk_ratios=computed.get("risk_ratios") if computed else None,
+            trade_rhythm_stats=computed.get("trade_rhythm_stats") if computed else None,
+            benchmark_stats=computed.get("benchmark_stats") if computed else None,
         )
         self.state.backtests.insert(0, record)
         self.add_event(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import threading
 import time
@@ -3722,6 +3723,26 @@ def build_backtest_payload(strategy: Any, data_range: str, timeframe: str) -> Op
         "parameter_snapshot": computation.parameter_snapshot,
         "symbol_scope": computation.symbol_scope,
         "data_granularity": computation.data_granularity,
+        "volatility_stats": (
+            dataclasses.asdict(computation.volatility_stats)
+            if computation.volatility_stats is not None
+            else None
+        ),
+        "risk_ratios": (
+            dataclasses.asdict(computation.risk_ratios)
+            if computation.risk_ratios is not None
+            else None
+        ),
+        "trade_rhythm_stats": (
+            dataclasses.asdict(computation.trade_rhythm_stats)
+            if computation.trade_rhythm_stats is not None
+            else None
+        ),
+        "benchmark_stats": (
+            dataclasses.asdict(computation.benchmark_stats)
+            if computation.benchmark_stats is not None
+            else None
+        ),
     }
 
 

@@ -675,6 +675,45 @@ class BacktestMetrics(BaseModel):
     trades: int
 
 
+class BacktestVolatilityStatsModel(BaseModel):
+    return_volatility_pct: float = 0.0
+    annualized_volatility_pct: float = 0.0
+    max_drawdown_duration_bars: int = 0
+    max_run_up_pct: float = 0.0
+    positive_bar_ratio_pct: float = 0.0
+
+
+class BacktestRiskRatiosModel(BaseModel):
+    sortino_ratio: float = 0.0
+    calmar_ratio: float = 0.0
+    profit_factor: float = 0.0
+    expectancy_pct: float = 0.0
+    worst_bar_return_pct: float = 0.0
+    best_bar_return_pct: float = 0.0
+
+
+class BacktestTradeRhythmStatsModel(BaseModel):
+    total_bars: int = 0
+    positive_bars: int = 0
+    negative_bars: int = 0
+    flat_bars: int = 0
+    win_loss_bar_ratio: float = 0.0
+    longest_winning_streak_bars: int = 0
+    longest_losing_streak_bars: int = 0
+    avg_positive_bar_return_pct: float = 0.0
+    avg_negative_bar_return_pct: float = 0.0
+    median_bar_return_pct: float = 0.0
+
+
+class BacktestBenchmarkStatsModel(BaseModel):
+    buy_hold_return_pct: float = 0.0
+    buy_hold_max_drawdown_pct: float = 0.0
+    strategy_over_buy_hold_pct: float = 0.0
+    alpha_pct: float = 0.0
+    correlation: float = 0.0
+    tracking_error_pct: float = 0.0
+
+
 class BacktestRun(BaseModel):
     id: str
     strategy_id: str
@@ -726,6 +765,10 @@ class BacktestRun(BaseModel):
     full_window_recommended_timeframe: Optional[BacktestTimeframe] = None
     full_window_recommended_action: Optional[str] = None
     notes: str
+    volatility_stats: Optional[BacktestVolatilityStatsModel] = None
+    risk_ratios: Optional[BacktestRiskRatiosModel] = None
+    trade_rhythm_stats: Optional[BacktestTradeRhythmStatsModel] = None
+    benchmark_stats: Optional[BacktestBenchmarkStatsModel] = None
 
 
 class ChangeRequest(BaseModel):

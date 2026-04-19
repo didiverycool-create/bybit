@@ -12398,6 +12398,35 @@ class ControlApiIntegrationTests(unittest.TestCase):
         self.assertEqual(backtest_market_data.requested_markets[-1], "spot")
         self.assertEqual(payload["symbol_scope"], ["SOLUSDT"])
 
+    def test_build_backtest_payload_exposes_stat_dataclasses_on_response(self) -> None:
+        original_market_data = control_main.market_data
+        control_main.market_data = RecordingBacktestMarketClient()
+        self.addCleanup(setattr, control_main, "market_data", original_market_data)
+
+        strategy = next(
+            item for item in control_main.repo.state.strategies if item.id == "trend-btc-01"
+        )
+        payload = control_main.build_backtest_payload(
+            strategy,
+            data_range="2025-12-01 ~ 2026-03-29",
+            timeframe="1h",
+        )
+
+        self.assertIsNotNone(payload)
+        for stat_key in (
+            "volatility_stats",
+            "risk_ratios",
+            "trade_rhythm_stats",
+            "benchmark_stats",
+        ):
+            self.assertIn(stat_key, payload, f"{stat_key} missing from backtest payload")
+            self.assertIsInstance(payload[stat_key], dict, f"{stat_key} should be a dict")
+
+        self.assertIn("annualized_volatility_pct", payload["volatility_stats"])
+        self.assertIn("sortino_ratio", payload["risk_ratios"])
+        self.assertIn("longest_winning_streak_bars", payload["trade_rhythm_stats"])
+        self.assertIn("correlation", payload["benchmark_stats"])
+
     def test_change_request_backtest_and_agent_job_endpoints(self) -> None:
         scheduler_status, scheduler_before = self._get("/api/ai/scheduler")
         self.assertEqual(scheduler_status, 200)
