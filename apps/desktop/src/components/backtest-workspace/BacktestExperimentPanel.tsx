@@ -103,6 +103,54 @@ export default function BacktestExperimentPanel({
           <strong>胜率</strong>
           <span>{selectedBacktest.metrics.win_rate}</span>
         </div>
+        {selectedBacktest.risk_ratios && (
+          <div className="stack-row">
+            <strong>风险比率</strong>
+            <span>
+              Sortino {selectedBacktest.risk_ratios.sortino_ratio.toFixed(2)}
+              {' · '}
+              Calmar {selectedBacktest.risk_ratios.calmar_ratio.toFixed(2)}
+              {' · '}
+              盈亏比 {selectedBacktest.risk_ratios.profit_factor.toFixed(2)}
+            </span>
+          </div>
+        )}
+        {selectedBacktest.volatility_stats && (
+          <div className="stack-row">
+            <strong>波动</strong>
+            <span>
+              年化 {selectedBacktest.volatility_stats.annualized_volatility_pct.toFixed(2)}%
+              {' · '}
+              正向 bar {selectedBacktest.volatility_stats.positive_bar_ratio_pct.toFixed(1)}%
+              {' · '}
+              最长回撤 {selectedBacktest.volatility_stats.max_drawdown_duration_bars} bar
+            </span>
+          </div>
+        )}
+        {selectedBacktest.trade_rhythm_stats && (
+          <div className="stack-row">
+            <strong>节奏</strong>
+            <span>
+              连胜 {selectedBacktest.trade_rhythm_stats.longest_winning_streak_bars}
+              {' / '}
+              连亏 {selectedBacktest.trade_rhythm_stats.longest_losing_streak_bars} bar
+              {' · '}
+              胜负 bar 比 {selectedBacktest.trade_rhythm_stats.win_loss_bar_ratio.toFixed(2)}
+            </span>
+          </div>
+        )}
+        {selectedBacktest.benchmark_stats && (
+          <div className="stack-row">
+            <strong>对比基准</strong>
+            <span>
+              持有收益 {selectedBacktest.benchmark_stats.buy_hold_return_pct.toFixed(2)}%
+              {' · '}
+              超额 {selectedBacktest.benchmark_stats.strategy_over_buy_hold_pct.toFixed(2)}%
+              {' · '}
+              Alpha {selectedBacktest.benchmark_stats.alpha_pct.toFixed(2)}%
+            </span>
+          </div>
+        )}
         <div className="stack-row">
           <strong>样本质量</strong>
           <span>{selectedBacktestSampleMeta?.description ?? '未标注'}</span>

@@ -672,6 +672,45 @@ export interface BacktestMetrics {
   trades: number
 }
 
+export interface BacktestVolatilityStats {
+  return_volatility_pct: number
+  annualized_volatility_pct: number
+  max_drawdown_duration_bars: number
+  max_run_up_pct: number
+  positive_bar_ratio_pct: number
+}
+
+export interface BacktestRiskRatios {
+  sortino_ratio: number
+  calmar_ratio: number
+  profit_factor: number
+  expectancy_pct: number
+  worst_bar_return_pct: number
+  best_bar_return_pct: number
+}
+
+export interface BacktestTradeRhythmStats {
+  total_bars: number
+  positive_bars: number
+  negative_bars: number
+  flat_bars: number
+  win_loss_bar_ratio: number
+  longest_winning_streak_bars: number
+  longest_losing_streak_bars: number
+  avg_positive_bar_return_pct: number
+  avg_negative_bar_return_pct: number
+  median_bar_return_pct: number
+}
+
+export interface BacktestBenchmarkStats {
+  buy_hold_return_pct: number
+  buy_hold_max_drawdown_pct: number
+  strategy_over_buy_hold_pct: number
+  alpha_pct: number
+  correlation: number
+  tracking_error_pct: number
+}
+
 export interface BacktestRun {
   id: string
   strategy_id: string
@@ -722,6 +761,10 @@ export interface BacktestRun {
   full_window_recommended_data_range?: string | null
   full_window_recommended_timeframe?: string | null
   full_window_recommended_action?: string | null
+  volatility_stats?: BacktestVolatilityStats | null
+  risk_ratios?: BacktestRiskRatios | null
+  trade_rhythm_stats?: BacktestTradeRhythmStats | null
+  benchmark_stats?: BacktestBenchmarkStats | null
   notes: string
 }
 
