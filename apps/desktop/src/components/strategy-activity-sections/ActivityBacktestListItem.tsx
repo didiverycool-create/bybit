@@ -111,6 +111,49 @@ export default function ActivityBacktestListItem({
             {label}
           </span>
         ))}
+        {linkedBacktest && (
+          <>
+            <span
+              className={(() => {
+                const value = Number(linkedBacktest.metrics.sharpe)
+                if (!Number.isFinite(value)) return 'chip chip--muted'
+                if (value >= 1.5) return 'chip chip--success'
+                if (value >= 0.5) return 'chip'
+                if (value > 0) return 'chip chip--muted'
+                return 'chip chip--warning'
+              })()}
+            >
+              Sharpe {linkedBacktest.metrics.sharpe}
+            </span>
+            <span className="chip chip--muted">胜率 {linkedBacktest.metrics.win_rate}</span>
+            {linkedBacktest.tail_risk_stats && (
+              <span
+                className={
+                  linkedBacktest.tail_risk_stats.var_95_pct >= 10
+                    ? 'chip chip--warning'
+                    : linkedBacktest.tail_risk_stats.var_95_pct >= 5
+                      ? 'chip'
+                      : 'chip chip--muted'
+                }
+              >
+                VaR95 {linkedBacktest.tail_risk_stats.var_95_pct.toFixed(2)}%
+              </span>
+            )}
+            {linkedBacktest.benchmark_stats && (
+              <span
+                className={
+                  linkedBacktest.benchmark_stats.strategy_over_buy_hold_pct > 0
+                    ? 'chip chip--success'
+                    : linkedBacktest.benchmark_stats.strategy_over_buy_hold_pct < 0
+                      ? 'chip chip--warning'
+                      : 'chip'
+                }
+              >
+                超额 {linkedBacktest.benchmark_stats.strategy_over_buy_hold_pct.toFixed(1)}%
+              </span>
+            )}
+          </>
+        )}
         <button type="button" className="micro-action" onClick={() => onOpenBacktestDetail(backtest.id, backtestStrategyId)}>
           打开回测
         </button>
