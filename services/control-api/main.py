@@ -218,6 +218,13 @@ from strategy_activity_summary import (
 from openclaw_client import OpenClawGatewayClient
 from repository import AppRepository
 from seed import build_market_detail_for_watchlist
+from execution_health import (
+    build_execution_health_top_issue_context as _build_execution_health_top_issue_context_impl,
+    build_public_execution_channel_health as _build_public_execution_channel_health_impl,
+    get_public_execution_channel_issue as _get_public_execution_channel_issue_impl,
+    merge_execution_health_review_risks as _merge_execution_health_review_risks_impl,
+    public_channel_for_market as _public_channel_for_market_impl,
+)
 
 
 app = FastAPI(title="Bybit 控制端本地服务", version="0.1.0")
@@ -1003,7 +1010,7 @@ def resolve_private_mode_access(mode: AccountMode) -> tuple[BybitPrivateStatus, 
 
 
 def _public_channel_for_market(market: str) -> str:
-    return "spot" if market == "spot" else "linear"
+    return _public_channel_for_market_impl(market)
 
 
 def _resolve_strategy_primary_market(state: Any, strategy: Any) -> str:
@@ -1073,97 +1080,24 @@ def _build_public_execution_channel_health(
     *,
     rest_probe: Optional[Dict[str, Optional[object]]] = None,
 ) -> Dict[str, Any]:
-    realtime = getattr(market_data, "realtime", None)
-    if realtime is None or not hasattr(realtime, "get_status"):
-        return {
-            "enabled": False,
-            "connected": False,
-            "stale": False,
-            "stale_seconds": 0,
-            "has_symbol_feed": False,
-            "issue": None,
-            "recommended_action": None,
-            "channel": _public_channel_for_market(market),
-            "symbol": symbol.upper(),
-            "rest_reachable": None,
-            "rest_last_error": None,
-            "rest_tested_at": None,
-        }
-
-    realtime_status = _build_public_realtime_health()
-    channel = _public_channel_for_market(market)
-    symbol_upper = symbol.upper()
-    connected = bool(realtime_status.get(f"connected_{channel}"))
-    enabled = bool(realtime_status.get("enabled", True))
-    last_error = str(realtime_status.get("last_error") or "").strip() or None
-    has_symbol_feed = bool(realtime.has_ticker(symbol_upper, market=market)) if hasattr(realtime, "has_ticker") else False
-    raw_symbol_last_message_at = (
-        realtime.get_symbol_last_message_at(symbol_upper, market=market)
-        if hasattr(realtime, "get_symbol_last_message_at")
-        else None
+    return _build_public_execution_channel_health_impl(
+        market,
+        symbol,
+        realtime=getattr(market_data, "realtime", None),
+        realtime_status_builder=_build_public_realtime_health,
+        rest_probe_fn=_probe_public_rest_connectivity,
+        recommended_action_builder=_build_public_execution_channel_recommended_action,
+        stale_threshold_seconds=PUBLIC_REALTIME_STALE_THRESHOLD_SECONDS,
+        rest_probe=rest_probe,
     )
-    stale_seconds = 0
-    stale = False
-    if raw_symbol_last_message_at:
-        try:
-            last_message_at = datetime.fromisoformat(str(raw_symbol_last_message_at))
-            stale_seconds = max(
-                int((datetime.now(timezone.utc).astimezone() - last_message_at).total_seconds()),
-                0,
-            )
-            stale = stale_seconds >= PUBLIC_REALTIME_STALE_THRESHOLD_SECONDS
-        except ValueError:
-            stale_seconds = 0
-            stale = False
-    elif has_symbol_feed:
-        stale = bool(realtime_status.get(f"{channel}_stale"))
-        stale_seconds = int(realtime_status.get(f"{channel}_stale_seconds") or 0)
-
-    issue = None
-    if not enabled:
-        issue = "当前 Bybit 公共 WS 未启用，无法安全执行真实策略委托，请先恢复公共实时链路。"
-    elif not connected:
-        issue = f"当前 Bybit 公共 WS ({channel}) 未连通，无法安全执行真实策略委托，请先恢复公共实时链路。"
-    elif not has_symbol_feed:
-        issue = f"当前 Bybit 公共 WS 尚未收到 {symbol_upper} 的实时行情，无法安全执行真实策略委托，请先恢复公共实时链路。"
-    elif stale:
-        issue = (
-            f"当前 Bybit 公共 WS 已超过约 {stale_seconds} 秒未收到 {symbol_upper} 的实时行情，"
-            "无法安全执行真实策略委托，请先恢复公共实时链路。"
-        )
-    if issue is not None and last_error:
-        issue = f"{issue} 最近错误：{last_error}"
-    resolved_rest_probe = rest_probe or (_probe_public_rest_connectivity() if issue is not None else {})
-    recommended_action = (
-        _build_public_execution_channel_recommended_action(
-            issue,
-            last_error=last_error,
-            rest_reachable=resolved_rest_probe.get("reachable") if resolved_rest_probe else None,
-        )
-        if issue is not None
-        else None
-    )
-
-    return {
-        "enabled": enabled,
-        "connected": connected,
-        "stale": stale,
-        "stale_seconds": stale_seconds,
-        "has_symbol_feed": has_symbol_feed,
-        "last_message_at": raw_symbol_last_message_at,
-        "last_error": last_error,
-        "issue": issue,
-        "recommended_action": recommended_action,
-        "channel": channel,
-        "symbol": symbol_upper,
-        "rest_reachable": resolved_rest_probe.get("reachable") if resolved_rest_probe else None,
-        "rest_last_error": resolved_rest_probe.get("last_error") if resolved_rest_probe else None,
-        "rest_tested_at": resolved_rest_probe.get("tested_at") if resolved_rest_probe else None,
-    }
 
 
 def get_public_execution_channel_issue(market: str, symbol: str) -> Optional[str]:
-    return _build_public_execution_channel_health(market, symbol).get("issue")
+    return _get_public_execution_channel_issue_impl(
+        market,
+        symbol,
+        build_channel_health=_build_public_execution_channel_health,
+    )
 
 
 def build_bybit_public_status() -> BybitPublicStatus:
@@ -1995,169 +1929,28 @@ def _build_execution_health_top_issue_context(
     runtime_health: Dict[str, Any],
     dynamic_auto_dispatch_blocked_contexts: Optional[List[Dict[str, Optional[str]]]] = None,
 ) -> Dict[str, Optional[str]]:
-    if runtime_health["runtime_last_error"]:
-        return {
-            "top_issue_strategy_id": None,
-            "top_issue_strategy_name": None,
-            "top_issue_symbol": None,
-            "top_issue_detail": f"后台策略运行线程最近一次报错：{runtime_health['runtime_last_error']}",
-            "top_issue_recommended_action": "打开设置页点击“恢复运行线程”，并检查最近审计日志。",
-        }
-    if runtime_health["runtime_worker_stale"]:
-        return {
-            "top_issue_strategy_id": None,
-            "top_issue_strategy_name": None,
-            "top_issue_symbol": None,
-            "top_issue_detail": f"后台策略运行线程最近约 {runtime_health['runtime_stale_seconds']} 秒未成功刷新。",
-            "top_issue_recommended_action": "打开设置页点击“恢复运行线程”，并确认行情链路与最新信号。",
-        }
-    selected_mode = state.workspace_preferences.selected_mode
-    real_execution_modes: set[AccountMode] = set()
-    for strategy in state.strategies:
-        if _has_active_strategy_live_stop_loss_alert(strategy.id):
-            return _build_execution_issue_strategy_context(
-                state,
-                strategy.id,
-                alert_prefix=f"strategy-live-stop-loss:{strategy.id}:",
-            )
-
-    for strategy in state.strategies:
-        if strategy.mode not in {AccountMode.DEMO, AccountMode.LIVE} or strategy.status != "running":
-            continue
-        market = _resolve_strategy_primary_market(state, strategy)
-        symbol = strategy.symbols[0] if strategy.symbols else None
-        if not symbol:
-            continue
-        public_health = _build_public_execution_channel_health(market, symbol)
-        public_issue = public_health.get("issue")
-        if public_issue is not None:
-            return _build_execution_issue_strategy_context(
-                state,
-                strategy.id,
-                symbol=symbol,
-                detail=public_issue,
-                recommended_action=public_health.get("recommended_action"),
-            )
-
-    for strategy in state.strategies:
-        remaining = _strategy_live_stop_loss_cooldown_remaining_minutes(strategy)
-        if remaining is not None:
-            return _build_execution_issue_strategy_context(
-                state,
-                strategy.id,
-                symbol=strategy.symbols[0] if strategy.symbols else None,
-                detail=f"{strategy.name} 当前处于真实模式止损后冷却期，剩余约 {remaining} 分钟。",
-                recommended_action="冷却结束前不再恢复自动执行；请先人工复核真实仓位和策略参数。",
-            )
-
-    for strategy in state.strategies:
-        remaining = _strategy_exchange_rejection_guard_remaining_minutes(strategy)
-        if remaining is not None:
-            return _build_execution_issue_strategy_context(
-                state,
-                strategy.id,
-                alert_prefix=f"strategy-exchange-rejection-guard:{strategy.id}:",
-                detail=f"{strategy.name} 最近真实策略委托连续拒绝，自动执行冷却剩余约 {remaining} 分钟。",
-            )
-
-    for strategy in state.strategies:
-        if _has_active_strategy_stale_order_alert(strategy.id):
-            return _build_execution_issue_strategy_context(
-                state,
-                strategy.id,
-                alert_prefix=f"strategy-stale-order:{strategy.id}:",
-            )
-
-    for strategy in state.strategies:
-        if _has_active_strategy_auto_dispatch_alert(strategy.id):
-            alert_prefix = f"strategy-auto-dispatch:{strategy.id}:"
-            alert = _find_latest_active_system_alert_by_prefix(state, alert_prefix)
-            return _build_execution_issue_strategy_context(
-                state,
-                strategy.id,
-                alert_prefix=alert_prefix,
-                recommended_action=_resolve_auto_dispatch_top_issue_recommended_action(state, strategy, alert),
-            )
-
-    blocked_contexts = (
-        dynamic_auto_dispatch_blocked_contexts
-        if dynamic_auto_dispatch_blocked_contexts is not None
-        else _collect_dynamic_auto_dispatch_blocked_contexts(state)
+    return _build_execution_health_top_issue_context_impl(
+        state,
+        runtime_health,
+        dynamic_auto_dispatch_blocked_contexts,
+        account_mode_cls=AccountMode,
+        has_active_strategy_live_stop_loss_alert=_has_active_strategy_live_stop_loss_alert,
+        strategy_live_stop_loss_cooldown_remaining_minutes=_strategy_live_stop_loss_cooldown_remaining_minutes,
+        strategy_exchange_rejection_guard_remaining_minutes=_strategy_exchange_rejection_guard_remaining_minutes,
+        has_active_strategy_stale_order_alert=_has_active_strategy_stale_order_alert,
+        has_active_strategy_auto_dispatch_alert=_has_active_strategy_auto_dispatch_alert,
+        find_latest_active_system_alert_by_prefix=_find_latest_active_system_alert_by_prefix,
+        resolve_auto_dispatch_top_issue_recommended_action=_resolve_auto_dispatch_top_issue_recommended_action,
+        build_execution_issue_strategy_context=_build_execution_issue_strategy_context,
+        resolve_strategy_primary_market=_resolve_strategy_primary_market,
+        build_public_channel_health=_build_public_execution_channel_health,
+        collect_dynamic_auto_dispatch_blocked_contexts=_collect_dynamic_auto_dispatch_blocked_contexts,
+        build_strategy_active_order_summary=_build_strategy_active_order_summary,
+        build_strategy_position_alignment_summary=_build_strategy_position_alignment_summary,
+        get_private_execution_channel_issue=get_private_execution_channel_issue,
+        build_private_execution_channel_recommended_action=_build_private_execution_channel_recommended_action,
+        private_realtime=private_realtime,
     )
-    for blocked_context in blocked_contexts:
-        return blocked_context
-
-    for runtime_snapshot in state.strategy_runtime_snapshots:
-        active_order_count, _active_order = _build_strategy_active_order_summary(
-            runtime_snapshot.strategy_id,
-            runtime_snapshot.mode,
-            runtime_snapshot.symbol,
-            runtime_snapshot.market,
-        )
-        (
-            _target_position_side,
-            _target_position_size,
-            position_alignment,
-            position_alignment_detail,
-        ) = _build_strategy_position_alignment_summary(
-            runtime_snapshot.strategy_id,
-            runtime_snapshot.mode,
-            runtime_snapshot.symbol,
-            runtime_snapshot.market,
-            active_order_count,
-        )
-        if position_alignment == "drifted":
-            return _build_execution_issue_strategy_context(
-                state,
-                runtime_snapshot.strategy_id,
-                symbol=runtime_snapshot.symbol,
-                detail=position_alignment_detail,
-                alert_prefix=f"strategy-position-drift:{runtime_snapshot.strategy_id}:",
-            )
-
-    if runtime_health.get("runtime_worker_stopped"):
-        last_refresh = runtime_health.get("runtime_last_refresh_at")
-        return {
-            "top_issue_strategy_id": None,
-            "top_issue_strategy_name": None,
-            "top_issue_symbol": None,
-            "top_issue_detail": (
-                f"后台策略运行线程当前未运行，最近一次成功刷新：{last_refresh}"
-                if last_refresh
-                else "后台策略运行线程当前未运行。"
-            ),
-            "top_issue_recommended_action": "打开设置页点击“恢复运行线程”，让后台自动执行链恢复。",
-        }
-
-    selected_mode = state.workspace_preferences.selected_mode
-    real_execution_modes: set[AccountMode] = set()
-    if selected_mode in {AccountMode.DEMO, AccountMode.LIVE}:
-        real_execution_modes.add(selected_mode)
-    for strategy in state.strategies:
-        if strategy.mode in {AccountMode.DEMO, AccountMode.LIVE} and strategy.status == "running":
-            real_execution_modes.add(strategy.mode)
-    for mode in real_execution_modes:
-        private_issue = get_private_execution_channel_issue(mode)
-        if private_issue is not None:
-            private_last_error = str(private_realtime.get_status().get("last_error") or "").strip() or None
-            return {
-                "top_issue_strategy_id": None,
-                "top_issue_strategy_name": None,
-                "top_issue_symbol": None,
-                "top_issue_detail": private_issue,
-                "top_issue_recommended_action": _build_private_execution_channel_recommended_action(
-                    private_issue,
-                    last_error=private_last_error,
-                ),
-            }
-
-    return {
-        "top_issue_strategy_id": None,
-        "top_issue_strategy_name": None,
-        "top_issue_symbol": None,
-        "top_issue_detail": None,
-        "top_issue_recommended_action": None,
-    }
 
 
 def _collect_dynamic_auto_dispatch_blocked_contexts(state: Any) -> List[Dict[str, Optional[str]]]:
@@ -5249,74 +5042,12 @@ def _extract_safe_sample_validation_payload(
 
 
 def _merge_execution_health_review_risks(risks: List[str], context: Optional[Dict[str, Any]] = None) -> List[str]:
-    merged = [str(item).strip() for item in risks if str(item).strip()]
-    review_health_context = (
-        _derive_review_health_context_from_context(context, include_strategy_activity=False)
-        if context is not None
-        else build_review_health_context()
+    return _merge_execution_health_review_risks_impl(
+        risks,
+        context,
+        derive_review_health_context_from_context=_derive_review_health_context_from_context,
+        build_review_health_context=build_review_health_context,
     )
-    execution_top_issue = str(review_health_context.get("execution_top_issue") or "").strip()
-    execution_top_issue_detail = str(review_health_context.get("execution_top_issue_detail") or "").strip()
-    execution_top_issue_recommended_action = str(
-        review_health_context.get("execution_top_issue_recommended_action") or ""
-    ).strip()
-    runtime_worker_top_issue = str(review_health_context.get("runtime_worker_top_issue") or "").strip()
-    runtime_worker_detail = str(review_health_context.get("runtime_worker_detail") or "").strip()
-    runtime_worker_recommended_action = str(
-        review_health_context.get("runtime_worker_recommended_action") or ""
-    ).strip()
-
-    def build_risk_entry(prefix: str, issue: str, detail: str = "", recommended_action: str = "") -> Optional[str]:
-        if not issue:
-            return None
-        sentences = [f"{prefix}：{issue.rstrip('。')}。"]
-        if detail and detail not in issue:
-            sentences.append(f"{detail.rstrip('。')}。")
-        if recommended_action and recommended_action not in detail:
-            sentences.append(f"建议：{recommended_action.rstrip('。')}。")
-        return " ".join(sentences)
-
-    def has_complete_risk_entry(issue: str, detail: str = "", recommended_action: str = "") -> bool:
-        if not issue:
-            return False
-        return any(
-            issue in item
-            and (not detail or detail in item)
-            and (not recommended_action or recommended_action in item)
-            for item in merged
-        )
-
-    execution_risk_entry = build_risk_entry(
-        "执行健康提示",
-        execution_top_issue,
-        execution_top_issue_detail,
-        execution_top_issue_recommended_action,
-    )
-    if execution_risk_entry and not has_complete_risk_entry(
-        execution_top_issue,
-        execution_top_issue_detail,
-        execution_top_issue_recommended_action,
-    ):
-        merged.append(execution_risk_entry)
-    if (
-        runtime_worker_top_issue
-        and runtime_worker_top_issue != execution_top_issue
-        and not has_complete_risk_entry(
-            runtime_worker_top_issue,
-            runtime_worker_detail,
-            runtime_worker_recommended_action,
-        )
-    ):
-        runtime_risk_entry = build_risk_entry(
-            "运行线程提示",
-            runtime_worker_top_issue,
-            detail=runtime_worker_detail,
-            recommended_action=runtime_worker_recommended_action,
-        )
-        if runtime_risk_entry:
-            merged.append(runtime_risk_entry)
-
-    return merged[:4]
 
 
 def _is_reference_only_backtest_context(context: Dict[str, Any]) -> bool:

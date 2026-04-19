@@ -18318,5 +18318,294 @@ class ExecutionImpactResponseUnitTests(unittest.TestCase):
         self.assertEqual(parsed_alt["follow_up_checks"], ["monitor next hour"])
 
 
+class ExecutionHealthModuleUnitTests(unittest.TestCase):
+    """Exercise helpers extracted into services/control-api/execution_health.py."""
+
+    def test_public_channel_for_market_maps_spot_and_derivatives(self) -> None:
+        from execution_health import public_channel_for_market  # type: ignore
+
+        self.assertEqual(public_channel_for_market("spot"), "spot")
+        self.assertEqual(public_channel_for_market("perp"), "linear")
+        self.assertEqual(public_channel_for_market("linear"), "linear")
+        self.assertEqual(public_channel_for_market("inverse"), "linear")
+        # main.py re-export should match the extracted helper byte-for-byte
+        self.assertEqual(control_main._public_channel_for_market("spot"), "spot")
+        self.assertEqual(control_main._public_channel_for_market("perp"), "linear")
+
+    def test_build_public_execution_channel_health_without_realtime_returns_disabled(self) -> None:
+        from execution_health import build_public_execution_channel_health  # type: ignore
+
+        health = build_public_execution_channel_health(
+            "spot",
+            "btcusdt",
+            realtime=None,
+            realtime_status_builder=lambda: {},
+            rest_probe_fn=lambda: {"reachable": None, "last_error": None, "tested_at": None},
+            recommended_action_builder=lambda *args, **kwargs: "noop",
+            stale_threshold_seconds=90,
+        )
+        self.assertFalse(health["enabled"])
+        self.assertFalse(health["connected"])
+        self.assertFalse(health["has_symbol_feed"])
+        self.assertIsNone(health["issue"])
+        self.assertIsNone(health["recommended_action"])
+        self.assertEqual(health["channel"], "spot")
+        self.assertEqual(health["symbol"], "BTCUSDT")
+        self.assertIsNone(health["rest_reachable"])
+
+    def test_build_public_execution_channel_health_happy_path_has_no_issue(self) -> None:
+        from execution_health import build_public_execution_channel_health  # type: ignore
+
+        feed = StubPublicExecutionRealtimeFeed(
+            ticker_symbols=["PERP:BTCUSDT", "BTCUSDT"],
+            symbol_last_message_at={
+                "PERP:BTCUSDT": datetime.now(timezone.utc).astimezone().isoformat(),
+            },
+        )
+        realtime_status = {
+            "enabled": True,
+            "connected_spot": True,
+            "connected_linear": True,
+            "spot_stale": False,
+            "spot_stale_seconds": 0,
+            "linear_stale": False,
+            "linear_stale_seconds": 0,
+            "last_error": None,
+        }
+        health = build_public_execution_channel_health(
+            "perp",
+            "btcusdt",
+            realtime=feed,
+            realtime_status_builder=lambda: dict(realtime_status),
+            rest_probe_fn=lambda: {"reachable": True, "last_error": None, "tested_at": None},
+            recommended_action_builder=lambda *args, **kwargs: "unused",
+            stale_threshold_seconds=90,
+        )
+        self.assertTrue(health["enabled"])
+        self.assertTrue(health["connected"])
+        self.assertTrue(health["has_symbol_feed"])
+        self.assertFalse(health["stale"])
+        self.assertIsNone(health["issue"])
+        self.assertIsNone(health["recommended_action"])
+        self.assertEqual(health["channel"], "linear")
+        self.assertEqual(health["symbol"], "BTCUSDT")
+
+    def test_build_public_execution_channel_health_reports_missing_symbol_feed(self) -> None:
+        from execution_health import build_public_execution_channel_health  # type: ignore
+
+        feed = StubPublicExecutionRealtimeFeed(
+            ticker_symbols=["PERP:ETHUSDT"],
+            symbol_last_message_at={},
+        )
+        realtime_status = {
+            "enabled": True,
+            "connected_spot": True,
+            "connected_linear": True,
+            "spot_stale": False,
+            "spot_stale_seconds": 0,
+            "linear_stale": False,
+            "linear_stale_seconds": 0,
+            "last_error": None,
+        }
+        rest_probe = {"reachable": False, "last_error": "connect timeout", "tested_at": "2026-04-01T00:00:00Z"}
+        recommended_calls: list[Any] = []
+
+        def fake_recommended_action(issue: Any, **kwargs: Any) -> str:
+            recommended_calls.append((issue, kwargs))
+            return "请先恢复 watchlist 订阅"
+
+        health = build_public_execution_channel_health(
+            "perp",
+            "btcusdt",
+            realtime=feed,
+            realtime_status_builder=lambda: dict(realtime_status),
+            rest_probe_fn=lambda: dict(rest_probe),
+            recommended_action_builder=fake_recommended_action,
+            stale_threshold_seconds=90,
+        )
+        self.assertTrue(health["enabled"])
+        self.assertTrue(health["connected"])
+        self.assertFalse(health["has_symbol_feed"])
+        self.assertIsNotNone(health["issue"])
+        self.assertIn("尚未收到 BTCUSDT", str(health["issue"]))
+        self.assertEqual(health["recommended_action"], "请先恢复 watchlist 订阅")
+        self.assertEqual(health["rest_reachable"], False)
+        self.assertEqual(health["rest_last_error"], "connect timeout")
+        self.assertEqual(len(recommended_calls), 1)
+
+    def test_build_public_execution_channel_health_uses_provided_rest_probe(self) -> None:
+        from execution_health import build_public_execution_channel_health  # type: ignore
+
+        feed = StubPublicExecutionRealtimeFeed(ticker_symbols=[])
+        realtime_status = {
+            "enabled": False,
+            "connected_spot": False,
+            "connected_linear": False,
+            "spot_stale": False,
+            "spot_stale_seconds": 0,
+            "linear_stale": False,
+            "linear_stale_seconds": 0,
+            "last_error": None,
+        }
+        probe_call_count = {"count": 0}
+
+        def probe_fn() -> Dict[str, Any]:
+            probe_call_count["count"] += 1
+            return {"reachable": True, "last_error": None, "tested_at": "ignored"}
+
+        supplied_probe = {"reachable": True, "last_error": None, "tested_at": "2026-04-01T12:00:00Z"}
+        health = build_public_execution_channel_health(
+            "spot",
+            "xrpusdt",
+            realtime=feed,
+            realtime_status_builder=lambda: dict(realtime_status),
+            rest_probe_fn=probe_fn,
+            recommended_action_builder=lambda *_args, **_kwargs: "restore-public-ws",
+            stale_threshold_seconds=90,
+            rest_probe=supplied_probe,
+        )
+        self.assertFalse(health["enabled"])
+        self.assertIsNotNone(health["issue"])
+        self.assertEqual(health["recommended_action"], "restore-public-ws")
+        self.assertEqual(health["rest_tested_at"], "2026-04-01T12:00:00Z")
+        self.assertEqual(probe_call_count["count"], 0)
+
+    def test_get_public_execution_channel_issue_returns_health_issue(self) -> None:
+        from execution_health import get_public_execution_channel_issue  # type: ignore
+
+        def fake_health(market: str, symbol: str) -> Dict[str, Any]:
+            return {"issue": f"{market}:{symbol}"}
+
+        self.assertEqual(
+            get_public_execution_channel_issue(
+                "perp", "btcusdt", build_channel_health=fake_health
+            ),
+            "perp:btcusdt",
+        )
+        self.assertIsNone(
+            get_public_execution_channel_issue(
+                "spot",
+                "eth",
+                build_channel_health=lambda *_args, **_kwargs: {"issue": None},
+            )
+        )
+
+    def test_merge_execution_health_review_risks_empty_context_returns_original(self) -> None:
+        from execution_health import merge_execution_health_review_risks  # type: ignore
+
+        derive_calls: list[Any] = []
+
+        def derive_from_context(context: Any, include_strategy_activity: bool = True) -> Dict[str, Any]:
+            derive_calls.append((context, include_strategy_activity))
+            return {
+                "execution_top_issue": "",
+                "execution_top_issue_detail": "",
+                "execution_top_issue_recommended_action": "",
+                "runtime_worker_top_issue": "",
+                "runtime_worker_detail": "",
+                "runtime_worker_recommended_action": "",
+            }
+
+        merged = merge_execution_health_review_risks(
+            ["原有风险 1", "  ", "原有风险 2"],
+            {"execution_health": {}},
+            derive_review_health_context_from_context=derive_from_context,
+            build_review_health_context=lambda: {},
+        )
+        self.assertEqual(merged, ["原有风险 1", "原有风险 2"])
+        self.assertEqual(len(derive_calls), 1)
+        self.assertEqual(derive_calls[0][1], False)
+
+    def test_merge_execution_health_review_risks_injects_top_issue_entry(self) -> None:
+        from execution_health import merge_execution_health_review_risks  # type: ignore
+
+        review_context = {
+            "execution_top_issue": "公共 WS 异常",
+            "execution_top_issue_detail": "BTCUSDT 已超时",
+            "execution_top_issue_recommended_action": "请先恢复公共实时链路",
+            "runtime_worker_top_issue": "",
+            "runtime_worker_detail": "",
+            "runtime_worker_recommended_action": "",
+        }
+        merged = merge_execution_health_review_risks(
+            ["保留第 1 条风险"],
+            None,
+            derive_review_health_context_from_context=lambda *args, **kwargs: {},
+            build_review_health_context=lambda: review_context,
+        )
+        self.assertEqual(len(merged), 2)
+        self.assertEqual(merged[0], "保留第 1 条风险")
+        self.assertIn("执行健康提示", merged[1])
+        self.assertIn("公共 WS 异常", merged[1])
+        self.assertIn("BTCUSDT 已超时", merged[1])
+        self.assertIn("请先恢复公共实时链路", merged[1])
+
+    def test_merge_execution_health_review_risks_appends_runtime_worker_entry(self) -> None:
+        from execution_health import merge_execution_health_review_risks  # type: ignore
+
+        review_context = {
+            "execution_top_issue": "公共 WS 异常",
+            "execution_top_issue_detail": "",
+            "execution_top_issue_recommended_action": "",
+            "runtime_worker_top_issue": "运行线程未运行",
+            "runtime_worker_detail": "已 120 秒未刷新",
+            "runtime_worker_recommended_action": "请重启运行线程",
+        }
+        merged = merge_execution_health_review_risks(
+            [],
+            {"execution_health": {}},
+            derive_review_health_context_from_context=lambda context, include_strategy_activity=True: review_context,
+            build_review_health_context=lambda: {},
+        )
+        self.assertEqual(len(merged), 2)
+        self.assertTrue(any("执行健康提示" in item and "公共 WS 异常" in item for item in merged))
+        self.assertTrue(any("运行线程提示" in item and "请重启运行线程" in item for item in merged))
+
+    def test_merge_execution_health_review_risks_deduplicates_existing_entries(self) -> None:
+        from execution_health import merge_execution_health_review_risks  # type: ignore
+
+        review_context = {
+            "execution_top_issue": "公共 WS 异常",
+            "execution_top_issue_detail": "BTCUSDT 已超时",
+            "execution_top_issue_recommended_action": "请先恢复公共实时链路",
+            "runtime_worker_top_issue": "",
+            "runtime_worker_detail": "",
+            "runtime_worker_recommended_action": "",
+        }
+        preexisting = (
+            "执行健康提示：公共 WS 异常。 BTCUSDT 已超时。 建议：请先恢复公共实时链路。"
+        )
+        merged = merge_execution_health_review_risks(
+            [preexisting],
+            {"execution_health": {}},
+            derive_review_health_context_from_context=lambda *args, **kwargs: review_context,
+            build_review_health_context=lambda: {},
+        )
+        self.assertEqual(merged, [preexisting])
+
+    def test_main_wrapper_delegates_to_extracted_helpers(self) -> None:
+        """Ensure main.py wrappers still invoke the extracted implementations."""
+
+        original_realtime = control_main.market_data.realtime
+        try:
+            control_main.market_data.realtime = StubPublicExecutionRealtimeFeed(
+                enabled=True,
+                connected_spot=False,
+                connected_linear=False,
+                last_error="ws handshake failed",
+            )
+            health = control_main._build_public_execution_channel_health("perp", "BTCUSDT")
+            self.assertFalse(health["connected"])
+            self.assertIsNotNone(health["issue"])
+            self.assertIn("公共 WS", str(health["issue"]))
+            self.assertEqual(health["symbol"], "BTCUSDT")
+            self.assertEqual(health["channel"], "linear")
+
+            issue = control_main.get_public_execution_channel_issue("perp", "BTCUSDT")
+            self.assertEqual(issue, health["issue"])
+        finally:
+            control_main.market_data.realtime = original_realtime
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
