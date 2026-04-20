@@ -287,6 +287,36 @@ export interface StrategyParameter {
   unit?: string | null
 }
 
+export interface PartialTakeProfit {
+  trigger_pct: number
+  exit_ratio: number
+}
+
+export interface VolatilityRegimeThresholds {
+  low_pct: number
+  high_pct: number
+}
+
+export interface RegimeExposureMultipliers {
+  low: number
+  normal: number
+  high: number
+}
+
+export interface ConfidenceRegimeAdjustments {
+  low: number
+  normal: number
+  high: number
+}
+
+export type StrategyKernel =
+  | 'trend'
+  | 'mean_revert'
+  | 'breakout'
+  | 'momentum'
+  | 'bollinger_squeeze'
+  | 'rsi_reversal'
+
 export interface StrategySummary {
   id: string
   name: string
@@ -300,6 +330,28 @@ export interface StrategySummary {
   risk_budget: string
   description: string
   parameters: StrategyParameter[]
+  trailing_stop_pct?: number | null
+  break_even_trigger_pct?: number | null
+  partial_take_profits?: PartialTakeProfit[] | null
+  volatility_sizing_enabled?: boolean
+  volatility_lookback?: number | null
+  volatility_target_pct?: number | null
+  volatility_regime_thresholds?: VolatilityRegimeThresholds | null
+  regime_exposure_multipliers?: RegimeExposureMultipliers | null
+  confidence_calibration_enabled?: boolean
+  confidence_regime_adjustments?: ConfidenceRegimeAdjustments | null
+  confidence_parameter_drift_penalty?: number | null
+  confidence_multi_timeframe_alignment?: boolean | null
+  kernel?: StrategyKernel | null
+  roc_window?: number | null
+  ema_trend_window?: number | null
+  momentum_threshold_pct?: number | null
+  bollinger_window?: number | null
+  bollinger_std?: number | null
+  squeeze_bandwidth_pct?: number | null
+  rsi_window?: number | null
+  rsi_overbought?: number | null
+  rsi_oversold?: number | null
 }
 
 export interface StrategyRuntimeSnapshot {
@@ -734,6 +786,17 @@ export interface BacktestOrderFlowStats {
   avg_trade_notional: number
 }
 
+export interface BacktestTrade {
+  side?: 'long' | 'short'
+  entry_time?: string | null
+  exit_time?: string | null
+  entry_price?: number
+  exit_price?: number
+  pnl_pct?: number
+  volatility_regime?: 'low' | 'normal' | 'high' | null
+  applied_risk_per_trade?: number | null
+}
+
 export interface BacktestRun {
   id: string
   strategy_id: string
@@ -791,6 +854,7 @@ export interface BacktestRun {
   exposure_stats?: BacktestExposureStats | null
   tail_risk_stats?: BacktestTailRiskStats | null
   order_flow_stats?: BacktestOrderFlowStats | null
+  trades?: BacktestTrade[] | null
   notes: string
 }
 

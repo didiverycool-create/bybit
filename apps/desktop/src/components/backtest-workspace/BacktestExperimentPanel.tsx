@@ -1,5 +1,35 @@
-import type { AgentJob, BacktestRun, ReviewDocument } from '../../types'
+import type { AgentJob, BacktestRun, BacktestTrade, ReviewDocument } from '../../types'
 import { formatTime, jobStatusToneClass } from '../../utils/app-helpers'
+
+function summarizeRegimeCounts(trades: BacktestTrade[]): string {
+  const counts = { low: 0, normal: 0, high: 0, other: 0 }
+  for (const trade of trades) {
+    const regime = trade.volatility_regime
+    if (regime === 'low' || regime === 'normal' || regime === 'high') {
+      counts[regime] += 1
+    } else if (regime != null) {
+      counts.other += 1
+    }
+  }
+  const parts: string[] = []
+  if (counts.low) parts.push(`低波 ${counts.low}`)
+  if (counts.normal) parts.push(`常态 ${counts.normal}`)
+  if (counts.high) parts.push(`高波 ${counts.high}`)
+  if (counts.other) parts.push(`其它 ${counts.other}`)
+  return parts.length > 0 ? parts.join(' · ') : '未标注'
+}
+
+function summarizeAppliedRisk(trades: BacktestTrade[]): string | null {
+  const values = trades
+    .map((trade) => trade.applied_risk_per_trade)
+    .filter((value): value is number => typeof value === 'number' && Number.isFinite(value))
+  if (values.length === 0) return null
+  const min = Math.min(...values)
+  const max = Math.max(...values)
+  const avg = values.reduce((sum, value) => sum + value, 0) / values.length
+  if (min === max) return `恒定 ${min.toFixed(3)}`
+  return `区间 ${min.toFixed(3)} ~ ${max.toFixed(3)} · 均值 ${avg.toFixed(3)}`
+}
 
 type BacktestSampleMeta = {
   label: string
@@ -196,6 +226,26 @@ export default function BacktestExperimentPanel({
               单笔 {selectedBacktest.order_flow_stats.avg_trade_notional.toFixed(0)}
             </span>
           </div>
+        )}
+        {selectedBacktest.trades && selectedBacktest.trades.length > 0 && (
+          <>
+            <div className="stack-row">
+              <strong>波动分箱</strong>
+              <span>
+                <span className="chip chip--muted">{summarizeRegimeCounts(selectedBacktest.trades)}</span>
+              </span>
+            </div>
+            {summarizeAppliedRisk(selectedBacktest.trades) && (
+              <div className="stack-row">
+                <strong>实际 risk_per_trade</strong>
+                <span>
+                  <span className="chip chip--muted">
+                    {summarizeAppliedRisk(selectedBacktest.trades)}
+                  </span>
+                </span>
+              </div>
+            )}
+          </>
         )}
         <div className="stack-row">
           <strong>样本质量</strong>
