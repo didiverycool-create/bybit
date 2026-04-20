@@ -163,7 +163,19 @@ def apply_confidence_calibration(
     return _clamp(calibrated, 0.0, 99.0)
 
 
+# Round 50 — Codex review found the runtime evaluator only consumed
+# ``strategy.parameters`` rows, so Round 47/49 promoted top-level fields
+# (``roc_window``, ``bollinger_window``, ``rsi_window`` and friends) were
+# silently ignored at runtime. We now prefer the top-level attribute when it is
+# populated and fall back to the legacy parameters list for backwards
+# compatibility with strategies that have not migrated yet.
 def _param_value(strategy: StrategySummary, key: str, default: float) -> float:
+    top_level = getattr(strategy, key, None)
+    if top_level is not None:
+        try:
+            return float(top_level)
+        except (TypeError, ValueError):
+            pass
     parameter = next((item for item in strategy.parameters if item.key == key), None)
     if parameter is None:
         return default

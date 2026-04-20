@@ -314,8 +314,37 @@ class BacktestComputation:
     trades: List[BacktestTrade] = field(default_factory=list)
 
 
+# Round 50 — Codex review flagged that the runner only saw ``strategy.parameters``
+# rows, which meant Round 47/49's promoted top-level kernel tuning fields were
+# silently ignored by ``run_local_backtest``. We now overlay any populated
+# top-level attribute on top of the legacy parameter rows. The overlay wins
+# when both are present so a strategy migrated to the new schema takes effect
+# even if a stale parameter row still exists.
+_STRATEGY_TOP_LEVEL_RUNNER_FIELDS: tuple[str, ...] = (
+    "roc_window",
+    "ema_trend_window",
+    "momentum_threshold_pct",
+    "bollinger_window",
+    "bollinger_std",
+    "squeeze_bandwidth_pct",
+    "rsi_window",
+    "rsi_overbought",
+    "rsi_oversold",
+    "trailing_stop_pct",
+    "break_even_trigger_pct",
+    "volatility_lookback",
+    "volatility_target_pct",
+    "confidence_parameter_drift_penalty",
+)
+
+
 def _parameter_map(strategy: StrategySummary) -> Dict[str, object]:
-    return {param.key: param.value for param in strategy.parameters}
+    mapping: Dict[str, object] = {param.key: param.value for param in strategy.parameters}
+    for field_name in _STRATEGY_TOP_LEVEL_RUNNER_FIELDS:
+        value = getattr(strategy, field_name, None)
+        if value is not None:
+            mapping[field_name] = value
+    return mapping
 
 
 def _timeframe_hours(timeframe: str) -> float:
@@ -1170,9 +1199,12 @@ def _apply_exit_tools_on_bar(
     exit_price: float,
     position_entry: float,
     position_entry_equity: float,
+    position_entry_bar_index: Optional[int] = None,
     sizing_multiplier: float,
     trades: List["BacktestTrade"],
     trade_returns: List[float],
+    volatility_regime: Optional["VolatilityRegime"] = None,
+    applied_risk_per_trade: Optional[float] = None,
 ) -> tuple[bool, float, List[_ExitToolRung]]:
     """Advance the opt-in exit state machine for one bar.
 
@@ -1220,13 +1252,26 @@ def _apply_exit_tools_on_bar(
         trade_returns.append(rung_return)
         notional = position_entry_equity * sizing_multiplier * fraction
         quantity = notional / position_entry if position_entry > 0 else 0.0
+        # Round 50 — Codex review flagged that partial rungs were stamping the
+        # current bar as the entry bar and skipping the regime / risk metadata
+        # attached to the original entry. We now inherit the position's real
+        # entry bar (falling back to ``bar_index`` only for legacy callers that
+        # didn't thread the entry index through) and forward the regime / risk
+        # metadata so downstream aggregations (active-bar ratio, regime-level
+        # stats) no longer drop partial trades.
         trades.append(
             BacktestTrade(
-                entry_bar_index=bar_index,
+                entry_bar_index=(
+                    position_entry_bar_index
+                    if position_entry_bar_index is not None
+                    else bar_index
+                ),
                 exit_bar_index=bar_index,
                 entry_price=position_entry,
                 exit_price=exit_price,
                 quantity=quantity,
+                volatility_regime=volatility_regime,
+                applied_risk_per_trade=applied_risk_per_trade,
             )
         )
         consumed.append(state.consumed_rungs[-1])
@@ -1547,6 +1592,9 @@ def _run_trend_follow(
                     sizing_multiplier=current_sizing_multiplier,
                     trades=trades,
                     trade_returns=trade_returns,
+                    position_entry_bar_index=position_entry_index,
+                    volatility_regime=current_regime,
+                    applied_risk_per_trade=current_applied_risk,
                 )
                 if partial_return_pct:
                     equity = _mark_to_market_equity(position_entry_equity, partial_return_pct)
@@ -1720,6 +1768,9 @@ def _run_mean_reversion(
                     sizing_multiplier=current_sizing_multiplier,
                     trades=trades,
                     trade_returns=trade_returns,
+                    position_entry_bar_index=position_entry_index,
+                    volatility_regime=current_regime,
+                    applied_risk_per_trade=current_applied_risk,
                 )
                 if partial_return_pct:
                     equity = _mark_to_market_equity(position_entry_equity, partial_return_pct)
@@ -1896,6 +1947,9 @@ def _run_breakout(
                 sizing_multiplier=current_sizing_multiplier,
                 trades=trades,
                 trade_returns=trade_returns,
+                position_entry_bar_index=position_entry_index,
+                volatility_regime=current_regime,
+                applied_risk_per_trade=current_applied_risk,
             )
             if partial_return_pct:
                 equity = _mark_to_market_equity(position_entry_equity, partial_return_pct)
@@ -2143,6 +2197,9 @@ def _run_momentum(
                 sizing_multiplier=current_sizing_multiplier,
                 trades=trades,
                 trade_returns=trade_returns,
+                position_entry_bar_index=position_entry_index,
+                volatility_regime=current_regime,
+                applied_risk_per_trade=current_applied_risk,
             )
             if partial_return_pct:
                 equity = _mark_to_market_equity(position_entry_equity, partial_return_pct)
@@ -2338,6 +2395,9 @@ def _run_bollinger_squeeze(
                 sizing_multiplier=current_sizing_multiplier,
                 trades=trades,
                 trade_returns=trade_returns,
+                position_entry_bar_index=position_entry_index,
+                volatility_regime=current_regime,
+                applied_risk_per_trade=current_applied_risk,
             )
             if partial_return_pct:
                 equity = _mark_to_market_equity(position_entry_equity, partial_return_pct)
@@ -2510,6 +2570,9 @@ def _run_rsi_reversal(
                 sizing_multiplier=current_sizing_multiplier,
                 trades=trades,
                 trade_returns=trade_returns,
+                position_entry_bar_index=position_entry_index,
+                volatility_regime=current_regime,
+                applied_risk_per_trade=current_applied_risk,
             )
             if partial_return_pct:
                 equity = _mark_to_market_equity(position_entry_equity, partial_return_pct)

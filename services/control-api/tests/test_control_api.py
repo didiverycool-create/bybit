@@ -20761,5 +20761,269 @@ class StrategyParameterPatchRound49UnitTests(unittest.TestCase):
         self.assertIsNone(restored.trades)
 
 
+class StrategyRuntimeTopLevelParamLookupRound50Tests(unittest.TestCase):
+    """Round 50 — the runtime evaluator must prefer the Round 47/49 top-level
+    scalar fields (``roc_window``, ``bollinger_window``, ``rsi_window``, etc.)
+    over the legacy ``StrategyParameter`` rows. Until R50 the evaluator only
+    looked at ``strategy.parameters`` which meant migrated strategies that
+    moved these knobs to the top level silently kept the evaluator defaults.
+    """
+
+    def _momentum_strategy(self, **overrides: Any) -> Any:
+        from models import StrategySummary
+
+        base = dict(
+            id="momentum-unit-01",
+            name="MomentumR50",
+            category="template",
+            status="running",
+            symbols=["BTCUSDT"],
+            mode=AccountMode.PAPER,
+            version="v1",
+            pnl_7d="+0.0%",
+            max_drawdown="-0.0%",
+            risk_budget="10%",
+            description="round50 runtime top-level lookup",
+            parameters=[],
+            kernel="momentum",
+        )
+        base.update(overrides)
+        return StrategySummary(**base)
+
+    def test_top_level_roc_window_overrides_default(self) -> None:
+        from strategy_runtime import _param_value
+
+        strategy = self._momentum_strategy(roc_window=7)
+        self.assertEqual(_param_value(strategy, "roc_window", 10.0), 7.0)
+
+    def test_top_level_none_falls_back_to_parameter_row(self) -> None:
+        from strategy_runtime import _param_value
+
+        strategy = self._momentum_strategy(
+            roc_window=None,
+            parameters=[StrategyParameter(key="roc_window", label="roc", value=5)],
+        )
+        self.assertEqual(_param_value(strategy, "roc_window", 10.0), 5.0)
+
+    def test_top_level_and_parameter_both_present_top_level_wins(self) -> None:
+        from strategy_runtime import _param_value
+
+        strategy = self._momentum_strategy(
+            roc_window=12,
+            parameters=[StrategyParameter(key="roc_window", label="roc", value=99)],
+        )
+        self.assertEqual(_param_value(strategy, "roc_window", 10.0), 12.0)
+
+    def test_default_returned_when_neither_source_has_value(self) -> None:
+        from strategy_runtime import _param_value
+
+        strategy = self._momentum_strategy(roc_window=None, parameters=[])
+        self.assertEqual(_param_value(strategy, "roc_window", 10.0), 10.0)
+
+
+class BacktestEngineTopLevelParameterMapRound50Tests(unittest.TestCase):
+    """Round 50 — ``_parameter_map`` now overlays the Round 47/49 top-level
+    kernel-tuning scalars on top of the legacy parameter list so the runners
+    and the ``BacktestComputation.parameter_snapshot`` both see the migrated
+    knobs. ``None`` top-level values skip the overlay so legacy payloads keep
+    their bit-exact pre-R50 mapping.
+    """
+
+    def _strategy(self, **overrides: Any) -> Any:
+        from models import StrategySummary
+
+        base = dict(
+            id="brk-top-level-01",
+            name="TopLevelOverlay",
+            category="template",
+            status="running",
+            symbols=["BTCUSDT"],
+            mode=AccountMode.PAPER,
+            version="v1",
+            pnl_7d="+0.0%",
+            max_drawdown="-0.0%",
+            risk_budget="12%",
+            description="round50 parameter overlay",
+            parameters=[
+                StrategyParameter(key="breakout_window", label="bw", value=5),
+                StrategyParameter(key="max_hold_hours", label="mh", value=200),
+            ],
+        )
+        base.update(overrides)
+        return StrategySummary(**base)
+
+    def test_top_level_fields_overlay_parameter_map(self) -> None:
+        strategy = self._strategy(
+            kernel="bollinger_squeeze",
+            bollinger_window=24,
+            bollinger_std=2.5,
+            squeeze_bandwidth_pct=1.75,
+        )
+        mapping = backtest_engine._parameter_map(strategy)
+        self.assertEqual(mapping["bollinger_window"], 24)
+        self.assertEqual(mapping["bollinger_std"], 2.5)
+        self.assertEqual(mapping["squeeze_bandwidth_pct"], 1.75)
+        self.assertEqual(mapping["breakout_window"], 5)
+
+    def test_none_top_level_fields_do_not_clobber_legacy_rows(self) -> None:
+        # rsi_window stays on the parameter row; the top-level attribute
+        # defaults to None, so the overlay must be a no-op for this key.
+        strategy = self._strategy(
+            parameters=[
+                StrategyParameter(key="breakout_window", label="bw", value=5),
+                StrategyParameter(key="rsi_window", label="rsi", value=21),
+            ],
+        )
+        mapping = backtest_engine._parameter_map(strategy)
+        self.assertEqual(mapping["rsi_window"], 21)
+
+    def test_parameter_snapshot_includes_top_level_fields(self) -> None:
+        strategy = self._strategy(
+            kernel="momentum",
+            roc_window=4,
+            ema_trend_window=6,
+            momentum_threshold_pct=0.5,
+        )
+        candles = [
+            backtest_engine.CandlePoint(
+                time=f"2026-01-{(idx % 28) + 1:02d}T{idx % 24:02d}:00:00+00:00",
+                open=100.0 + idx,
+                high=100.0 + idx,
+                low=100.0 + idx,
+                close=100.0 + idx,
+                volume=1000.0,
+            )
+            for idx in range(30)
+        ]
+        result = backtest_engine.run_local_backtest(
+            strategy,
+            candles,
+            "1h",
+            "2026-01-01 ~ 2026-01-05",
+        )
+        self.assertEqual(result.parameter_snapshot["roc_window"], 4)
+        self.assertEqual(result.parameter_snapshot["ema_trend_window"], 6)
+        self.assertAlmostEqual(result.parameter_snapshot["momentum_threshold_pct"], 0.5)
+
+
+class PartialTakeProfitTradeMetadataRound50Tests(unittest.TestCase):
+    """Round 50 — partial take-profit trade records must inherit the original
+    entry bar index and carry the volatility-regime / applied-risk metadata.
+    Before R50 the helper stamped the current bar as the entry and dropped
+    the regime / risk fields entirely, which skewed the holding-rhythm and
+    per-regime aggregations that R48 surfaced in the UI.
+    """
+
+    BREAKOUT_WINDOW = 5
+    BREAKOUT_BAR = 5
+
+    def _strategy_with_partial_ladder(self) -> Any:
+        from models import StrategySummary
+
+        return StrategySummary(
+            id="brk-partial-metadata-01",
+            name="PartialTpMetadataR50",
+            category="template",
+            status="running",
+            symbols=["BTCUSDT"],
+            mode=AccountMode.PAPER,
+            version="v1",
+            pnl_7d="+0.0%",
+            max_drawdown="-0.0%",
+            risk_budget="18%",
+            description="round50 partial tp metadata",
+            parameters=[
+                StrategyParameter(key="breakout_window", label="bw", value=self.BREAKOUT_WINDOW),
+                StrategyParameter(key="volume_ratio", label="vr", value=1.0),
+                StrategyParameter(key="max_hold_hours", label="mh", value=2000),
+            ],
+            partial_take_profits=[
+                PartialTakeProfit(trigger_pct=1.0, exit_ratio=0.5),
+                PartialTakeProfit(trigger_pct=2.5, exit_ratio=0.5),
+            ],
+        )
+
+    def _candles(self, prices: List[float]) -> List[Any]:
+        return [
+            backtest_engine.CandlePoint(
+                time=f"2026-01-{(index % 28) + 1:02d}T{index % 24:02d}:00:00+00:00",
+                open=price,
+                high=price,
+                low=price,
+                close=price,
+                volume=1000.0 * (3.0 if index == self.BREAKOUT_BAR else 1.0),
+            )
+            for index, price in enumerate(prices)
+        ]
+
+    def test_partial_trade_inherits_original_entry_bar_index(self) -> None:
+        strategy = self._strategy_with_partial_ladder()
+        # Entry on bar 5 (breakout with 3x volume). Bar 6 prints 112 → rung 1
+        # fires (pnl ~1.82%). Bar 7 prints 113 → rung 2 fires (pnl ~2.73%,
+        # drains the ladder). Before R50 the partial trade would have
+        # ``entry_bar_index == exit_bar_index``; after R50 it must inherit
+        # the actual entry bar.
+        candles = self._candles([100, 101, 102, 103, 104, 110, 112, 113])
+
+        result = backtest_engine.run_local_backtest(
+            strategy,
+            candles,
+            "1h",
+            "2026-01-01 ~ 2026-01-05",
+        )
+
+        self.assertGreaterEqual(len(result.trades), 1)
+        partial_trades = [trade for trade in result.trades if trade.exit_bar_index != trade.entry_bar_index]
+        self.assertTrue(partial_trades, "expected at least one partial trade with entry != exit")
+        for trade in partial_trades:
+            self.assertEqual(
+                trade.entry_bar_index,
+                self.BREAKOUT_BAR,
+                "partial trade must inherit the original entry bar",
+            )
+            self.assertGreater(trade.exit_bar_index, trade.entry_bar_index)
+
+    def test_partial_trade_carries_regime_and_applied_risk_when_sizing_enabled(self) -> None:
+        from models import RegimeExposureMultipliers, StrategySummary, VolatilityRegimeThresholds
+
+        strategy = StrategySummary(
+            id="brk-partial-regime-01",
+            name="PartialTpRegimeR50",
+            category="template",
+            status="running",
+            symbols=["BTCUSDT"],
+            mode=AccountMode.PAPER,
+            version="v1",
+            pnl_7d="+0.0%",
+            max_drawdown="-0.0%",
+            risk_budget="18%",
+            description="round50 partial tp regime",
+            parameters=[
+                StrategyParameter(key="breakout_window", label="bw", value=self.BREAKOUT_WINDOW),
+                StrategyParameter(key="volume_ratio", label="vr", value=1.0),
+                StrategyParameter(key="max_hold_hours", label="mh", value=2000),
+            ],
+            partial_take_profits=[PartialTakeProfit(trigger_pct=1.0, exit_ratio=0.5)],
+            volatility_sizing_enabled=True,
+            volatility_lookback=3,
+            volatility_regime_thresholds=VolatilityRegimeThresholds(low_pct=0.0, high_pct=100.0),
+            regime_exposure_multipliers=RegimeExposureMultipliers(low=1.0, normal=1.0, high=1.0),
+        )
+        candles = self._candles([100, 101, 102, 103, 104, 110, 112, 113])
+
+        result = backtest_engine.run_local_backtest(
+            strategy,
+            candles,
+            "1h",
+            "2026-01-01 ~ 2026-01-05",
+        )
+
+        partial_trades = [trade for trade in result.trades if trade.exit_bar_index != trade.entry_bar_index]
+        self.assertTrue(partial_trades)
+        for trade in partial_trades:
+            self.assertIsNotNone(trade.volatility_regime)
+            self.assertIsNotNone(trade.applied_risk_per_trade)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
