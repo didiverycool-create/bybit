@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from statistics import mean, median, pstdev
 from typing import Dict, List, Literal, Optional
@@ -307,6 +307,11 @@ class BacktestComputation:
     exposure_stats: Optional[BacktestExposureStats] = None
     tail_risk_stats: Optional[BacktestTailRiskStats] = None
     order_flow_stats: Optional[BacktestOrderFlowStats] = None
+    # Round 49 — surface the runner's closed-trade list so ``BacktestRun`` can
+    # expose per-trade volatility regime / applied risk metadata to the UI.
+    # Legacy callers that construct ``BacktestComputation`` manually continue
+    # to default to an empty list.
+    trades: List[BacktestTrade] = field(default_factory=list)
 
 
 def _parameter_map(strategy: StrategySummary) -> Dict[str, object]:
@@ -2740,4 +2745,5 @@ def run_local_backtest(strategy: StrategySummary, candles: List[CandlePoint], ti
         exposure_stats=exposure_stats,
         tail_risk_stats=tail_risk_stats,
         order_flow_stats=order_flow_stats,
+        trades=list(final_trades),
     )

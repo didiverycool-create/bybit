@@ -20594,5 +20594,172 @@ class NewStrategyKernelsUnitTests(unittest.TestCase):
         self.assertGreater(base_snap.confidence, calib_snap.confidence)
 
 
+class StrategyParameterPatchRound49UnitTests(unittest.TestCase):
+    """Round 49 — _apply_parameter_patch routes Round 44-47 top-level fields
+    directly onto the strategy record; unknown keys continue to fall through
+    to auxiliary StrategyParameter rows; BacktestRun.trades round-trips."""
+
+    def setUp(self) -> None:
+        self.strategy_id = "trend-btc-01"
+        strategy = control_main.repo._find_strategy(self.strategy_id)
+        self._snapshot = strategy.model_dump()
+
+    def tearDown(self) -> None:
+        from models import StrategySummary
+
+        restored = StrategySummary.model_validate(self._snapshot)
+        for idx, item in enumerate(control_main.repo.state.strategies):
+            if item.id == self.strategy_id:
+                control_main.repo.state.strategies[idx] = restored
+                break
+
+    def test_kernel_override_applied_to_top_level_field(self) -> None:
+        control_main.repo._apply_parameter_patch(
+            self.strategy_id,
+            {"kernel": "momentum"},
+        )
+        strategy = control_main.repo._find_strategy(self.strategy_id)
+        self.assertEqual(strategy.kernel, "momentum")
+        self.assertFalse(any(p.key == "kernel" for p in strategy.parameters))
+
+    def test_scalar_exit_tool_fields_applied(self) -> None:
+        control_main.repo._apply_parameter_patch(
+            self.strategy_id,
+            {"trailing_stop_pct": 2.5, "break_even_trigger_pct": 1.0},
+        )
+        strategy = control_main.repo._find_strategy(self.strategy_id)
+        self.assertEqual(strategy.trailing_stop_pct, 2.5)
+        self.assertEqual(strategy.break_even_trigger_pct, 1.0)
+
+    def test_nested_volatility_regime_thresholds_validated(self) -> None:
+        control_main.repo._apply_parameter_patch(
+            self.strategy_id,
+            {"volatility_regime_thresholds": {"low_pct": 0.5, "high_pct": 2.0}},
+        )
+        strategy = control_main.repo._find_strategy(self.strategy_id)
+        self.assertIsNotNone(strategy.volatility_regime_thresholds)
+        self.assertEqual(strategy.volatility_regime_thresholds.low_pct, 0.5)
+        self.assertEqual(strategy.volatility_regime_thresholds.high_pct, 2.0)
+
+    def test_partial_take_profits_list_validated(self) -> None:
+        control_main.repo._apply_parameter_patch(
+            self.strategy_id,
+            {
+                "partial_take_profits": [
+                    {"trigger_pct": 1.0, "exit_ratio": 0.5},
+                    {"trigger_pct": 2.5, "exit_ratio": 0.5},
+                ]
+            },
+        )
+        strategy = control_main.repo._find_strategy(self.strategy_id)
+        self.assertIsNotNone(strategy.partial_take_profits)
+        self.assertEqual(len(strategy.partial_take_profits), 2)
+        self.assertEqual(strategy.partial_take_profits[0].trigger_pct, 1.0)
+        self.assertEqual(strategy.partial_take_profits[1].exit_ratio, 0.5)
+
+    def test_regime_exposure_multipliers_validated(self) -> None:
+        control_main.repo._apply_parameter_patch(
+            self.strategy_id,
+            {"regime_exposure_multipliers": {"low": 1.5, "normal": 1.0, "high": 0.4}},
+        )
+        strategy = control_main.repo._find_strategy(self.strategy_id)
+        self.assertEqual(strategy.regime_exposure_multipliers.high, 0.4)
+
+    def test_confidence_regime_adjustments_validated(self) -> None:
+        control_main.repo._apply_parameter_patch(
+            self.strategy_id,
+            {"confidence_regime_adjustments": {"low": 1.1, "normal": 1.0, "high": 0.7}},
+        )
+        strategy = control_main.repo._find_strategy(self.strategy_id)
+        self.assertEqual(strategy.confidence_regime_adjustments.low, 1.1)
+
+    def test_invalid_kernel_raises(self) -> None:
+        with self.assertRaises(ValueError):
+            control_main.repo._apply_parameter_patch(
+                self.strategy_id,
+                {"kernel": "nonexistent_kernel"},
+            )
+
+    def test_unknown_key_falls_through_to_parameter_row(self) -> None:
+        control_main.repo._apply_parameter_patch(
+            self.strategy_id,
+            {"custom_legacy_knob_round49": 123},
+        )
+        strategy = control_main.repo._find_strategy(self.strategy_id)
+        self.assertTrue(any(p.key == "custom_legacy_knob_round49" for p in strategy.parameters))
+
+    def test_backtest_run_trades_round_trip(self) -> None:
+        from models import BacktestTradeModel
+
+        trade_model = BacktestTradeModel.model_validate(
+            {
+                "entry_bar_index": 0,
+                "exit_bar_index": 5,
+                "entry_price": 100.0,
+                "exit_price": 110.0,
+                "quantity": 0.5,
+                "side": "long",
+                "volatility_regime": "low",
+                "applied_risk_per_trade": 0.008,
+            }
+        )
+        run = control_main.BacktestRun(
+            id="bt-r49-test",
+            strategy_id=self.strategy_id,
+            strategy_name="Round 49 Test",
+            status="completed",
+            started_at="2026-04-20T00:00:00+08:00",
+            symbol_scope=["BTCUSDT"],
+            timeframe="1h",
+            data_range="2026-01-01 ~ 2026-01-02",
+            data_granularity="kline",
+            fee_model="bybit-v5-standard",
+            slippage_model="control-v1-adaptive",
+            parameter_snapshot={},
+            metrics=BacktestMetrics(
+                annual_return="+10%",
+                max_drawdown="-2%",
+                sharpe="1.4",
+                win_rate="55%",
+                pnl="+1,000 USDT",
+                trades=1,
+            ),
+            notes="round 49 trades round-trip",
+            trades=[trade_model],
+        )
+        restored = control_main.BacktestRun.model_validate(run.model_dump())
+        self.assertIsNotNone(restored.trades)
+        self.assertEqual(len(restored.trades), 1)
+        self.assertEqual(restored.trades[0].volatility_regime, "low")
+        self.assertAlmostEqual(restored.trades[0].applied_risk_per_trade, 0.008)
+
+    def test_backtest_run_legacy_no_trades_round_trip(self) -> None:
+        run = control_main.BacktestRun(
+            id="bt-r49-legacy",
+            strategy_id=self.strategy_id,
+            strategy_name="Round 49 Legacy",
+            status="completed",
+            started_at="2026-04-20T00:00:00+08:00",
+            symbol_scope=["BTCUSDT"],
+            timeframe="1h",
+            data_range="2026-01-01 ~ 2026-01-02",
+            data_granularity="kline",
+            fee_model="bybit-v5-standard",
+            slippage_model="control-v1-adaptive",
+            parameter_snapshot={},
+            metrics=BacktestMetrics(
+                annual_return="0",
+                max_drawdown="0",
+                sharpe="0",
+                win_rate="0",
+                pnl="0",
+                trades=0,
+            ),
+            notes="legacy",
+        )
+        restored = control_main.BacktestRun.model_validate(run.model_dump())
+        self.assertIsNone(restored.trades)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

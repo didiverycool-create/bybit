@@ -22,6 +22,10 @@ from models import (
     derive_backtest_sample_quality,
     normalize_backtest_timeframe,
     BacktestRun,
+    ConfidenceRegimeAdjustments,
+    PartialTakeProfit,
+    RegimeExposureMultipliers,
+    VolatilityRegimeThresholds,
     ChangeRequest,
     ChangeRequestCreate,
     ChangeRequestStatus,
@@ -3359,6 +3363,7 @@ class AppRepository:
             exposure_stats=computed.get("exposure_stats") if computed else None,
             tail_risk_stats=computed.get("tail_risk_stats") if computed else None,
             order_flow_stats=computed.get("order_flow_stats") if computed else None,
+            trades=computed.get("trades") if computed else None,
         )
         self.state.backtests.insert(0, record)
         self.add_event(
@@ -3664,6 +3669,71 @@ class AppRepository:
         }
         return {key: value for key, value in payload.items() if key not in reserved_keys}
 
+    # Round 49 — top-level StrategySummary fields added in Rounds 44-47 so
+    # _apply_parameter_patch can route them directly onto the strategy record
+    # instead of falling through to the auxiliary StrategyParameter row path.
+    _STRATEGY_TOP_LEVEL_SCALAR_FIELDS = frozenset({
+        "trailing_stop_pct",
+        "break_even_trigger_pct",
+        "volatility_sizing_enabled",
+        "volatility_lookback",
+        "volatility_target_pct",
+        "confidence_calibration_enabled",
+        "confidence_parameter_drift_penalty",
+        "confidence_multi_timeframe_alignment",
+        "roc_window",
+        "ema_trend_window",
+        "momentum_threshold_pct",
+        "bollinger_window",
+        "bollinger_std",
+        "squeeze_bandwidth_pct",
+        "rsi_window",
+        "rsi_overbought",
+        "rsi_oversold",
+    })
+    _STRATEGY_KERNEL_VALUES = frozenset({
+        "trend",
+        "mean_revert",
+        "breakout",
+        "momentum",
+        "bollinger_squeeze",
+        "rsi_reversal",
+    })
+
+    def _apply_strategy_top_level_field(self, strategy: Any, key: str, value: Any) -> bool:
+        if key == "kernel":
+            if value is None or value in self._STRATEGY_KERNEL_VALUES:
+                strategy.kernel = value
+                return True
+            raise ValueError(f"Unknown strategy kernel: {value!r}")
+        if key == "volatility_regime_thresholds":
+            strategy.volatility_regime_thresholds = (
+                VolatilityRegimeThresholds.model_validate(value) if value is not None else None
+            )
+            return True
+        if key == "regime_exposure_multipliers":
+            strategy.regime_exposure_multipliers = (
+                RegimeExposureMultipliers.model_validate(value) if value is not None else None
+            )
+            return True
+        if key == "confidence_regime_adjustments":
+            strategy.confidence_regime_adjustments = (
+                ConfidenceRegimeAdjustments.model_validate(value) if value is not None else None
+            )
+            return True
+        if key == "partial_take_profits":
+            if value is None:
+                strategy.partial_take_profits = None
+            else:
+                strategy.partial_take_profits = [
+                    PartialTakeProfit.model_validate(item) for item in value
+                ]
+            return True
+        if key in self._STRATEGY_TOP_LEVEL_SCALAR_FIELDS:
+            setattr(strategy, key, value)
+            return True
+        return False
+
     def _apply_parameter_patch(self, strategy_id: str, patch: Dict[str, Any]) -> None:
         if not patch:
             return
@@ -3671,6 +3741,8 @@ class AppRepository:
         strategy = self._find_strategy(strategy_id)
         parameter_map = {parameter.key: parameter for parameter in strategy.parameters}
         for key, value in patch.items():
+            if self._apply_strategy_top_level_field(strategy, key, value):
+                continue
             current = parameter_map.get(key)
             if current is None:
                 strategy.parameters.append(

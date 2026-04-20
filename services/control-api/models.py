@@ -858,6 +858,28 @@ class BacktestOrderFlowStatsModel(BaseModel):
     avg_trade_notional: float = 0.0
 
 
+# Round 49 — Pydantic counterpart of the internal ``BacktestTrade`` dataclass
+# in ``backtest_engine``. Kept lean so newly completed runs can surface the
+# trade list to the frontend without pulling the dataclass into the API
+# boundary. Volatility regime / applied risk metadata are opt-in (Round 45).
+class BacktestTradeModel(BaseModel):
+    entry_bar_index: int
+    exit_bar_index: int
+    entry_price: float
+    exit_price: float
+    quantity: float
+    side: str = "long"
+    volatility_regime: Optional[str] = None
+    applied_risk_per_trade: Optional[float] = None
+
+
+# Cap the number of trades serialized on a single BacktestRun response. Keeps
+# the API payload bounded even when a long-horizon backtest produces thousands
+# of closed positions. The cap is inclusive — the first N trades (chronological
+# order as emitted by the runner) are preserved.
+BACKTEST_RUN_TRADE_SERIALIZATION_CAP = 500
+
+
 class BacktestRun(BaseModel):
     id: str
     strategy_id: str
@@ -916,6 +938,10 @@ class BacktestRun(BaseModel):
     exposure_stats: Optional[BacktestExposureStatsModel] = None
     tail_risk_stats: Optional[BacktestTailRiskStatsModel] = None
     order_flow_stats: Optional[BacktestOrderFlowStatsModel] = None
+    # Round 49 — closed-trade surface for completed runs. Legacy persisted runs
+    # have no trade list so the field stays Optional / None; populated only by
+    # newly executed backtests (capped by BACKTEST_RUN_TRADE_SERIALIZATION_CAP).
+    trades: Optional[List[BacktestTradeModel]] = None
 
 
 class ChangeRequest(BaseModel):

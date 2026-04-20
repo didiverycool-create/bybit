@@ -115,6 +115,7 @@ from models import (
     BybitPublicSymbolDiagnostic,
     BybitPrivateStatus,
     BybitTradeProbeResult,
+    BACKTEST_RUN_TRADE_SERIALIZATION_CAP,
     BacktestRun,
     CandlePoint,
     ChangeRequestCreate,
@@ -2883,6 +2884,10 @@ def build_backtest_payload(strategy: Any, data_range: str, timeframe: str) -> Op
             if computation.order_flow_stats is not None
             else None
         ),
+        "trades": [
+            dataclasses.asdict(trade)
+            for trade in computation.trades[:BACKTEST_RUN_TRADE_SERIALIZATION_CAP]
+        ],
     }
 
 
