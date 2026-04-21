@@ -1413,6 +1413,11 @@ class ExecutionEvent(BaseModel):
     impact_detail: Optional[str] = None
     priority: Optional[int] = None
     is_key_event: Optional[bool] = None
+    # Round B — strategy-originated events carry a frozen snapshot of the
+    # parameters that were in effect at dispatch time. Non-strategy events
+    # (manual paper trades, exchange-only order lifecycle, news alerts, etc.)
+    # leave this ``None`` so legacy callers continue to behave as before.
+    parameter_snapshot: Optional[Dict[str, Any]] = None
     trace_id: str
     occurred_at: str
 

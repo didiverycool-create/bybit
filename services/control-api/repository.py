@@ -57,6 +57,7 @@ from models import (
     WorkspacePreferences,
     WorkspacePreferencesUpdate,
 )
+import parameter_resolver
 from datetime_utils import parse_optional_iso_datetime
 from risk_guards import evaluate_paper_order_risk
 from seed import build_market_detail_for_watchlist, build_state
@@ -2863,6 +2864,7 @@ class AppRepository:
         payload: Dict[str, Any],
         symbol: Optional[str] = None,
         strategy_id: Optional[str] = None,
+        parameter_snapshot: Optional[Dict[str, Any]] = None,
     ) -> ExecutionEvent:
         event = self._decorate_execution_event(
             ExecutionEvent(
@@ -2873,6 +2875,7 @@ class AppRepository:
             symbol=symbol,
             strategy_id=strategy_id,
             payload=payload,
+            parameter_snapshot=parameter_snapshot,
             trace_id=f"trace-{uuid4().hex[:12]}",
             occurred_at=now_iso(),
             )
@@ -3669,28 +3672,12 @@ class AppRepository:
         }
         return {key: value for key, value in payload.items() if key not in reserved_keys}
 
-    # Round 49 — top-level StrategySummary fields added in Rounds 44-47 so
-    # _apply_parameter_patch can route them directly onto the strategy record
-    # instead of falling through to the auxiliary StrategyParameter row path.
-    _STRATEGY_TOP_LEVEL_SCALAR_FIELDS = frozenset({
-        "trailing_stop_pct",
-        "break_even_trigger_pct",
-        "volatility_sizing_enabled",
-        "volatility_lookback",
-        "volatility_target_pct",
-        "confidence_calibration_enabled",
-        "confidence_parameter_drift_penalty",
-        "confidence_multi_timeframe_alignment",
-        "roc_window",
-        "ema_trend_window",
-        "momentum_threshold_pct",
-        "bollinger_window",
-        "bollinger_std",
-        "squeeze_bandwidth_pct",
-        "rsi_window",
-        "rsi_overbought",
-        "rsi_oversold",
-    })
+    # Round 49 introduced this write-side whitelist so ``_apply_parameter_patch``
+    # could route newly promoted top-level fields directly onto the strategy
+    # record; Round A of the quant-core adapter consolidation moved the
+    # canonical set into ``parameter_resolver`` so the runtime evaluator, the
+    # backtest runner and the persistence path cannot drift apart.
+    _STRATEGY_TOP_LEVEL_SCALAR_FIELDS = parameter_resolver.STRATEGY_TOP_LEVEL_SCALAR_FIELDS
     _STRATEGY_KERNEL_VALUES = frozenset({
         "trend",
         "mean_revert",
@@ -5334,6 +5321,7 @@ class AppRepository:
         quantity_override: Optional[float] = None,
         event_type: str = "strategy.paper_trade.executed",
         requested_by: Optional[str] = None,
+        parameter_snapshot: Optional[Dict[str, Any]] = None,
     ) -> Optional[TradeRecord]:
         quantity = max(quantity_override or self._estimate_strategy_trade_quantity(strategy_id, price), 0.001)
         preview = self._build_execution_preview_locked(
@@ -5408,6 +5396,7 @@ class AppRepository:
             },
             symbol=symbol,
             strategy_id=strategy_id,
+            parameter_snapshot=parameter_snapshot,
         )
         return record
 
@@ -5816,6 +5805,12 @@ class AppRepository:
             if not preview.allowed:
                 raise ValueError(preview.blocked_reason or "当前策略纸面执行预估未通过。")
 
+            # Round B — freeze the parameter snapshot at dispatch time so the
+            # audit event records exactly what was in effect when the signal
+            # was realised. Reads through ``parameter_resolver`` so the runtime
+            # evaluator, the backtest runner and this execution path cannot
+            # disagree on which value "won" (top-level scalar vs legacy row).
+            frozen_parameters = parameter_resolver.snapshot_parameters(strategy)
             trade = self._create_strategy_trade_locked(
                 strategy_id=strategy_id,
                 symbol=snapshot.symbol,
@@ -5826,6 +5821,7 @@ class AppRepository:
                 note=note or snapshot.next_action or f"{snapshot.strategy_name} 人工执行当前纸面信号。",
                 event_type="strategy.paper_trade.executed_manual",
                 requested_by=requested_by,
+                parameter_snapshot=frozen_parameters,
             )
             if trade is None:
                 raise ValueError("当前策略纸面执行被风控拦截。")

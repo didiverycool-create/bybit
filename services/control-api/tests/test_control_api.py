@@ -5912,7 +5912,28 @@ class ControlApiIntegrationTests(unittest.TestCase):
 
         audit_status, audit_events = self._get("/api/audit/events")
         self.assertEqual(audit_status, 200)
-        self.assertTrue(any(item["event_type"] == "strategy.paper_trade.executed_manual" for item in audit_events))
+        manual_event = next(
+            (item for item in audit_events if item["event_type"] == "strategy.paper_trade.executed_manual"),
+            None,
+        )
+        self.assertIsNotNone(manual_event)
+        assert manual_event is not None
+        # Round B — the manual-execution audit event must carry a frozen
+        # parameter snapshot so auditors can later explain which parameter
+        # values were in effect when the Paper trade was realised. The
+        # snapshot is produced by ``parameter_resolver.snapshot_parameters``
+        # so it must agree with the runtime evaluator's dual-read result.
+        parameter_snapshot = manual_event.get("parameter_snapshot")
+        self.assertIsInstance(parameter_snapshot, dict)
+        assert isinstance(parameter_snapshot, dict)
+        self.assertGreater(len(parameter_snapshot), 0)
+        strategy_record = next(
+            item for item in control_main.repo.state.strategies if item.id == "eth-revert-02"
+        )
+        import parameter_resolver as _pr  # type: ignore  # noqa: PLC0415
+
+        expected = _pr.snapshot_parameters(strategy_record)
+        self.assertEqual(parameter_snapshot, expected)
 
     def test_execute_strategy_signal_endpoint_rejects_paused_strategy(self) -> None:
         target = next(item for item in control_main.repo.state.strategies if item.id == "eth-revert-02")

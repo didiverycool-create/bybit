@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from statistics import mean, median, pstdev
 from typing import Dict, List, Literal, Optional
 
+import parameter_resolver
 from models import (
     BacktestMetrics,
     CandlePoint,
@@ -314,37 +315,16 @@ class BacktestComputation:
     trades: List[BacktestTrade] = field(default_factory=list)
 
 
-# Round 50 — Codex review flagged that the runner only saw ``strategy.parameters``
-# rows, which meant Round 47/49's promoted top-level kernel tuning fields were
-# silently ignored by ``run_local_backtest``. We now overlay any populated
-# top-level attribute on top of the legacy parameter rows. The overlay wins
-# when both are present so a strategy migrated to the new schema takes effect
-# even if a stale parameter row still exists.
-_STRATEGY_TOP_LEVEL_RUNNER_FIELDS: tuple[str, ...] = (
-    "roc_window",
-    "ema_trend_window",
-    "momentum_threshold_pct",
-    "bollinger_window",
-    "bollinger_std",
-    "squeeze_bandwidth_pct",
-    "rsi_window",
-    "rsi_overbought",
-    "rsi_oversold",
-    "trailing_stop_pct",
-    "break_even_trigger_pct",
-    "volatility_lookback",
-    "volatility_target_pct",
-    "confidence_parameter_drift_penalty",
-)
+# Round 50 introduced the top-level overlay here; Round A of the quant-core
+# adapter consolidation moved the whitelist and the overlay implementation
+# into ``parameter_resolver`` so a new top-level scalar cannot be added to
+# one site's whitelist but forgotten on another. The module-level aliases
+# below remain for backward compatibility with existing imports / tests.
+_STRATEGY_TOP_LEVEL_RUNNER_FIELDS = parameter_resolver.STRATEGY_TOP_LEVEL_RUNNER_FIELDS
 
 
 def _parameter_map(strategy: StrategySummary) -> Dict[str, object]:
-    mapping: Dict[str, object] = {param.key: param.value for param in strategy.parameters}
-    for field_name in _STRATEGY_TOP_LEVEL_RUNNER_FIELDS:
-        value = getattr(strategy, field_name, None)
-        if value is not None:
-            mapping[field_name] = value
-    return mapping
+    return parameter_resolver.build_parameter_map(strategy)
 
 
 def _timeframe_hours(timeframe: str) -> float:

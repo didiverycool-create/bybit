@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from statistics import mean, pstdev
 from typing import Any, Dict, Iterable, List, Optional
 
+import parameter_resolver
 from models import StrategyRuntimeSnapshot, StrategySummary, WatchlistInstrument
 
 
@@ -163,26 +164,12 @@ def apply_confidence_calibration(
     return _clamp(calibrated, 0.0, 99.0)
 
 
-# Round 50 — Codex review found the runtime evaluator only consumed
-# ``strategy.parameters`` rows, so Round 47/49 promoted top-level fields
-# (``roc_window``, ``bollinger_window``, ``rsi_window`` and friends) were
-# silently ignored at runtime. We now prefer the top-level attribute when it is
-# populated and fall back to the legacy parameters list for backwards
-# compatibility with strategies that have not migrated yet.
+# Round 50 introduced a dual-read (top-level wins, ``strategy.parameters``
+# fallback) here; Round A of the quant-core adapter consolidation moved the
+# implementation into ``parameter_resolver`` so the runtime evaluator, the
+# backtest runner and the persistence path share a single source of truth.
 def _param_value(strategy: StrategySummary, key: str, default: float) -> float:
-    top_level = getattr(strategy, key, None)
-    if top_level is not None:
-        try:
-            return float(top_level)
-        except (TypeError, ValueError):
-            pass
-    parameter = next((item for item in strategy.parameters if item.key == key), None)
-    if parameter is None:
-        return default
-    try:
-        return float(parameter.value)
-    except (TypeError, ValueError):
-        return default
+    return parameter_resolver.resolve_float(strategy, key, default)
 
 
 def _clamp(value: float, low: float = 0.0, high: float = 100.0) -> float:
