@@ -217,6 +217,7 @@ from strategy_activity_summary import (
     has_strategy_activity_change_request_rerun_recommendation as _has_strategy_activity_change_request_rerun_recommendation,
 )
 from openclaw_client import OpenClawGatewayClient
+import parameter_resolver
 from repository import AppRepository
 from seed import build_market_detail_for_watchlist
 from execution_health import (
@@ -6934,6 +6935,7 @@ def _dispatch_strategy_signal_from_state(strategy_id: str, payload: StrategyExec
             },
             symbol=stale_order.symbol,
             strategy_id=strategy_id,
+            parameter_snapshot=parameter_resolver.snapshot_parameters(strategy),
         )
 
     preview_requires_reduce_only = _execution_preview_requires_reduce_only(preview)
@@ -6977,6 +6979,7 @@ def _dispatch_strategy_signal_from_state(strategy_id: str, payload: StrategyExec
                 },
                 symbol=snapshot.symbol,
                 strategy_id=strategy_id,
+                parameter_snapshot=parameter_resolver.snapshot_parameters(strategy),
             )
             repo._persist()  # type: ignore[attr-defined]
             return StrategyExecutionResult(
@@ -7028,6 +7031,7 @@ def _dispatch_strategy_signal_from_state(strategy_id: str, payload: StrategyExec
             },
             symbol=snapshot.symbol,
             strategy_id=strategy_id,
+            parameter_snapshot=parameter_resolver.snapshot_parameters(strategy),
         )
         repo._persist()  # type: ignore[attr-defined]
         return StrategyExecutionResult(
@@ -7090,6 +7094,7 @@ def _dispatch_strategy_signal_from_state(strategy_id: str, payload: StrategyExec
         },
         symbol=snapshot.symbol,
         strategy_id=strategy_id,
+        parameter_snapshot=parameter_resolver.snapshot_parameters(strategy),
     )
     repo._persist()  # type: ignore[attr-defined]
     return StrategyExecutionResult(

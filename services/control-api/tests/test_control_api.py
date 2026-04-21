@@ -8002,6 +8002,41 @@ class ControlApiIntegrationTests(unittest.TestCase):
         self.assertEqual(audit_status, 200)
         self.assertTrue(any(item["event_type"] == "strategy.exchange_order.replaced_existing" for item in audit_events))
 
+        # Round 52 — Live-branch exchange dispatch events must carry the same
+        # frozen parameter snapshot the Paper path already emits, so auditors
+        # can reconstruct exactly which parameter values were in effect when
+        # the real-money order was submitted / amended / cancelled. The
+        # snapshot is produced by ``parameter_resolver.snapshot_parameters``
+        # and must agree across all four ``_dispatch_strategy_signal_from_state``
+        # Live-branch ``repo.add_event`` sites.
+        import parameter_resolver as _pr  # type: ignore  # noqa: PLC0415
+
+        strategy_record = next(
+            item for item in control_main.repo.state.strategies if item.id == "trend-btc-01"
+        )
+        expected_snapshot = _pr.snapshot_parameters(strategy_record)
+        self.assertIsInstance(expected_snapshot, dict)
+        self.assertGreater(len(expected_snapshot), 0)
+
+        live_event_types = {
+            "strategy.exchange_order.cancelled_stale",
+            "strategy.exchange_order.reused_existing",
+            "strategy.exchange_order.replaced_existing",
+            "strategy.exchange_order.submitted",
+        }
+        live_branch_events = [
+            item for item in audit_events if item["event_type"] in live_event_types
+        ]
+        self.assertTrue(live_branch_events)
+        for event in live_branch_events:
+            snapshot = event.get("parameter_snapshot")
+            self.assertIsInstance(
+                snapshot,
+                dict,
+                msg=f"Live-branch event {event['event_type']} missing parameter_snapshot",
+            )
+            self.assertEqual(snapshot, expected_snapshot)
+
     def test_strategy_runtime_refresh_auto_dispatches_live_strategy_signal(self) -> None:
         original_market = control_main.market_data
         original_private = control_main.private_data
