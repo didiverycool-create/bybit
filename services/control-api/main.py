@@ -146,6 +146,7 @@ from models import (
     PaperPositionBulkCloseResult,
     ReconcileChangeRequestOutcome,
     ReviewDocument,
+    RiskDecision,
     RuntimeWorkerActionPayload,
     RuntimeWorkerActionResult,
     RuntimeWorkerStatus,
@@ -243,6 +244,7 @@ from execution_preview_builders import (
     private_released_order_reservation as _private_released_order_reservation_impl,
     private_reserved_spot_sell_quantity as _private_reserved_spot_sell_quantity_impl,
 )
+from risk_decision import evaluate_risk_decision
 
 
 app = FastAPI(title="Bybit 控制端本地服务", version="0.1.0")
@@ -6866,6 +6868,12 @@ def _apply_live_strategy_stop_loss_guards(current_items: List[StrategyRuntimeSna
 
 def _dispatch_strategy_signal_from_state(strategy_id: str, payload: StrategyExecutionRequest) -> StrategyExecutionResult:
     preview = _build_strategy_execution_preview_from_state(strategy_id, payload.mode)
+    # Round 58 — wrap the preview in a structured ``RiskDecision`` so every
+    # downstream branch inspects a typed ``verdict`` + machine-readable
+    # ``reason_code`` instead of ad-hoc ``preview.allowed`` / substring checks
+    # on ``preview.blocked_reason``.  The embedded ``decision.preview`` keeps
+    # numeric fields readable for the ``StrategyExecutionResult`` payload.
+    decision = evaluate_risk_decision(preview)
     state = repo.snapshot()
     resolved_mode = payload.mode or state.workspace_preferences.selected_mode
     strategy = next((item for item in state.strategies if item.id == strategy_id), None)
@@ -6887,8 +6895,8 @@ def _dispatch_strategy_signal_from_state(strategy_id: str, payload: StrategyExec
         )
 
     if resolved_mode == AccountMode.PAPER:
-        if not preview.allowed:
-            detail = preview.blocked_reason or "当前策略 Paper 执行预检未通过。"
+        if decision.verdict != "allow":
+            detail = preview.blocked_reason or decision.reason_detail or "当前策略 Paper 执行预检未通过。"
             _record_manual_execution_blocked(detail, preview.recommended_action)
             raise StrategyExecutionBlockedError(detail, preview.recommended_action)
         trade = repo.execute_strategy_signal(
@@ -6911,8 +6919,8 @@ def _dispatch_strategy_signal_from_state(strategy_id: str, payload: StrategyExec
             generated_at=datetime.now(timezone.utc).astimezone().isoformat(),
         )
 
-    if not preview.allowed:
-        detail = preview.blocked_reason or "当前策略真实模式执行预检未通过。"
+    if decision.verdict != "allow":
+        detail = preview.blocked_reason or decision.reason_detail or "当前策略真实模式执行预检未通过。"
         _record_manual_execution_blocked(detail, preview.recommended_action)
         raise StrategyExecutionBlockedError(detail, preview.recommended_action)
 
@@ -9537,11 +9545,35 @@ def create_paper_order(payload: ManualOrderRequest):
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
-@app.post("/api/trades/preview", response_model=ExecutionPreview)
-def preview_trade(payload: ExecutionPreviewRequest):
+def _build_preview_for_request(payload: ExecutionPreviewRequest) -> ExecutionPreview:
+    """Route ``payload`` to the Paper or private preview builder.
+
+    Round 58 — extracted so the raw preview endpoint and the new structured
+    ``/api/trades/preview/decision`` endpoint share a single dispatch path.
+    """
+
     if payload.mode == AccountMode.PAPER:
         return repo.preview_execution(payload)
     return build_private_execution_preview(payload)
+
+
+@app.post("/api/trades/preview", response_model=ExecutionPreview)
+def preview_trade(payload: ExecutionPreviewRequest):
+    return _build_preview_for_request(payload)
+
+
+@app.post("/api/trades/preview/decision", response_model=RiskDecision)
+def preview_trade_decision(payload: ExecutionPreviewRequest) -> RiskDecision:
+    """Return the Round 58 :class:`RiskDecision` for ``payload``.
+
+    Wraps the same preview the ``/api/trades/preview`` endpoint returns so
+    callers can branch on the typed ``verdict`` / ``reason_code`` while still
+    reading the embedded preview's numeric fields (notional, projected
+    position, sizing budgets, …).
+    """
+
+    preview = _build_preview_for_request(payload)
+    return evaluate_risk_decision(preview)
 
 
 @app.post("/api/account/paper/orders/{order_id}/cancel", response_model=OrderRecord)

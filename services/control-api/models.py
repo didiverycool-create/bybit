@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Dict, List, Literal, Optional, Union
 
@@ -1353,6 +1354,51 @@ class ExecutionPreview(BaseModel):
     available_balance_after: str
     estimated_realized_pnl: str
     generated_at: str
+
+
+# Round 58 — ``RiskDecision`` wraps ``ExecutionPreview`` so every callsite that
+# today inspects ``preview.allowed`` / ``preview.blocked_reason`` / the free-form
+# ``preview.warnings`` list gets a single, typed verdict to branch on.  The
+# embedded ``preview`` is preserved verbatim so numeric fields (notional,
+# projected position, sizing budgets, …) stay readable.  The ``verdict`` and
+# ``reason_code`` are the stable machine-readable contract; ``reason_detail``
+# carries the human-readable message that used to live in ``blocked_reason``.
+RiskVerdict = Literal["allow", "block", "degrade", "wait"]
+
+
+# Stable machine-readable reason codes emitted by ``evaluate_risk_decision``.
+# ``allow``-path decisions carry ``RISK_REASON_APPROVED``.  The ``block``-path
+# codes map today's implicit block reasons onto a small, stable vocabulary;
+# callers must never branch on substrings of ``reason_detail`` and should rely
+# on ``reason_code`` instead.
+RISK_REASON_APPROVED = "risk.approved"
+RISK_REASON_ACCOUNT_MODE_UNAVAILABLE = "risk.account_mode_unavailable"
+RISK_REASON_INSUFFICIENT_BALANCE = "risk.insufficient_balance"
+RISK_REASON_INSUFFICIENT_INVENTORY = "risk.insufficient_inventory"
+RISK_REASON_EXCHANGE_CONSTRAINT = "risk.exchange_constraint"
+RISK_REASON_PREVIEW_BLOCKED = "risk.preview_blocked"
+
+
+class RiskDecision(BaseModel):
+    """Structured risk verdict wrapping an :class:`ExecutionPreview`.
+
+    * ``allow`` — proceed with the embedded preview as planned.
+    * ``block`` — reject outright; ``reason_code`` and ``reason_detail`` explain why.
+    * ``degrade`` — proceed with reduced size / adjusted params;
+      ``recommended_action`` carries the delta (e.g. ``{"size_multiplier": 0.5}``).
+    * ``wait`` — retry later; ``recommended_action`` carries e.g.
+      ``{"retry_after_seconds": 30}``.
+
+    The wrapped ``preview`` is kept intact so callers can still read numeric
+    fields such as ``preview.notional`` or ``preview.projected_position_size``.
+    """
+
+    verdict: RiskVerdict
+    reason_code: str
+    reason_detail: str
+    recommended_action: Optional[Dict[str, Any]] = None
+    preview: ExecutionPreview
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 class StrategyExecutionResult(BaseModel):

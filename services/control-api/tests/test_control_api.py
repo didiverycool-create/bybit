@@ -21187,5 +21187,159 @@ class PartialTakeProfitTradeMetadataRound50Tests(unittest.TestCase):
             self.assertIsNotNone(trade.applied_risk_per_trade)
 
 
+class RiskDecisionRound58UnitTests(unittest.TestCase):
+    """Round 58 — structured :class:`RiskDecision` wrapper regression suite.
+
+    Asserts the four pieces of the new typing surface:
+
+    * ``RiskDecision`` accepts the documented verdict enum + reason code and
+      survives a pydantic JSON round-trip.
+    * The ``allow``-path mapping returns ``verdict="allow"`` with
+      ``reason_code="risk.approved"``.
+    * The ``block``-path mapping returns ``verdict="block"`` with a stable
+      ``reason_code`` derived from today's free-form ``blocked_reason`` text.
+    * Old callers that still inspect numeric fields keep working through the
+      embedded ``decision.preview`` —  this is the compatibility contract we
+      promised when introducing the wrapper.
+    """
+
+    @staticmethod
+    def _build_preview(
+        *,
+        allowed: bool,
+        blocked_reason: Optional[str] = None,
+        warnings: Optional[List[str]] = None,
+        recommended_action: Optional[str] = None,
+    ):
+        """Return a minimal ``ExecutionPreview`` tailored for this suite.
+
+        All numeric fields are filled with concrete values so the
+        compatibility test below can assert the embedded preview still
+        exposes them verbatim.
+        """
+
+        from models import ExecutionPreview  # type: ignore  # noqa: E402
+
+        return ExecutionPreview(
+            symbol="BTCUSDT",
+            market="perp",
+            mode=AccountMode.PAPER,
+            side=Direction.BUY,
+            origin="manual",
+            quantity=0.5,
+            price=42_000.0,
+            notional="21000.00",
+            action="开多",
+            allowed=allowed,
+            blocked_reason=blocked_reason,
+            recommended_action=recommended_action,
+            warnings=list(warnings or []),
+            current_position_size="0",
+            current_avg_price="--",
+            projected_position_size="0.5",
+            projected_avg_price="42000.00",
+            available_balance_before="50000.00",
+            available_balance_after="29000.00",
+            estimated_realized_pnl="--",
+            generated_at="2026-04-21T08:00:00+08:00",
+        )
+
+    def test_risk_decision_model_round_trips_verdict_and_reason_code(self) -> None:
+        """The pydantic model must accept the documented verdict literal +
+        machine-readable ``reason_code`` and survive a JSON round-trip so
+        downstream services can persist decisions to audit stores without
+        losing structure."""
+
+        from models import RiskDecision  # type: ignore  # noqa: E402
+
+        preview = self._build_preview(allowed=True)
+        decision = RiskDecision(
+            verdict="degrade",
+            reason_code="risk.exposure_cap",
+            reason_detail="当前敞口已接近上限，建议按 50% 规模继续。",
+            recommended_action={"size_multiplier": 0.5},
+            preview=preview,
+        )
+
+        self.assertEqual(decision.verdict, "degrade")
+        self.assertEqual(decision.reason_code, "risk.exposure_cap")
+        assert decision.recommended_action is not None
+        self.assertEqual(decision.recommended_action.get("size_multiplier"), 0.5)
+        self.assertIsNotNone(decision.timestamp)
+
+        payload = decision.model_dump_json()
+        restored = RiskDecision.model_validate_json(payload)
+        self.assertEqual(restored.verdict, "degrade")
+        self.assertEqual(restored.reason_code, "risk.exposure_cap")
+        self.assertEqual(restored.reason_detail, decision.reason_detail)
+        self.assertEqual(restored.preview.symbol, preview.symbol)
+
+    def test_evaluate_risk_decision_allow_path_returns_allow_verdict(self) -> None:
+        """An ``ExecutionPreview`` with ``allowed=True`` must map to a
+        ``verdict="allow"`` decision carrying the ``risk.approved`` code —
+        this is the happy-path contract the dispatcher relies on to branch."""
+
+        import risk_decision  # type: ignore  # noqa: E402
+        from models import RISK_REASON_APPROVED  # type: ignore  # noqa: E402
+
+        preview = self._build_preview(allowed=True)
+
+        decision = risk_decision.evaluate_risk_decision(preview)
+
+        self.assertEqual(decision.verdict, "allow")
+        self.assertEqual(decision.reason_code, RISK_REASON_APPROVED)
+        self.assertIs(decision.preview, preview)
+
+    def test_evaluate_risk_decision_block_path_maps_insufficient_balance(
+        self,
+    ) -> None:
+        """When the preview is blocked for balance reasons the wrapper must
+        emit ``verdict="block"`` with the stable
+        ``risk.insufficient_balance`` code — so callers can stop substring-
+        matching on Chinese strings like ``"可用余额不足"``."""
+
+        import risk_decision  # type: ignore  # noqa: E402
+        from models import RISK_REASON_INSUFFICIENT_BALANCE  # type: ignore  # noqa: E402
+
+        preview = self._build_preview(
+            allowed=False,
+            blocked_reason="当前 Paper 可用余额不足，缺口 2000 USDT。",
+            recommended_action="请先补充 Paper 可用余额。",
+        )
+
+        decision = risk_decision.evaluate_risk_decision(preview)
+
+        self.assertEqual(decision.verdict, "block")
+        self.assertEqual(decision.reason_code, RISK_REASON_INSUFFICIENT_BALANCE)
+        self.assertIn("可用余额不足", decision.reason_detail)
+        assert decision.recommended_action is not None
+        self.assertEqual(
+            decision.recommended_action.get("recommendation"),
+            "请先补充 Paper 可用余额。",
+        )
+
+    def test_embedded_preview_keeps_numeric_fields_readable(self) -> None:
+        """Old callers that read numeric fields off the preview must keep
+        working through ``decision.preview`` — this is the backward-compat
+        contract the wrapper commits to.  Without it the structural refactor
+        would silently break every downstream consumer."""
+
+        import risk_decision  # type: ignore  # noqa: E402
+
+        preview = self._build_preview(allowed=True)
+
+        decision = risk_decision.evaluate_risk_decision(preview)
+
+        # Numeric-ish fields that today's callers read off the preview:
+        self.assertEqual(decision.preview.quantity, 0.5)
+        self.assertEqual(decision.preview.price, 42_000.0)
+        self.assertEqual(decision.preview.notional, "21000.00")
+        self.assertEqual(decision.preview.projected_position_size, "0.5")
+        self.assertEqual(decision.preview.available_balance_before, "50000.00")
+        self.assertEqual(decision.preview.available_balance_after, "29000.00")
+        # And structural fields such as the rendered action label:
+        self.assertEqual(decision.preview.action, "开多")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
