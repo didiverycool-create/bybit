@@ -6899,6 +6899,94 @@ class ControlApiIntegrationTests(unittest.TestCase):
         self.assertEqual(control_snapshot["execution_health"]["top_issue"], "执行受阻 1")
         self.assertEqual(control_snapshot["execution_health"]["top_issue_recommended_action"], blocked_action)
 
+    def test_strategy_issue_recorders_attach_parameter_snapshot_to_audit_event(self) -> None:
+        """Round 53 — strategy-issue audit events must carry the live parameter snapshot
+        so auditors can see the effective parameters when the block fired."""
+
+        control_main.repo.state.alerts = []
+
+        strategy = next(
+            item for item in control_main.repo.state.strategies if item.id == "trend-btc-01"
+        )
+        expected_snapshot = control_main.parameter_resolver.snapshot_parameters(strategy)
+        # Seed strategy carries legacy parameter rows (fast_ma, slow_ma, ...) so the snapshot
+        # must at least surface those — protects against future refactors that silently strip
+        # keys from the canonical snapshot.
+        self.assertIn("fast_ma", expected_snapshot)
+        self.assertEqual(expected_snapshot["fast_ma"], 21)
+
+        # Auto-dispatch issue recorder with explicit strategy kwarg.
+        control_main._record_strategy_auto_dispatch_issue(
+            strategy.id,
+            strategy.name,
+            strategy.symbols[0],
+            "long",
+            AccountMode.LIVE,
+            "regression: ensure parameter_snapshot is attached on auto-dispatch block",
+            strategy=strategy,
+        )
+
+        # Manual-execution recorder also carries the snapshot when strategy is supplied.
+        control_main._record_strategy_manual_execution_issue(
+            strategy.id,
+            strategy.name,
+            strategy.symbols[0],
+            AccountMode.LIVE,
+            "regression: ensure parameter_snapshot is attached on manual execution block",
+            strategy=strategy,
+        )
+
+        # Without strategy context the snapshot must stay None — do NOT fabricate defaults.
+        control_main._record_strategy_auto_dispatch_issue(
+            strategy.id,
+            strategy.name,
+            strategy.symbols[0],
+            "short",
+            AccountMode.LIVE,
+            "regression: ensure parameter_snapshot stays None when strategy is unknown",
+        )
+
+        audit_status, audit_events = self._get("/api/audit/events")
+        self.assertEqual(audit_status, 200)
+
+        auto_blocked_events = [
+            item
+            for item in audit_events
+            if item["event_type"] == "strategy.exchange_order.auto_blocked"
+            and item.get("strategy_id") == strategy.id
+        ]
+        self.assertEqual(len(auto_blocked_events), 2)
+
+        with_strategy = next(
+            item
+            for item in auto_blocked_events
+            if item["payload"].get("signal") == "long"
+        )
+        self.assertEqual(with_strategy["parameter_snapshot"], expected_snapshot)
+
+        without_strategy = next(
+            item
+            for item in auto_blocked_events
+            if item["payload"].get("signal") == "short"
+        )
+        self.assertIsNone(without_strategy["parameter_snapshot"])
+
+        manual_blocked_event = next(
+            item
+            for item in audit_events
+            if item["event_type"] == "strategy.execution.blocked"
+            and item.get("strategy_id") == strategy.id
+        )
+        self.assertEqual(manual_blocked_event["parameter_snapshot"], expected_snapshot)
+
+        manual_blocked_alerted_event = next(
+            item
+            for item in audit_events
+            if item["event_type"] == "strategy.execution.blocked_alerted"
+            and item.get("strategy_id") == strategy.id
+        )
+        self.assertEqual(manual_blocked_alerted_event["parameter_snapshot"], expected_snapshot)
+
     def test_strategy_runtime_endpoint_blocks_live_execution_preview_when_runtime_worker_is_unhealthy(self) -> None:
         original_market = control_main.market_data
         original_private = control_main.private_data

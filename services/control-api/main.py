@@ -168,6 +168,7 @@ from models import (
     StrategyProposal,
     StrategyProposalActionPayload,
     StrategyProposalActionResult,
+    StrategySummary,
     TradeRecord,
     WatchlistCreatePayload,
     WatchlistInstrument,
@@ -6345,9 +6346,14 @@ def _record_strategy_auto_dispatch_issue(
     mode: AccountMode,
     detail: str,
     recommended_action: Optional[str] = None,
+    *,
+    strategy: Optional[StrategySummary] = None,
 ) -> None:
     rule_key = f"strategy-auto-dispatch:{strategy_id}:{signal}:{mode.value}"
     suggested_action = recommended_action or _build_auto_dispatch_recommended_action(detail)
+    parameter_snapshot = (
+        parameter_resolver.snapshot_parameters(strategy) if strategy is not None else None
+    )
     with repo._lock:  # type: ignore[attr-defined]
         changed = repo._upsert_system_alert_locked(  # type: ignore[attr-defined]
             rule_key=rule_key,
@@ -6384,6 +6390,7 @@ def _record_strategy_auto_dispatch_issue(
                 },
                 symbol=symbol,
                 strategy_id=strategy_id,
+                parameter_snapshot=parameter_snapshot,
             )
         repo._refresh_derived_state()  # type: ignore[attr-defined]
         repo._persist()  # type: ignore[attr-defined]
@@ -6395,9 +6402,14 @@ def _record_strategy_manual_execution_issue(
     mode: AccountMode,
     detail: str,
     recommended_action: Optional[str] = None,
+    *,
+    strategy: Optional[StrategySummary] = None,
 ) -> None:
     rule_key = f"strategy-blocked-execution:{strategy_id}:{mode.value}"
     suggested_action = recommended_action or _build_manual_execution_recommended_action(detail)
+    parameter_snapshot = (
+        parameter_resolver.snapshot_parameters(strategy) if strategy is not None else None
+    )
     with repo._lock:  # type: ignore[attr-defined]
         changed = repo._upsert_system_alert_locked(  # type: ignore[attr-defined]
             rule_key=rule_key,
@@ -6422,6 +6434,7 @@ def _record_strategy_manual_execution_issue(
             },
             symbol=symbol,
             strategy_id=strategy_id,
+            parameter_snapshot=parameter_snapshot,
         )
         if changed:
             _queue_strategy_issue_review_locked(
@@ -6448,6 +6461,7 @@ def _record_strategy_manual_execution_issue(
                 },
                 symbol=symbol,
                 strategy_id=strategy_id,
+                parameter_snapshot=parameter_snapshot,
             )
         repo._refresh_derived_state()  # type: ignore[attr-defined]
         repo._persist()  # type: ignore[attr-defined]
@@ -6719,6 +6733,7 @@ def _record_strategy_live_stop_loss_issue(
                 },
                 symbol=snapshot.symbol,
                 strategy_id=strategy.id,
+                parameter_snapshot=parameter_resolver.snapshot_parameters(strategy),
             )
         repo._refresh_derived_state()  # type: ignore[attr-defined]
         repo._persist()  # type: ignore[attr-defined]
@@ -7185,6 +7200,7 @@ def _auto_dispatch_strategy_signal_changes(
                 snapshot.signal,
                 strategy.mode,
                 gate_reason,
+                strategy=strategy,
             )
             continue
         if snapshot.runtime_status != "running":
@@ -7347,6 +7363,7 @@ def _auto_dispatch_strategy_signal_changes(
                 strategy.mode,
                 detail,
                 recommended_action=recommended_action,
+                strategy=strategy,
             )
         except Exception as exc:  # pragma: no cover - defensive guard for background worker
             _record_strategy_auto_dispatch_issue(
@@ -7356,6 +7373,7 @@ def _auto_dispatch_strategy_signal_changes(
                 snapshot.signal,
                 strategy.mode,
                 f"后台自动执行异常：{exc}",
+                strategy=strategy,
             )
 
 def refresh_strategy_runtime_once(auto_dispatch: bool = False) -> List[StrategyRuntimeSnapshot]:
@@ -8448,6 +8466,7 @@ def dispatch_strategy_signal(strategy_id: str, payload: StrategyExecutionRequest
                     resolved_mode,
                     runtime_block_reason,
                     recommended_action=_build_manual_execution_recommended_action(runtime_block_reason),
+                    strategy=strategy,
                 )
             raise StrategyExecutionBlockedError(
                 runtime_block_reason,
@@ -8469,6 +8488,7 @@ def dispatch_strategy_signal(strategy_id: str, payload: StrategyExecutionRequest
                     resolved_mode,
                     str(exc),
                     recommended_action=exc.recommended_action if isinstance(exc, StrategyExecutionBlockedError) else None,
+                    strategy=strategy,
                 )
         raise
 
