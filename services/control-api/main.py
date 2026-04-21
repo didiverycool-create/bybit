@@ -5250,6 +5250,17 @@ def build_private_execution_preview(payload: ExecutionPreviewRequest) -> Executi
         private_order_reserves_private_balance=_private_order_reserves_private_balance,
     )
 
+def _resolve_strategy_parameter_snapshot(strategy_id: Optional[str]) -> Optional[Dict[str, Any]]:
+    if not strategy_id:
+        return None
+    strategy = next(
+        (item for item in repo.snapshot().strategies if item.id == strategy_id),
+        None,
+    )
+    if strategy is None:
+        return None
+    return parameter_resolver.snapshot_parameters(strategy)
+
 def submit_exchange_order(
     payload: ManualOrderRequest,
     *,
@@ -5368,6 +5379,8 @@ def submit_exchange_order(
             "note": payload.note,
         },
         symbol=payload.symbol.upper(),
+        strategy_id=strategy_id,
+        parameter_snapshot=_resolve_strategy_parameter_snapshot(strategy_id),
     )
     repo._persist()  # type: ignore[attr-defined]
 
@@ -5454,6 +5467,8 @@ def cancel_exchange_order(order_id: str, requested_by: str, mode: Optional[Accou
             "requested_by": requested_by,
         },
         symbol=target.symbol,
+        strategy_id=target.strategy_id,
+        parameter_snapshot=_resolve_strategy_parameter_snapshot(target.strategy_id),
     )
     repo._persist()  # type: ignore[attr-defined]
 
@@ -5853,6 +5868,8 @@ def replace_exchange_order(
                 "price": price,
             },
             symbol=target.symbol,
+            strategy_id=target.strategy_id,
+            parameter_snapshot=_resolve_strategy_parameter_snapshot(target.strategy_id),
         )
         repo._persist()  # type: ignore[attr-defined]
         return target
@@ -5931,6 +5948,8 @@ def replace_exchange_order(
             "price": price,
         },
         symbol=target.symbol,
+        strategy_id=target.strategy_id,
+        parameter_snapshot=_resolve_strategy_parameter_snapshot(target.strategy_id),
     )
     repo._persist()  # type: ignore[attr-defined]
     return target.model_copy(
@@ -6776,6 +6795,7 @@ def _cancel_strategy_exchange_orders(
             },
             symbol=symbol,
             strategy_id=strategy_id,
+            parameter_snapshot=_resolve_strategy_parameter_snapshot(strategy_id),
         )
     if cancelled_count:
         repo._persist()  # type: ignore[attr-defined]
@@ -7252,6 +7272,7 @@ def _auto_dispatch_strategy_signal_changes(
                     },
                     symbol=snapshot.symbol,
                     strategy_id=snapshot.strategy_id,
+                    parameter_snapshot=parameter_resolver.snapshot_parameters(strategy),
                 )
             repo._persist()  # type: ignore[attr-defined]
             active_order_count, active_order = _build_strategy_active_order_summary(
@@ -7278,6 +7299,7 @@ def _auto_dispatch_strategy_signal_changes(
                 },
                 symbol=snapshot.symbol,
                 strategy_id=snapshot.strategy_id,
+                parameter_snapshot=parameter_resolver.snapshot_parameters(strategy),
             )
             repo._persist()  # type: ignore[attr-defined]
             active_order_count = 0
@@ -7315,6 +7337,7 @@ def _auto_dispatch_strategy_signal_changes(
                         },
                         symbol=snapshot.symbol,
                         strategy_id=snapshot.strategy_id,
+                        parameter_snapshot=parameter_resolver.snapshot_parameters(strategy),
                     )
                     repo._persist()  # type: ignore[attr-defined]
                 else:
@@ -7360,6 +7383,7 @@ def _auto_dispatch_strategy_signal_changes(
                     },
                     symbol=snapshot.symbol,
                     strategy_id=snapshot.strategy_id,
+                    parameter_snapshot=parameter_resolver.snapshot_parameters(strategy),
                 )
                 repo._persist()  # type: ignore[attr-defined]
                 continue
@@ -7733,6 +7757,7 @@ def _sync_strategy_exchange_order_history_events(history_items: List[OrderRecord
                 },
                 symbol=order.symbol,
                 strategy_id=order.strategy_id,
+                parameter_snapshot=_resolve_strategy_parameter_snapshot(order.strategy_id),
             )
             changed = True
         if changed:
@@ -7853,6 +7878,7 @@ def _sync_strategy_exchange_rejection_guards(current_items: List[StrategyRuntime
                     },
                     symbol=snapshot.symbol,
                     strategy_id=snapshot.strategy_id,
+                    parameter_snapshot=parameter_resolver.snapshot_parameters(strategy),
                 )
                 repo._refresh_derived_state()  # type: ignore[attr-defined]
                 repo._persist()  # type: ignore[attr-defined]
@@ -7925,6 +7951,7 @@ def _sync_strategy_stale_order_issues(current_items: List[StrategyRuntimeSnapsho
                     },
                     symbol=snapshot.symbol,
                     strategy_id=snapshot.strategy_id,
+                    parameter_snapshot=parameter_resolver.snapshot_parameters(strategy),
                 )
                 repo._refresh_derived_state()  # type: ignore[attr-defined]
                 repo._persist()  # type: ignore[attr-defined]

@@ -6987,6 +6987,80 @@ class ControlApiIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(manual_blocked_alerted_event["parameter_snapshot"], expected_snapshot)
 
+    def test_exchange_order_lifecycle_events_attach_parameter_snapshot_for_strategy_orders(self) -> None:
+        """Round 56 — exchange-order lifecycle events (created / cancelled /
+        replaced) emitted for a strategy-attributed order must carry the same
+        frozen parameter snapshot the auto-dispatch events already do, so the
+        audit trail is bit-exact across the paper, live-dispatch, and direct
+        exchange-lifecycle paths. Unknown / missing strategy stays None."""
+
+        import parameter_resolver as _pr  # type: ignore  # noqa: PLC0415
+
+        # Resolver returns None for the falsy / unknown cases.
+        self.assertIsNone(control_main._resolve_strategy_parameter_snapshot(None))
+        self.assertIsNone(control_main._resolve_strategy_parameter_snapshot(""))
+        self.assertIsNone(control_main._resolve_strategy_parameter_snapshot("strategy-does-not-exist"))
+
+        strategy = next(
+            item for item in control_main.repo.state.strategies if item.id == "trend-btc-01"
+        )
+        expected_snapshot = _pr.snapshot_parameters(strategy)
+        self.assertEqual(
+            control_main._resolve_strategy_parameter_snapshot(strategy.id),
+            expected_snapshot,
+        )
+
+        # Emit a representative strategy-attributed exchange-lifecycle event
+        # through the repository's audit trail, exercising the kwarg surface
+        # the Round-56 call sites now feed. We deliberately hit add_event
+        # directly rather than spinning up the full private-trade stack so the
+        # test stays focused on the snapshot plumbing contract.
+        control_main.repo.add_event(
+            event_type="exchange_order.created",
+            source="quant-core",
+            severity=control_main.EventSeverity.INFO,
+            payload={
+                "origin": "strategy",
+                "strategy_id": strategy.id,
+                "order_id": "round56-probe-001",
+                "symbol": strategy.symbols[0],
+            },
+            symbol=strategy.symbols[0],
+            strategy_id=strategy.id,
+            parameter_snapshot=control_main._resolve_strategy_parameter_snapshot(strategy.id),
+        )
+        control_main.repo.add_event(
+            event_type="exchange_order.created",
+            source="quant-core",
+            severity=control_main.EventSeverity.INFO,
+            payload={
+                "origin": "strategy",
+                "strategy_id": "strategy-does-not-exist",
+                "order_id": "round56-probe-unknown",
+                "symbol": "BTCUSDT",
+            },
+            symbol="BTCUSDT",
+            strategy_id="strategy-does-not-exist",
+            parameter_snapshot=control_main._resolve_strategy_parameter_snapshot("strategy-does-not-exist"),
+        )
+
+        audit_status, audit_events = self._get("/api/audit/events")
+        self.assertEqual(audit_status, 200)
+
+        known_event = next(
+            item
+            for item in audit_events
+            if item.get("payload", {}).get("order_id") == "round56-probe-001"
+        )
+        self.assertEqual(known_event["parameter_snapshot"], expected_snapshot)
+
+        unknown_event = next(
+            item
+            for item in audit_events
+            if item.get("payload", {}).get("order_id") == "round56-probe-unknown"
+        )
+        self.assertIsNone(unknown_event["parameter_snapshot"])
+
     def test_strategy_runtime_endpoint_blocks_live_execution_preview_when_runtime_worker_is_unhealthy(self) -> None:
         original_market = control_main.market_data
         original_private = control_main.private_data
