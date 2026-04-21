@@ -13674,6 +13674,24 @@ class ControlApiIntegrationTests(unittest.TestCase):
         self.assertIsNone(backtest_context.get("latest_review_record"))
         self.assertIsNone(backtest_context.get("actionable_review_record"))
 
+        audit_status, audit_events = self._get("/api/audit/events")
+        self.assertEqual(audit_status, 200)
+        backtest_completed_event = next(
+            (
+                event
+                for event in audit_events
+                if event["event_type"] == "backtest.completed"
+                and event["payload"].get("id") == result["created_backtest"]["id"]
+            ),
+            None,
+        )
+        self.assertIsNotNone(backtest_completed_event)
+        self.assertEqual(
+            backtest_completed_event["parameter_snapshot"],
+            result["created_backtest"]["parameter_snapshot"],
+        )
+        self.assertIsNotNone(backtest_completed_event["parameter_snapshot"])
+
         activity_status, activity = self._get("/api/strategies/sol-breakout-03/activity")
         self.assertEqual(activity_status, 200)
         proposal_context = activity["decision_context"]["proposal"]

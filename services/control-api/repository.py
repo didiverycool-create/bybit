@@ -3376,6 +3376,7 @@ class AppRepository:
             payload=record.model_dump(mode="json"),
             strategy_id=strategy_id,
             symbol=",".join(strategy.symbols),
+            parameter_snapshot=record.parameter_snapshot,
         )
         return record
 
