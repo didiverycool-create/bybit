@@ -8,7 +8,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_UP
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 from uuid import uuid4
 
 import uvicorn
@@ -125,6 +125,7 @@ from models import (
     ExecutionIntent,
     ExecutionPreview,
     ExecutionPreviewRequest,
+    LiveOrderReconciliation,
     ExchangePositionBulkCloseResult,
     ExecutionEvent,
     EventSeverity,
@@ -6979,11 +6980,84 @@ def _dispatch_paper_intent(intent: ExecutionIntent) -> StrategyExecutionResult:
     )
 
 
+def _classify_live_order_reconciliation(
+    intent: ExecutionIntent,
+    existing_orders: Sequence[OrderRecord],
+    *,
+    requires_reduce_only: bool,
+) -> LiveOrderReconciliation:
+    """Classify how a live ``ExecutionIntent`` should reconcile against any
+    pre-existing strategy orders on the exchange, without performing any side
+    effects.  The returned :class:`LiveOrderReconciliation` decision carries:
+
+    * ``action`` — ``"reuse"`` (existing order already matches target),
+      ``"amend"`` (existing order differs on quantity/price/reduce_only), or
+      ``"submit"`` (no matching order on the requested side).
+    * ``reason_code`` — machine-readable classification:
+      ``"order.matches_target"`` / ``"order.differs_numeric"`` /
+      ``"order.requires_reduce_only"`` / ``"order.no_existing_match"``.
+    * ``matching_order`` — the order on the same ``side`` as the intent, if
+      any (used by reuse / amend branches).
+    * ``stale_orders`` — every other order on the same strategy / symbol /
+      market that must be cancelled before the chosen action runs.
+
+    Pure function so it can be unit-tested without the full runtime stack
+    (``test_control_api.py :: LiveOrderReconciliationRound59UnitTests``).
+    """
+    matching_order = next((item for item in existing_orders if item.side == intent.side), None)
+    stale_orders = [
+        item
+        for item in existing_orders
+        if matching_order is None or item.order_id != matching_order.order_id
+    ]
+
+    if matching_order is None:
+        return LiveOrderReconciliation(
+            action="submit",
+            reason_code="order.no_existing_match",
+            matching_order=None,
+            stale_orders=list(stale_orders),
+        )
+
+    if _exchange_order_matches_requested_target(
+        matching_order,
+        intent.quantity,
+        intent.price,
+        require_reduce_only=requires_reduce_only,
+    ):
+        return LiveOrderReconciliation(
+            action="reuse",
+            reason_code="order.matches_target",
+            matching_order=matching_order,
+            stale_orders=list(stale_orders),
+        )
+
+    # Target differs.  Distinguish numeric-diff (qty/price) from a pure
+    # reduce_only toggle so the audit trail captures why we had to amend.
+    qty_matches = abs(parse_metric_number(matching_order.qty) - float(intent.quantity)) <= 1e-9
+    price_matches = abs(parse_metric_number(matching_order.price) - float(intent.price)) <= 1e-9
+    if qty_matches and price_matches and requires_reduce_only:
+        reason_code = "order.requires_reduce_only"
+    else:
+        reason_code = "order.differs_numeric"
+    return LiveOrderReconciliation(
+        action="amend",
+        reason_code=reason_code,
+        matching_order=matching_order,
+        stale_orders=list(stale_orders),
+    )
+
+
 def _dispatch_live_intent(intent: ExecutionIntent) -> StrategyExecutionResult:
     """Realise a Live strategy intent against Bybit: reconcile any pre-existing
     strategy order for the same symbol/market (reuse, amend, or cancel +
     submit), emit audit events with the intent's frozen parameter snapshot,
     and clear recovery alerts.
+
+    Round 59 — the reuse / amend / submit decision is delegated to
+    :func:`_classify_live_order_reconciliation` which returns a typed
+    :class:`LiveOrderReconciliation`; this dispatcher only acts on the
+    classification.
     """
     strategy_id = intent.strategy_id
     strategy_name = intent.strategy_name
@@ -7007,14 +7081,13 @@ def _dispatch_live_intent(intent: ExecutionIntent) -> StrategyExecutionResult:
         and item.symbol == snapshot_symbol
         and item.market == snapshot_market
     ]
-    matching_order = next((item for item in existing_strategy_orders if item.side == side), None)
-    stale_orders = [
-        item
-        for item in existing_strategy_orders
-        if matching_order is None or item.order_id != matching_order.order_id
-    ]
+    reconciliation = _classify_live_order_reconciliation(
+        intent,
+        existing_strategy_orders,
+        requires_reduce_only=_execution_preview_requires_reduce_only(preview),
+    )
 
-    for stale_order in stale_orders:
+    for stale_order in reconciliation.stale_orders:
         cancel_exchange_order(stale_order.order_id, requested_by, resolved_mode)
         repo.add_event(
             event_type="strategy.exchange_order.cancelled_stale",
@@ -7033,59 +7106,58 @@ def _dispatch_live_intent(intent: ExecutionIntent) -> StrategyExecutionResult:
             parameter_snapshot=parameter_snapshot,
         )
 
-    preview_requires_reduce_only = _execution_preview_requires_reduce_only(preview)
-    if matching_order is not None:
-        if _exchange_order_matches_requested_target(
-            matching_order,
-            quantity,
-            price,
-            require_reduce_only=preview_requires_reduce_only,
-        ):
-            _clear_strategy_manual_execution_alerts(
-                strategy_id,
-                resolved_mode,
-                resolution_detail="后续真实手动策略执行已恢复成功，旧的拦截提醒已收起。",
-            )
-            _clear_strategy_exchange_rejected_alerts(
-                strategy_id,
-                resolution_detail="当前真实策略委托已重新进入有效状态，拒单提醒已收起。",
-            )
-            _clear_strategy_exchange_rejection_guard_alerts(
-                strategy_id,
-                resolution_detail="当前真实策略委托已重新进入有效状态，连续拒单熔断已收起。",
-            )
-            _clear_strategy_stale_order_alerts(
-                strategy_id,
-                resolution_detail="当前真实策略委托已重新进入有效状态，停滞挂单提醒已收起。",
-            )
-            repo.add_event(
-                event_type="strategy.exchange_order.reused_existing",
-                source="quant-core",
-                severity=EventSeverity.INFO,
-                payload={
-                    "strategy_id": strategy_id,
-                    "strategy_name": strategy_name,
-                    "symbol": snapshot_symbol,
-                    "mode": resolved_mode.value,
-                    "order_id": matching_order.order_id,
-                    "quantity": quantity,
-                    "price": price,
-                    "requested_by": requested_by,
-                },
-                symbol=snapshot_symbol,
-                strategy_id=strategy_id,
-                parameter_snapshot=parameter_snapshot,
-            )
-            repo._persist()  # type: ignore[attr-defined]
-            return StrategyExecutionResult(
-                kind="exchange_order",
-                strategy_id=strategy_id,
-                mode=resolved_mode,
-                preview=preview,
-                order=matching_order,
-                message=f"{strategy_name} 当前真实策略委托已经与最新信号一致，无需改单。",
-                generated_at=datetime.now(timezone.utc).astimezone().isoformat(),
-            )
+    if reconciliation.action == "reuse":
+        matching_order = reconciliation.matching_order
+        assert matching_order is not None  # invariant: classifier sets it on reuse
+        _clear_strategy_manual_execution_alerts(
+            strategy_id,
+            resolved_mode,
+            resolution_detail="后续真实手动策略执行已恢复成功，旧的拦截提醒已收起。",
+        )
+        _clear_strategy_exchange_rejected_alerts(
+            strategy_id,
+            resolution_detail="当前真实策略委托已重新进入有效状态，拒单提醒已收起。",
+        )
+        _clear_strategy_exchange_rejection_guard_alerts(
+            strategy_id,
+            resolution_detail="当前真实策略委托已重新进入有效状态，连续拒单熔断已收起。",
+        )
+        _clear_strategy_stale_order_alerts(
+            strategy_id,
+            resolution_detail="当前真实策略委托已重新进入有效状态，停滞挂单提醒已收起。",
+        )
+        repo.add_event(
+            event_type="strategy.exchange_order.reused_existing",
+            source="quant-core",
+            severity=EventSeverity.INFO,
+            payload={
+                "strategy_id": strategy_id,
+                "strategy_name": strategy_name,
+                "symbol": snapshot_symbol,
+                "mode": resolved_mode.value,
+                "order_id": matching_order.order_id,
+                "quantity": quantity,
+                "price": price,
+                "requested_by": requested_by,
+            },
+            symbol=snapshot_symbol,
+            strategy_id=strategy_id,
+            parameter_snapshot=parameter_snapshot,
+        )
+        repo._persist()  # type: ignore[attr-defined]
+        return StrategyExecutionResult(
+            kind="exchange_order",
+            strategy_id=strategy_id,
+            mode=resolved_mode,
+            preview=preview,
+            order=matching_order,
+            message=f"{strategy_name} 当前真实策略委托已经与最新信号一致，无需改单。",
+            generated_at=datetime.now(timezone.utc).astimezone().isoformat(),
+        )
+
+    if reconciliation.action == "amend":
+        matching_order = reconciliation.matching_order
+        assert matching_order is not None  # invariant: classifier sets it on amend
         order = replace_exchange_order(
             matching_order.order_id,
             quantity,
@@ -7139,6 +7211,7 @@ def _dispatch_live_intent(intent: ExecutionIntent) -> StrategyExecutionResult:
             generated_at=datetime.now(timezone.utc).astimezone().isoformat(),
         )
 
+    # reconciliation.action == "submit"
     order = submit_exchange_order(
         ManualOrderRequest(
             symbol=snapshot_symbol,

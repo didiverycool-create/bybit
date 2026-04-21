@@ -1446,6 +1446,27 @@ class ExecutionIntent(BaseModel):
     created_at: str
 
 
+# Round 59 — ``LiveOrderReconciliation`` captures the outcome of comparing a
+# frozen :class:`ExecutionIntent` against the pre-existing strategy orders on
+# the exchange.  Before R59, ``_dispatch_live_intent`` interleaved the
+# "which branch?" decision with the "act on the decision" side effects, so
+# the 3-way branch (reuse / amend / submit) could not be inspected or tested
+# in isolation.  Wrapping the decision in a typed record — in the same
+# shape as R58's :class:`RiskDecision` — freezes the reconciliation verdict,
+# the machine-readable reason code, the matched order (if any) and the
+# stale orders that must be cancelled before the chosen action runs.
+LiveOrderAction = Literal["reuse", "amend", "submit"]
+
+
+class LiveOrderReconciliation(BaseModel):
+    action: LiveOrderAction
+    reason_code: str
+    reason_detail: Optional[str] = None
+    matching_order: Optional[OrderRecord] = None
+    stale_orders: List[OrderRecord] = Field(default_factory=list)
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
 class ClosePaperPositionPayload(BaseModel):
     requested_by: str = "desktop_operator"
 

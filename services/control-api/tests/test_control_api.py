@@ -21617,5 +21617,182 @@ class ExecutionIntentRound57UnitTests(unittest.TestCase):
         self.assertEqual(intent.parameter_snapshot.get("fast_ma"), 21)
 
 
+class LiveOrderReconciliationRound59UnitTests(unittest.TestCase):
+    """Round 59 — ``LiveOrderReconciliation`` + ``_classify_live_order_reconciliation``
+    regression suite.
+
+    Before R59 the reuse / amend / submit decision was interleaved with side
+    effects inside ``_dispatch_live_intent``, so the branching couldn't be
+    asserted without the full runtime stack.  The classifier is now a pure
+    function whose typed decision is frozen here against four invariants:
+
+    * **submit** — no existing order on the requested side (stale orders on
+      the opposite side are still surfaced for cancellation).
+    * **reuse** — existing order matches target on quantity + price (and
+      ``reduce_only`` when required).
+    * **amend (numeric)** — existing order differs on quantity or price.
+    * **amend (reduce_only)** — existing order matches on qty + price but
+      lacks the ``reduce_only`` flag that the preview requires.
+    """
+
+    def _order(
+        self,
+        *,
+        order_id: str,
+        side: Direction = Direction.BUY,
+        qty: str = "0.25",
+        price: str = "42100.00",
+    ):
+        from models import OrderRecord
+
+        return OrderRecord(
+            source="bybit_private",
+            origin="strategy",
+            strategy_id="intent-r59-01",
+            order_id=order_id,
+            symbol="BTCUSDT",
+            market="perp",
+            side=side,
+            order_type="limit",
+            qty=qty,
+            price=price,
+            status="new",
+            created_at="2026-04-22T08:00:00+08:00",
+        )
+
+    def _intent(
+        self,
+        *,
+        side: Direction = Direction.BUY,
+        quantity: float = 0.25,
+        price: float = 42_100.0,
+    ):
+        from models import (
+            ExecutionIntent,
+            ExecutionPreview,
+        )
+        from risk_decision import evaluate_risk_decision
+
+        preview = ExecutionPreview(
+            symbol="BTCUSDT",
+            market="perp",
+            mode=AccountMode.LIVE,
+            side=side,
+            origin="strategy",
+            quantity=quantity,
+            price=price,
+            notional=f"{quantity * price:.2f}",
+            action="开多" if side == Direction.BUY else "开空",
+            allowed=True,
+            warnings=[],
+            current_position_size="0",
+            current_avg_price="--",
+            projected_position_size=str(quantity),
+            projected_avg_price=str(price),
+            available_balance_before="50000.00",
+            available_balance_after="39475.00",
+            estimated_realized_pnl="--",
+            generated_at="2026-04-22T08:00:00+08:00",
+        )
+        return ExecutionIntent(
+            strategy_id="intent-r59-01",
+            strategy_name="ReconHarness",
+            source="auto",
+            mode=AccountMode.LIVE,
+            symbol="BTCUSDT",
+            market="perp",
+            side=side,
+            quantity=quantity,
+            price=price,
+            signal="long",
+            preview=preview,
+            decision=evaluate_risk_decision(preview),
+            parameter_snapshot={},
+            requested_by="strategy_runtime_worker",
+            note=None,
+            created_at="2026-04-22T08:00:00+08:00",
+        )
+
+    def test_submit_when_no_matching_order_exists(self) -> None:
+        """An empty order book surfaces as ``action="submit"`` with the
+        ``order.no_existing_match`` reason; opposite-side orders are carried
+        through as stale so the dispatcher cancels them before submit.
+        """
+
+        intent = self._intent(side=Direction.BUY)
+        opposite = self._order(order_id="opp-01", side=Direction.SELL)
+
+        recon = control_main._classify_live_order_reconciliation(
+            intent, [opposite], requires_reduce_only=False,
+        )
+
+        self.assertEqual(recon.action, "submit")
+        self.assertEqual(recon.reason_code, "order.no_existing_match")
+        self.assertIsNone(recon.matching_order)
+        self.assertEqual([o.order_id for o in recon.stale_orders], ["opp-01"])
+
+    def test_reuse_when_matching_order_matches_target(self) -> None:
+        """A same-side order whose qty + price match the intent surfaces as
+        ``action="reuse"`` with reason ``order.matches_target``.  Any
+        opposite-side orders are kept as stale for cancellation.
+        """
+
+        intent = self._intent(side=Direction.BUY, quantity=0.25, price=42_100.0)
+        matching = self._order(order_id="match-01", side=Direction.BUY, qty="0.25", price="42100.00")
+        opposite = self._order(order_id="opp-01", side=Direction.SELL)
+
+        recon = control_main._classify_live_order_reconciliation(
+            intent, [matching, opposite], requires_reduce_only=False,
+        )
+
+        self.assertEqual(recon.action, "reuse")
+        self.assertEqual(recon.reason_code, "order.matches_target")
+        assert recon.matching_order is not None
+        self.assertEqual(recon.matching_order.order_id, "match-01")
+        self.assertEqual([o.order_id for o in recon.stale_orders], ["opp-01"])
+
+    def test_amend_with_numeric_reason_when_quantity_or_price_differs(self) -> None:
+        """A same-side order that differs on quantity (or price) surfaces as
+        ``action="amend"`` with reason ``order.differs_numeric``.
+        """
+
+        intent = self._intent(side=Direction.BUY, quantity=0.25, price=42_100.0)
+        # quantity differs (0.50 vs 0.25)
+        diff_qty = self._order(order_id="amend-qty", side=Direction.BUY, qty="0.50", price="42100.00")
+
+        recon = control_main._classify_live_order_reconciliation(
+            intent, [diff_qty], requires_reduce_only=False,
+        )
+
+        self.assertEqual(recon.action, "amend")
+        self.assertEqual(recon.reason_code, "order.differs_numeric")
+        assert recon.matching_order is not None
+        self.assertEqual(recon.matching_order.order_id, "amend-qty")
+
+    def test_amend_with_reduce_only_reason_when_flag_required_but_absent(self) -> None:
+        """When qty + price match but the preview requires ``reduce_only`` and
+        the underlying private order lacks the flag,
+        ``_exchange_order_matches_requested_target`` returns False and the
+        classifier must surface reason ``order.requires_reduce_only`` so the
+        audit trail can distinguish a flag toggle from a true numeric diff.
+        """
+
+        intent = self._intent(side=Direction.BUY, quantity=0.25, price=42_100.0)
+        matching = self._order(order_id="match-reduce", side=Direction.BUY, qty="0.25", price="42100.00")
+
+        # Patch the raw-private lookup so ``_exchange_order_matches_requested_target``
+        # treats the matching order as lacking the reduce_only flag.
+        with patch.object(control_main, "_find_private_raw_open_order", return_value=None), \
+             patch.object(control_main, "_raw_private_order_reduce_only_enabled", return_value=False):
+            recon = control_main._classify_live_order_reconciliation(
+                intent, [matching], requires_reduce_only=True,
+            )
+
+        self.assertEqual(recon.action, "amend")
+        self.assertEqual(recon.reason_code, "order.requires_reduce_only")
+        assert recon.matching_order is not None
+        self.assertEqual(recon.matching_order.order_id, "match-reduce")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
