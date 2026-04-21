@@ -22229,5 +22229,128 @@ class AutoDispatchGateRound60UnitTests(unittest.TestCase):
         self.assertFalse(gate.record_issue)
 
 
+class AutoDispatchOutcomeRound61UnitTests(unittest.TestCase):
+    """Round 61 — ``AutoDispatchOutcome`` + ``_classify_auto_dispatch_outcome``
+    regression suite.
+
+    Before R61 the autonomous dispatch loop used a ``try/except`` with
+    three inlined recovery branches (noop / blocked / failed), so the
+    outcome classification was interleaved with audit side effects.
+    The classifier is now a pure function whose typed decision is
+    frozen here against five invariants:
+
+    * ``dispatched`` — dispatcher returns cleanly.
+    * ``noop`` — ``RuntimeError`` carrying ``"无需再次提交委托"``.
+    * ``blocked`` — :class:`StrategyExecutionBlockedError` with
+      ``recommended_action``.
+    * ``failed`` (RuntimeError path) — plain ``RuntimeError`` without
+      the noop sentinel.
+    * ``failed`` (generic exception path) — any other ``Exception``.
+
+    Side-effect flags (``clear_alerts`` / ``emit_noop_event`` /
+    ``record_issue``) must be frozen too: they are what the dispatcher
+    loop runs on each outcome, so a silent flag drift would break
+    the audit trail.
+    """
+
+    def test_dispatched_outcome_when_no_exception_raised(self) -> None:
+        """A successful dispatcher call returns no exception, so the
+        classifier must surface ``verdict="dispatched"`` with reason
+        ``auto.dispatch.success``, ``clear_alerts=True``, and the other
+        side-effect flags off.
+        """
+
+        outcome = control_main._classify_auto_dispatch_outcome(None)
+
+        self.assertEqual(outcome.verdict, "dispatched")
+        self.assertEqual(outcome.reason_code, "auto.dispatch.success")
+        self.assertTrue(outcome.clear_alerts)
+        self.assertFalse(outcome.emit_noop_event)
+        self.assertFalse(outcome.record_issue)
+        self.assertIsNone(outcome.recommended_action)
+
+    def test_noop_outcome_recognised_from_runtime_error_substring(self) -> None:
+        """``RuntimeError`` whose detail carries ``"无需再次提交委托"`` is
+        the pre-R61 pattern for "the dispatcher concluded nothing needed
+        to happen".  The classifier must emit ``verdict="noop"`` with
+        ``emit_noop_event=True`` so the audit trail still records why the
+        loop iteration did not fire an order.
+        """
+
+        exc = RuntimeError("当前挂单已与目标一致，无需再次提交委托。")
+
+        outcome = control_main._classify_auto_dispatch_outcome(exc)
+
+        self.assertEqual(outcome.verdict, "noop")
+        self.assertEqual(outcome.reason_code, "auto.dispatch.noop")
+        self.assertIn("无需再次提交委托", outcome.reason_detail)
+        self.assertTrue(outcome.clear_alerts)
+        self.assertTrue(outcome.emit_noop_event)
+        self.assertFalse(outcome.record_issue)
+
+    def test_blocked_outcome_carries_recommended_action(self) -> None:
+        """A :class:`StrategyExecutionBlockedError` must surface as
+        ``verdict="blocked"`` and propagate ``exc.recommended_action``
+        through ``outcome.recommended_action`` — that is the contract the
+        operator console relies on to render a next-step button.
+        """
+
+        exc = control_main.StrategyExecutionBlockedError(
+            "当前 Live 余额不足，暂缓自动执行。",
+            recommended_action="请先补充 Live 可用余额。",
+        )
+
+        outcome = control_main._classify_auto_dispatch_outcome(exc)
+
+        self.assertEqual(outcome.verdict, "blocked")
+        self.assertEqual(outcome.reason_code, "auto.dispatch.blocked")
+        self.assertEqual(outcome.recommended_action, "请先补充 Live 可用余额。")
+        self.assertFalse(outcome.clear_alerts)
+        self.assertFalse(outcome.emit_noop_event)
+        self.assertTrue(outcome.record_issue)
+
+    def test_failed_outcome_from_plain_runtime_error(self) -> None:
+        """A plain ``RuntimeError`` that is neither a noop nor a
+        ``StrategyExecutionBlockedError`` must surface as
+        ``verdict="failed"`` with ``reason_code="auto.dispatch.failed"``
+        and no ``recommended_action`` — R61 preserves the pre-existing
+        contract that operators must handle generic failures without a
+        canned next-step hint.
+        """
+
+        exc = RuntimeError("私有通道暂时不可用，请稍后重试。")
+
+        outcome = control_main._classify_auto_dispatch_outcome(exc)
+
+        self.assertEqual(outcome.verdict, "failed")
+        self.assertEqual(outcome.reason_code, "auto.dispatch.failed")
+        self.assertEqual(outcome.reason_detail, "私有通道暂时不可用，请稍后重试。")
+        self.assertIsNone(outcome.recommended_action)
+        self.assertFalse(outcome.clear_alerts)
+        self.assertFalse(outcome.emit_noop_event)
+        self.assertTrue(outcome.record_issue)
+
+    def test_failed_outcome_from_generic_exception_keeps_worker_loop_alive(self) -> None:
+        """A non-``RuntimeError`` exception must not propagate out of the
+        autonomous worker.  The classifier converts it into
+        ``verdict="failed"`` with ``reason_detail`` prefixed by
+        ``"后台自动执行异常："`` so the audit trail records the original
+        exception text — this is the pre-R61 defensive contract.
+        """
+
+        exc = ValueError("unexpected state machine transition")
+
+        outcome = control_main._classify_auto_dispatch_outcome(exc)
+
+        self.assertEqual(outcome.verdict, "failed")
+        self.assertEqual(outcome.reason_code, "auto.dispatch.failed")
+        self.assertTrue(outcome.reason_detail.startswith("后台自动执行异常："))
+        self.assertIn("unexpected state machine transition", outcome.reason_detail)
+        self.assertIsNone(outcome.recommended_action)
+        self.assertFalse(outcome.clear_alerts)
+        self.assertFalse(outcome.emit_noop_event)
+        self.assertTrue(outcome.record_issue)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

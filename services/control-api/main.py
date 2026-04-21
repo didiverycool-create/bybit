@@ -111,6 +111,7 @@ from models import (
     AgentJobCreate,
     AiLiveSnapshot,
     AutoDispatchGate,
+    AutoDispatchOutcome,
     BybitBalanceDiagnostic,
     BybitPublicStatus,
     BybitPublicSymbolDiagnostic,
@@ -7575,6 +7576,7 @@ def _auto_dispatch_strategy_signal_changes(
             )
             _clear_strategy_auto_dispatch_alerts(snapshot.strategy_id)
             continue
+        caught: Optional[BaseException] = None
         try:
             _dispatch_strategy_signal_from_state(
                 snapshot.strategy_id,
@@ -7584,50 +7586,108 @@ def _auto_dispatch_strategy_signal_changes(
                     mode=strategy.mode,
                 ),
             )
-            _clear_strategy_auto_dispatch_alerts(snapshot.strategy_id)
-        except RuntimeError as exc:
-            detail = str(exc)
-            if "无需再次提交委托" in detail:
-                _clear_strategy_auto_dispatch_alerts(snapshot.strategy_id)
-                repo.add_event(
-                    event_type="strategy.exchange_order.auto_noop",
-                    source="quant-core",
-                    severity=EventSeverity.INFO,
-                    payload={
-                        "strategy_id": snapshot.strategy_id,
-                        "strategy_name": snapshot.strategy_name,
-                        "symbol": snapshot.symbol,
-                        "signal": snapshot.signal,
-                        "mode": strategy.mode.value,
-                        "detail": detail,
-                    },
-                    symbol=snapshot.symbol,
-                    strategy_id=snapshot.strategy_id,
-                    parameter_snapshot=parameter_resolver.snapshot_parameters(strategy),
-                )
-                repo._persist()  # type: ignore[attr-defined]
-                continue
-            recommended_action = exc.recommended_action if isinstance(exc, StrategyExecutionBlockedError) else None
-            _record_strategy_auto_dispatch_issue(
-                snapshot.strategy_id,
-                snapshot.strategy_name,
-                snapshot.symbol,
-                snapshot.signal,
-                strategy.mode,
-                detail,
-                recommended_action=recommended_action,
-                strategy=strategy,
-            )
         except Exception as exc:  # pragma: no cover - defensive guard for background worker
+            caught = exc
+        outcome = _classify_auto_dispatch_outcome(caught)
+        if outcome.clear_alerts:
+            _clear_strategy_auto_dispatch_alerts(snapshot.strategy_id)
+        if outcome.emit_noop_event:
+            repo.add_event(
+                event_type="strategy.exchange_order.auto_noop",
+                source="quant-core",
+                severity=EventSeverity.INFO,
+                payload={
+                    "strategy_id": snapshot.strategy_id,
+                    "strategy_name": snapshot.strategy_name,
+                    "symbol": snapshot.symbol,
+                    "signal": snapshot.signal,
+                    "mode": strategy.mode.value,
+                    "detail": outcome.reason_detail,
+                },
+                symbol=snapshot.symbol,
+                strategy_id=snapshot.strategy_id,
+                parameter_snapshot=parameter_resolver.snapshot_parameters(strategy),
+            )
+            repo._persist()  # type: ignore[attr-defined]
+        if outcome.record_issue:
             _record_strategy_auto_dispatch_issue(
                 snapshot.strategy_id,
                 snapshot.strategy_name,
                 snapshot.symbol,
                 snapshot.signal,
                 strategy.mode,
-                f"后台自动执行异常：{exc}",
+                outcome.reason_detail,
+                recommended_action=outcome.recommended_action,
                 strategy=strategy,
             )
+
+
+# Round 61 — ``_classify_auto_dispatch_outcome`` classifies the terminal
+# result of an autonomous dispatch call into a typed
+# :class:`AutoDispatchOutcome`.  Four verdicts + reason codes:
+#
+# * ``dispatched`` / ``auto.dispatch.success`` — dispatcher returned without
+#   raising; clear any lingering auto-dispatch alerts.
+# * ``noop`` / ``auto.dispatch.noop`` — ``RuntimeError`` whose detail carries
+#   ``"无需再次提交委托"``; emit an audit noop event + clear alerts.
+# * ``blocked`` / ``auto.dispatch.blocked`` — a
+#   :class:`StrategyExecutionBlockedError`; record the issue carrying the
+#   attached ``recommended_action`` so the operator console can render it.
+# * ``failed`` / ``auto.dispatch.failed`` — any other ``RuntimeError`` (and,
+#   defensively, any other ``Exception``); record the issue without a
+#   ``recommended_action``.
+def _classify_auto_dispatch_outcome(exc: Optional[BaseException]) -> AutoDispatchOutcome:
+    if exc is None:
+        return AutoDispatchOutcome(
+            verdict="dispatched",
+            reason_code="auto.dispatch.success",
+            reason_detail="",
+            recommended_action=None,
+            clear_alerts=True,
+            emit_noop_event=False,
+            record_issue=False,
+        )
+    if isinstance(exc, RuntimeError):
+        detail = str(exc)
+        if "无需再次提交委托" in detail:
+            return AutoDispatchOutcome(
+                verdict="noop",
+                reason_code="auto.dispatch.noop",
+                reason_detail=detail,
+                recommended_action=None,
+                clear_alerts=True,
+                emit_noop_event=True,
+                record_issue=False,
+            )
+        if isinstance(exc, StrategyExecutionBlockedError):
+            return AutoDispatchOutcome(
+                verdict="blocked",
+                reason_code="auto.dispatch.blocked",
+                reason_detail=detail,
+                recommended_action=exc.recommended_action,
+                clear_alerts=False,
+                emit_noop_event=False,
+                record_issue=True,
+            )
+        return AutoDispatchOutcome(
+            verdict="failed",
+            reason_code="auto.dispatch.failed",
+            reason_detail=detail,
+            recommended_action=None,
+            clear_alerts=False,
+            emit_noop_event=False,
+            record_issue=True,
+        )
+    return AutoDispatchOutcome(
+        verdict="failed",
+        reason_code="auto.dispatch.failed",
+        reason_detail=f"后台自动执行异常：{exc}",
+        recommended_action=None,
+        clear_alerts=False,
+        emit_noop_event=False,
+        record_issue=True,
+    )
+
 
 def refresh_strategy_runtime_once(auto_dispatch: bool = False) -> List[StrategyRuntimeSnapshot]:
     state = repo.snapshot()

@@ -1489,6 +1489,32 @@ class AutoDispatchGate(BaseModel):
     timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
+# Round 61 — ``AutoDispatchOutcome`` captures the terminal result of a
+# single autonomous ``_dispatch_strategy_signal_from_state`` call inside
+# ``_auto_dispatch_strategy_signal_changes``.  Before R61 the try/except
+# had four side-effect branches: success (clear alerts), RuntimeError
+# carrying ``"无需再次提交委托"`` (noop event + clear alerts),
+# :class:`StrategyExecutionBlockedError` (record issue with
+# ``recommended_action``), other ``RuntimeError`` (record issue with
+# detail), and the catch-all ``Exception`` (record issue with generic
+# detail).  Wrapping the verdict in a typed record — same shape as
+# R60's :class:`AutoDispatchGate` — makes every outcome individually
+# unit-testable and pins the side effects the dispatcher must run on
+# each verdict.
+AutoDispatchOutcomeVerdict = Literal["dispatched", "noop", "blocked", "failed"]
+
+
+class AutoDispatchOutcome(BaseModel):
+    verdict: AutoDispatchOutcomeVerdict
+    reason_code: str
+    reason_detail: str = ""
+    recommended_action: Optional[str] = None
+    clear_alerts: bool = False
+    emit_noop_event: bool = False
+    record_issue: bool = False
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
 class ClosePaperPositionPayload(BaseModel):
     requested_by: str = "desktop_operator"
 
