@@ -6883,6 +6883,7 @@ def _dispatch_strategy_signal_from_state(strategy_id: str, payload: StrategyExec
             resolved_mode,
             detail,
             recommended_action=recommended_action,
+            strategy=strategy,
         )
 
     if resolved_mode == AccountMode.PAPER:

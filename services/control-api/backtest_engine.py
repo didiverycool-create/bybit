@@ -2769,7 +2769,13 @@ def run_local_backtest(strategy: StrategySummary, candles: List[CandlePoint], ti
     return BacktestComputation(
         metrics=metrics,
         notes=notes,
-        parameter_snapshot=params,
+        # Round 55 — the numeric ``params`` dict that the kernel runners
+        # consume lacks the bool opt-in toggles and the ``kernel`` selector
+        # that ``parameter_resolver.snapshot_parameters`` returns. Switching
+        # to the canonical snapshot here aligns the BacktestRun / backtest
+        # audit trail with the live / paper execution snapshot so future
+        # diffing tools can compare them bit-for-bit without a subset caveat.
+        parameter_snapshot=parameter_resolver.snapshot_parameters(strategy),
         symbol_scope=list(strategy.symbols),
         data_granularity="kline",
         reference_only=used_reference_path,
