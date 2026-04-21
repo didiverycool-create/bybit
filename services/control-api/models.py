@@ -1412,6 +1412,40 @@ class StrategyExecutionResult(BaseModel):
     generated_at: str
 
 
+# Round 57 — ``ExecutionIntent`` is the canonical handoff between the two
+# strategy-signal entry points (manual "Execute" button / REST POST, and the
+# autonomous strategy-runtime worker) and the shared dispatcher that converts
+# an intent into either a Paper ``TradeRecord`` or a Live ``OrderRecord``.
+#
+# The intent freezes everything the downstream dispatcher needs so the Paper
+# and Live branches no longer have to re-derive state from ``repo.snapshot()``:
+# the ``preview`` (numeric fields), the ``decision`` (R58 verdict + reason
+# code), and the ``parameter_snapshot`` (R51+ frozen parameters) travel
+# together.  ``source`` discriminates manual vs. autonomous dispatch so the
+# dispatcher can pick the right audit emission / alert-clear semantics
+# without re-parsing ``requested_by``.
+ExecutionIntentSource = Literal["manual", "auto"]
+
+
+class ExecutionIntent(BaseModel):
+    strategy_id: str
+    strategy_name: str
+    source: ExecutionIntentSource
+    mode: AccountMode
+    symbol: str
+    market: Literal["spot", "perp"]
+    side: Direction
+    quantity: float
+    price: float
+    signal: str
+    preview: ExecutionPreview
+    decision: RiskDecision
+    parameter_snapshot: Dict[str, Any]
+    requested_by: str
+    note: Optional[str] = None
+    created_at: str
+
+
 class ClosePaperPositionPayload(BaseModel):
     requested_by: str = "desktop_operator"
 

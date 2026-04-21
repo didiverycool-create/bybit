@@ -31,6 +31,7 @@ from models import (
     ChangeRequestStatus,
     Direction,
     ExecutionImpactRecord,
+    ExecutionIntent,
     ExecutionPreview,
     ExecutionPreviewRequest,
     EventSeverity,
@@ -59,6 +60,7 @@ from models import (
 )
 import parameter_resolver
 from datetime_utils import parse_optional_iso_datetime
+from risk_decision import evaluate_risk_decision
 from risk_guards import evaluate_paper_order_risk
 from seed import build_market_detail_for_watchlist, build_state
 
@@ -5789,6 +5791,17 @@ class AppRepository:
             }
 
     def execute_strategy_signal(self, strategy_id: str, requested_by: str, note: Optional[str] = None) -> TradeRecord:
+        """Public entry point for Paper strategy signal execution.
+
+        Round 57 — responsibilities split between this facade (state
+        discovery + guard rails + ``ExecutionIntent`` assembly) and the locked
+        helper ``_execute_strategy_signal_from_intent_locked`` (actual trade
+        creation + snapshot / audit persistence).  The facade holds the lock
+        so the snapshot + preview read used to build the intent cannot race
+        against concurrent state mutations; the locked helper continues under
+        the same ``with self._lock`` block so persistence is atomic with the
+        intent construction.
+        """
         with self._lock:
             strategy = self._find_strategy(strategy_id)
             if not (strategy.mode == AccountMode.PAPER or strategy.status == "paper_only"):
@@ -5806,44 +5819,83 @@ class AppRepository:
             if not preview.allowed:
                 raise ValueError(preview.blocked_reason or "当前策略纸面执行预估未通过。")
 
-            # Round B — freeze the parameter snapshot at dispatch time so the
-            # audit event records exactly what was in effect when the signal
-            # was realised. Reads through ``parameter_resolver`` so the runtime
-            # evaluator, the backtest runner and this execution path cannot
-            # disagree on which value "won" (top-level scalar vs legacy row).
+            # Round 57 — build the canonical ``ExecutionIntent`` once and
+            # delegate to the locked helper so the repo's Paper dispatch path
+            # shares the same immutable hand-off contract as the runtime
+            # dispatcher in ``main.py``.  The embedded ``decision`` is re-run
+            # here (on the same preview the caller evaluated) to keep this
+            # repo-level entry point self-contained for callers that invoke
+            # it outside the main dispatcher.
             frozen_parameters = parameter_resolver.snapshot_parameters(strategy)
-            trade = self._create_strategy_trade_locked(
+            intent = ExecutionIntent(
                 strategy_id=strategy_id,
+                strategy_name=strategy.name,
+                source=(
+                    "auto"
+                    if (requested_by or "").strip() == "strategy_runtime_worker"
+                    else "manual"
+                ),
+                mode=strategy.mode,
                 symbol=snapshot.symbol,
                 market=snapshot.market,
                 side=preview.side,
+                quantity=preview.quantity,
                 price=preview.price,
-                quantity_override=preview.quantity,
-                note=note or snapshot.next_action or f"{snapshot.strategy_name} 人工执行当前纸面信号。",
-                event_type="strategy.paper_trade.executed_manual",
-                requested_by=requested_by,
+                signal=snapshot.signal,
+                preview=preview,
+                decision=evaluate_risk_decision(preview),
                 parameter_snapshot=frozen_parameters,
+                requested_by=requested_by,
+                note=note,
+                created_at=datetime.now(timezone.utc).astimezone().isoformat(),
             )
-            if trade is None:
-                raise ValueError("当前策略纸面执行被风控拦截。")
+            return self._execute_strategy_signal_from_intent_locked(intent, snapshot=snapshot)
 
-            next_snapshots: list[StrategyRuntimeSnapshot] = []
-            for item in self.state.strategy_runtime_snapshots:
-                if item.strategy_id == strategy_id:
-                    next_snapshots.append(
-                        item.model_copy(
-                            update={
-                                "last_trade_id": trade.id,
-                                "last_trade_at": trade.created_at,
-                            }
-                        )
+    def _execute_strategy_signal_from_intent_locked(
+        self,
+        intent: ExecutionIntent,
+        *,
+        snapshot: StrategyRuntimeSnapshot,
+    ) -> TradeRecord:
+        """Realise a Paper ``ExecutionIntent`` into a persisted ``TradeRecord``.
+
+        Must be called with ``self._lock`` held.  Freezes the audit parameter
+        snapshot from the intent (R51+), creates the strategy trade, and
+        updates the runtime snapshot's ``last_trade_*`` pointers in-place so
+        the UI reflects the realised fill without a full refresh.
+        """
+        trade = self._create_strategy_trade_locked(
+            strategy_id=intent.strategy_id,
+            symbol=intent.symbol,
+            market=intent.market,
+            side=intent.side,
+            price=intent.price,
+            quantity_override=intent.quantity,
+            note=intent.note or snapshot.next_action or f"{intent.strategy_name} 人工执行当前纸面信号。",
+            event_type="strategy.paper_trade.executed_manual",
+            requested_by=intent.requested_by,
+            parameter_snapshot=intent.parameter_snapshot,
+        )
+        if trade is None:
+            raise ValueError("当前策略纸面执行被风控拦截。")
+
+        next_snapshots: list[StrategyRuntimeSnapshot] = []
+        for item in self.state.strategy_runtime_snapshots:
+            if item.strategy_id == intent.strategy_id:
+                next_snapshots.append(
+                    item.model_copy(
+                        update={
+                            "last_trade_id": trade.id,
+                            "last_trade_at": trade.created_at,
+                        }
                     )
-                else:
-                    next_snapshots.append(item)
-            self.state.strategy_runtime_snapshots = next_snapshots
-            self._refresh_derived_state()
-            self._persist()
-            return trade.model_copy(deep=True)
+                )
+            else:
+                next_snapshots.append(item)
+        self.state.strategy_runtime_snapshots = next_snapshots
+        self._refresh_derived_state()
+        self._persist()
+        return trade.model_copy(deep=True)
 
     def apply_reconcile_change_request_outcome(
         self,

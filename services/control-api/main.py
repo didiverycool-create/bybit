@@ -122,6 +122,7 @@ from models import (
     ClosePaperPositionPayload,
     Direction,
     ExecutionImpactRecord,
+    ExecutionIntent,
     ExecutionPreview,
     ExecutionPreviewRequest,
     ExchangePositionBulkCloseResult,
@@ -6886,75 +6887,125 @@ def _apply_live_strategy_stop_loss_guards(current_items: List[StrategyRuntimeSna
             cancelled_count=cancelled_count,
         )
 
-def _dispatch_strategy_signal_from_state(strategy_id: str, payload: StrategyExecutionRequest) -> StrategyExecutionResult:
-    preview = _build_strategy_execution_preview_from_state(strategy_id, payload.mode)
-    # Round 58 — wrap the preview in a structured ``RiskDecision`` so every
-    # downstream branch inspects a typed ``verdict`` + machine-readable
-    # ``reason_code`` instead of ad-hoc ``preview.allowed`` / substring checks
-    # on ``preview.blocked_reason``.  The embedded ``decision.preview`` keeps
-    # numeric fields readable for the ``StrategyExecutionResult`` payload.
-    decision = evaluate_risk_decision(preview)
-    state = repo.snapshot()
-    resolved_mode = payload.mode or state.workspace_preferences.selected_mode
-    strategy = next((item for item in state.strategies if item.id == strategy_id), None)
-    if strategy is None:
-        raise KeyError(strategy_id)
-    snapshot = next((item for item in state.strategy_runtime_snapshots if item.strategy_id == strategy_id), None)
-    if snapshot is None:
-        raise RuntimeError("当前策略运行态尚未准备好，请先刷新策略页后再试。")
+# Round 57 — the five helpers below + ``_dispatch_strategy_signal_from_state``
+# realise a strategy signal via a canonical ``ExecutionIntent`` (models.py).
+# Both entry points (manual REST ``execute_strategy_signal`` endpoint and the
+# autonomous ``_auto_dispatch_strategy_signal_changes`` worker) funnel through
+# ``_dispatch_strategy_signal_from_state`` which:
+#   (a) builds the preview + R58 ``RiskDecision`` + parameter snapshot,
+#   (b) freezes everything into an ``ExecutionIntent``, and
+#   (c) delegates to ``_dispatch_execution_intent`` which routes to the
+#       paper or live branch on ``intent.mode``.
+# Before R57 each entry point re-derived preview/decision/snapshot and the
+# paper + live branches were inlined directly into the dispatcher, so the
+# "what shape does the dispatcher take?" contract drifted between manual and
+# autonomous calls.  The intent is the single hand-off contract now.
+def _classify_execution_intent_source(payload: StrategyExecutionRequest) -> ExecutionIntentSource:
+    """Discriminator for the strategy-signal dispatcher — returns ``"auto"``
+    when the autonomous runtime worker submitted the request (its
+    ``requested_by`` is the sentinel ``"strategy_runtime_worker"``) and
+    ``"manual"`` for the REST 'Execute' button / operator-attributed call.
+    The value is frozen onto ``ExecutionIntent.source`` so downstream audit
+    emissions and the repo persistence helper can tell the two apart without
+    re-parsing ``requested_by``.
+    """
+    if (payload.requested_by or "").strip() == "strategy_runtime_worker":
+        return "auto"
+    return "manual"
 
-    def _record_manual_execution_blocked(detail: str, recommended_action: Optional[str] = None) -> None:
-        _record_strategy_manual_execution_issue(
-            strategy_id,
-            strategy.name,
-            snapshot.symbol,
-            resolved_mode,
-            detail,
-            recommended_action=recommended_action,
-            strategy=strategy,
-        )
 
-    if resolved_mode == AccountMode.PAPER:
-        if decision.verdict != "allow":
-            detail = preview.blocked_reason or decision.reason_detail or "当前策略 Paper 执行预检未通过。"
-            _record_manual_execution_blocked(detail, preview.recommended_action)
-            raise StrategyExecutionBlockedError(detail, preview.recommended_action)
-        trade = repo.execute_strategy_signal(
-            strategy_id,
-            payload.requested_by,
-            payload.note,
-        )
-        _clear_strategy_manual_execution_alerts(
-            strategy_id,
-            resolved_mode,
-            resolution_detail="后续 Paper 手动策略执行已恢复成功，旧的拦截提醒已收起。",
-        )
-        return StrategyExecutionResult(
-            kind="paper_trade",
-            strategy_id=strategy_id,
-            mode=resolved_mode,
-            preview=preview,
-            trade=trade,
-            message=f"{strategy.name} 已按当前策略信号写入 Paper 成交。",
-            generated_at=datetime.now(timezone.utc).astimezone().isoformat(),
-        )
+def _build_execution_intent_from_state(
+    *,
+    strategy_id: str,
+    payload: StrategyExecutionRequest,
+    strategy: StrategySummary,
+    snapshot: StrategyRuntimeSnapshot,
+    resolved_mode: AccountMode,
+    preview: ExecutionPreview,
+    decision: RiskDecision,
+) -> ExecutionIntent:
+    """Freeze the full dispatch context into an ``ExecutionIntent`` so the
+    paper + live branches share a single immutable contract.  Numeric fields
+    are copied from ``preview`` (side / quantity / price) rather than the
+    live ``snapshot`` to ensure the intent matches the R58 decision that the
+    guard already evaluated.  ``parameter_snapshot`` is resolved through
+    :mod:`parameter_resolver` so the frozen view matches every other R51+
+    audit surface.
+    """
+    return ExecutionIntent(
+        strategy_id=strategy_id,
+        strategy_name=strategy.name,
+        source=_classify_execution_intent_source(payload),
+        mode=resolved_mode,
+        symbol=snapshot.symbol,
+        market=snapshot.market,
+        side=preview.side,
+        quantity=preview.quantity,
+        price=preview.price,
+        signal=snapshot.signal,
+        preview=preview,
+        decision=decision,
+        parameter_snapshot=parameter_resolver.snapshot_parameters(strategy),
+        requested_by=payload.requested_by,
+        note=payload.note,
+        created_at=datetime.now(timezone.utc).astimezone().isoformat(),
+    )
 
-    if decision.verdict != "allow":
-        detail = preview.blocked_reason or decision.reason_detail or "当前策略真实模式执行预检未通过。"
-        _record_manual_execution_blocked(detail, preview.recommended_action)
-        raise StrategyExecutionBlockedError(detail, preview.recommended_action)
 
-    side = preview.side
-    quantity = preview.quantity
-    price = preview.price
+def _dispatch_paper_intent(intent: ExecutionIntent) -> StrategyExecutionResult:
+    """Realise a Paper strategy intent: delegate trade creation + parameter
+    freezing to ``repo.execute_strategy_signal`` (itself rebuilt on top of
+    ``_execute_strategy_signal_from_intent_locked`` in R57) and clear any
+    lingering manual-execution alerts so the operator sees recovery.
+    """
+    trade = repo.execute_strategy_signal(
+        intent.strategy_id,
+        intent.requested_by,
+        intent.note,
+    )
+    _clear_strategy_manual_execution_alerts(
+        intent.strategy_id,
+        intent.mode,
+        resolution_detail="后续 Paper 手动策略执行已恢复成功，旧的拦截提醒已收起。",
+    )
+    return StrategyExecutionResult(
+        kind="paper_trade",
+        strategy_id=intent.strategy_id,
+        mode=intent.mode,
+        preview=intent.preview,
+        trade=trade,
+        message=f"{intent.strategy_name} 已按当前策略信号写入 Paper 成交。",
+        generated_at=datetime.now(timezone.utc).astimezone().isoformat(),
+    )
+
+
+def _dispatch_live_intent(intent: ExecutionIntent) -> StrategyExecutionResult:
+    """Realise a Live strategy intent against Bybit: reconcile any pre-existing
+    strategy order for the same symbol/market (reuse, amend, or cancel +
+    submit), emit audit events with the intent's frozen parameter snapshot,
+    and clear recovery alerts.
+    """
+    strategy_id = intent.strategy_id
+    strategy_name = intent.strategy_name
+    resolved_mode = intent.mode
+    preview = intent.preview
+    side = intent.side
+    quantity = intent.quantity
+    price = intent.price
+    snapshot_symbol = intent.symbol
+    snapshot_market = intent.market
+    parameter_snapshot = intent.parameter_snapshot
+    requested_by = intent.requested_by
+    note = intent.note
+
     existing_strategy_orders = [
         item
         for item in parse_open_orders(use_private_only=True)
         if item.source == "bybit_private"
         and item.origin == "strategy"
         and item.strategy_id == strategy_id
-        and item.symbol == snapshot.symbol
-        and item.market == snapshot.market
+        and item.symbol == snapshot_symbol
+        and item.market == snapshot_market
     ]
     matching_order = next((item for item in existing_strategy_orders if item.side == side), None)
     stale_orders = [
@@ -6964,22 +7015,22 @@ def _dispatch_strategy_signal_from_state(strategy_id: str, payload: StrategyExec
     ]
 
     for stale_order in stale_orders:
-        cancel_exchange_order(stale_order.order_id, payload.requested_by, resolved_mode)
+        cancel_exchange_order(stale_order.order_id, requested_by, resolved_mode)
         repo.add_event(
             event_type="strategy.exchange_order.cancelled_stale",
             source="quant-core",
             severity=EventSeverity.WARNING,
             payload={
                 "strategy_id": strategy_id,
-                "strategy_name": strategy.name,
+                "strategy_name": strategy_name,
                 "symbol": stale_order.symbol,
                 "order_id": stale_order.order_id,
                 "mode": resolved_mode.value,
-                "requested_by": payload.requested_by,
+                "requested_by": requested_by,
             },
             symbol=stale_order.symbol,
             strategy_id=strategy_id,
-            parameter_snapshot=parameter_resolver.snapshot_parameters(strategy),
+            parameter_snapshot=parameter_snapshot,
         )
 
     preview_requires_reduce_only = _execution_preview_requires_reduce_only(preview)
@@ -7013,17 +7064,17 @@ def _dispatch_strategy_signal_from_state(strategy_id: str, payload: StrategyExec
                 severity=EventSeverity.INFO,
                 payload={
                     "strategy_id": strategy_id,
-                    "strategy_name": strategy.name,
-                    "symbol": snapshot.symbol,
+                    "strategy_name": strategy_name,
+                    "symbol": snapshot_symbol,
                     "mode": resolved_mode.value,
                     "order_id": matching_order.order_id,
                     "quantity": quantity,
                     "price": price,
-                    "requested_by": payload.requested_by,
+                    "requested_by": requested_by,
                 },
-                symbol=snapshot.symbol,
+                symbol=snapshot_symbol,
                 strategy_id=strategy_id,
-                parameter_snapshot=parameter_resolver.snapshot_parameters(strategy),
+                parameter_snapshot=parameter_snapshot,
             )
             repo._persist()  # type: ignore[attr-defined]
             return StrategyExecutionResult(
@@ -7032,14 +7083,14 @@ def _dispatch_strategy_signal_from_state(strategy_id: str, payload: StrategyExec
                 mode=resolved_mode,
                 preview=preview,
                 order=matching_order,
-                message=f"{strategy.name} 当前真实策略委托已经与最新信号一致，无需改单。",
+                message=f"{strategy_name} 当前真实策略委托已经与最新信号一致，无需改单。",
                 generated_at=datetime.now(timezone.utc).astimezone().isoformat(),
             )
         order = replace_exchange_order(
             matching_order.order_id,
             quantity,
             price,
-            payload.requested_by,
+            requested_by,
             resolved_mode,
         )
         _clear_strategy_manual_execution_alerts(
@@ -7065,17 +7116,17 @@ def _dispatch_strategy_signal_from_state(strategy_id: str, payload: StrategyExec
             severity=EventSeverity.INFO,
             payload={
                 "strategy_id": strategy_id,
-                "strategy_name": strategy.name,
-                "symbol": snapshot.symbol,
+                "strategy_name": strategy_name,
+                "symbol": snapshot_symbol,
                 "mode": resolved_mode.value,
                 "order_id": order.order_id,
                 "quantity": quantity,
                 "price": price,
-                "requested_by": payload.requested_by,
+                "requested_by": requested_by,
             },
-            symbol=snapshot.symbol,
+            symbol=snapshot_symbol,
             strategy_id=strategy_id,
-            parameter_snapshot=parameter_resolver.snapshot_parameters(strategy),
+            parameter_snapshot=parameter_snapshot,
         )
         repo._persist()  # type: ignore[attr-defined]
         return StrategyExecutionResult(
@@ -7084,23 +7135,23 @@ def _dispatch_strategy_signal_from_state(strategy_id: str, payload: StrategyExec
             mode=resolved_mode,
             preview=preview,
             order=order,
-            message=f"{strategy.name} 已复用当前策略委托并更新为最新信号参数。",
+            message=f"{strategy_name} 已复用当前策略委托并更新为最新信号参数。",
             generated_at=datetime.now(timezone.utc).astimezone().isoformat(),
         )
 
     order = submit_exchange_order(
         ManualOrderRequest(
-            symbol=snapshot.symbol,
-            market=snapshot.market,
+            symbol=snapshot_symbol,
+            market=snapshot_market,
             mode=resolved_mode,
             side=side,
             quantity=quantity,
             price=price,
-            note=payload.note or f"{strategy.name} 按当前策略信号提交真实委托。",
+            note=note or f"{strategy_name} 按当前策略信号提交真实委托。",
         ),
         origin="strategy",
         strategy_id=strategy_id,
-        requested_by=payload.requested_by,
+        requested_by=requested_by,
     )
     _clear_strategy_manual_execution_alerts(
         strategy_id,
@@ -7125,20 +7176,20 @@ def _dispatch_strategy_signal_from_state(strategy_id: str, payload: StrategyExec
         severity=EventSeverity.INFO,
         payload={
             "strategy_id": strategy_id,
-            "strategy_name": strategy.name,
-            "symbol": snapshot.symbol,
-            "market": snapshot.market,
+            "strategy_name": strategy_name,
+            "symbol": snapshot_symbol,
+            "market": snapshot_market,
             "mode": resolved_mode.value,
-            "signal": snapshot.signal,
+            "signal": intent.signal,
             "side": side.value,
             "quantity": quantity,
             "price": price,
             "order_id": order.order_id,
-            "requested_by": payload.requested_by,
+            "requested_by": requested_by,
         },
-        symbol=snapshot.symbol,
+        symbol=snapshot_symbol,
         strategy_id=strategy_id,
-        parameter_snapshot=parameter_resolver.snapshot_parameters(strategy),
+        parameter_snapshot=parameter_snapshot,
     )
     repo._persist()  # type: ignore[attr-defined]
     return StrategyExecutionResult(
@@ -7147,9 +7198,67 @@ def _dispatch_strategy_signal_from_state(strategy_id: str, payload: StrategyExec
         mode=resolved_mode,
         preview=preview,
         order=order,
-        message=f"{strategy.name} 已按当前策略信号向 Bybit 提交真实委托。",
+        message=f"{strategy_name} 已按当前策略信号向 Bybit 提交真实委托。",
         generated_at=datetime.now(timezone.utc).astimezone().isoformat(),
     )
+
+
+def _dispatch_execution_intent(intent: ExecutionIntent) -> StrategyExecutionResult:
+    """Route a frozen ``ExecutionIntent`` to the paper or live branch based on
+    ``intent.mode``.  The decision verdict is assumed to already be
+    ``"allow"``: blocked decisions must be surfaced before intent
+    construction by ``_dispatch_strategy_signal_from_state``.
+    """
+    if intent.mode == AccountMode.PAPER:
+        return _dispatch_paper_intent(intent)
+    return _dispatch_live_intent(intent)
+
+
+def _dispatch_strategy_signal_from_state(strategy_id: str, payload: StrategyExecutionRequest) -> StrategyExecutionResult:
+    preview = _build_strategy_execution_preview_from_state(strategy_id, payload.mode)
+    # Round 58 — wrap the preview in a structured ``RiskDecision`` so every
+    # downstream branch inspects a typed ``verdict`` + machine-readable
+    # ``reason_code`` instead of ad-hoc ``preview.allowed`` / substring checks
+    # on ``preview.blocked_reason``.  The embedded ``decision.preview`` keeps
+    # numeric fields readable for the ``StrategyExecutionResult`` payload.
+    decision = evaluate_risk_decision(preview)
+    state = repo.snapshot()
+    resolved_mode = payload.mode or state.workspace_preferences.selected_mode
+    strategy = next((item for item in state.strategies if item.id == strategy_id), None)
+    if strategy is None:
+        raise KeyError(strategy_id)
+    snapshot = next((item for item in state.strategy_runtime_snapshots if item.strategy_id == strategy_id), None)
+    if snapshot is None:
+        raise RuntimeError("当前策略运行态尚未准备好，请先刷新策略页后再试。")
+
+    if decision.verdict != "allow":
+        default_detail = (
+            "当前策略 Paper 执行预检未通过。"
+            if resolved_mode == AccountMode.PAPER
+            else "当前策略真实模式执行预检未通过。"
+        )
+        detail = preview.blocked_reason or decision.reason_detail or default_detail
+        _record_strategy_manual_execution_issue(
+            strategy_id,
+            strategy.name,
+            snapshot.symbol,
+            resolved_mode,
+            detail,
+            recommended_action=preview.recommended_action,
+            strategy=strategy,
+        )
+        raise StrategyExecutionBlockedError(detail, preview.recommended_action)
+
+    intent = _build_execution_intent_from_state(
+        strategy_id=strategy_id,
+        payload=payload,
+        strategy=strategy,
+        snapshot=snapshot,
+        resolved_mode=resolved_mode,
+        preview=preview,
+        decision=decision,
+    )
+    return _dispatch_execution_intent(intent)
 
 def _auto_dispatch_strategy_signal_changes(
     previous_by_id: Dict[str, StrategyRuntimeSnapshot],

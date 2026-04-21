@@ -21415,5 +21415,207 @@ class RiskDecisionRound58UnitTests(unittest.TestCase):
         self.assertEqual(decision.preview.action, "开多")
 
 
+class ExecutionIntentRound57UnitTests(unittest.TestCase):
+    """Round 57 — ``ExecutionIntent`` is the canonical hand-off between the
+    two strategy-signal entry points (manual REST / autonomous worker) and
+    the paper + live dispatcher branches.  These tests freeze two load-bearing
+    invariants so future refactors cannot silently drift:
+
+    * ``_classify_execution_intent_source`` discriminator — the source label
+      must be ``"auto"`` iff ``requested_by`` is the sentinel
+      ``"strategy_runtime_worker"``, regardless of surrounding whitespace.
+      A drift here would mis-attribute autonomous fills as operator-issued
+      on downstream audit surfaces.
+    * ``_build_execution_intent_from_state`` factory — the frozen intent
+      must reflect ``preview``'s numeric fields (side / quantity / price) so
+      the dispatcher cannot re-derive stale values from the live snapshot,
+      and the ``parameter_snapshot`` must match
+      ``parameter_resolver.snapshot_parameters(strategy)`` byte-for-byte so
+      the R51+ audit emissions keep agreeing with the runtime evaluator.
+    """
+
+    def _make_strategy(self, **overrides: Any) -> Any:
+        from models import StrategySummary
+
+        base: Dict[str, Any] = dict(
+            id="intent-r57-01",
+            name="ExecutionIntentHarness",
+            category="template",
+            status="running",
+            symbols=["BTCUSDT"],
+            mode=AccountMode.PAPER,
+            version="v1",
+            pnl_7d="+0.0%",
+            max_drawdown="-0.0%",
+            risk_budget="10%",
+            description="Round 57 ExecutionIntent harness",
+            parameters=[StrategyParameter(key="fast_ma", label="fast", value=21)],
+            kernel="momentum",
+            roc_window=9,
+            ema_trend_window=13,
+        )
+        base.update(overrides)
+        return StrategySummary(**base)
+
+    def _make_snapshot(self, strategy: Any, **overrides: Any) -> StrategyRuntimeSnapshot:
+        base: Dict[str, Any] = dict(
+            strategy_id=strategy.id,
+            strategy_name=strategy.name,
+            symbol="BTCUSDT",
+            market="perp",
+            mode=strategy.mode,
+            runtime_status="running",
+            signal="long",
+            confidence=0.72,
+            last_price=42_100.0,
+            reference_price=42_050.0,
+            change_24h=0.012,
+            note="R57 harness snapshot",
+            next_action="按信号执行",
+            last_evaluated_at="2026-04-21T08:00:00+08:00",
+        )
+        base.update(overrides)
+        return StrategyRuntimeSnapshot(**base)
+
+    def _make_preview(
+        self,
+        *,
+        allowed: bool = True,
+        side: Direction = Direction.BUY,
+        quantity: float = 0.25,
+        price: float = 42_100.0,
+    ):
+        from models import ExecutionPreview
+
+        return ExecutionPreview(
+            symbol="BTCUSDT",
+            market="perp",
+            mode=AccountMode.PAPER,
+            side=side,
+            origin="strategy",
+            quantity=quantity,
+            price=price,
+            notional="10525.00",
+            action="开多",
+            allowed=allowed,
+            blocked_reason=None,
+            recommended_action=None,
+            warnings=[],
+            current_position_size="0",
+            current_avg_price="--",
+            projected_position_size=str(quantity),
+            projected_avg_price=str(price),
+            available_balance_before="50000.00",
+            available_balance_after="39475.00",
+            estimated_realized_pnl="--",
+            generated_at="2026-04-21T08:00:00+08:00",
+        )
+
+    def test_classify_execution_intent_source_distinguishes_auto_vs_manual(self) -> None:
+        """The discriminator must tag autonomous dispatches as ``"auto"`` and
+        every other requester (desktop operator, REST "Execute" button, etc.)
+        as ``"manual"`` — whitespace-only / empty ``requested_by`` also
+        collapses to ``"manual"`` since nothing claims to be the runtime
+        worker.  Without this invariant, audit surfaces (``source`` label on
+        emitted events, parameter-snapshot attribution) cannot reliably tell
+        which entry point originated a fill.
+        """
+
+        from models import StrategyExecutionRequest
+
+        auto = StrategyExecutionRequest(requested_by="strategy_runtime_worker")
+        self.assertEqual(
+            control_main._classify_execution_intent_source(auto),
+            "auto",
+        )
+        padded_auto = StrategyExecutionRequest(requested_by="  strategy_runtime_worker  ")
+        self.assertEqual(
+            control_main._classify_execution_intent_source(padded_auto),
+            "auto",
+        )
+
+        manual = StrategyExecutionRequest(requested_by="desktop_operator")
+        self.assertEqual(
+            control_main._classify_execution_intent_source(manual),
+            "manual",
+        )
+        empty = StrategyExecutionRequest(requested_by="")
+        self.assertEqual(
+            control_main._classify_execution_intent_source(empty),
+            "manual",
+        )
+        whitespace = StrategyExecutionRequest(requested_by="   ")
+        self.assertEqual(
+            control_main._classify_execution_intent_source(whitespace),
+            "manual",
+        )
+
+    def test_build_execution_intent_from_state_freezes_preview_and_parameter_snapshot(self) -> None:
+        """The factory must copy numeric fields from ``preview`` (not from the
+        live snapshot, which could drift mid-dispatch), route the snapshot
+        through :mod:`parameter_resolver` so R51+ audit emissions agree with
+        the runtime evaluator, and surface the R58 ``RiskDecision`` verdict
+        verbatim.
+        """
+
+        import parameter_resolver as param_resolver
+        from models import StrategyExecutionRequest
+        from risk_decision import evaluate_risk_decision
+
+        strategy = self._make_strategy()
+        snapshot = self._make_snapshot(strategy)
+        preview = self._make_preview(
+            side=Direction.SELL,
+            quantity=0.375,
+            price=41_900.0,
+        )
+        decision = evaluate_risk_decision(preview)
+        payload = StrategyExecutionRequest(
+            requested_by="strategy_runtime_worker",
+            note="R57 自动执行",
+            mode=AccountMode.PAPER,
+        )
+
+        intent = control_main._build_execution_intent_from_state(
+            strategy_id=strategy.id,
+            payload=payload,
+            strategy=strategy,
+            snapshot=snapshot,
+            resolved_mode=AccountMode.PAPER,
+            preview=preview,
+            decision=decision,
+        )
+
+        self.assertEqual(intent.strategy_id, strategy.id)
+        self.assertEqual(intent.strategy_name, strategy.name)
+        self.assertEqual(intent.source, "auto")
+        self.assertEqual(intent.mode, AccountMode.PAPER)
+        self.assertEqual(intent.symbol, snapshot.symbol)
+        self.assertEqual(intent.market, snapshot.market)
+        self.assertEqual(intent.signal, snapshot.signal)
+        self.assertEqual(intent.requested_by, payload.requested_by)
+        self.assertEqual(intent.note, payload.note)
+        # Numeric fields must mirror the preview the R58 decision evaluated:
+        self.assertEqual(intent.side, preview.side)
+        self.assertEqual(intent.quantity, preview.quantity)
+        self.assertEqual(intent.price, preview.price)
+        # Decision travels verbatim so the dispatcher never re-derives it:
+        self.assertEqual(intent.decision.verdict, decision.verdict)
+        self.assertEqual(intent.decision.reason_code, decision.reason_code)
+        # Parameter snapshot must match parameter_resolver byte-for-byte so
+        # the runtime evaluator, the backtest runner and the dispatcher all
+        # see the same effective values (R51+ cross-site invariant).
+        self.assertEqual(
+            intent.parameter_snapshot,
+            param_resolver.snapshot_parameters(strategy),
+        )
+        # ``kernel`` and the top-level scalars flow through the snapshot:
+        self.assertEqual(intent.parameter_snapshot.get("kernel"), "momentum")
+        self.assertEqual(intent.parameter_snapshot.get("roc_window"), 9)
+        self.assertEqual(intent.parameter_snapshot.get("ema_trend_window"), 13)
+        # Legacy parameter rows merge in alongside top-level scalars:
+        self.assertEqual(intent.parameter_snapshot.get("fast_ma"), 21)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
