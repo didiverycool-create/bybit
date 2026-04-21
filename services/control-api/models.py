@@ -1467,6 +1467,28 @@ class LiveOrderReconciliation(BaseModel):
     timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
+# Round 60 — ``AutoDispatchGate`` captures the verdict of the autonomous
+# strategy-runtime worker's pre-flight guard chain.  Before R60, six
+# ``continue``-style guards inside ``_auto_dispatch_strategy_signal_changes``
+# interleaved the "should we dispatch?" decision with the "what side effects
+# do we run on block?" logic (cancel existing orders / clear
+# auto_dispatch alerts / record an issue).  Wrapping the verdict in a typed
+# record — in the same shape as R58's :class:`RiskDecision` and R59's
+# :class:`LiveOrderReconciliation` — makes each guard individually
+# unit-testable via ``_evaluate_strategy_auto_dispatch_gate``.
+AutoDispatchVerdict = Literal["allow", "block"]
+
+
+class AutoDispatchGate(BaseModel):
+    verdict: AutoDispatchVerdict
+    reason_code: str
+    reason_detail: str = ""
+    cancel_existing_orders: bool = False
+    clear_alerts: bool = False
+    record_issue: bool = False
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
 class ClosePaperPositionPayload(BaseModel):
     requested_by: str = "desktop_operator"
 

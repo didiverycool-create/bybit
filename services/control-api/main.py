@@ -110,6 +110,7 @@ from models import (
     AlertAcknowledgePayload,
     AgentJobCreate,
     AiLiveSnapshot,
+    AutoDispatchGate,
     BybitBalanceDiagnostic,
     BybitPublicStatus,
     BybitPublicSymbolDiagnostic,
@@ -7333,6 +7334,99 @@ def _dispatch_strategy_signal_from_state(strategy_id: str, payload: StrategyExec
     )
     return _dispatch_execution_intent(intent)
 
+
+# Round 60 — ``_evaluate_strategy_auto_dispatch_gate`` classifies the autonomous
+# strategy-runtime worker's pre-flight guard chain into a typed
+# :class:`AutoDispatchGate` decision.  Before R60, six ``continue``-style
+# guards interleaved "should we dispatch?" with "what side effects do we run
+# on block?" (cancel orders / clear auto-dispatch alerts / record an issue).
+# Reason codes: ``auto.paper_or_paused_strategy`` /
+# ``auto.live_stop_loss_cooldown`` / ``auto.live_stop_loss_active`` /
+# ``auto.rejection_guard_active`` / ``auto.scheduler_or_channel_gate`` /
+# ``auto.runtime_not_running`` / ``auto.ready``.
+def _evaluate_strategy_auto_dispatch_gate(
+    strategy: StrategySummary,
+    snapshot: StrategyRuntimeSnapshot,
+) -> AutoDispatchGate:
+    if strategy.mode == AccountMode.PAPER or strategy.status in {"paper_only", "paused", "shadow"}:
+        return AutoDispatchGate(
+            verdict="block",
+            reason_code="auto.paper_or_paused_strategy",
+            reason_detail="策略已暂停或切入影子/仅模拟模式，自动撤销旧策略委托。",
+            cancel_existing_orders=True,
+            clear_alerts=True,
+            record_issue=False,
+        )
+    cooldown_remaining = _strategy_live_stop_loss_cooldown_remaining_minutes(strategy)
+    if cooldown_remaining is not None:
+        return AutoDispatchGate(
+            verdict="block",
+            reason_code="auto.live_stop_loss_cooldown",
+            reason_detail=(
+                f"当前处于真实模式止损后冷却期，剩余约 {cooldown_remaining} 分钟，"
+                "后台自动执行继续保持暂停。"
+            ),
+            cancel_existing_orders=True,
+            clear_alerts=False,
+            record_issue=False,
+        )
+    if _has_active_strategy_live_stop_loss_alert(snapshot.strategy_id):
+        return AutoDispatchGate(
+            verdict="block",
+            reason_code="auto.live_stop_loss_active",
+            reason_detail="当前参考价已触发真实模式止损保护，后台自动执行继续保持暂停。",
+            cancel_existing_orders=True,
+            clear_alerts=False,
+            record_issue=False,
+        )
+    rejection_guard_remaining = _strategy_exchange_rejection_guard_remaining_minutes(strategy)
+    if rejection_guard_remaining is not None:
+        return AutoDispatchGate(
+            verdict="block",
+            reason_code="auto.rejection_guard_active",
+            reason_detail=(
+                f"最近真实策略委托连续拒绝，冷却剩余约 {rejection_guard_remaining} 分钟，"
+                "后台自动执行继续保持暂停。"
+            ),
+            cancel_existing_orders=True,
+            clear_alerts=False,
+            record_issue=False,
+        )
+    gate_reason = _strategy_auto_dispatch_gate_reason(strategy)
+    if gate_reason is not None:
+        scheduler_status = repo.snapshot().control_snapshot.scheduler.status
+        cancel_existing = (
+            scheduler_status in {"paused", "manual_override"}
+            or "公共 WS" in gate_reason
+            or "私有 WS" in gate_reason
+        )
+        return AutoDispatchGate(
+            verdict="block",
+            reason_code="auto.scheduler_or_channel_gate",
+            reason_detail=gate_reason,
+            cancel_existing_orders=cancel_existing,
+            clear_alerts=False,
+            record_issue=True,
+        )
+    if snapshot.runtime_status != "running":
+        return AutoDispatchGate(
+            verdict="block",
+            reason_code="auto.runtime_not_running",
+            reason_detail="策略运行态不再处于 running，自动撤销旧策略委托。",
+            cancel_existing_orders=True,
+            clear_alerts=True,
+            record_issue=False,
+        )
+    return AutoDispatchGate(
+        verdict="allow",
+        reason_code="auto.ready",
+        reason_detail="",
+        cancel_existing_orders=False,
+        clear_alerts=False,
+        record_issue=False,
+    )
+
+
 def _auto_dispatch_strategy_signal_changes(
     previous_by_id: Dict[str, StrategyRuntimeSnapshot],
     current_items: List[StrategyRuntimeSnapshot],
@@ -7345,85 +7439,29 @@ def _auto_dispatch_strategy_signal_changes(
         if strategy is None:
             continue
         pending_reconcile = _has_active_strategy_auto_dispatch_alert(snapshot.strategy_id)
-        gate_reason = _strategy_auto_dispatch_gate_reason(strategy)
-        if strategy.mode == AccountMode.PAPER or strategy.status in {"paper_only", "paused", "shadow"}:
-            _cancel_strategy_exchange_orders(
-                snapshot.strategy_id,
-                snapshot.symbol,
-                snapshot.market,
-                strategy.mode,
-                "strategy_runtime_worker",
-                "策略已暂停或切入影子/仅模拟模式，自动撤销旧策略委托。",
-            )
-            _clear_strategy_auto_dispatch_alerts(snapshot.strategy_id)
-            continue
-        cooldown_remaining = _strategy_live_stop_loss_cooldown_remaining_minutes(strategy)
-        if cooldown_remaining is not None:
-            _cancel_strategy_exchange_orders(
-                snapshot.strategy_id,
-                snapshot.symbol,
-                snapshot.market,
-                strategy.mode,
-                "strategy_runtime_worker",
-                f"当前处于真实模式止损后冷却期，剩余约 {cooldown_remaining} 分钟，后台自动执行继续保持暂停。",
-            )
-            continue
-        if _has_active_strategy_live_stop_loss_alert(snapshot.strategy_id):
-            _cancel_strategy_exchange_orders(
-                snapshot.strategy_id,
-                snapshot.symbol,
-                snapshot.market,
-                strategy.mode,
-                "strategy_runtime_worker",
-                "当前参考价已触发真实模式止损保护，后台自动执行继续保持暂停。",
-            )
-            continue
-        rejection_guard_remaining = _strategy_exchange_rejection_guard_remaining_minutes(strategy)
-        if rejection_guard_remaining is not None:
-            _cancel_strategy_exchange_orders(
-                snapshot.strategy_id,
-                snapshot.symbol,
-                snapshot.market,
-                strategy.mode,
-                "strategy_runtime_worker",
-                f"最近真实策略委托连续拒绝，冷却剩余约 {rejection_guard_remaining} 分钟，后台自动执行继续保持暂停。",
-            )
-            continue
-        if gate_reason is not None:
-            scheduler_status = repo.snapshot().control_snapshot.scheduler.status
-            if (
-                scheduler_status in {"paused", "manual_override"}
-                or "公共 WS" in gate_reason
-                or "私有 WS" in gate_reason
-            ):
+        gate = _evaluate_strategy_auto_dispatch_gate(strategy, snapshot)
+        if gate.verdict == "block":
+            if gate.cancel_existing_orders:
                 _cancel_strategy_exchange_orders(
                     snapshot.strategy_id,
                     snapshot.symbol,
                     snapshot.market,
                     strategy.mode,
                     "strategy_runtime_worker",
-                    gate_reason,
+                    gate.reason_detail,
                 )
-            _record_strategy_auto_dispatch_issue(
-                snapshot.strategy_id,
-                snapshot.strategy_name,
-                snapshot.symbol,
-                snapshot.signal,
-                strategy.mode,
-                gate_reason,
-                strategy=strategy,
-            )
-            continue
-        if snapshot.runtime_status != "running":
-            _cancel_strategy_exchange_orders(
-                snapshot.strategy_id,
-                snapshot.symbol,
-                snapshot.market,
-                strategy.mode,
-                "strategy_runtime_worker",
-                "策略运行态不再处于 running，自动撤销旧策略委托。",
-            )
-            _clear_strategy_auto_dispatch_alerts(snapshot.strategy_id)
+            if gate.clear_alerts:
+                _clear_strategy_auto_dispatch_alerts(snapshot.strategy_id)
+            if gate.record_issue:
+                _record_strategy_auto_dispatch_issue(
+                    snapshot.strategy_id,
+                    snapshot.strategy_name,
+                    snapshot.symbol,
+                    snapshot.signal,
+                    strategy.mode,
+                    gate.reason_detail,
+                    strategy=strategy,
+                )
             continue
         active_order_count, active_order = _build_strategy_active_order_summary(
             snapshot.strategy_id,

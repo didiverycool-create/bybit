@@ -7,7 +7,7 @@ import sys
 import threading
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -21792,6 +21792,441 @@ class LiveOrderReconciliationRound59UnitTests(unittest.TestCase):
         self.assertEqual(recon.reason_code, "order.requires_reduce_only")
         assert recon.matching_order is not None
         self.assertEqual(recon.matching_order.order_id, "match-reduce")
+
+
+class AutoDispatchGateRound60UnitTests(unittest.TestCase):
+    """Round 60 — ``AutoDispatchGate`` + ``_evaluate_strategy_auto_dispatch_gate``
+    regression suite.
+
+    Before R60 the autonomous strategy-runtime worker used six
+    ``continue``-style guards at the head of
+    ``_auto_dispatch_strategy_signal_changes`` to interleave the
+    "should we dispatch?" verdict with the side effects on block
+    (cancel existing orders / clear auto-dispatch alerts / record an
+    auto-dispatch issue).  The typed decision is now pinned here
+    against the seven documented reason codes so future refactors
+    cannot silently drift the gate shape:
+
+    * ``auto.paper_or_paused_strategy`` — paper / shadow / paused.
+    * ``auto.live_stop_loss_cooldown`` — cooldown minutes remaining.
+    * ``auto.live_stop_loss_active`` — reference-price alert armed.
+    * ``auto.rejection_guard_active`` — exchange-rejection cooldown.
+    * ``auto.scheduler_or_channel_gate`` — scheduler paused / WS down.
+    * ``auto.runtime_not_running`` — runtime in a non-running state.
+    * ``auto.ready`` — all guards pass; intent is dispatchable.
+    """
+
+    def _strategy(
+        self,
+        *,
+        mode: AccountMode = AccountMode.LIVE,
+        status: str = "running",
+    ):
+        from models import StrategyParameter, StrategySummary
+
+        return StrategySummary(
+            id="gate-r60-01",
+            name="GateHarness",
+            category="template",
+            status=status,
+            symbols=["BTCUSDT"],
+            mode=mode,
+            version="v1",
+            pnl_7d="+0.0%",
+            max_drawdown="-0.0%",
+            risk_budget="10%",
+            description="R60 gate harness",
+            parameters=[StrategyParameter(key="noop", label="noop", value=0.0)],
+        )
+
+    def _snapshot(self, *, runtime_status: str = "running"):
+        return StrategyRuntimeSnapshot(
+            strategy_id="gate-r60-01",
+            strategy_name="GateHarness",
+            symbol="BTCUSDT",
+            market="perp",
+            mode=AccountMode.LIVE,
+            runtime_status=runtime_status,
+            signal="long",
+            confidence=42.0,
+            last_price=42_000.0,
+            reference_price=42_000.0,
+            change_24h=0.0,
+            note="",
+            next_action="",
+            last_evaluated_at="2026-04-22T08:00:00+08:00",
+        )
+
+    def _patch_clean_gates(self):
+        """Neutralize every side-gate so each test exercises exactly one branch.
+
+        Returns a list of ``patch`` context managers the caller enters via
+        ``ExitStack``.  Without this helper every test would otherwise have to
+        spell out the full set of mocks just to ensure "no other guard fires".
+        """
+
+        return [
+            patch.object(
+                control_main,
+                "_strategy_live_stop_loss_cooldown_remaining_minutes",
+                return_value=None,
+            ),
+            patch.object(
+                control_main,
+                "_has_active_strategy_live_stop_loss_alert",
+                return_value=False,
+            ),
+            patch.object(
+                control_main,
+                "_strategy_exchange_rejection_guard_remaining_minutes",
+                return_value=None,
+            ),
+            patch.object(
+                control_main,
+                "_strategy_auto_dispatch_gate_reason",
+                return_value=None,
+            ),
+        ]
+
+    def test_gate_blocks_paper_or_paused_strategy_and_clears_alerts(self) -> None:
+        """A strategy on PAPER or with status ∈ {paper_only,paused,shadow}
+        must block with ``auto.paper_or_paused_strategy`` and request both
+        order cancellation and alert cleanup — the two cleanup side effects
+        Round 60 pinned together for this terminal state.
+        """
+
+        from contextlib import ExitStack
+
+        strategy = self._strategy(mode=AccountMode.PAPER)
+        snapshot = self._snapshot()
+
+        with ExitStack() as stack:
+            for p in self._patch_clean_gates():
+                stack.enter_context(p)
+            gate = control_main._evaluate_strategy_auto_dispatch_gate(strategy, snapshot)
+
+        self.assertEqual(gate.verdict, "block")
+        self.assertEqual(gate.reason_code, "auto.paper_or_paused_strategy")
+        self.assertTrue(gate.cancel_existing_orders)
+        self.assertTrue(gate.clear_alerts)
+        self.assertFalse(gate.record_issue)
+
+    def test_gate_blocks_with_live_stop_loss_cooldown_reason(self) -> None:
+        """When ``_strategy_live_stop_loss_cooldown_remaining_minutes``
+        surfaces a remaining-minute count, the gate must block with reason
+        ``auto.live_stop_loss_cooldown``, cancel surviving orders, but leave
+        alerts intact (operator acknowledgment is the dismiss channel).
+        """
+
+        from contextlib import ExitStack
+
+        strategy = self._strategy()
+        snapshot = self._snapshot()
+
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(
+                control_main,
+                "_strategy_live_stop_loss_cooldown_remaining_minutes",
+                return_value=7,
+            ))
+            stack.enter_context(patch.object(
+                control_main,
+                "_has_active_strategy_live_stop_loss_alert",
+                return_value=False,
+            ))
+            stack.enter_context(patch.object(
+                control_main,
+                "_strategy_exchange_rejection_guard_remaining_minutes",
+                return_value=None,
+            ))
+            stack.enter_context(patch.object(
+                control_main,
+                "_strategy_auto_dispatch_gate_reason",
+                return_value=None,
+            ))
+            gate = control_main._evaluate_strategy_auto_dispatch_gate(strategy, snapshot)
+
+        self.assertEqual(gate.verdict, "block")
+        self.assertEqual(gate.reason_code, "auto.live_stop_loss_cooldown")
+        self.assertIn("7 分钟", gate.reason_detail)
+        self.assertTrue(gate.cancel_existing_orders)
+        self.assertFalse(gate.clear_alerts)
+        self.assertFalse(gate.record_issue)
+
+    def test_gate_blocks_when_live_stop_loss_alert_armed(self) -> None:
+        """An armed live-stop-loss reference-price alert must block with
+        ``auto.live_stop_loss_active`` without clearing the alert — the
+        dispatcher keeps the alert so the operator must acknowledge it
+        before the gate reopens.
+        """
+
+        from contextlib import ExitStack
+
+        strategy = self._strategy()
+        snapshot = self._snapshot()
+
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(
+                control_main,
+                "_strategy_live_stop_loss_cooldown_remaining_minutes",
+                return_value=None,
+            ))
+            stack.enter_context(patch.object(
+                control_main,
+                "_has_active_strategy_live_stop_loss_alert",
+                return_value=True,
+            ))
+            stack.enter_context(patch.object(
+                control_main,
+                "_strategy_exchange_rejection_guard_remaining_minutes",
+                return_value=None,
+            ))
+            stack.enter_context(patch.object(
+                control_main,
+                "_strategy_auto_dispatch_gate_reason",
+                return_value=None,
+            ))
+            gate = control_main._evaluate_strategy_auto_dispatch_gate(strategy, snapshot)
+
+        self.assertEqual(gate.verdict, "block")
+        self.assertEqual(gate.reason_code, "auto.live_stop_loss_active")
+        self.assertTrue(gate.cancel_existing_orders)
+        self.assertFalse(gate.clear_alerts)
+        self.assertFalse(gate.record_issue)
+
+    def test_gate_blocks_with_rejection_guard_cooldown_reason(self) -> None:
+        """Recent live-order rejections must block via
+        ``auto.rejection_guard_active`` with cooldown minutes embedded in
+        ``reason_detail`` so the audit trail records *why* the strategy
+        was halted rather than leaking ``gate_reason is not None`` paths.
+        """
+
+        from contextlib import ExitStack
+
+        strategy = self._strategy()
+        snapshot = self._snapshot()
+
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(
+                control_main,
+                "_strategy_live_stop_loss_cooldown_remaining_minutes",
+                return_value=None,
+            ))
+            stack.enter_context(patch.object(
+                control_main,
+                "_has_active_strategy_live_stop_loss_alert",
+                return_value=False,
+            ))
+            stack.enter_context(patch.object(
+                control_main,
+                "_strategy_exchange_rejection_guard_remaining_minutes",
+                return_value=12,
+            ))
+            stack.enter_context(patch.object(
+                control_main,
+                "_strategy_auto_dispatch_gate_reason",
+                return_value=None,
+            ))
+            gate = control_main._evaluate_strategy_auto_dispatch_gate(strategy, snapshot)
+
+        self.assertEqual(gate.verdict, "block")
+        self.assertEqual(gate.reason_code, "auto.rejection_guard_active")
+        self.assertIn("12 分钟", gate.reason_detail)
+        self.assertTrue(gate.cancel_existing_orders)
+        self.assertFalse(gate.clear_alerts)
+        self.assertFalse(gate.record_issue)
+
+    def test_gate_scheduler_channel_reason_cancels_when_ws_down(self) -> None:
+        """A scheduler/channel gate reason that mentions ``公共 WS``
+        (or ``私有 WS``) must set ``cancel_existing_orders=True`` even
+        when the scheduler status itself is not paused — the
+        connectivity-loss branch pinned by ``_auto_dispatch`` logic.
+        Side effect: ``record_issue=True`` so the operator console keeps
+        surfacing the degraded channel.
+        """
+
+        from contextlib import ExitStack
+
+        strategy = self._strategy()
+        snapshot = self._snapshot()
+
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(
+                control_main,
+                "_strategy_live_stop_loss_cooldown_remaining_minutes",
+                return_value=None,
+            ))
+            stack.enter_context(patch.object(
+                control_main,
+                "_has_active_strategy_live_stop_loss_alert",
+                return_value=False,
+            ))
+            stack.enter_context(patch.object(
+                control_main,
+                "_strategy_exchange_rejection_guard_remaining_minutes",
+                return_value=None,
+            ))
+            stack.enter_context(patch.object(
+                control_main,
+                "_strategy_auto_dispatch_gate_reason",
+                return_value="公共 WS 行情断线，自动撤销旧策略委托。",
+            ))
+            repo_snapshot = MagicMock()
+            repo_snapshot.control_snapshot.scheduler.status = "running"
+            stack.enter_context(patch.object(
+                control_main.repo,
+                "snapshot",
+                return_value=repo_snapshot,
+            ))
+            gate = control_main._evaluate_strategy_auto_dispatch_gate(strategy, snapshot)
+
+        self.assertEqual(gate.verdict, "block")
+        self.assertEqual(gate.reason_code, "auto.scheduler_or_channel_gate")
+        self.assertIn("公共 WS", gate.reason_detail)
+        self.assertTrue(gate.cancel_existing_orders)
+        self.assertFalse(gate.clear_alerts)
+        self.assertTrue(gate.record_issue)
+
+    def test_gate_scheduler_paused_cancels_and_records_issue(self) -> None:
+        """When the scheduler is explicitly paused / manual-override,
+        ``cancel_existing_orders`` must also fire even if the gate reason
+        text does not mention WS connectivity — the scheduler-state branch.
+        """
+
+        from contextlib import ExitStack
+
+        strategy = self._strategy()
+        snapshot = self._snapshot()
+
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(
+                control_main,
+                "_strategy_live_stop_loss_cooldown_remaining_minutes",
+                return_value=None,
+            ))
+            stack.enter_context(patch.object(
+                control_main,
+                "_has_active_strategy_live_stop_loss_alert",
+                return_value=False,
+            ))
+            stack.enter_context(patch.object(
+                control_main,
+                "_strategy_exchange_rejection_guard_remaining_minutes",
+                return_value=None,
+            ))
+            stack.enter_context(patch.object(
+                control_main,
+                "_strategy_auto_dispatch_gate_reason",
+                return_value="调度器处于人工干预暂停状态。",
+            ))
+            repo_snapshot = MagicMock()
+            repo_snapshot.control_snapshot.scheduler.status = "paused"
+            stack.enter_context(patch.object(
+                control_main.repo,
+                "snapshot",
+                return_value=repo_snapshot,
+            ))
+            gate = control_main._evaluate_strategy_auto_dispatch_gate(strategy, snapshot)
+
+        self.assertEqual(gate.verdict, "block")
+        self.assertEqual(gate.reason_code, "auto.scheduler_or_channel_gate")
+        self.assertTrue(gate.cancel_existing_orders)
+        self.assertTrue(gate.record_issue)
+
+    def test_gate_scheduler_reason_without_ws_or_paused_skips_cancel(self) -> None:
+        """When the gate reason is non-connectivity and the scheduler is
+        still ``running``, ``cancel_existing_orders`` must stay False —
+        the gate surfaces an issue without tearing down live working
+        orders that may still reconcile on their own.
+        """
+
+        from contextlib import ExitStack
+
+        strategy = self._strategy()
+        snapshot = self._snapshot()
+
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(
+                control_main,
+                "_strategy_live_stop_loss_cooldown_remaining_minutes",
+                return_value=None,
+            ))
+            stack.enter_context(patch.object(
+                control_main,
+                "_has_active_strategy_live_stop_loss_alert",
+                return_value=False,
+            ))
+            stack.enter_context(patch.object(
+                control_main,
+                "_strategy_exchange_rejection_guard_remaining_minutes",
+                return_value=None,
+            ))
+            stack.enter_context(patch.object(
+                control_main,
+                "_strategy_auto_dispatch_gate_reason",
+                return_value="当前品类风控降级，等待人工复核。",
+            ))
+            repo_snapshot = MagicMock()
+            repo_snapshot.control_snapshot.scheduler.status = "running"
+            stack.enter_context(patch.object(
+                control_main.repo,
+                "snapshot",
+                return_value=repo_snapshot,
+            ))
+            gate = control_main._evaluate_strategy_auto_dispatch_gate(strategy, snapshot)
+
+        self.assertEqual(gate.verdict, "block")
+        self.assertEqual(gate.reason_code, "auto.scheduler_or_channel_gate")
+        self.assertFalse(gate.cancel_existing_orders)
+        self.assertTrue(gate.record_issue)
+
+    def test_gate_blocks_when_runtime_status_is_not_running(self) -> None:
+        """A snapshot whose ``runtime_status`` has drifted off ``running``
+        (because the runtime worker tripped a health check or an operator
+        forced ``stopped``) must block with ``auto.runtime_not_running``
+        and clear auto-dispatch alerts — this matches the
+        pre-R60 ``snapshot.runtime_status != "running"`` guard.
+        """
+
+        from contextlib import ExitStack
+
+        strategy = self._strategy()
+        snapshot = self._snapshot(runtime_status="paused")
+
+        with ExitStack() as stack:
+            for p in self._patch_clean_gates():
+                stack.enter_context(p)
+            gate = control_main._evaluate_strategy_auto_dispatch_gate(strategy, snapshot)
+
+        self.assertEqual(gate.verdict, "block")
+        self.assertEqual(gate.reason_code, "auto.runtime_not_running")
+        self.assertTrue(gate.cancel_existing_orders)
+        self.assertTrue(gate.clear_alerts)
+        self.assertFalse(gate.record_issue)
+
+    def test_gate_allows_dispatch_when_every_guard_passes(self) -> None:
+        """The happy path — every pre-flight guard returns a passing value,
+        so the gate must surface ``verdict="allow"`` with reason
+        ``auto.ready`` and zero side effects; anything else would cause
+        the dispatcher loop to short-circuit a genuinely dispatchable
+        intent.
+        """
+
+        from contextlib import ExitStack
+
+        strategy = self._strategy()
+        snapshot = self._snapshot()
+
+        with ExitStack() as stack:
+            for p in self._patch_clean_gates():
+                stack.enter_context(p)
+            gate = control_main._evaluate_strategy_auto_dispatch_gate(strategy, snapshot)
+
+        self.assertEqual(gate.verdict, "allow")
+        self.assertEqual(gate.reason_code, "auto.ready")
+        self.assertFalse(gate.cancel_existing_orders)
+        self.assertFalse(gate.clear_alerts)
+        self.assertFalse(gate.record_issue)
 
 
 if __name__ == "__main__":
