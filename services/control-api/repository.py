@@ -60,7 +60,7 @@ from models import (
 )
 import parameter_resolver
 from datetime_utils import parse_optional_iso_datetime
-from risk_decision import evaluate_risk_decision
+from risk_decision import derive_block_reason_code, evaluate_risk_decision
 from risk_guards import evaluate_paper_order_risk
 from seed import build_market_detail_for_watchlist, build_state
 
@@ -4984,6 +4984,10 @@ class AppRepository:
                 payload.price,
             )
             if blocked_reason is not None:
+                # Round 66 — attach a stable machine-readable ``reason_code``
+                # derived from the free-form ``blocked_reason`` so audit
+                # consumers can filter by typed risk category without parsing
+                # Chinese substrings.
                 self.add_event(
                     event_type="risk.blocked_order",
                     source="quant-core",
@@ -4996,6 +5000,7 @@ class AppRepository:
                         "quantity": payload.quantity,
                         "price": payload.price,
                         "reason": blocked_reason,
+                        "reason_code": derive_block_reason_code(blocked_reason),
                         "stage": "paper_order_create",
                     },
                     symbol=payload.symbol,
@@ -5074,6 +5079,9 @@ class AppRepository:
                 exclude_order_id=order_id,
             )
             if blocked_reason is not None:
+                # Round 66 — attach the typed ``reason_code`` alongside the
+                # free-form ``reason`` string so the replace-side audit payload
+                # matches the create-side schema.
                 self.add_event(
                     event_type="risk.blocked_order",
                     source="quant-core",
@@ -5087,6 +5095,7 @@ class AppRepository:
                         "quantity": quantity,
                         "price": price,
                         "reason": blocked_reason,
+                        "reason_code": derive_block_reason_code(blocked_reason),
                         "stage": "paper_order_replace",
                     },
                     symbol=order.symbol,
@@ -5404,7 +5413,11 @@ class AppRepository:
                 note=note,
             )
         )
-        if not preview.allowed:
+        # Round 66 — route the block decision through the typed ``RiskDecision``
+        # wrapper so ``risk.blocked_order`` audits carry a stable ``reason_code``
+        # alongside the free-form ``reason`` string.
+        decision = evaluate_risk_decision(preview)
+        if decision.verdict == "block":
             strategy_name = strategy_id
             try:
                 strategy_name = self._find_strategy(strategy_id).name
@@ -5422,6 +5435,7 @@ class AppRepository:
                     "quantity": quantity,
                     "price": price,
                     "reason": preview.blocked_reason,
+                    "reason_code": decision.reason_code,
                 },
                 symbol=symbol,
                 strategy_id=strategy_id,
@@ -5432,7 +5446,7 @@ class AppRepository:
                 severity="P1",
                 symbol=symbol,
                 title=f"{strategy_name} 执行被风控拦截",
-                description=preview.blocked_reason or "当前策略纸面执行未通过风控校验。",
+                description=decision.reason_detail,
                 suggested_action="打开策略页查看当前 execution preview、Paper 余额与已有持仓，再决定是否手动处理。",
                 strategy_id=strategy_id,
             )
@@ -5705,7 +5719,13 @@ class AppRepository:
                     note=payload.note,
                 )
             )
-            if not preview.allowed:
+            # Round 66 — route manual-trade block through ``RiskDecision`` so the
+            # audit payload carries a stable ``reason_code`` alongside the
+            # free-form ``reason`` string, and the raised ``ValueError`` message
+            # falls back to the decision's Chinese ``reason_detail`` instead of
+            # a bespoke fallback sentence.
+            decision = evaluate_risk_decision(preview)
+            if decision.verdict == "block":
                 self.add_event(
                     event_type="risk.blocked_order",
                     source="quant-core",
@@ -5718,11 +5738,12 @@ class AppRepository:
                         "quantity": payload.quantity,
                         "price": payload.price,
                         "reason": preview.blocked_reason,
+                        "reason_code": decision.reason_code,
                     },
                     symbol=payload.symbol,
                 )
                 self._persist()
-                raise ValueError(preview.blocked_reason or "当前执行预检未通过。")
+                raise ValueError(decision.reason_detail)
 
             record = TradeRecord(
                 id=f"trade-{uuid4().hex[:6]}",

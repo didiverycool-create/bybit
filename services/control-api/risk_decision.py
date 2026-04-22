@@ -77,12 +77,17 @@ _ACCOUNT_MODE_HINTS = (
 )
 
 
-def _derive_block_reason_code(detail: str) -> str:
+def derive_block_reason_code(detail: str) -> str:
     """Return the best-effort ``risk.*`` reason code for ``detail``.
 
-    ``detail`` is the preview's free-form ``blocked_reason`` string.  The
-    mapping is intentionally conservative: if no hint matches we fall back to
+    ``detail`` is a free-form Chinese blocked-reason string.  The mapping is
+    intentionally conservative: if no hint matches we fall back to
     :data:`RISK_REASON_PREVIEW_BLOCKED` rather than guessing.
+
+    Round 66 — this helper is also consumed outside ``evaluate_risk_decision``
+    (``paper_order_create`` / ``paper_order_replace`` emit ``risk.blocked_order``
+    from a non-preview ``evaluate_paper_order_risk`` reason and still want a
+    uniform ``reason_code`` on the audit payload), so the name is now public.
     """
 
     if not detail:
@@ -137,7 +142,7 @@ def evaluate_risk_decision(
         action = {"recommendation": preview.recommended_action}
     return RiskDecision(
         verdict="block",
-        reason_code=_derive_block_reason_code(detail),
+        reason_code=derive_block_reason_code(detail),
         reason_detail=detail,
         recommended_action=action,
         preview=preview,

@@ -662,7 +662,11 @@ def build_state() -> AppState:
             source="quant-core",
             symbol="ETHUSDT",
             strategy_id="eth-revert-02",
-            payload={"reason": "超过单日亏损预算", "mode": "paper"},
+            payload={
+                "reason": "超过单日亏损预算",
+                "reason_code": "risk.preview_blocked",
+                "mode": "paper",
+            },
             trace_id="trace-risk-002",
             occurred_at=iso(BASE_NOW - timedelta(hours=1, minutes=27)),
         ),

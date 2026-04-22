@@ -16361,6 +16361,22 @@ class ControlApiIntegrationTests(unittest.TestCase):
         self.assertEqual(audit_status, 200)
         risk_events = [item for item in audit_events if item["event_type"] == "risk.blocked_order"]
         self.assertGreaterEqual(len(risk_events), 2)
+        # Round 66 — the audit payload must now carry the typed ``reason_code``
+        # derived from ``RiskDecision`` alongside the free-form ``reason``.
+        from models import (  # noqa: PLC0415
+            RISK_REASON_INSUFFICIENT_BALANCE,
+            RISK_REASON_INSUFFICIENT_INVENTORY,
+        )
+        reason_codes = {
+            item["payload"]["reason_code"]
+            for item in risk_events
+            if item["payload"].get("reason_code")
+        }
+        self.assertIn(RISK_REASON_INSUFFICIENT_BALANCE, reason_codes)
+        self.assertIn(RISK_REASON_INSUFFICIENT_INVENTORY, reason_codes)
+        for item in risk_events:
+            self.assertIn("reason", item["payload"])
+            self.assertIn("reason_code", item["payload"])
 
     def test_paper_order_history_includes_manual_and_strategy_records(self) -> None:
         history_status, history_orders = self._get("/api/account/order-history")
