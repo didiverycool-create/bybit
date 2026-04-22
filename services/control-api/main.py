@@ -5296,8 +5296,12 @@ def submit_exchange_order(
             note=payload.note,
         )
     )
-    if not preview.allowed:
-        raise RuntimeError(preview.blocked_reason or "当前真实交易预检未通过。")
+    # Round 67 — route the submit-side preview check through ``RiskDecision``
+    # so the raised message reuses the same Chinese fallback as every other
+    # block surface.
+    submit_decision = evaluate_risk_decision(preview)
+    if submit_decision.verdict == "block":
+        raise RuntimeError(submit_decision.reason_detail)
 
     reduce_only = _execution_preview_requires_reduce_only(preview)
     if origin == "strategy" and strategy_id:
@@ -5854,8 +5858,11 @@ def replace_exchange_order(
             exclude_order_id=order_id,
         )
     )
-    if not preview.allowed:
-        raise RuntimeError(preview.blocked_reason or "当前真实委托改单预检未通过。")
+    # Round 67 — route replace-side preview check through ``RiskDecision`` so
+    # it matches the submit-side pattern.
+    replace_decision = evaluate_risk_decision(preview)
+    if replace_decision.verdict == "block":
+        raise RuntimeError(replace_decision.reason_detail)
     desired_reduce_only = _execution_preview_requires_reduce_only(preview)
     if _exchange_order_matches_requested_target(
         target,

@@ -5903,16 +5903,18 @@ class AppRepository:
             preview = snapshot.execution_preview
             if preview is None:
                 raise ValueError("当前策略没有可执行的纸面预估。")
-            if not preview.allowed:
-                raise ValueError(preview.blocked_reason or "当前策略纸面执行预估未通过。")
+            # Round 67 — route the pre-dispatch preview check through
+            # ``RiskDecision`` and reuse the same decision when assembling the
+            # ``ExecutionIntent`` below, so the block-side raise and the
+            # intent's embedded decision cannot disagree about this preview.
+            decision = evaluate_risk_decision(preview)
+            if decision.verdict == "block":
+                raise ValueError(decision.reason_detail)
 
             # Round 57 — build the canonical ``ExecutionIntent`` once and
             # delegate to the locked helper so the repo's Paper dispatch path
             # shares the same immutable hand-off contract as the runtime
-            # dispatcher in ``main.py``.  The embedded ``decision`` is re-run
-            # here (on the same preview the caller evaluated) to keep this
-            # repo-level entry point self-contained for callers that invoke
-            # it outside the main dispatcher.
+            # dispatcher in ``main.py``.
             frozen_parameters = parameter_resolver.snapshot_parameters(strategy)
             intent = ExecutionIntent(
                 strategy_id=strategy_id,
@@ -5930,7 +5932,7 @@ class AppRepository:
                 price=preview.price,
                 signal=snapshot.signal,
                 preview=preview,
-                decision=evaluate_risk_decision(preview),
+                decision=decision,
                 parameter_snapshot=frozen_parameters,
                 requested_by=requested_by,
                 note=note,
