@@ -23418,9 +23418,13 @@ class ExecutionPreviewRecommendedActionTypedDispatchRound77Tests(unittest.TestCa
     def test_typed_insufficient_balance_with_perp_margin_detail_returns_margin_copy(self) -> None:
         from models import RISK_REASON_INSUFFICIENT_BALANCE  # noqa: PLC0415
 
+        # Round 87 — the ``"可用保证金不足"`` substring fallback is removed,
+        # so the perp-margin copy is now reachable only via the typed
+        # ``market="perp"`` kwarg; the detail alone is not a discriminator.
         result = control_main._build_execution_preview_recommended_action(
             "当前 Bybit 可用保证金不足，当前可用 0.00 USDT。",
             block_code=RISK_REASON_INSUFFICIENT_BALANCE,
+            market="perp",
         )
         self.assertIsNotNone(result)
         assert result is not None
@@ -23735,9 +23739,12 @@ class InsufficientBalanceMarketDiscriminatorRound79Tests(unittest.TestCase):
     2. ``market="spot"`` → available-balance recommendation even when the
        detail *does* contain ``"保证金"`` (typed discriminator overrides the
        legacy substring probe).
-    3. ``market=None`` → substring fallback preserves the legacy behaviour
-       (perp for ``"保证金不足"``, spot otherwise) so audit-record callers
-       that don't yet thread ``market`` stay functional.
+    3. ``market=None`` → **deterministic spot-balance default** (R87 removed
+       the legacy substring fallback; every in-tree caller now threads
+       ``market`` or pre-computes the recommendation, so the substring
+       probe was dead code).  Invariant is covered by the R87 observable-
+       removal test class; the R79 suite no longer asserts the probe
+       behaviour.
     4. ``_build_blocked_strategy_execution_preview`` threads
        ``market=snapshot.market`` end-to-end so the recommended_action
        emitted on the blocked preview uses the typed field.
@@ -23783,28 +23790,6 @@ class InsufficientBalanceMarketDiscriminatorRound79Tests(unittest.TestCase):
         assert result is not None
         self.assertIn("UNIFIED 账户可用余额", result)
         self.assertNotIn("可用保证金", result)
-
-    def test_market_none_falls_back_to_substring_probe_for_perp(self) -> None:
-        from models import RISK_REASON_INSUFFICIENT_BALANCE  # noqa: PLC0415
-
-        result = control_main._build_execution_preview_recommended_action(
-            "当前可用保证金不足，当前可用 0.00 USDT。",
-            block_code=RISK_REASON_INSUFFICIENT_BALANCE,
-        )
-        self.assertIsNotNone(result)
-        assert result is not None
-        self.assertIn("UNIFIED 账户可用保证金", result)
-
-    def test_market_none_falls_back_to_substring_probe_for_spot(self) -> None:
-        from models import RISK_REASON_INSUFFICIENT_BALANCE  # noqa: PLC0415
-
-        result = control_main._build_execution_preview_recommended_action(
-            "当前 Bybit 可用余额不足，当前可用 0.00 USDT。",
-            block_code=RISK_REASON_INSUFFICIENT_BALANCE,
-        )
-        self.assertIsNotNone(result)
-        assert result is not None
-        self.assertIn("UNIFIED 账户可用余额", result)
 
     def test_blocked_strategy_execution_preview_threads_market_to_recommendation(self) -> None:
         from models import RISK_REASON_INSUFFICIENT_BALANCE  # noqa: PLC0415
@@ -24569,6 +24554,109 @@ class DispatchStrategySignalExcTypedKwargsRound86Tests(unittest.TestCase):
         self.assertTrue(captured.get("called"))
         kwargs = captured["kwargs"]
         self.assertEqual(kwargs.get("recommended_action"), "自定义建议：请联系运营。")
+
+
+class InsufficientBalanceMarketSubstringRemovalRound87Tests(unittest.TestCase):
+    """Round 87 — the ``"可用保证金不足"`` / ``"保证金不足"`` substring
+    fallback inside the ``RISK_REASON_INSUFFICIENT_BALANCE`` branch of
+    ``_build_execution_preview_recommended_action`` has been deleted.  R79
+    threaded a typed ``market`` kwarg end-to-end (``ExecutionPreview.market``
+    / ``StrategyRuntimeSnapshot.market``) and R84 then threaded it through
+    ``_record_strategy_{auto_dispatch,manual_execution}_issue`` as well, so
+    every in-tree caller either:
+
+    (a) forwards ``market=`` explicitly when the detail *could* carry an
+        INSUFFICIENT_BALANCE context (``_build_blocked_strategy_execution_preview``
+        / ``_decorate_strategy_runtime_item`` /
+        ``_resolve_auto_dispatch_top_issue_recommended_action`` /
+        the two record helpers), or
+    (b) pre-computes ``recommended_action=`` from the preview / outcome so
+        the helper's fallback branch never fires (``_record_strategy_manual_execution_issue``
+        callers at ``_dispatch_strategy_signal_from_state`` /
+        ``dispatch_strategy_signal``'s ``except StrategyExecutionBlockedError``
+        branch, ``_record_strategy_auto_dispatch_issue`` caller at the
+        outcome-blocked site), or
+    (c) emits a detail that is structurally never INSUFFICIENT_BALANCE
+        (runtime-worker / gate-rejected / channel-outage).
+
+    The substring probe was therefore dead — this round deletes it and
+    pins the removal with an observable test: when ``market=None`` *and*
+    the detail carries the legacy ``"保证金不足"`` token, the helper now
+    returns the spot available-balance copy rather than the perp margin
+    copy the probe used to flip to.
+
+    Invariants pinned:
+
+    1. ``market=None`` + detail with ``"保证金不足"`` → spot available-balance
+       copy (observable proof that the probe no longer runs).
+    2. ``market=None`` + detail without ``"保证金"`` → spot available-balance
+       copy (unchanged; the default was already spot here).
+    3. ``market="perp"`` still returns the margin copy (typed dispatch
+       preserved).
+    4. ``market="spot"`` + detail with ``"保证金不足"`` → spot copy (typed
+       dispatch still overrides legacy substring, unchanged from R79).
+    """
+
+    def setUp(self) -> None:
+        self._account_patch = patch.object(
+            control_main, "_resolve_private_account_type_label", return_value="UNIFIED"
+        )
+        self._account_patch.start()
+        self.addCleanup(self._account_patch.stop)
+
+    def test_market_none_with_perp_substring_no_longer_returns_margin_copy(self) -> None:
+        from models import RISK_REASON_INSUFFICIENT_BALANCE  # noqa: PLC0415
+
+        # Detail deliberately carries the legacy ``"保证金不足"`` probe token
+        # so the pre-R87 fallback would have returned the margin copy.
+        # R87 deleted the probe — the helper now returns the spot default.
+        result = control_main._build_execution_preview_recommended_action(
+            "当前可用保证金不足，当前可用 0.00 USDT。",
+            block_code=RISK_REASON_INSUFFICIENT_BALANCE,
+        )
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertIn("UNIFIED 账户可用余额", result)
+        self.assertNotIn("可用保证金", result)
+
+    def test_market_none_without_margin_substring_returns_spot_copy(self) -> None:
+        from models import RISK_REASON_INSUFFICIENT_BALANCE  # noqa: PLC0415
+
+        result = control_main._build_execution_preview_recommended_action(
+            "当前 Bybit 可用余额不足，当前可用 0.00 USDT。",
+            block_code=RISK_REASON_INSUFFICIENT_BALANCE,
+        )
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertIn("UNIFIED 账户可用余额", result)
+
+    def test_typed_perp_market_still_returns_margin_copy(self) -> None:
+        from models import RISK_REASON_INSUFFICIENT_BALANCE  # noqa: PLC0415
+
+        result = control_main._build_execution_preview_recommended_action(
+            "当前 Bybit 可用余额不足，当前可用 0.00 USDT。",
+            block_code=RISK_REASON_INSUFFICIENT_BALANCE,
+            market="perp",
+        )
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertIn("UNIFIED 账户可用保证金", result)
+
+    def test_typed_spot_market_overrides_margin_substring(self) -> None:
+        from models import RISK_REASON_INSUFFICIENT_BALANCE  # noqa: PLC0415
+
+        # R79 invariant preserved: typed ``market="spot"`` overrides the
+        # legacy substring.  Now that the substring no longer fires at all,
+        # this test proves the typed branch still does the right thing.
+        result = control_main._build_execution_preview_recommended_action(
+            "当前可用保证金不足，当前可用 0.00 USDT。",
+            block_code=RISK_REASON_INSUFFICIENT_BALANCE,
+            market="spot",
+        )
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertIn("UNIFIED 账户可用余额", result)
+        self.assertNotIn("可用保证金", result)
 
 
 class AlertSubBlockCodeMappingRound85Tests(unittest.TestCase):

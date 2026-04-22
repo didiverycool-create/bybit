@@ -1038,14 +1038,19 @@ def _build_execution_preview_recommended_action(
     resolved_code = block_code or derive_block_reason_code(detail)
     if resolved_code == RISK_REASON_INSUFFICIENT_BALANCE:
         account_type = _resolve_private_account_type_label()
-        # Round 79 — prefer the typed ``market`` kwarg; fall back to the
-        # legacy substring probe only when the caller did not supply one.
-        is_perp = (
-            market == "perp"
-            if market is not None
-            else ("可用保证金不足" in detail or "保证金不足" in detail)
-        )
-        if is_perp:
+        # Round 87 — the ``"可用保证金不足"`` / ``"保证金不足"`` substring
+        # fallback (R79) has been removed: every in-tree emitter of an
+        # INSUFFICIENT_BALANCE preview / alert threads ``market`` through
+        # end-to-end (``_build_blocked_strategy_execution_preview`` /
+        # ``_decorate_strategy_runtime_item`` /
+        # ``_resolve_auto_dispatch_top_issue_recommended_action`` /
+        # ``_record_strategy_{auto_dispatch,manual_execution}_issue``), and
+        # the record-helper callers that don't forward ``market`` pre-compute
+        # the recommendation via ``preview.recommended_action`` (so the
+        # fallback branch never runs).  ``market=None`` now deterministically
+        # resolves to the spot available-balance copy rather than probing the
+        # Chinese detail for a perp hint.
+        if market == "perp":
             return f"请先补充 {account_type} 账户可用保证金，或降低委托数量后再重试。"
         return f"请先补充 {account_type} 账户可用余额，或先把资金划转到 {account_type} 后再重试。"
     if resolved_code == RISK_REASON_INSUFFICIENT_INVENTORY:
