@@ -955,6 +955,7 @@ def _build_execution_preview_recommended_action(
     detail: Optional[str],
     *,
     block_code: Optional[str] = None,
+    market: Optional[str] = None,
 ) -> Optional[str]:
     """Derive a user-facing recommendation for a blocked ``ExecutionPreview``.
 
@@ -964,11 +965,15 @@ def _build_execution_preview_recommended_action(
     ``RiskDecision.reason_code``) they pass it in explicitly; otherwise the
     free-form ``detail`` is classified via
     :func:`risk_decision.derive_block_reason_code` so the probe lives in one
-    place.  Sub-distinctions inside a typed branch (e.g. 可用余额 vs
-    可用保证金 under ``RISK_REASON_INSUFFICIENT_BALANCE``, or private-WS vs
-    public-WS under ``RISK_REASON_RUNTIME_UNAVAILABLE``) still require a
-    detail-token check because the current ``RISK_REASON_*`` taxonomy is
-    coarser than the recommendation copy.
+    place.
+
+    Round 79 — ``market`` is now threaded through so the spot vs perp
+    sub-distinction inside ``RISK_REASON_INSUFFICIENT_BALANCE`` keys off the
+    already-typed ``ExecutionPreview.market`` field rather than a detail
+    substring probe (previously ``"可用保证金不足"`` vs fallback).  Detail-
+    token sub-distinctions inside ``RISK_REASON_RUNTIME_UNAVAILABLE`` still
+    require a substring probe because the private-WS / public-WS /
+    runtime-thread split is orthogonal to ``market``.
 
     Stop-loss-guard and residual inventory-hint fallbacks that do not yet
     have a typed code remain as trailing substring probes — they fire only
@@ -980,9 +985,14 @@ def _build_execution_preview_recommended_action(
     resolved_code = block_code or derive_block_reason_code(detail)
     if resolved_code == RISK_REASON_INSUFFICIENT_BALANCE:
         account_type = _resolve_private_account_type_label()
-        # Sub-distinguish 保证金 (perp) vs 余额 (spot) inside the typed
-        # branch so the wording matches the underlying account concept.
-        if "可用保证金不足" in detail or "保证金不足" in detail:
+        # Round 79 — prefer the typed ``market`` kwarg; fall back to the
+        # legacy substring probe only when the caller did not supply one.
+        is_perp = (
+            market == "perp"
+            if market is not None
+            else ("可用保证金不足" in detail or "保证金不足" in detail)
+        )
+        if is_perp:
             return f"请先补充 {account_type} 账户可用保证金，或降低委托数量后再重试。"
         return f"请先补充 {account_type} 账户可用余额，或先把资金划转到 {account_type} 后再重试。"
     if resolved_code == RISK_REASON_INSUFFICIENT_INVENTORY:
@@ -1018,15 +1028,31 @@ def _build_execution_preview_recommended_action(
     return None
 
 
-def _build_auto_dispatch_recommended_action(detail: Optional[str], fallback_action: Optional[str] = None) -> str:
-    inferred_action = _build_execution_preview_recommended_action(detail)
+def _build_auto_dispatch_recommended_action(
+    detail: Optional[str],
+    fallback_action: Optional[str] = None,
+    *,
+    market: Optional[str] = None,
+) -> str:
+    # Round 79 — ``market`` threads the typed discriminator through to the
+    # INSUFFICIENT_BALANCE sub-dispatch so spot vs perp copy comes from the
+    # preview's typed field rather than a detail substring probe.
+    inferred_action = _build_execution_preview_recommended_action(detail, market=market)
     if inferred_action is not None:
         return inferred_action
     return fallback_action or "切到策略页查看执行预检与当前委托，必要时进入人工接管。"
 
 
-def _build_manual_execution_recommended_action(detail: Optional[str], fallback_action: Optional[str] = None) -> str:
-    inferred_action = _build_execution_preview_recommended_action(detail)
+def _build_manual_execution_recommended_action(
+    detail: Optional[str],
+    fallback_action: Optional[str] = None,
+    *,
+    market: Optional[str] = None,
+) -> str:
+    # Round 79 — ``market`` threads the typed discriminator through to the
+    # INSUFFICIENT_BALANCE sub-dispatch so spot vs perp copy comes from the
+    # preview's typed field rather than a detail substring probe.
+    inferred_action = _build_execution_preview_recommended_action(detail, market=market)
     if inferred_action is not None:
         return inferred_action
     return fallback_action or "先查看策略页执行预检、当前仓位与委托状态；必要时恢复运行线程或调整模式后再重试。"
@@ -7997,7 +8023,11 @@ def _build_blocked_strategy_execution_preview(
         block_code=block_code,
         # Round 77 — pass the typed ``block_code`` through so the recommender
         # dispatches on the typed family rather than re-classifying ``detail``.
-        recommended_action=_build_execution_preview_recommended_action(detail, block_code=block_code),
+        # Round 79 — also thread ``market`` so the INSUFFICIENT_BALANCE branch
+        # keys spot vs perp off the typed field rather than a substring probe.
+        recommended_action=_build_execution_preview_recommended_action(
+            detail, block_code=block_code, market=snapshot.market
+        ),
         warnings=[detail],
         current_position_side="flat",
         current_position_size="--",
@@ -8978,7 +9008,9 @@ def build_strategy_runtime_response() -> List[StrategyRuntimeSnapshot]:
             and last_execution_event_type in {"strategy.execution.blocked", "strategy.exchange_order.auto_blocked"}
             and last_execution_detail
         ):
-            recommended_action = last_execution_recommended_action or _build_execution_preview_recommended_action(last_execution_detail)
+            recommended_action = last_execution_recommended_action or _build_execution_preview_recommended_action(
+                last_execution_detail, market=item.market
+            )
             item = item.model_copy(
                 update={
                     "note": last_execution_detail,

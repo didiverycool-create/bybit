@@ -23719,5 +23719,144 @@ class ExchangeConstraintViolationTypedReturnRound78Tests(unittest.TestCase):
         )
 
 
+class InsufficientBalanceMarketDiscriminatorRound79Tests(unittest.TestCase):
+    """Round 79 — the ``RISK_REASON_INSUFFICIENT_BALANCE`` sub-dispatch in
+    ``_build_execution_preview_recommended_action`` now keys spot vs perp copy
+    off the typed ``market`` kwarg (already carried on every
+    ``ExecutionPreview`` / ``StrategyRuntimeSnapshot``) rather than the
+    ``"可用保证金不足"`` substring probe.  The substring path survives as a
+    fallback only for callers that still invoke the helper without a typed
+    ``market`` (e.g. audit-record paths that receive only the detail string).
+
+    Invariants pinned:
+
+    1. ``market="perp"`` → margin recommendation even when the detail does
+       not contain ``"保证金"`` (typed discriminator wins).
+    2. ``market="spot"`` → available-balance recommendation even when the
+       detail *does* contain ``"保证金"`` (typed discriminator overrides the
+       legacy substring probe).
+    3. ``market=None`` → substring fallback preserves the legacy behaviour
+       (perp for ``"保证金不足"``, spot otherwise) so audit-record callers
+       that don't yet thread ``market`` stay functional.
+    4. ``_build_blocked_strategy_execution_preview`` threads
+       ``market=snapshot.market`` end-to-end so the recommended_action
+       emitted on the blocked preview uses the typed field.
+    5. ``_build_auto_dispatch_recommended_action`` /
+       ``_build_manual_execution_recommended_action`` accept ``market`` and
+       forward it to the inner dispatch.
+    """
+
+    def setUp(self) -> None:
+        self._account_patch = patch.object(
+            control_main, "_resolve_private_account_type_label", return_value="UNIFIED"
+        )
+        self._account_patch.start()
+        self.addCleanup(self._account_patch.stop)
+
+    def test_typed_perp_market_returns_margin_copy_regardless_of_detail(self) -> None:
+        from models import RISK_REASON_INSUFFICIENT_BALANCE  # noqa: PLC0415
+
+        # Detail intentionally omits "保证金" so only the typed ``market``
+        # can drive the margin branch.
+        result = control_main._build_execution_preview_recommended_action(
+            "当前 Bybit 可用余额不足，当前可用 0.00 USDT。",
+            block_code=RISK_REASON_INSUFFICIENT_BALANCE,
+            market="perp",
+        )
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertIn("UNIFIED 账户可用保证金", result)
+        self.assertNotIn("可用余额", result)
+
+    def test_typed_spot_market_overrides_margin_substring(self) -> None:
+        from models import RISK_REASON_INSUFFICIENT_BALANCE  # noqa: PLC0415
+
+        # Detail contains "保证金不足" which the legacy substring probe would
+        # have classified as perp; the typed ``market="spot"`` must override
+        # and produce the available-balance copy.
+        result = control_main._build_execution_preview_recommended_action(
+            "当前可用保证金不足，当前可用 0.00 USDT。",
+            block_code=RISK_REASON_INSUFFICIENT_BALANCE,
+            market="spot",
+        )
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertIn("UNIFIED 账户可用余额", result)
+        self.assertNotIn("可用保证金", result)
+
+    def test_market_none_falls_back_to_substring_probe_for_perp(self) -> None:
+        from models import RISK_REASON_INSUFFICIENT_BALANCE  # noqa: PLC0415
+
+        result = control_main._build_execution_preview_recommended_action(
+            "当前可用保证金不足，当前可用 0.00 USDT。",
+            block_code=RISK_REASON_INSUFFICIENT_BALANCE,
+        )
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertIn("UNIFIED 账户可用保证金", result)
+
+    def test_market_none_falls_back_to_substring_probe_for_spot(self) -> None:
+        from models import RISK_REASON_INSUFFICIENT_BALANCE  # noqa: PLC0415
+
+        result = control_main._build_execution_preview_recommended_action(
+            "当前 Bybit 可用余额不足，当前可用 0.00 USDT。",
+            block_code=RISK_REASON_INSUFFICIENT_BALANCE,
+        )
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertIn("UNIFIED 账户可用余额", result)
+
+    def test_blocked_strategy_execution_preview_threads_market_to_recommendation(self) -> None:
+        from models import RISK_REASON_INSUFFICIENT_BALANCE  # noqa: PLC0415
+
+        snapshot = StrategyRuntimeSnapshot(
+            strategy_id="swing-eth-01",
+            strategy_name="ETH 波段",
+            symbol="ETHUSDT",
+            market="perp",
+            mode=AccountMode.LIVE,
+            runtime_status="running",
+            signal="long",
+            confidence=50.0,
+            last_price=3200.0,
+            reference_price=3190.0,
+            change_24h=0.3,
+            note="",
+            next_action="",
+            last_evaluated_at="2026-04-22T00:00:00+08:00",
+        )
+        # Detail deliberately omits ``保证金`` so only ``snapshot.market="perp"``
+        # can drive the margin branch — pins the end-to-end typed threading.
+        detail = "当前 Bybit 可用余额不足，当前可用 0.00 USDT。"
+        preview = control_main._build_blocked_strategy_execution_preview(
+            snapshot,
+            AccountMode.LIVE,
+            detail,
+            block_code=RISK_REASON_INSUFFICIENT_BALANCE,
+        )
+        self.assertEqual(preview.market, "perp")
+        self.assertIsNotNone(preview.recommended_action)
+        assert preview.recommended_action is not None
+        self.assertIn("UNIFIED 账户可用保证金", preview.recommended_action)
+
+    def test_auto_dispatch_recommended_action_forwards_market_kwarg(self) -> None:
+        from models import RISK_REASON_INSUFFICIENT_BALANCE  # noqa: PLC0415
+
+        _ = RISK_REASON_INSUFFICIENT_BALANCE  # import-for-side-effects only
+        # Detail omits ``保证金``; ``market="perp"`` must flip the sub-dispatch.
+        result = control_main._build_auto_dispatch_recommended_action(
+            "当前 Bybit 可用余额不足，当前可用 0.00 USDT。",
+            market="perp",
+        )
+        self.assertIn("UNIFIED 账户可用保证金", result)
+
+    def test_manual_execution_recommended_action_forwards_market_kwarg(self) -> None:
+        result = control_main._build_manual_execution_recommended_action(
+            "当前可用保证金不足，当前可用 0.00 USDT。",
+            market="spot",
+        )
+        self.assertIn("UNIFIED 账户可用余额", result)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
