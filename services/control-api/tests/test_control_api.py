@@ -24067,6 +24067,111 @@ class RuntimeUnavailableSubBlockCodeRound80Tests(unittest.TestCase):
         self.assertNotIn("公共 WS", result)
 
 
+class StopLossGuardTypedBlockCodeRound82Tests(unittest.TestCase):
+    """Round 82 — lift the ``"止损保护"`` substring probe in
+    ``_build_execution_preview_recommended_action`` to a typed
+    ``RISK_REASON_STOP_LOSS_GUARD`` code set at the preview-builder source.
+
+    Invariants pinned:
+
+    1. ``derive_block_reason_code`` classifies the canonical live-stop-loss
+       copy onto ``RISK_REASON_STOP_LOSS_GUARD`` (legacy audit strings stay
+       classified even when they arrive without a typed ``block_code``).
+    2. ``derive_block_reason_code`` is conservative: unrelated details still
+       fall back to ``RISK_REASON_PREVIEW_BLOCKED``.
+    3. ``_build_execution_preview_recommended_action`` dispatches on the
+       typed code (``block_code=RISK_REASON_STOP_LOSS_GUARD``) even when the
+       detail omits the ``"止损保护"`` token — proving typed-first dispatch.
+    4. The legacy substring still classifies via ``derive_block_reason_code``
+       so unconverted callers (audit record re-rendering) keep working.
+    5. ``ExecutionPreview.block_code`` round-trips via ``evaluate_risk_decision``
+       onto ``RiskDecision.reason_code``.
+    """
+
+    def test_derive_block_reason_code_classifies_stop_loss_guard_detail(self) -> None:
+        from models import RISK_REASON_STOP_LOSS_GUARD  # noqa: PLC0415
+        from risk_decision import derive_block_reason_code  # noqa: PLC0415
+
+        detail = "当前已触发真实模式止损保护，请先人工复核真实仓位后再决定是否恢复策略执行。"
+        self.assertEqual(derive_block_reason_code(detail), RISK_REASON_STOP_LOSS_GUARD)
+
+    def test_derive_block_reason_code_ignores_unrelated_detail(self) -> None:
+        from models import RISK_REASON_PREVIEW_BLOCKED  # noqa: PLC0415
+        from risk_decision import derive_block_reason_code  # noqa: PLC0415
+
+        # An unrelated free-form detail must not spuriously classify as
+        # stop-loss-guard.  The probe is narrow enough that the default
+        # preview-blocked fallback should fire.
+        detail = "某条运营经验提示：请先与团队沟通后再操作。"
+        self.assertEqual(derive_block_reason_code(detail), RISK_REASON_PREVIEW_BLOCKED)
+
+    def test_typed_block_code_overrides_detail_without_substring(self) -> None:
+        from models import RISK_REASON_STOP_LOSS_GUARD  # noqa: PLC0415
+
+        # Detail deliberately omits the ``"止损保护"`` token so only the
+        # typed ``block_code`` can drive the stop-loss-guard copy — pins
+        # typed-first dispatch.
+        result = control_main._build_execution_preview_recommended_action(
+            "自动执行暂缓，请先人工复核。",
+            block_code=RISK_REASON_STOP_LOSS_GUARD,
+        )
+        self.assertEqual(
+            result,
+            "请先人工复核真实仓位与策略参数，确认无误后再恢复策略执行。",
+        )
+
+    def test_legacy_substring_still_classifies_via_derive(self) -> None:
+        # ``_build_execution_preview_recommended_action`` resolves the code
+        # via ``derive_block_reason_code`` when no typed ``block_code`` is
+        # passed; the probe recognises ``"止损保护"`` so the legacy callers
+        # (audit record re-rendering) still get the right copy.
+        result = control_main._build_execution_preview_recommended_action(
+            "当前已触发真实模式止损保护，请先人工复核真实仓位。",
+        )
+        self.assertEqual(
+            result,
+            "请先人工复核真实仓位与策略参数，确认无误后再恢复策略执行。",
+        )
+
+    def test_risk_decision_exposes_stop_loss_guard_reason_code(self) -> None:
+        from models import ExecutionPreview, RISK_REASON_STOP_LOSS_GUARD  # noqa: PLC0415
+        from risk_decision import evaluate_risk_decision  # noqa: PLC0415
+
+        # Build a minimal blocked preview with the typed ``block_code`` set
+        # at source and confirm ``evaluate_risk_decision`` surfaces it on
+        # the typed ``RiskDecision.reason_code``.
+        preview = ExecutionPreview(
+            symbol="BTCUSDT",
+            market="perp",
+            mode=AccountMode.LIVE,
+            side=Direction.BUY,
+            origin="strategy",
+            strategy_id="swing-btc-01",
+            quantity=0.0,
+            price=70000.0,
+            notional="--",
+            action="hold",
+            allowed=False,
+            blocked_reason="当前已触发真实模式止损保护，请先人工复核真实仓位。",
+            block_code=RISK_REASON_STOP_LOSS_GUARD,
+            recommended_action="请先人工复核真实仓位与策略参数，确认无误后再恢复策略执行。",
+            warnings=["当前真实模式止损保护仍在生效。"],
+            current_position_side="flat",
+            current_position_size="--",
+            current_avg_price="--",
+            projected_position_side="flat",
+            projected_position_size="--",
+            projected_avg_price="--",
+            available_balance_before="--",
+            available_balance_after="--",
+            estimated_realized_pnl="--",
+            generated_at="2026-04-23T00:00:00+08:00",
+        )
+        decision = evaluate_risk_decision(preview)
+        self.assertEqual(decision.verdict, "block")
+        self.assertEqual(decision.reason_code, RISK_REASON_STOP_LOSS_GUARD)
+
+
 class StrategyExecutionNoopTypedExceptionRound81Tests(unittest.TestCase):
     """Round 81 — the ``auto.dispatch.noop`` verdict emitted by
     ``_classify_auto_dispatch_outcome`` now keys off the typed

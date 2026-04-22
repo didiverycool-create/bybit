@@ -1423,6 +1423,14 @@ RISK_REASON_RUNTIME_UNAVAILABLE = "risk.runtime_unavailable"
 RISK_REASON_RUNTIME_UNAVAILABLE_PRIVATE_CHANNEL = "risk.runtime_unavailable.private_channel"
 RISK_REASON_RUNTIME_UNAVAILABLE_PUBLIC_CHANNEL = "risk.runtime_unavailable.public_channel"
 RISK_REASON_RUNTIME_UNAVAILABLE_WORKER_THREAD = "risk.runtime_unavailable.worker_thread"
+# Round 82 — typed code for real-mode stop-loss-guard blocks.  Previously the
+# stop-loss-guard preview at ``_build_strategy_execution_preview_from_state``
+# attached ``blocked_reason="当前已触发真实模式止损保护..."`` with no typed
+# ``block_code``; ``_build_execution_preview_recommended_action`` re-classified
+# via an ``if "止损保护" in detail:`` substring probe.  The new code tags the
+# block at source so downstream recommenders, audit consumers and
+# ``derive_block_reason_code`` all see a stable machine-readable code.
+RISK_REASON_STOP_LOSS_GUARD = "risk.stop_loss_guard"
 RISK_REASON_PREVIEW_BLOCKED = "risk.preview_blocked"
 
 

@@ -41,6 +41,7 @@ from models import (
     RISK_REASON_INVALID_REQUEST,
     RISK_REASON_PREVIEW_BLOCKED,
     RISK_REASON_RUNTIME_UNAVAILABLE,
+    RISK_REASON_STOP_LOSS_GUARD,
     RiskDecision,
     RiskDecisionRecommendation,
 )
@@ -102,6 +103,15 @@ _RUNTIME_UNAVAILABLE_HINTS = (
     "公共 WS",
     "Bybit 私有账户链路",
 )
+# Round 82 — live-mode stop-loss-guard blocks carry ``"止损保护"`` in every
+# in-tree producer of the copy ("当前已触发真实模式止损保护...").  The primary
+# path now sets :data:`RISK_REASON_STOP_LOSS_GUARD` at source, but this probe
+# classifies legacy audit strings / externally-constructed previews onto the
+# same code so downstream recommenders don't fall through to the generic
+# ``risk.preview_blocked`` fallback.
+_STOP_LOSS_GUARD_HINTS = (
+    "止损保护",
+)
 
 
 def derive_block_reason_code(detail: str) -> str:
@@ -143,6 +153,12 @@ def derive_block_reason_code(detail: str) -> str:
     for hint in _RUNTIME_UNAVAILABLE_HINTS:
         if hint in detail:
             return RISK_REASON_RUNTIME_UNAVAILABLE
+    # Round 82 — stop-loss-guard hint probed at the same tier as the runtime
+    # outage hints: the phrase is narrow enough that a false positive is
+    # essentially impossible (only the live-stop-loss preview carries it).
+    for hint in _STOP_LOSS_GUARD_HINTS:
+        if hint in detail:
+            return RISK_REASON_STOP_LOSS_GUARD
     return RISK_REASON_PREVIEW_BLOCKED
 
 

@@ -137,6 +137,7 @@ from models import (
     RISK_REASON_RUNTIME_UNAVAILABLE_PRIVATE_CHANNEL,
     RISK_REASON_RUNTIME_UNAVAILABLE_PUBLIC_CHANNEL,
     RISK_REASON_RUNTIME_UNAVAILABLE_WORKER_THREAD,
+    RISK_REASON_STOP_LOSS_GUARD,
     LiveOrderReconciliation,
     ExchangePositionBulkCloseResult,
     ExecutionEvent,
@@ -1071,13 +1072,15 @@ def _build_execution_preview_recommended_action(
             return _build_public_execution_channel_recommended_action(detail)
         if "运行线程" in detail:
             return "打开设置页点击“恢复运行线程”，并确认最近审计日志与最新信号。"
-    # Residual substring fallbacks for details that have no typed code yet.
-    # ``止损保护`` classifies as ``PREVIEW_BLOCKED`` under
-    # ``derive_block_reason_code`` (no dedicated ``RISK_REASON_*`` code); the
-    # ``未成交卖单 + 可卖`` pair is a defensive catch for spot-sell inventory
-    # hints produced without the dominant ``现货可卖数量不足`` token.
-    if "止损保护" in detail:
+    # Round 82 — typed stop-loss-guard dispatch.  ``_build_strategy_execution_preview_from_state``
+    # tags the stop-loss-guard block with ``RISK_REASON_STOP_LOSS_GUARD`` at
+    # source and ``derive_block_reason_code`` classifies legacy ``"止损保护"``
+    # detail strings (e.g. from older audit payloads) onto the same code.
+    if resolved_code == RISK_REASON_STOP_LOSS_GUARD:
         return "请先人工复核真实仓位与策略参数，确认无误后再恢复策略执行。"
+    # Residual substring fallbacks for details that have no typed code yet.
+    # The ``未成交卖单 + 可卖`` pair is a defensive catch for spot-sell
+    # inventory hints produced without the dominant ``现货可卖数量不足`` token.
     if "未成交卖单" in detail and "可卖" in detail:
         return "请先撤销相关未成交卖单，或降低卖出数量后再重试。"
     return None
@@ -8975,11 +8978,16 @@ def _build_strategy_execution_preview_from_state(
         warnings.append("当前还存在旧策略委托，若继续执行会先自动撤掉旧委托。")
     if _has_active_strategy_live_stop_loss_alert(strategy_id):
         warnings.append("当前真实模式止损保护仍在生效。")
+        # Round 82 — tag the stop-loss-guard block with the typed
+        # ``RISK_REASON_STOP_LOSS_GUARD`` code at source so downstream
+        # recommenders branch on the typed field rather than substring-probe
+        # ``"止损保护"`` on the detail.
         return preview.model_copy(
             update={
                 "allowed": False,
                 "blocked_reason": "当前已触发真实模式止损保护，请先人工复核真实仓位后再决定是否恢复策略执行。",
                 "recommended_action": "请先人工复核真实仓位与策略参数，确认无误后再恢复策略执行。",
+                "block_code": RISK_REASON_STOP_LOSS_GUARD,
                 "warnings": warnings,
             }
         )
