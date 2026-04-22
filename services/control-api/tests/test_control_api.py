@@ -23352,5 +23352,197 @@ class AlertRecordTypedReasonCodeRound76Tests(unittest.TestCase):
             control_main.repo.state.alerts = original_alerts
 
 
+class ExecutionPreviewRecommendedActionTypedDispatchRound77Tests(unittest.TestCase):
+    """Round 77 — ``_build_execution_preview_recommended_action`` now keys
+    top-level dispatch off the typed ``block_code`` (``RISK_REASON_*``)
+    rather than a flat substring probe on ``detail``.  Callers pass
+    ``block_code`` directly when a typed code is already known
+    (e.g. ``_build_blocked_strategy_execution_preview``); when absent, the
+    helper classifies ``detail`` through ``derive_block_reason_code`` so the
+    substring probe lives in exactly one place.  Sub-distinctions inside a
+    typed branch (余额 vs 保证金; private vs public vs runtime-thread)
+    still use detail-token checks because the typed taxonomy is coarser
+    than the recommendation copy.
+
+    Invariants pinned:
+
+    1. ``block_code=RISK_REASON_INSUFFICIENT_BALANCE`` + spot-balance
+       detail → 可用余额 recommendation.
+    2. ``block_code=RISK_REASON_INSUFFICIENT_BALANCE`` + perp-margin
+       detail → 可用保证金 recommendation.
+    3. ``block_code=RISK_REASON_INSUFFICIENT_INVENTORY`` → inventory
+       recommendation even when the detail does not include the
+       canonical ``"现货可卖数量不足"`` substring (typed code drives
+       dispatch).
+    4. ``block_code=RISK_REASON_EXCHANGE_CONSTRAINT`` + constraint
+       detail → the narrower exchange-constraint recommendation.
+    5. ``block_code=RISK_REASON_RUNTIME_UNAVAILABLE`` + private-WS
+       detail → private-channel recommendation.
+    6. ``block_code=RISK_REASON_RUNTIME_UNAVAILABLE`` + public-WS
+       detail → public-channel recommendation.
+    7. ``block_code=RISK_REASON_RUNTIME_UNAVAILABLE`` + runtime-thread
+       detail → 恢复运行线程 recommendation.
+    8. ``block_code=None`` with balance detail → classifier fallback
+       matches the typed branch (preserves legacy behaviour for
+       callers that still invoke the helper without a typed code).
+    9. Stop-loss-guard residual fallback ("止损保护") still emits the
+       人工复核 recommendation when no typed code matches.
+    10. ``_build_blocked_strategy_execution_preview`` threads ``block_code``
+        through so the emitted ``ExecutionPreview.recommended_action`` is
+        produced by the typed dispatch (pinned end-to-end).
+    """
+
+    def setUp(self) -> None:
+        # ``_build_execution_preview_recommended_action`` reads the live
+        # account type label for the INSUFFICIENT_BALANCE branch; pin it to a
+        # stable value so assertions are deterministic regardless of the
+        # ambient ``private_data.get_status()`` result.
+        self._account_patch = patch.object(
+            control_main, "_resolve_private_account_type_label", return_value="UNIFIED"
+        )
+        self._account_patch.start()
+        self.addCleanup(self._account_patch.stop)
+
+    def test_typed_insufficient_balance_with_spot_detail_returns_available_balance_copy(self) -> None:
+        from models import RISK_REASON_INSUFFICIENT_BALANCE  # noqa: PLC0415
+
+        result = control_main._build_execution_preview_recommended_action(
+            "当前 Bybit 可用余额不足，当前可用 0.00 USDT。",
+            block_code=RISK_REASON_INSUFFICIENT_BALANCE,
+        )
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertIn("UNIFIED 账户可用余额", result)
+        self.assertNotIn("可用保证金", result)
+
+    def test_typed_insufficient_balance_with_perp_margin_detail_returns_margin_copy(self) -> None:
+        from models import RISK_REASON_INSUFFICIENT_BALANCE  # noqa: PLC0415
+
+        result = control_main._build_execution_preview_recommended_action(
+            "当前 Bybit 可用保证金不足，当前可用 0.00 USDT。",
+            block_code=RISK_REASON_INSUFFICIENT_BALANCE,
+        )
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertIn("UNIFIED 账户可用保证金", result)
+
+    def test_typed_insufficient_inventory_drives_dispatch_without_canonical_token(self) -> None:
+        from models import RISK_REASON_INSUFFICIENT_INVENTORY  # noqa: PLC0415
+
+        # Detail intentionally omits "现货可卖数量不足" / "未成交卖单"+"可卖"
+        # so only the typed code can drive the inventory branch — pins that
+        # R77 trusts the type over the substring heuristic.
+        result = control_main._build_execution_preview_recommended_action(
+            "当前库存出现异常限制，无法继续执行真实卖出委托。",
+            block_code=RISK_REASON_INSUFFICIENT_INVENTORY,
+        )
+        self.assertEqual(
+            result,
+            "请先撤销相关未成交卖单，或降低卖出数量后再重试。",
+        )
+
+    def test_typed_exchange_constraint_with_min_qty_detail_returns_constraint_copy(self) -> None:
+        from models import RISK_REASON_EXCHANGE_CONSTRAINT  # noqa: PLC0415
+
+        result = control_main._build_execution_preview_recommended_action(
+            "当前 Bybit 最小下单量 0.001 BTC，需要调整数量步长。",
+            block_code=RISK_REASON_EXCHANGE_CONSTRAINT,
+        )
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertIn("最小下单量", result)
+        self.assertIn("数量步长", result)
+
+    def test_typed_runtime_unavailable_with_private_ws_detail_returns_private_recommendation(self) -> None:
+        from models import RISK_REASON_RUNTIME_UNAVAILABLE  # noqa: PLC0415
+
+        detail = "当前 Bybit 私有 WS 未连通，无法安全执行真实策略委托。"
+        result = control_main._build_execution_preview_recommended_action(
+            detail,
+            block_code=RISK_REASON_RUNTIME_UNAVAILABLE,
+        )
+        self.assertEqual(
+            result,
+            control_main._build_private_execution_channel_recommended_action(detail),
+        )
+
+    def test_typed_runtime_unavailable_with_public_ws_detail_returns_public_recommendation(self) -> None:
+        from models import RISK_REASON_RUNTIME_UNAVAILABLE  # noqa: PLC0415
+
+        detail = "当前 Bybit 公共 WS 行情断线，公共实时链路暂停。"
+        result = control_main._build_execution_preview_recommended_action(
+            detail,
+            block_code=RISK_REASON_RUNTIME_UNAVAILABLE,
+        )
+        self.assertEqual(
+            result,
+            control_main._build_public_execution_channel_recommended_action(detail),
+        )
+
+    def test_typed_runtime_unavailable_with_runtime_thread_detail_returns_thread_recovery_copy(self) -> None:
+        from models import RISK_REASON_RUNTIME_UNAVAILABLE  # noqa: PLC0415
+
+        result = control_main._build_execution_preview_recommended_action(
+            "当前策略运行线程存在异常，请先在设置页恢复运行线程后再执行真实策略。",
+            block_code=RISK_REASON_RUNTIME_UNAVAILABLE,
+        )
+        self.assertEqual(
+            result,
+            "打开设置页点击“恢复运行线程”，并确认最近审计日志与最新信号。",
+        )
+
+    def test_classifier_fallback_recovers_balance_branch_when_block_code_absent(self) -> None:
+        # The legacy calling contract — caller passes ``detail`` only — must
+        # still resolve to the 可用余额 recommendation via the
+        # ``derive_block_reason_code`` fallback.
+        result = control_main._build_execution_preview_recommended_action(
+            "当前 Bybit 可用余额不足，当前可用 0.00 USDT。",
+        )
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertIn("UNIFIED 账户可用余额", result)
+
+    def test_stop_loss_guard_residual_substring_still_fires_without_typed_code(self) -> None:
+        result = control_main._build_execution_preview_recommended_action(
+            "当前已触发真实模式止损保护，请先人工复核真实仓位后再决定是否恢复策略执行。",
+        )
+        self.assertEqual(
+            result,
+            "请先人工复核真实仓位与策略参数，确认无误后再恢复策略执行。",
+        )
+
+    def test_blocked_strategy_execution_preview_threads_block_code_into_recommendation(self) -> None:
+        from models import RISK_REASON_RUNTIME_UNAVAILABLE  # noqa: PLC0415
+
+        snapshot = StrategyRuntimeSnapshot(
+            strategy_id="trend-btc-01",
+            strategy_name="BTC 趋势跟随",
+            symbol="BTCUSDT",
+            market="perp",
+            mode=AccountMode.LIVE,
+            runtime_status="running",
+            signal="long",
+            confidence=42.0,
+            last_price=66800.0,
+            reference_price=66720.0,
+            change_24h=0.6,
+            note="",
+            next_action="",
+            last_evaluated_at="2026-04-22T00:00:00+08:00",
+        )
+        detail = "当前 Bybit 私有 WS 未连通，无法安全执行真实策略委托。"
+        preview = control_main._build_blocked_strategy_execution_preview(
+            snapshot,
+            AccountMode.LIVE,
+            detail,
+            block_code=RISK_REASON_RUNTIME_UNAVAILABLE,
+        )
+        self.assertEqual(preview.block_code, RISK_REASON_RUNTIME_UNAVAILABLE)
+        self.assertEqual(
+            preview.recommended_action,
+            control_main._build_private_execution_channel_recommended_action(detail),
+        )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -156,7 +156,9 @@ from models import (
     PaperPositionBulkCloseResult,
     ReconcileChangeRequestOutcome,
     ReviewDocument,
+    RISK_REASON_EXCHANGE_CONSTRAINT,
     RISK_REASON_INSUFFICIENT_BALANCE,
+    RISK_REASON_INSUFFICIENT_INVENTORY,
     RISK_REASON_RUNTIME_UNAVAILABLE,
     RiskDecision,
     RuntimeWorkerActionPayload,
@@ -938,28 +940,65 @@ def _build_private_execution_channel_recommended_action(
     return "请先恢复 Bybit 私有实时链路，并确认程序侧 Demo / Live 模式与 API 配置一致。"
 
 
-def _build_execution_preview_recommended_action(detail: Optional[str]) -> Optional[str]:
+def _build_execution_preview_recommended_action(
+    detail: Optional[str],
+    *,
+    block_code: Optional[str] = None,
+) -> Optional[str]:
+    """Derive a user-facing recommendation for a blocked ``ExecutionPreview``.
+
+    Round 77 — top-level dispatch now keys off the typed ``block_code``
+    (``RISK_REASON_*``) rather than substring-probing ``detail``.  When
+    callers have a typed code on hand (``ExecutionPreview.block_code``,
+    ``RiskDecision.reason_code``) they pass it in explicitly; otherwise the
+    free-form ``detail`` is classified via
+    :func:`risk_decision.derive_block_reason_code` so the probe lives in one
+    place.  Sub-distinctions inside a typed branch (e.g. 可用余额 vs
+    可用保证金 under ``RISK_REASON_INSUFFICIENT_BALANCE``, or private-WS vs
+    public-WS under ``RISK_REASON_RUNTIME_UNAVAILABLE``) still require a
+    detail-token check because the current ``RISK_REASON_*`` taxonomy is
+    coarser than the recommendation copy.
+
+    Stop-loss-guard and residual inventory-hint fallbacks that do not yet
+    have a typed code remain as trailing substring probes — they fire only
+    when the typed dispatch declines to produce a recommendation.
+    """
+
     if not detail:
         return None
-    if "可用余额不足" in detail:
+    resolved_code = block_code or derive_block_reason_code(detail)
+    if resolved_code == RISK_REASON_INSUFFICIENT_BALANCE:
         account_type = _resolve_private_account_type_label()
+        # Sub-distinguish 保证金 (perp) vs 余额 (spot) inside the typed
+        # branch so the wording matches the underlying account concept.
+        if "可用保证金不足" in detail or "保证金不足" in detail:
+            return f"请先补充 {account_type} 账户可用保证金，或降低委托数量后再重试。"
         return f"请先补充 {account_type} 账户可用余额，或先把资金划转到 {account_type} 后再重试。"
-    if "可用保证金不足" in detail:
-        account_type = _resolve_private_account_type_label()
-        return f"请先补充 {account_type} 账户可用保证金，或降低委托数量后再重试。"
-    if "现货可卖数量不足" in detail or ("未成交卖单" in detail and "可卖" in detail):
+    if resolved_code == RISK_REASON_INSUFFICIENT_INVENTORY:
         return "请先撤销相关未成交卖单，或降低卖出数量后再重试。"
-    exchange_constraint_action = _build_exchange_constraint_recommended_action(detail)
-    if exchange_constraint_action is not None:
-        return exchange_constraint_action
+    if resolved_code == RISK_REASON_EXCHANGE_CONSTRAINT:
+        constraint_action = _build_exchange_constraint_recommended_action(detail)
+        if constraint_action is not None:
+            return constraint_action
+    if resolved_code == RISK_REASON_RUNTIME_UNAVAILABLE:
+        # Sub-distinguish private WS / public WS / runtime-worker thread
+        # inside the RUNTIME_UNAVAILABLE branch — the typed code alone is
+        # not granular enough to choose between three different recoveries.
+        if "私有 WS" in detail:
+            return _build_private_execution_channel_recommended_action(detail)
+        if "公共 WS" in detail or "公共实时链路" in detail:
+            return _build_public_execution_channel_recommended_action(detail)
+        if "运行线程" in detail:
+            return "打开设置页点击“恢复运行线程”，并确认最近审计日志与最新信号。"
+    # Residual substring fallbacks for details that have no typed code yet.
+    # ``止损保护`` classifies as ``PREVIEW_BLOCKED`` under
+    # ``derive_block_reason_code`` (no dedicated ``RISK_REASON_*`` code); the
+    # ``未成交卖单 + 可卖`` pair is a defensive catch for spot-sell inventory
+    # hints produced without the dominant ``现货可卖数量不足`` token.
     if "止损保护" in detail:
         return "请先人工复核真实仓位与策略参数，确认无误后再恢复策略执行。"
-    if "私有 WS" in detail:
-        return _build_private_execution_channel_recommended_action(detail)
-    if "公共 WS" in detail or "公共实时链路" in detail:
-        return _build_public_execution_channel_recommended_action(detail)
-    if "恢复运行线程" in detail or "运行线程" in detail:
-        return "打开设置页点击“恢复运行线程”，并确认最近审计日志与最新信号。"
+    if "未成交卖单" in detail and "可卖" in detail:
+        return "请先撤销相关未成交卖单，或降低卖出数量后再重试。"
     return None
 
 
@@ -7924,7 +7963,9 @@ def _build_blocked_strategy_execution_preview(
         allowed=False,
         blocked_reason=detail,
         block_code=block_code,
-        recommended_action=_build_execution_preview_recommended_action(detail),
+        # Round 77 — pass the typed ``block_code`` through so the recommender
+        # dispatches on the typed family rather than re-classifying ``detail``.
+        recommended_action=_build_execution_preview_recommended_action(detail, block_code=block_code),
         warnings=[detail],
         current_position_side="flat",
         current_position_size="--",
