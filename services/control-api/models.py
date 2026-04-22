@@ -1559,6 +1559,36 @@ class AutoDispatchOutcome(BaseModel):
     timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
+# Round 75 — typed return of ``_strategy_auto_dispatch_gate_reason`` replacing
+# the historical ``Optional[str]`` shape.  Before R75 the gate evaluator
+# decided whether to cancel existing orders by substring-probing the
+# free-form detail string for ``"公共 WS"`` / ``"私有 WS"`` alongside a
+# scheduler-status check; the classifier is now carried explicitly on the
+# context object so every sub-reason (manual override / scheduler paused /
+# freeze publish / public channel outage / private channel outage) has a
+# machine-readable identity that drives the ``cancel_existing`` side effect
+# and can be extended without reaching back into substring rules.
+AUTO_DISPATCH_GATE_REASON_SCHEDULER_MANUAL_OVERRIDE = "auto.scheduler.manual_override"
+AUTO_DISPATCH_GATE_REASON_SCHEDULER_PAUSED = "auto.scheduler.paused"
+AUTO_DISPATCH_GATE_REASON_SCHEDULER_FREEZE_PUBLISH = "auto.scheduler.freeze_publish"
+AUTO_DISPATCH_GATE_REASON_PUBLIC_CHANNEL_OUTAGE = "auto.channel.public_outage"
+AUTO_DISPATCH_GATE_REASON_PRIVATE_CHANNEL_OUTAGE = "auto.channel.private_outage"
+
+AutoDispatchGateReasonCode = Literal[
+    "auto.scheduler.manual_override",
+    "auto.scheduler.paused",
+    "auto.scheduler.freeze_publish",
+    "auto.channel.public_outage",
+    "auto.channel.private_outage",
+]
+
+
+class AutoDispatchGateReasonContext(BaseModel):
+    reason_code: AutoDispatchGateReasonCode
+    detail: str
+    cancel_existing: bool
+
+
 class ClosePaperPositionPayload(BaseModel):
     requested_by: str = "desktop_operator"
 

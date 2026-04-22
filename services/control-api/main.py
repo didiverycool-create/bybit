@@ -110,7 +110,13 @@ from models import (
     AlertAcknowledgePayload,
     AgentJobCreate,
     AiLiveSnapshot,
+    AUTO_DISPATCH_GATE_REASON_PRIVATE_CHANNEL_OUTAGE,
+    AUTO_DISPATCH_GATE_REASON_PUBLIC_CHANNEL_OUTAGE,
+    AUTO_DISPATCH_GATE_REASON_SCHEDULER_FREEZE_PUBLISH,
+    AUTO_DISPATCH_GATE_REASON_SCHEDULER_MANUAL_OVERRIDE,
+    AUTO_DISPATCH_GATE_REASON_SCHEDULER_PAUSED,
     AutoDispatchGate,
+    AutoDispatchGateReasonContext,
     AutoDispatchOutcome,
     BybitBalanceDiagnostic,
     BybitPublicStatus,
@@ -6647,14 +6653,37 @@ def _sync_strategy_position_drift_issue(
         repo._refresh_derived_state()  # type: ignore[attr-defined]
         repo._persist()  # type: ignore[attr-defined]
 
-def _strategy_auto_dispatch_gate_reason(strategy: Optional[StrategySummary] = None) -> Optional[str]:
+def _strategy_auto_dispatch_gate_reason(
+    strategy: Optional[StrategySummary] = None,
+) -> Optional[AutoDispatchGateReasonContext]:
+    """Return the typed gate reason blocking autonomous dispatch, if any.
+
+    Round 75 — return shape promoted from ``Optional[str]`` to the new
+    :class:`AutoDispatchGateReasonContext` so the downstream
+    ``_evaluate_strategy_auto_dispatch_gate`` can decide ``cancel_existing``
+    directly from a typed field instead of substring-probing the free-form
+    detail for ``"公共 WS"`` / ``"私有 WS"``.
+    """
+
     scheduler = repo.snapshot().control_snapshot.scheduler
     if scheduler.status == "manual_override":
-        return "当前 AI 调度处于人工接管，后台自动执行已暂停。"
+        return AutoDispatchGateReasonContext(
+            reason_code=AUTO_DISPATCH_GATE_REASON_SCHEDULER_MANUAL_OVERRIDE,
+            detail="当前 AI 调度处于人工接管，后台自动执行已暂停。",
+            cancel_existing=True,
+        )
     if scheduler.status == "paused":
-        return "当前 AI 调度已暂停，后台自动执行已暂停。"
+        return AutoDispatchGateReasonContext(
+            reason_code=AUTO_DISPATCH_GATE_REASON_SCHEDULER_PAUSED,
+            detail="当前 AI 调度已暂停，后台自动执行已暂停。",
+            cancel_existing=True,
+        )
     if scheduler.freeze_publish:
-        return "当前已冻结自动发布，后台自动执行暂不继续提交新委托。"
+        return AutoDispatchGateReasonContext(
+            reason_code=AUTO_DISPATCH_GATE_REASON_SCHEDULER_FREEZE_PUBLISH,
+            detail="当前已冻结自动发布，后台自动执行暂不继续提交新委托。",
+            cancel_existing=False,
+        )
     if strategy is not None and strategy.mode in {AccountMode.DEMO, AccountMode.LIVE}:
         state = repo.snapshot()
         market = _resolve_strategy_primary_market(state, strategy)
@@ -6662,10 +6691,18 @@ def _strategy_auto_dispatch_gate_reason(strategy: Optional[StrategySummary] = No
         if symbol:
             public_channel_issue = get_public_execution_channel_issue(market, symbol)
             if public_channel_issue is not None:
-                return public_channel_issue
+                return AutoDispatchGateReasonContext(
+                    reason_code=AUTO_DISPATCH_GATE_REASON_PUBLIC_CHANNEL_OUTAGE,
+                    detail=public_channel_issue,
+                    cancel_existing=True,
+                )
         private_channel_issue = get_private_execution_channel_issue(strategy.mode)
         if private_channel_issue is not None:
-            return private_channel_issue
+            return AutoDispatchGateReasonContext(
+                reason_code=AUTO_DISPATCH_GATE_REASON_PRIVATE_CHANNEL_OUTAGE,
+                detail=private_channel_issue,
+                cancel_existing=True,
+            )
     return None
 
 def _strategy_parameter_float(strategy: StrategySummary, key: str) -> Optional[float]:
@@ -7463,19 +7500,20 @@ def _evaluate_strategy_auto_dispatch_gate(
             clear_alerts=False,
             record_issue=False,
         )
-    gate_reason = _strategy_auto_dispatch_gate_reason(strategy)
-    if gate_reason is not None:
-        scheduler_status = repo.snapshot().control_snapshot.scheduler.status
-        cancel_existing = (
-            scheduler_status in {"paused", "manual_override"}
-            or "公共 WS" in gate_reason
-            or "私有 WS" in gate_reason
-        )
+    gate_reason_context = _strategy_auto_dispatch_gate_reason(strategy)
+    if gate_reason_context is not None:
+        # Round 75 — ``cancel_existing`` now reads directly off the typed
+        # context (``AutoDispatchGateReasonContext.cancel_existing``) instead
+        # of substring-probing ``gate_reason`` for ``"公共 WS"`` / ``"私有 WS"``
+        # and cross-referencing the scheduler status.  The outer
+        # ``reason_code`` remains ``auto.scheduler_or_channel_gate`` so the
+        # ``AutoDispatchGate`` API surface is unchanged; finer-grained
+        # sub-classification is carried on ``gate_reason_context.reason_code``.
         return AutoDispatchGate(
             verdict="block",
             reason_code="auto.scheduler_or_channel_gate",
-            reason_detail=gate_reason,
-            cancel_existing_orders=cancel_existing,
+            reason_detail=gate_reason_context.detail,
+            cancel_existing_orders=gate_reason_context.cancel_existing,
             clear_alerts=False,
             record_issue=True,
         )

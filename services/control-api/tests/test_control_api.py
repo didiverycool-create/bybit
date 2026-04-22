@@ -22100,15 +22100,19 @@ class AutoDispatchGateRound60UnitTests(unittest.TestCase):
         self.assertFalse(gate.record_issue)
 
     def test_gate_scheduler_channel_reason_cancels_when_ws_down(self) -> None:
-        """A scheduler/channel gate reason that mentions ``公共 WS``
-        (or ``私有 WS``) must set ``cancel_existing_orders=True`` even
-        when the scheduler status itself is not paused — the
-        connectivity-loss branch pinned by ``_auto_dispatch`` logic.
-        Side effect: ``record_issue=True`` so the operator console keeps
-        surfacing the degraded channel.
+        """A scheduler/channel gate reason carrying the public-channel-outage
+        code must set ``cancel_existing_orders=True`` even when the scheduler
+        status itself is not paused — the connectivity-loss branch pinned by
+        ``_auto_dispatch`` logic.  Side effect: ``record_issue=True`` so the
+        operator console keeps surfacing the degraded channel.
+
+        Round 75 — the classifier is now the typed
+        ``AutoDispatchGateReasonContext.cancel_existing`` field instead of a
+        substring probe on ``"公共 WS"``.
         """
 
         from contextlib import ExitStack
+        from models import AutoDispatchGateReasonContext, AUTO_DISPATCH_GATE_REASON_PUBLIC_CHANNEL_OUTAGE  # noqa: PLC0415
 
         strategy = self._strategy()
         snapshot = self._snapshot()
@@ -22132,14 +22136,11 @@ class AutoDispatchGateRound60UnitTests(unittest.TestCase):
             stack.enter_context(patch.object(
                 control_main,
                 "_strategy_auto_dispatch_gate_reason",
-                return_value="公共 WS 行情断线，自动撤销旧策略委托。",
-            ))
-            repo_snapshot = MagicMock()
-            repo_snapshot.control_snapshot.scheduler.status = "running"
-            stack.enter_context(patch.object(
-                control_main.repo,
-                "snapshot",
-                return_value=repo_snapshot,
+                return_value=AutoDispatchGateReasonContext(
+                    reason_code=AUTO_DISPATCH_GATE_REASON_PUBLIC_CHANNEL_OUTAGE,
+                    detail="公共 WS 行情断线，自动撤销旧策略委托。",
+                    cancel_existing=True,
+                ),
             ))
             gate = control_main._evaluate_strategy_auto_dispatch_gate(strategy, snapshot)
 
@@ -22154,9 +22155,17 @@ class AutoDispatchGateRound60UnitTests(unittest.TestCase):
         """When the scheduler is explicitly paused / manual-override,
         ``cancel_existing_orders`` must also fire even if the gate reason
         text does not mention WS connectivity — the scheduler-state branch.
+
+        Round 75 — the scheduler-state branch is now expressed directly on
+        ``AutoDispatchGateReasonContext.reason_code ==
+        AUTO_DISPATCH_GATE_REASON_SCHEDULER_PAUSED`` with ``cancel_existing=True``,
+        so the gate evaluator no longer has to re-read
+        ``repo.snapshot().control_snapshot.scheduler.status`` after the
+        substring probe.
         """
 
         from contextlib import ExitStack
+        from models import AutoDispatchGateReasonContext, AUTO_DISPATCH_GATE_REASON_SCHEDULER_PAUSED  # noqa: PLC0415
 
         strategy = self._strategy()
         snapshot = self._snapshot()
@@ -22180,14 +22189,11 @@ class AutoDispatchGateRound60UnitTests(unittest.TestCase):
             stack.enter_context(patch.object(
                 control_main,
                 "_strategy_auto_dispatch_gate_reason",
-                return_value="调度器处于人工干预暂停状态。",
-            ))
-            repo_snapshot = MagicMock()
-            repo_snapshot.control_snapshot.scheduler.status = "paused"
-            stack.enter_context(patch.object(
-                control_main.repo,
-                "snapshot",
-                return_value=repo_snapshot,
+                return_value=AutoDispatchGateReasonContext(
+                    reason_code=AUTO_DISPATCH_GATE_REASON_SCHEDULER_PAUSED,
+                    detail="调度器处于人工干预暂停状态。",
+                    cancel_existing=True,
+                ),
             ))
             gate = control_main._evaluate_strategy_auto_dispatch_gate(strategy, snapshot)
 
@@ -22197,13 +22203,19 @@ class AutoDispatchGateRound60UnitTests(unittest.TestCase):
         self.assertTrue(gate.record_issue)
 
     def test_gate_scheduler_reason_without_ws_or_paused_skips_cancel(self) -> None:
-        """When the gate reason is non-connectivity and the scheduler is
-        still ``running``, ``cancel_existing_orders`` must stay False —
-        the gate surfaces an issue without tearing down live working
-        orders that may still reconcile on their own.
+        """When the gate reason is a non-cancelling sub-reason (e.g. the
+        scheduler has ``freeze_publish=True`` but is otherwise running),
+        ``cancel_existing_orders`` must stay False — the gate surfaces an
+        issue without tearing down live working orders that may still
+        reconcile on their own.
+
+        Round 75 — ``cancel_existing=False`` is now carried on the typed
+        context for the freeze-publish sub-reason, so the evaluator doesn't
+        need to combine a scheduler-status check with a substring exclusion.
         """
 
         from contextlib import ExitStack
+        from models import AutoDispatchGateReasonContext, AUTO_DISPATCH_GATE_REASON_SCHEDULER_FREEZE_PUBLISH  # noqa: PLC0415
 
         strategy = self._strategy()
         snapshot = self._snapshot()
@@ -22227,14 +22239,11 @@ class AutoDispatchGateRound60UnitTests(unittest.TestCase):
             stack.enter_context(patch.object(
                 control_main,
                 "_strategy_auto_dispatch_gate_reason",
-                return_value="当前品类风控降级，等待人工复核。",
-            ))
-            repo_snapshot = MagicMock()
-            repo_snapshot.control_snapshot.scheduler.status = "running"
-            stack.enter_context(patch.object(
-                control_main.repo,
-                "snapshot",
-                return_value=repo_snapshot,
+                return_value=AutoDispatchGateReasonContext(
+                    reason_code=AUTO_DISPATCH_GATE_REASON_SCHEDULER_FREEZE_PUBLISH,
+                    detail="当前已冻结自动发布，后台自动执行暂不继续提交新委托。",
+                    cancel_existing=False,
+                ),
             ))
             gate = control_main._evaluate_strategy_auto_dispatch_gate(strategy, snapshot)
 
@@ -22923,6 +22932,148 @@ class StrategyExecutionChannelOutageTypedExceptionRound74Tests(unittest.TestCase
             with self.assertRaises(RuntimeError) as ctx:
                 control_main.build_strategy_execution_preview(strategy_id, resolved_mode)
         self.assertIs(ctx.exception, plain)
+
+
+class AutoDispatchGateReasonContextTypedReturnRound75Tests(unittest.TestCase):
+    """Round 75 — ``_strategy_auto_dispatch_gate_reason`` previously returned
+    ``Optional[str]`` and the caller decided ``cancel_existing`` by
+    substring-probing the detail for ``"公共 WS"`` / ``"私有 WS"`` plus a
+    scheduler-status check.  The return shape is now the typed
+    :class:`AutoDispatchGateReasonContext` carrying both a
+    machine-readable ``reason_code`` and the ``cancel_existing`` flag.
+
+    Five sub-reasons are pinned one-per-test:
+
+    1. Scheduler ``manual_override`` → ``auto.scheduler.manual_override`` +
+       ``cancel_existing=True``.
+    2. Scheduler ``paused`` → ``auto.scheduler.paused`` + ``cancel_existing=True``.
+    3. Scheduler ``freeze_publish=True`` → ``auto.scheduler.freeze_publish``
+       + ``cancel_existing=False`` (the freeze surfaces the issue but lets
+       working orders reconcile naturally).
+    4. Public-channel outage (demo/live strategy) →
+       ``auto.channel.public_outage`` + ``cancel_existing=True``.
+    5. Private-channel outage (demo/live strategy) →
+       ``auto.channel.private_outage`` + ``cancel_existing=True``.
+
+    The ``None`` branch is implicitly covered by
+    ``AutoDispatchGateRound60UnitTests.test_gate_allows_dispatch_when_every_guard_passes``
+    which runs every other guard clean.
+    """
+
+    def _scheduler_snapshot(self, **overrides: Any) -> MagicMock:
+        repo_snapshot = MagicMock()
+        repo_snapshot.control_snapshot.scheduler.status = overrides.get("status", "running")
+        repo_snapshot.control_snapshot.scheduler.freeze_publish = overrides.get(
+            "freeze_publish", False
+        )
+        return repo_snapshot
+
+    def _live_strategy(self) -> Any:
+        return MagicMock(
+            id="strategy-r75",
+            mode=AccountMode.LIVE,
+            symbols=["BTCUSDT"],
+        )
+
+    def test_manual_override_returns_typed_context(self) -> None:
+        from models import (  # noqa: PLC0415
+            AUTO_DISPATCH_GATE_REASON_SCHEDULER_MANUAL_OVERRIDE,
+            AutoDispatchGateReasonContext,
+        )
+
+        with patch.object(control_main.repo, "snapshot", return_value=self._scheduler_snapshot(status="manual_override")):
+            context = control_main._strategy_auto_dispatch_gate_reason(self._live_strategy())
+
+        self.assertIsInstance(context, AutoDispatchGateReasonContext)
+        assert context is not None
+        self.assertEqual(context.reason_code, AUTO_DISPATCH_GATE_REASON_SCHEDULER_MANUAL_OVERRIDE)
+        self.assertTrue(context.cancel_existing)
+        self.assertIn("人工接管", context.detail)
+
+    def test_scheduler_paused_returns_typed_context(self) -> None:
+        from models import (  # noqa: PLC0415
+            AUTO_DISPATCH_GATE_REASON_SCHEDULER_PAUSED,
+            AutoDispatchGateReasonContext,
+        )
+
+        with patch.object(control_main.repo, "snapshot", return_value=self._scheduler_snapshot(status="paused")):
+            context = control_main._strategy_auto_dispatch_gate_reason(self._live_strategy())
+
+        self.assertIsInstance(context, AutoDispatchGateReasonContext)
+        assert context is not None
+        self.assertEqual(context.reason_code, AUTO_DISPATCH_GATE_REASON_SCHEDULER_PAUSED)
+        self.assertTrue(context.cancel_existing)
+
+    def test_freeze_publish_returns_typed_context_without_cancel(self) -> None:
+        from models import (  # noqa: PLC0415
+            AUTO_DISPATCH_GATE_REASON_SCHEDULER_FREEZE_PUBLISH,
+            AutoDispatchGateReasonContext,
+        )
+
+        with patch.object(
+            control_main.repo,
+            "snapshot",
+            return_value=self._scheduler_snapshot(status="running", freeze_publish=True),
+        ):
+            context = control_main._strategy_auto_dispatch_gate_reason(self._live_strategy())
+
+        self.assertIsInstance(context, AutoDispatchGateReasonContext)
+        assert context is not None
+        self.assertEqual(context.reason_code, AUTO_DISPATCH_GATE_REASON_SCHEDULER_FREEZE_PUBLISH)
+        self.assertFalse(context.cancel_existing)
+        self.assertIn("冻结自动发布", context.detail)
+
+    def test_public_channel_outage_returns_typed_context(self) -> None:
+        from models import (  # noqa: PLC0415
+            AUTO_DISPATCH_GATE_REASON_PUBLIC_CHANNEL_OUTAGE,
+            AutoDispatchGateReasonContext,
+        )
+
+        with patch.object(control_main.repo, "snapshot", return_value=self._scheduler_snapshot()), \
+             patch.object(control_main, "_resolve_strategy_primary_market", return_value="perp"), \
+             patch.object(
+                 control_main,
+                 "get_public_execution_channel_issue",
+                 return_value="当前 Bybit 公共 WS 未启用，无法安全执行真实策略委托。",
+             ), \
+             patch.object(
+                 control_main,
+                 "get_private_execution_channel_issue",
+                 return_value=None,
+             ):
+            context = control_main._strategy_auto_dispatch_gate_reason(self._live_strategy())
+
+        self.assertIsInstance(context, AutoDispatchGateReasonContext)
+        assert context is not None
+        self.assertEqual(context.reason_code, AUTO_DISPATCH_GATE_REASON_PUBLIC_CHANNEL_OUTAGE)
+        self.assertTrue(context.cancel_existing)
+        self.assertIn("公共 WS", context.detail)
+
+    def test_private_channel_outage_returns_typed_context(self) -> None:
+        from models import (  # noqa: PLC0415
+            AUTO_DISPATCH_GATE_REASON_PRIVATE_CHANNEL_OUTAGE,
+            AutoDispatchGateReasonContext,
+        )
+
+        with patch.object(control_main.repo, "snapshot", return_value=self._scheduler_snapshot()), \
+             patch.object(control_main, "_resolve_strategy_primary_market", return_value="perp"), \
+             patch.object(
+                 control_main,
+                 "get_public_execution_channel_issue",
+                 return_value=None,
+             ), \
+             patch.object(
+                 control_main,
+                 "get_private_execution_channel_issue",
+                 return_value="当前 Bybit 私有 WS 未连通，无法安全执行真实策略委托。",
+             ):
+            context = control_main._strategy_auto_dispatch_gate_reason(self._live_strategy())
+
+        self.assertIsInstance(context, AutoDispatchGateReasonContext)
+        assert context is not None
+        self.assertEqual(context.reason_code, AUTO_DISPATCH_GATE_REASON_PRIVATE_CHANNEL_OUTAGE)
+        self.assertTrue(context.cancel_existing)
+        self.assertIn("私有 WS", context.detail)
 
 
 if __name__ == "__main__":
