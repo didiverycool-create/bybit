@@ -23858,5 +23858,214 @@ class InsufficientBalanceMarketDiscriminatorRound79Tests(unittest.TestCase):
         self.assertIn("UNIFIED 账户可用余额", result)
 
 
+class RuntimeUnavailableSubBlockCodeRound80Tests(unittest.TestCase):
+    """Round 80 — the ``RISK_REASON_RUNTIME_UNAVAILABLE`` umbrella now splits
+    into three typed sub-codes (``_PUBLIC_CHANNEL`` / ``_PRIVATE_CHANNEL`` /
+    ``_WORKER_THREAD``) so ``_build_execution_preview_recommended_action``
+    picks between channel-recovery / worker-thread recovery copy off a typed
+    discriminator rather than ``"私有 WS"`` / ``"公共 WS"`` / ``"运行线程"``
+    substring probes.
+
+    Invariants pinned:
+
+    1. ``StrategyExecutionChannelOutageError`` exposes ``sub_block_code``
+       derived from ``channel=``: ``"public"`` →
+       ``RISK_REASON_RUNTIME_UNAVAILABLE_PUBLIC_CHANNEL`` / ``"private"`` →
+       ``RISK_REASON_RUNTIME_UNAVAILABLE_PRIVATE_CHANNEL`` / omitted → ``None``.
+    2. ``_build_blocked_strategy_execution_preview`` accepts ``sub_block_code``
+       and surfaces it on the ``ExecutionPreview`` instance.
+    3. ``_build_execution_preview_recommended_action`` dispatches on the typed
+       sub-code *before* the substring probe — typed wins over substring even
+       when the two would disagree.
+    4. Worker-thread sub-code returns the "恢复运行线程" copy without any
+       ``"运行线程"`` detail substring (confirms typed-only path).
+    5. When ``sub_block_code`` is omitted the legacy substring probe still
+       classifies the detail so unconverted callers stay functional.
+    6. ``_build_auto_dispatch_recommended_action`` /
+       ``_build_manual_execution_recommended_action`` thread ``sub_block_code``
+       through to the inner dispatch.
+    """
+
+    def test_channel_outage_public_exposes_typed_sub_block_code(self) -> None:
+        from models import (  # noqa: PLC0415
+            RISK_REASON_RUNTIME_UNAVAILABLE,
+            RISK_REASON_RUNTIME_UNAVAILABLE_PUBLIC_CHANNEL,
+        )
+
+        exc = control_main.StrategyExecutionChannelOutageError(
+            "公共 WS 行情已断线", channel="public"
+        )
+        self.assertEqual(exc.block_code, RISK_REASON_RUNTIME_UNAVAILABLE)
+        self.assertEqual(exc.channel, "public")
+        self.assertEqual(
+            exc.sub_block_code,
+            RISK_REASON_RUNTIME_UNAVAILABLE_PUBLIC_CHANNEL,
+        )
+
+    def test_channel_outage_private_exposes_typed_sub_block_code(self) -> None:
+        from models import (  # noqa: PLC0415
+            RISK_REASON_RUNTIME_UNAVAILABLE,
+            RISK_REASON_RUNTIME_UNAVAILABLE_PRIVATE_CHANNEL,
+        )
+
+        exc = control_main.StrategyExecutionChannelOutageError(
+            "私有 WS 下单链路未就绪", channel="private"
+        )
+        self.assertEqual(exc.block_code, RISK_REASON_RUNTIME_UNAVAILABLE)
+        self.assertEqual(exc.channel, "private")
+        self.assertEqual(
+            exc.sub_block_code,
+            RISK_REASON_RUNTIME_UNAVAILABLE_PRIVATE_CHANNEL,
+        )
+
+    def test_channel_outage_without_channel_leaves_sub_code_none(self) -> None:
+        exc = control_main.StrategyExecutionChannelOutageError("通道掉线")
+        self.assertIsNone(exc.channel)
+        self.assertIsNone(exc.sub_block_code)
+
+    def test_typed_public_channel_sub_code_overrides_private_substring(self) -> None:
+        from models import (  # noqa: PLC0415
+            RISK_REASON_RUNTIME_UNAVAILABLE,
+            RISK_REASON_RUNTIME_UNAVAILABLE_PUBLIC_CHANNEL,
+        )
+
+        # Detail intentionally says "私有 WS" so the legacy substring probe
+        # would pick private-channel copy; the typed sub-code must override.
+        result = control_main._build_execution_preview_recommended_action(
+            "私有 WS 下单链路未就绪，请先恢复连接。",
+            block_code=RISK_REASON_RUNTIME_UNAVAILABLE,
+            sub_block_code=RISK_REASON_RUNTIME_UNAVAILABLE_PUBLIC_CHANNEL,
+        )
+        self.assertIsNotNone(result)
+        assert result is not None
+        # The public-channel recommender copy is built from the detail string
+        # by ``_build_public_execution_channel_recommended_action``; assert it
+        # does not quote the private-channel canned copy.
+        self.assertNotIn("私有 WS 下单链路", result)
+
+    def test_typed_private_channel_sub_code_overrides_public_substring(self) -> None:
+        from models import (  # noqa: PLC0415
+            RISK_REASON_RUNTIME_UNAVAILABLE,
+            RISK_REASON_RUNTIME_UNAVAILABLE_PRIVATE_CHANNEL,
+        )
+
+        result = control_main._build_execution_preview_recommended_action(
+            "公共 WS 行情已断线，请先恢复连接。",
+            block_code=RISK_REASON_RUNTIME_UNAVAILABLE,
+            sub_block_code=RISK_REASON_RUNTIME_UNAVAILABLE_PRIVATE_CHANNEL,
+        )
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertNotIn("公共 WS", result)
+
+    def test_typed_worker_thread_sub_code_returns_canned_copy_without_detail_substring(self) -> None:
+        from models import (  # noqa: PLC0415
+            RISK_REASON_RUNTIME_UNAVAILABLE,
+            RISK_REASON_RUNTIME_UNAVAILABLE_WORKER_THREAD,
+        )
+
+        # Detail deliberately omits the ``"运行线程"`` token so only the
+        # typed sub-code can drive the canned worker-thread copy.
+        result = control_main._build_execution_preview_recommended_action(
+            "后台调度未就绪，请稍后重试。",
+            block_code=RISK_REASON_RUNTIME_UNAVAILABLE,
+            sub_block_code=RISK_REASON_RUNTIME_UNAVAILABLE_WORKER_THREAD,
+        )
+        self.assertEqual(
+            result,
+            "打开设置页点击“恢复运行线程”，并确认最近审计日志与最新信号。",
+        )
+
+    def test_sub_code_omitted_falls_back_to_legacy_substring(self) -> None:
+        from models import RISK_REASON_RUNTIME_UNAVAILABLE  # noqa: PLC0415
+
+        # No ``sub_block_code`` kwarg — the substring probe still classifies
+        # the detail so unconverted callers (audit records) stay functional.
+        result_private = control_main._build_execution_preview_recommended_action(
+            "私有 WS 下单链路未就绪，请先恢复连接。",
+            block_code=RISK_REASON_RUNTIME_UNAVAILABLE,
+        )
+        self.assertIsNotNone(result_private)
+        result_public = control_main._build_execution_preview_recommended_action(
+            "公共 WS 行情已断线，请先恢复连接。",
+            block_code=RISK_REASON_RUNTIME_UNAVAILABLE,
+        )
+        self.assertIsNotNone(result_public)
+        result_worker = control_main._build_execution_preview_recommended_action(
+            "当前策略运行线程已停滞，请先在设置页恢复运行线程。",
+            block_code=RISK_REASON_RUNTIME_UNAVAILABLE,
+        )
+        self.assertEqual(
+            result_worker,
+            "打开设置页点击“恢复运行线程”，并确认最近审计日志与最新信号。",
+        )
+
+    def test_blocked_strategy_execution_preview_surfaces_sub_block_code(self) -> None:
+        from models import (  # noqa: PLC0415
+            RISK_REASON_RUNTIME_UNAVAILABLE,
+            RISK_REASON_RUNTIME_UNAVAILABLE_WORKER_THREAD,
+        )
+
+        snapshot = StrategyRuntimeSnapshot(
+            strategy_id="swing-eth-01",
+            strategy_name="ETH 波段",
+            symbol="ETHUSDT",
+            market="perp",
+            mode=AccountMode.LIVE,
+            runtime_status="running",
+            signal="long",
+            confidence=50.0,
+            last_price=3200.0,
+            reference_price=3190.0,
+            change_24h=0.3,
+            note="",
+            next_action="",
+            last_evaluated_at="2026-04-22T00:00:00+08:00",
+        )
+        # Detail deliberately omits the ``"运行线程"`` token; only the typed
+        # sub-code can drive the canned copy — pins end-to-end threading.
+        preview = control_main._build_blocked_strategy_execution_preview(
+            snapshot,
+            AccountMode.LIVE,
+            "后台调度未就绪，请稍后重试。",
+            block_code=RISK_REASON_RUNTIME_UNAVAILABLE,
+            sub_block_code=RISK_REASON_RUNTIME_UNAVAILABLE_WORKER_THREAD,
+        )
+        self.assertEqual(preview.block_code, RISK_REASON_RUNTIME_UNAVAILABLE)
+        self.assertEqual(
+            preview.sub_block_code,
+            RISK_REASON_RUNTIME_UNAVAILABLE_WORKER_THREAD,
+        )
+        self.assertEqual(
+            preview.recommended_action,
+            "打开设置页点击“恢复运行线程”，并确认最近审计日志与最新信号。",
+        )
+
+    def test_auto_dispatch_recommended_action_forwards_sub_block_code(self) -> None:
+        from models import RISK_REASON_RUNTIME_UNAVAILABLE_WORKER_THREAD  # noqa: PLC0415
+
+        # Detail without any legacy substring — only the typed sub-code can
+        # drive the worker-thread copy.
+        result = control_main._build_auto_dispatch_recommended_action(
+            "后台调度未就绪，请稍后重试。",
+            sub_block_code=RISK_REASON_RUNTIME_UNAVAILABLE_WORKER_THREAD,
+        )
+        self.assertEqual(
+            result,
+            "打开设置页点击“恢复运行线程”，并确认最近审计日志与最新信号。",
+        )
+
+    def test_manual_execution_recommended_action_forwards_sub_block_code(self) -> None:
+        from models import RISK_REASON_RUNTIME_UNAVAILABLE_PRIVATE_CHANNEL  # noqa: PLC0415
+
+        # Detail says "公共 WS" (legacy probe would pick public copy); the
+        # typed sub-code must override to the private-channel path.
+        result = control_main._build_manual_execution_recommended_action(
+            "公共 WS 行情已断线，请先恢复连接。",
+            sub_block_code=RISK_REASON_RUNTIME_UNAVAILABLE_PRIVATE_CHANNEL,
+        )
+        self.assertNotIn("公共 WS", result)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -1350,6 +1350,15 @@ class ExecutionPreview(BaseModel):
     # when set and only falls back to the substring-probe helper
     # ``derive_block_reason_code`` when a preview arrived without a typed code.
     block_code: Optional[str] = None
+    # Round 80 — finer-grained discriminator when ``block_code`` is an umbrella
+    # like ``RISK_REASON_RUNTIME_UNAVAILABLE`` that has multiple recovery
+    # paths.  Today this carries the ``RISK_REASON_RUNTIME_UNAVAILABLE_*``
+    # sub-codes so recommendation builders can pick between private-channel
+    # / public-channel / worker-thread recovery copy without re-parsing
+    # ``blocked_reason``.  Consumers should always check the umbrella
+    # ``block_code`` first and only read this field when they need the
+    # finer distinction.
+    sub_block_code: Optional[str] = None
     recommended_action: Optional[str] = None
     sizing_risk_budget: Optional[str] = None
     sizing_budget_notional: Optional[str] = None
@@ -1403,6 +1412,17 @@ RISK_REASON_INVALID_REQUEST = "risk.invalid_request"
 # The new code tags runtime / websocket outages so auditors can separate
 # infra outages from true risk blocks.
 RISK_REASON_RUNTIME_UNAVAILABLE = "risk.runtime_unavailable"
+# Round 80 — finer-grained sub-codes for the ``RISK_REASON_RUNTIME_UNAVAILABLE``
+# umbrella.  Prior to R80, ``_build_execution_preview_recommended_action``
+# substring-probed the detail for ``"私有 WS"`` / ``"公共 WS"`` / ``"运行线程"``
+# to pick between three different recovery copies.  The sub-codes below let
+# preview builders and typed exception subclasses tag the kind at source so
+# the recommendation branch dispatches on a stable machine-readable string.
+# The umbrella ``RISK_REASON_RUNTIME_UNAVAILABLE`` stays wire-compatible so
+# existing consumers that only check the top-level code keep working.
+RISK_REASON_RUNTIME_UNAVAILABLE_PRIVATE_CHANNEL = "risk.runtime_unavailable.private_channel"
+RISK_REASON_RUNTIME_UNAVAILABLE_PUBLIC_CHANNEL = "risk.runtime_unavailable.public_channel"
+RISK_REASON_RUNTIME_UNAVAILABLE_WORKER_THREAD = "risk.runtime_unavailable.worker_thread"
 RISK_REASON_PREVIEW_BLOCKED = "risk.preview_blocked"
 
 

@@ -134,6 +134,9 @@ from models import (
     ExecutionIntent,
     ExecutionPreview,
     ExecutionPreviewRequest,
+    RISK_REASON_RUNTIME_UNAVAILABLE_PRIVATE_CHANNEL,
+    RISK_REASON_RUNTIME_UNAVAILABLE_PUBLIC_CHANNEL,
+    RISK_REASON_RUNTIME_UNAVAILABLE_WORKER_THREAD,
     LiveOrderReconciliation,
     ExchangePositionBulkCloseResult,
     ExecutionEvent,
@@ -288,12 +291,28 @@ class StrategyExecutionBlockedError(RuntimeError):
 # :data:`RISK_REASON_RUNTIME_UNAVAILABLE`.  Other ``RuntimeError`` instances
 # (paused runtime, missing Paper preview, runtime worker outage, mode
 # mismatch, cooldowns, …) continue to propagate to the caller unchanged.
+#
+# Round 80 — the caller now passes the ``channel`` kwarg
+# (``"public"`` / ``"private"``) so the instance carries a typed
+# ``sub_block_code`` (``RISK_REASON_RUNTIME_UNAVAILABLE_PUBLIC_CHANNEL`` /
+# ``RISK_REASON_RUNTIME_UNAVAILABLE_PRIVATE_CHANNEL``) alongside the umbrella
+# ``block_code``.  The R77 recommendation dispatch reads ``sub_block_code``
+# first and only falls back to the ``"私有 WS"`` / ``"公共 WS"`` substring
+# probe when the typed sub-code is missing.
+_CHANNEL_SUB_BLOCK_CODE: Dict[str, str] = {
+    "public": RISK_REASON_RUNTIME_UNAVAILABLE_PUBLIC_CHANNEL,
+    "private": RISK_REASON_RUNTIME_UNAVAILABLE_PRIVATE_CHANNEL,
+}
+
+
 class StrategyExecutionChannelOutageError(RuntimeError):
     block_code: str = RISK_REASON_RUNTIME_UNAVAILABLE
 
-    def __init__(self, detail: str) -> None:
+    def __init__(self, detail: str, *, channel: Optional[str] = None) -> None:
         super().__init__(detail)
         self.detail = detail
+        self.channel = channel
+        self.sub_block_code = _CHANNEL_SUB_BLOCK_CODE.get(channel) if channel else None
 
 
 repo = AppRepository()
@@ -955,6 +974,7 @@ def _build_execution_preview_recommended_action(
     detail: Optional[str],
     *,
     block_code: Optional[str] = None,
+    sub_block_code: Optional[str] = None,
     market: Optional[str] = None,
 ) -> Optional[str]:
     """Derive a user-facing recommendation for a blocked ``ExecutionPreview``.
@@ -970,10 +990,14 @@ def _build_execution_preview_recommended_action(
     Round 79 — ``market`` is now threaded through so the spot vs perp
     sub-distinction inside ``RISK_REASON_INSUFFICIENT_BALANCE`` keys off the
     already-typed ``ExecutionPreview.market`` field rather than a detail
-    substring probe (previously ``"可用保证金不足"`` vs fallback).  Detail-
-    token sub-distinctions inside ``RISK_REASON_RUNTIME_UNAVAILABLE`` still
-    require a substring probe because the private-WS / public-WS /
-    runtime-thread split is orthogonal to ``market``.
+    substring probe (previously ``"可用保证金不足"`` vs fallback).
+
+    Round 80 — ``sub_block_code`` carries the finer-grained discriminator for
+    the ``RISK_REASON_RUNTIME_UNAVAILABLE`` umbrella so the private-WS /
+    public-WS / runtime-worker-thread recovery is picked off a typed code
+    rather than a ``"私有 WS"`` / ``"公共 WS"`` / ``"运行线程"`` detail probe.
+    Substring fallbacks remain for callers that have not been wired yet
+    (audit-record paths, legacy exception strings).
 
     Stop-loss-guard and residual inventory-hint fallbacks that do not yet
     have a typed code remain as trailing substring probes — they fire only
@@ -982,6 +1006,17 @@ def _build_execution_preview_recommended_action(
 
     if not detail:
         return None
+    # Round 80 — a typed ``sub_block_code`` is a strict discriminator and must
+    # dispatch even when the caller did not pass the umbrella ``block_code``
+    # (auto/manual dispatch helpers pass only ``sub_block_code`` on their way
+    # through).  The three RUNTIME_UNAVAILABLE sub-codes map deterministically
+    # to their recovery copy; return early before the umbrella cascade.
+    if sub_block_code == RISK_REASON_RUNTIME_UNAVAILABLE_PRIVATE_CHANNEL:
+        return _build_private_execution_channel_recommended_action(detail)
+    if sub_block_code == RISK_REASON_RUNTIME_UNAVAILABLE_PUBLIC_CHANNEL:
+        return _build_public_execution_channel_recommended_action(detail)
+    if sub_block_code == RISK_REASON_RUNTIME_UNAVAILABLE_WORKER_THREAD:
+        return "打开设置页点击“恢复运行线程”，并确认最近审计日志与最新信号。"
     resolved_code = block_code or derive_block_reason_code(detail)
     if resolved_code == RISK_REASON_INSUFFICIENT_BALANCE:
         account_type = _resolve_private_account_type_label()
@@ -1007,9 +1042,12 @@ def _build_execution_preview_recommended_action(
         # without re-parsing the detail.
         return "请按 Bybit 的最小下单量、数量步长、价格步长和最小名义价值调整参数后再重试。"
     if resolved_code == RISK_REASON_RUNTIME_UNAVAILABLE:
-        # Sub-distinguish private WS / public WS / runtime-worker thread
-        # inside the RUNTIME_UNAVAILABLE branch — the typed code alone is
-        # not granular enough to choose between three different recoveries.
+        # Round 80 — typed sub-dispatch already fired above (pre-umbrella
+        # early-return); this branch only runs when the caller passed the
+        # umbrella ``block_code`` without a typed ``sub_block_code``, so we
+        # fall back to the ``"私有 WS"`` / ``"公共 WS"`` / ``"运行线程"``
+        # substring probe to classify the detail.  New call sites should
+        # always pass ``sub_block_code`` so the probe never fires.
         if "私有 WS" in detail:
             return _build_private_execution_channel_recommended_action(detail)
         if "公共 WS" in detail or "公共实时链路" in detail:
@@ -1033,11 +1071,18 @@ def _build_auto_dispatch_recommended_action(
     fallback_action: Optional[str] = None,
     *,
     market: Optional[str] = None,
+    sub_block_code: Optional[str] = None,
 ) -> str:
     # Round 79 — ``market`` threads the typed discriminator through to the
     # INSUFFICIENT_BALANCE sub-dispatch so spot vs perp copy comes from the
     # preview's typed field rather than a detail substring probe.
-    inferred_action = _build_execution_preview_recommended_action(detail, market=market)
+    # Round 80 — ``sub_block_code`` threads the typed RUNTIME_UNAVAILABLE
+    # sub-discriminator (public/private channel, worker thread) through
+    # so channel-outage copy comes from the typed field rather than the
+    # ``"私有 WS"`` / ``"公共 WS"`` / ``"运行线程"`` detail probe.
+    inferred_action = _build_execution_preview_recommended_action(
+        detail, sub_block_code=sub_block_code, market=market
+    )
     if inferred_action is not None:
         return inferred_action
     return fallback_action or "切到策略页查看执行预检与当前委托，必要时进入人工接管。"
@@ -1048,11 +1093,18 @@ def _build_manual_execution_recommended_action(
     fallback_action: Optional[str] = None,
     *,
     market: Optional[str] = None,
+    sub_block_code: Optional[str] = None,
 ) -> str:
     # Round 79 — ``market`` threads the typed discriminator through to the
     # INSUFFICIENT_BALANCE sub-dispatch so spot vs perp copy comes from the
     # preview's typed field rather than a detail substring probe.
-    inferred_action = _build_execution_preview_recommended_action(detail, market=market)
+    # Round 80 — ``sub_block_code`` threads the typed RUNTIME_UNAVAILABLE
+    # sub-discriminator (public/private channel, worker thread) through
+    # so channel-outage copy comes from the typed field rather than the
+    # ``"私有 WS"`` / ``"公共 WS"`` / ``"运行线程"`` detail probe.
+    inferred_action = _build_execution_preview_recommended_action(
+        detail, sub_block_code=sub_block_code, market=market
+    )
     if inferred_action is not None:
         return inferred_action
     return fallback_action or "先查看策略页执行预检、当前仓位与委托状态；必要时恢复运行线程或调整模式后再重试。"
@@ -3260,11 +3312,15 @@ def _build_strategy_activity_runtime_snapshot(
     if strategy.mode != AccountMode.PAPER:
         runtime_block_reason = _runtime_worker_execution_block_reason(_build_strategy_runtime_worker_health())
         if runtime_block_reason is not None:
+            # Round 80 — tag the runtime worker-thread outage with the typed
+            # sub-code so the recommender picks the "打开设置页…恢复运行线程"
+            # copy off ``sub_block_code`` rather than the ``"运行线程"`` probe.
             strategy_mode_preview = _build_blocked_strategy_execution_preview(
                 runtime,
                 strategy.mode,
                 runtime_block_reason,
                 block_code=RISK_REASON_RUNTIME_UNAVAILABLE,
+                sub_block_code=RISK_REASON_RUNTIME_UNAVAILABLE_WORKER_THREAD,
             )
         else:
             try:
@@ -7999,11 +8055,20 @@ def _build_blocked_strategy_execution_preview(
     mode: AccountMode,
     detail: str,
     block_code: Optional[str] = None,
+    *,
+    sub_block_code: Optional[str] = None,
 ) -> ExecutionPreview:
     """Round 71 — ``block_code`` lets callers tag the typed risk code at the
     source (worker-health / WS outage / runtime error) so ``evaluate_risk_decision``
     does not need to re-derive it via substring probe.  When ``None`` the
     probe remains the fallback path.
+
+    Round 80 — ``sub_block_code`` carries the finer-grained discriminator for
+    umbrella codes that have multiple recovery paths.  The only umbrella
+    covered today is ``RISK_REASON_RUNTIME_UNAVAILABLE``: channel-outage
+    callers pass the typed private / public channel sub-code via
+    ``StrategyExecutionChannelOutageError.sub_block_code``, and runtime
+    worker-thread callers pass ``RISK_REASON_RUNTIME_UNAVAILABLE_WORKER_THREAD``.
     """
 
     fallback_side = Direction.BUY if snapshot.signal != "short" else Direction.SELL
@@ -8021,12 +8086,19 @@ def _build_blocked_strategy_execution_preview(
         allowed=False,
         blocked_reason=detail,
         block_code=block_code,
+        sub_block_code=sub_block_code,
         # Round 77 — pass the typed ``block_code`` through so the recommender
         # dispatches on the typed family rather than re-classifying ``detail``.
         # Round 79 — also thread ``market`` so the INSUFFICIENT_BALANCE branch
         # keys spot vs perp off the typed field rather than a substring probe.
+        # Round 80 — thread the typed ``sub_block_code`` so the RUNTIME_UNAVAILABLE
+        # branch picks the channel / worker-thread recovery copy off the typed
+        # discriminator rather than a ``"私有 WS"`` / ``"公共 WS"`` / ``"运行线程"`` probe.
         recommended_action=_build_execution_preview_recommended_action(
-            detail, block_code=block_code, market=snapshot.market
+            detail,
+            block_code=block_code,
+            sub_block_code=sub_block_code,
+            market=snapshot.market,
         ),
         warnings=[detail],
         current_position_side="flat",
@@ -8715,12 +8787,17 @@ def _build_strategy_execution_preview_from_state(
         # Round 74 — typed subclass so ``build_strategy_execution_preview``
         # can recover this as a blocked preview without substring-probing
         # ``str(exc)`` for "公共 WS".
-        raise StrategyExecutionChannelOutageError(public_channel_issue)
+        # Round 80 — pass ``channel="public"`` so the exception carries the
+        # typed ``RISK_REASON_RUNTIME_UNAVAILABLE_PUBLIC_CHANNEL`` sub-code
+        # alongside the umbrella ``RISK_REASON_RUNTIME_UNAVAILABLE`` block code.
+        raise StrategyExecutionChannelOutageError(public_channel_issue, channel="public")
 
     private_channel_issue = get_private_execution_channel_issue(resolved_mode)
     if private_channel_issue is not None:
         # Round 74 — see ``public_channel_issue`` branch above.
-        raise StrategyExecutionChannelOutageError(private_channel_issue)
+        # Round 80 — see ``channel="public"`` note above; this path emits the
+        # ``RISK_REASON_RUNTIME_UNAVAILABLE_PRIVATE_CHANNEL`` sub-code.
+        raise StrategyExecutionChannelOutageError(private_channel_issue, channel="private")
 
     if runtime_health["runtime_last_error"]:
         raise RuntimeError("当前策略运行线程存在异常，请先在设置页恢复运行线程后再执行真实策略。")
@@ -8904,6 +8981,10 @@ def build_strategy_execution_preview(strategy_id: str, mode: Optional[AccountMod
         # realtime-channel outage paths in
         # ``_build_strategy_execution_preview_from_state``; every other
         # ``RuntimeError`` now propagates naturally without a re-raise.
+        # Round 80 — forward the typed ``sub_block_code`` (public/private
+        # channel) so the blocked preview carries it and
+        # ``_build_execution_preview_recommended_action`` dispatches without
+        # substring-probing the detail for ``"私有 WS"`` / ``"公共 WS"``.
         detail = str(exc)
         snapshot = next((item for item in repo.snapshot().strategy_runtime_snapshots if item.strategy_id == strategy_id), None)
         if snapshot is None:
@@ -8913,6 +8994,7 @@ def build_strategy_execution_preview(strategy_id: str, mode: Optional[AccountMod
             resolved_mode,
             detail,
             block_code=exc.block_code,
+            sub_block_code=exc.sub_block_code,
         )
 
 def _apply_runtime_blocked_preview_context(
@@ -9034,11 +9116,15 @@ def build_strategy_runtime_response() -> List[StrategyRuntimeSnapshot]:
                         "guard_detail": runtime_block_reason,
                     }
                 )
+            # Round 80 — tag the runtime worker-thread outage with the typed
+            # sub-code so the recommender picks the "打开设置页…恢复运行线程"
+            # copy off ``sub_block_code`` rather than the ``"运行线程"`` probe.
             blocked_preview = _build_blocked_strategy_execution_preview(
                 blocked_item,
                 resolved_mode,
                 runtime_block_reason,
                 block_code=RISK_REASON_RUNTIME_UNAVAILABLE,
+                sub_block_code=RISK_REASON_RUNTIME_UNAVAILABLE_WORKER_THREAD,
             )
             blocked_item = _apply_runtime_blocked_preview_context(blocked_item, blocked_preview)
             next_items.append(
