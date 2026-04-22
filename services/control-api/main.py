@@ -270,6 +270,23 @@ class StrategyExecutionBlockedError(RuntimeError):
         self.recommended_action = recommended_action
 
 
+# Round 74 — typed ``RuntimeError`` subclass raised by
+# ``_build_strategy_execution_preview_from_state`` when the upstream
+# public/private realtime channel is unavailable.  The ``build_strategy_execution_preview``
+# wrapper catches this subclass specifically (replacing the historical
+# ``if "私有 WS" not in detail and "公共 WS" not in detail: raise`` substring
+# branch) and maps it onto a blocked :class:`ExecutionPreview` carrying
+# :data:`RISK_REASON_RUNTIME_UNAVAILABLE`.  Other ``RuntimeError`` instances
+# (paused runtime, missing Paper preview, runtime worker outage, mode
+# mismatch, cooldowns, …) continue to propagate to the caller unchanged.
+class StrategyExecutionChannelOutageError(RuntimeError):
+    block_code: str = RISK_REASON_RUNTIME_UNAVAILABLE
+
+    def __init__(self, detail: str) -> None:
+        super().__init__(detail)
+        self.detail = detail
+
+
 repo = AppRepository()
 openclaw = OpenClawGatewayClient()
 market_data = BybitPublicMarketClient(repo.snapshot().settings.api_base_url)
@@ -8505,11 +8522,15 @@ def _build_strategy_execution_preview_from_state(
 
     public_channel_issue = get_public_execution_channel_issue(snapshot.market, snapshot.symbol)
     if public_channel_issue is not None:
-        raise RuntimeError(public_channel_issue)
+        # Round 74 — typed subclass so ``build_strategy_execution_preview``
+        # can recover this as a blocked preview without substring-probing
+        # ``str(exc)`` for "公共 WS".
+        raise StrategyExecutionChannelOutageError(public_channel_issue)
 
     private_channel_issue = get_private_execution_channel_issue(resolved_mode)
     if private_channel_issue is not None:
-        raise RuntimeError(private_channel_issue)
+        # Round 74 — see ``public_channel_issue`` branch above.
+        raise StrategyExecutionChannelOutageError(private_channel_issue)
 
     if runtime_health["runtime_last_error"]:
         raise RuntimeError("当前策略运行线程存在异常，请先在设置页恢复运行线程后再执行真实策略。")
@@ -8686,10 +8707,14 @@ def build_strategy_execution_preview(strategy_id: str, mode: Optional[AccountMod
     refresh_strategy_runtime_once()
     try:
         return _build_strategy_execution_preview_from_state(strategy_id, mode)
-    except RuntimeError as exc:
+    except StrategyExecutionChannelOutageError as exc:
+        # Round 74 — replaces the previous
+        # ``except RuntimeError`` + ``if "私有 WS" not in detail and "公共 WS" not in detail: raise``
+        # substring branch.  The typed subclass is only raised for the two
+        # realtime-channel outage paths in
+        # ``_build_strategy_execution_preview_from_state``; every other
+        # ``RuntimeError`` now propagates naturally without a re-raise.
         detail = str(exc)
-        if "私有 WS" not in detail and "公共 WS" not in detail:
-            raise
         snapshot = next((item for item in repo.snapshot().strategy_runtime_snapshots if item.strategy_id == strategy_id), None)
         if snapshot is None:
             raise
@@ -8697,7 +8722,7 @@ def build_strategy_execution_preview(strategy_id: str, mode: Optional[AccountMod
             snapshot,
             resolved_mode,
             detail,
-            block_code=RISK_REASON_RUNTIME_UNAVAILABLE,
+            block_code=exc.block_code,
         )
 
 def _apply_runtime_blocked_preview_context(

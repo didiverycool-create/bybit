@@ -22831,5 +22831,99 @@ class RiskDecisionBlockCodeSourcePrecedenceRound70Tests(unittest.TestCase):
         self.assertEqual(decision.reason_code, RISK_REASON_INSUFFICIENT_BALANCE)
 
 
+class StrategyExecutionChannelOutageTypedExceptionRound74Tests(unittest.TestCase):
+    """Round 74 — ``build_strategy_execution_preview`` no longer decides
+    "is this a WS outage?" by substring-probing ``str(exc)`` for
+    ``"私有 WS"`` / ``"公共 WS"``.  The classifier is now a typed
+    ``StrategyExecutionChannelOutageError(RuntimeError)`` subclass raised at
+    the two channel-issue call sites inside
+    ``_build_strategy_execution_preview_from_state``.
+
+    These tests pin three contracts:
+
+    1. The subclass is a :class:`RuntimeError` and carries
+       ``block_code == RISK_REASON_RUNTIME_UNAVAILABLE``.
+    2. An ``except StrategyExecutionChannelOutageError`` frame catches the
+       subclass but *not* a plain ``RuntimeError`` — i.e. the typed branch
+       is narrow by construction.
+    3. When ``_build_strategy_execution_preview_from_state`` raises the
+       subclass, the wrapper produces a blocked preview with
+       ``block_code=RISK_REASON_RUNTIME_UNAVAILABLE`` — exactly as the old
+       substring branch did — but a plain ``RuntimeError`` with the same
+       detail propagates to the caller.
+    """
+
+    def test_subclass_is_runtime_error_with_typed_block_code(self) -> None:
+        from models import RISK_REASON_RUNTIME_UNAVAILABLE  # noqa: PLC0415
+
+        exc = control_main.StrategyExecutionChannelOutageError("私有 WS 未连通")
+        self.assertIsInstance(exc, RuntimeError)
+        self.assertEqual(exc.detail, "私有 WS 未连通")
+        self.assertEqual(str(exc), "私有 WS 未连通")
+        self.assertEqual(exc.block_code, RISK_REASON_RUNTIME_UNAVAILABLE)
+
+    def test_typed_except_narrowly_distinguishes_plain_runtime_error(self) -> None:
+        plain = RuntimeError("当前策略运行线程已停滞")
+        channel = control_main.StrategyExecutionChannelOutageError("私有 WS 未连通")
+
+        try:
+            raise plain
+        except control_main.StrategyExecutionChannelOutageError:
+            self.fail("plain RuntimeError must not be caught by typed subclass except")
+        except RuntimeError:
+            pass
+
+        caught: Optional[control_main.StrategyExecutionChannelOutageError] = None
+        try:
+            raise channel
+        except control_main.StrategyExecutionChannelOutageError as exc:
+            caught = exc
+        self.assertIs(caught, channel)
+
+    def test_wrapper_maps_channel_outage_to_blocked_preview_but_propagates_plain_runtime(self) -> None:
+        from models import RISK_REASON_RUNTIME_UNAVAILABLE  # noqa: PLC0415
+
+        state = control_main.repo.snapshot()
+        snapshot = next(iter(state.strategy_runtime_snapshots), None)
+        self.assertIsNotNone(snapshot, "seed state must carry at least one runtime snapshot")
+        assert snapshot is not None
+        strategy_id = snapshot.strategy_id
+        resolved_mode = state.workspace_preferences.selected_mode
+
+        # Case 1: typed subclass → wrapper returns a blocked preview tagged
+        # with ``block_code=RISK_REASON_RUNTIME_UNAVAILABLE``.
+        outage = control_main.StrategyExecutionChannelOutageError(
+            "当前 Bybit 私有 WS 未连通，无法安全执行真实策略委托，请先恢复私有实时链路。"
+        )
+        with patch.object(control_main, "_build_strategy_execution_preview_from_state", side_effect=outage), \
+             patch.object(control_main, "refresh_strategy_runtime_once", return_value=None), \
+             patch.object(
+                 control_main,
+                 "_runtime_worker_execution_block_reason",
+                 return_value=None,
+             ):
+            preview = control_main.build_strategy_execution_preview(strategy_id, resolved_mode)
+
+        self.assertFalse(preview.allowed)
+        self.assertEqual(preview.block_code, RISK_REASON_RUNTIME_UNAVAILABLE)
+        self.assertIn("私有 WS", preview.blocked_reason or "")
+
+        # Case 2: plain ``RuntimeError`` with the same kind of message must
+        # propagate — the wrapper no longer "rescues" it by substring parsing.
+        plain = RuntimeError(
+            "当前 Bybit 私有 WS 未连通，无法安全执行真实策略委托，请先恢复私有实时链路。"
+        )
+        with patch.object(control_main, "_build_strategy_execution_preview_from_state", side_effect=plain), \
+             patch.object(control_main, "refresh_strategy_runtime_once", return_value=None), \
+             patch.object(
+                 control_main,
+                 "_runtime_worker_execution_block_reason",
+                 return_value=None,
+             ):
+            with self.assertRaises(RuntimeError) as ctx:
+                control_main.build_strategy_execution_preview(strategy_id, resolved_mode)
+        self.assertIs(ctx.exception, plain)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
