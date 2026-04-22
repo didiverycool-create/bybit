@@ -1078,11 +1078,14 @@ def _build_execution_preview_recommended_action(
     # detail strings (e.g. from older audit payloads) onto the same code.
     if resolved_code == RISK_REASON_STOP_LOSS_GUARD:
         return "请先人工复核真实仓位与策略参数，确认无误后再恢复策略执行。"
-    # Residual substring fallbacks for details that have no typed code yet.
-    # The ``未成交卖单 + 可卖`` pair is a defensive catch for spot-sell
-    # inventory hints produced without the dominant ``现货可卖数量不足`` token.
-    if "未成交卖单" in detail and "可卖" in detail:
-        return "请先撤销相关未成交卖单，或降低卖出数量后再重试。"
+    # Round 83 — the residual ``未成交卖单 + 可卖`` defensive probe was
+    # removed.  All in-tree producers of spot-sell-inventory blocks emit the
+    # canonical ``"现货可卖数量不足"`` token AND set
+    # :data:`RISK_REASON_INSUFFICIENT_INVENTORY` at source, so the typed
+    # branch above always fires before any free-form string probe could.
+    # ``derive_block_reason_code`` still classifies legacy / externally-built
+    # previews carrying only the canonical token, so unconverted callers
+    # remain covered without a second probe here.
     return None
 
 

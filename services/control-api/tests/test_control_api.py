@@ -24172,6 +24172,97 @@ class StopLossGuardTypedBlockCodeRound82Tests(unittest.TestCase):
         self.assertEqual(decision.reason_code, RISK_REASON_STOP_LOSS_GUARD)
 
 
+class SpotInventoryDefensiveProbeRemovalRound83Tests(unittest.TestCase):
+    """Round 83 — the residual ``"未成交卖单" + "可卖"`` defensive substring
+    probe at the tail of ``_build_execution_preview_recommended_action``
+    was removed as dead code.  Every in-tree producer of a spot-sell
+    inventory block emits the canonical ``"现货可卖数量不足"`` token AND
+    sets :data:`RISK_REASON_INSUFFICIENT_INVENTORY` at the preview-builder
+    source, so the typed branch always fires before any residual probe
+    could run.  ``derive_block_reason_code`` still classifies legacy
+    details carrying the canonical token, so unconverted callers stay
+    covered without a second probe at the dispatch helper.
+
+    Invariants pinned:
+
+    1. Canonical private spot-sell detail (``execution_preview_builders``
+       shape) still dispatches to the inventory copy via the typed branch.
+    2. Canonical Paper spot-sell detail (``risk_guards`` shape) still
+       dispatches via the classifier when no typed ``block_code`` is
+       passed — the ``_INSUFFICIENT_INVENTORY_HINTS`` tuple still matches
+       the canonical token.
+    3. A hypothetical detail that would have hit the removed defensive
+       probe (``"未成交卖单" + "可卖"`` but missing the dominant
+       canonical token) now correctly returns ``None``: no in-tree path
+       produces such a detail, and the removal is observable here.
+    4. The typed-first branch still wins end-to-end: a preview built with
+       ``block_code=RISK_REASON_INSUFFICIENT_INVENTORY`` but a detail
+       that omits every inventory substring still emits the inventory
+       copy (regression guard for R77 typed-first dispatch).
+    """
+
+    def setUp(self) -> None:
+        self._account_patch = patch.object(
+            control_main, "_resolve_private_account_type_label", return_value="UNIFIED"
+        )
+        self._account_patch.start()
+        self.addCleanup(self._account_patch.stop)
+
+    def test_canonical_private_spot_sell_detail_still_returns_inventory_copy(self) -> None:
+        # ``execution_preview_builders.build_private_execution_preview``
+        # emits this exact shape alongside the typed block code; the
+        # detail gets classified via ``_INSUFFICIENT_INVENTORY_HINTS``
+        # and the typed branch fires before any residual probe.
+        result = control_main._build_execution_preview_recommended_action(
+            "当前 Bybit 现货可卖数量不足，扣除未成交卖单占用后最多可卖 0.5。",
+        )
+        self.assertEqual(
+            result,
+            "请先撤销相关未成交卖单，或降低卖出数量后再重试。",
+        )
+
+    def test_canonical_paper_spot_sell_detail_still_returns_inventory_copy(self) -> None:
+        # ``risk_guards.evaluate_paper_order_risk`` emits this shape for
+        # the Paper spot-sell path; it does NOT include ``"未成交卖单"``,
+        # so the removed defensive probe could never have fired here.
+        # The classifier still maps ``"现货可卖数量不足"`` onto the typed
+        # code and the typed branch produces the inventory copy.
+        result = control_main._build_execution_preview_recommended_action(
+            "BTCUSDT 当前 Paper 现货可卖数量不足，最多可卖 0.5。",
+        )
+        self.assertEqual(
+            result,
+            "请先撤销相关未成交卖单，或降低卖出数量后再重试。",
+        )
+
+    def test_probe_only_tokens_without_canonical_token_return_none(self) -> None:
+        # Construct a detail that carries ``"未成交卖单"`` + ``"可卖"``
+        # but NOT the canonical ``"现货可卖数量不足"`` token.  Prior to
+        # R83 the defensive probe would have returned the inventory copy;
+        # after R83 the helper returns ``None`` because no typed code is
+        # set and no classifier hint matches.  This pins the removal.
+        result = control_main._build_execution_preview_recommended_action(
+            "当前存在未成交卖单，请先撤销再调整可卖仓位。",
+        )
+        self.assertIsNone(result)
+
+    def test_typed_block_code_still_wins_for_inventory_without_any_substring(self) -> None:
+        from models import RISK_REASON_INSUFFICIENT_INVENTORY  # noqa: PLC0415
+
+        # Detail intentionally omits every inventory substring — only the
+        # typed ``block_code`` drives dispatch.  This pins that the R77
+        # typed-first dispatch still handles externally-built previews
+        # that carry the typed code but free-form copy.
+        result = control_main._build_execution_preview_recommended_action(
+            "自定义库存限制，已阻断真实卖出委托。",
+            block_code=RISK_REASON_INSUFFICIENT_INVENTORY,
+        )
+        self.assertEqual(
+            result,
+            "请先撤销相关未成交卖单，或降低卖出数量后再重试。",
+        )
+
+
 class StrategyExecutionNoopTypedExceptionRound81Tests(unittest.TestCase):
     """Round 81 — the ``auto.dispatch.noop`` verdict emitted by
     ``_classify_auto_dispatch_outcome`` now keys off the typed
