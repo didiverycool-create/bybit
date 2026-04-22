@@ -2089,6 +2089,7 @@ def _clear_public_execution_channel_alert(
                     "detail": resolution_detail or "Bybit 公有执行链路异常已解除。",
                 },
                 strategy_id=strategy_id,
+                parameter_snapshot=_resolve_strategy_parameter_snapshot(strategy_id),
             )
             repo._refresh_derived_state()  # type: ignore[attr-defined]
             repo._persist()  # type: ignore[attr-defined]
@@ -6199,6 +6200,7 @@ def _clear_strategy_position_drift_alerts(
                     "detail": resolution_detail or "当前实际仓位已重新与策略目标对齐，偏离提醒已收起。",
                 },
                 strategy_id=strategy_id,
+                parameter_snapshot=_resolve_strategy_parameter_snapshot(strategy_id),
             )
             repo._refresh_derived_state()  # type: ignore[attr-defined]
             repo._persist()  # type: ignore[attr-defined]
@@ -6240,6 +6242,7 @@ def _clear_strategy_exchange_rejected_alerts(
                     "detail": resolution_detail or "真实策略委托已恢复正常，拒单提醒已收起。",
                 },
                 strategy_id=strategy_id,
+                parameter_snapshot=_resolve_strategy_parameter_snapshot(strategy_id),
             )
             repo._refresh_derived_state()  # type: ignore[attr-defined]
             repo._persist()  # type: ignore[attr-defined]
@@ -6271,6 +6274,7 @@ def _clear_strategy_exchange_rejection_guard_alerts(
                     "detail": resolution_detail or "连续拒单熔断已解除，真实策略自动执行可继续人工复核后恢复。",
                 },
                 strategy_id=strategy_id,
+                parameter_snapshot=_resolve_strategy_parameter_snapshot(strategy_id),
             )
             repo._refresh_derived_state()  # type: ignore[attr-defined]
             repo._persist()  # type: ignore[attr-defined]
@@ -6312,6 +6316,7 @@ def _clear_strategy_stale_order_alerts(
                     "detail": resolution_detail or "停滞挂单异常已解除，旧提醒已收起。",
                 },
                 strategy_id=strategy_id,
+                parameter_snapshot=_resolve_strategy_parameter_snapshot(strategy_id),
             )
             repo._refresh_derived_state()  # type: ignore[attr-defined]
             repo._persist()  # type: ignore[attr-defined]
@@ -6521,6 +6526,7 @@ def _clear_strategy_manual_execution_alerts(
                     "detail": resolution_detail or "后续手动策略执行已恢复成功，旧的拦截提醒已收起。",
                 },
                 strategy_id=strategy_id,
+                parameter_snapshot=_resolve_strategy_parameter_snapshot(strategy_id),
             )
             repo._refresh_derived_state()  # type: ignore[attr-defined]
             repo._persist()  # type: ignore[attr-defined]
@@ -6580,6 +6586,7 @@ def _sync_strategy_position_drift_issue(
                 },
                 symbol=snapshot.symbol,
                 strategy_id=snapshot.strategy_id,
+                parameter_snapshot=_resolve_strategy_parameter_snapshot(snapshot.strategy_id),
             )
         repo._refresh_derived_state()  # type: ignore[attr-defined]
         repo._persist()  # type: ignore[attr-defined]
