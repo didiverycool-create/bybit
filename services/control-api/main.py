@@ -8863,6 +8863,7 @@ def dispatch_strategy_signal(strategy_id: str, payload: StrategyExecutionRequest
                     runtime_block_reason,
                     recommended_action=_build_manual_execution_recommended_action(runtime_block_reason),
                     strategy=strategy,
+                    reason_code=RISK_REASON_RUNTIME_UNAVAILABLE,
                 )
             raise StrategyExecutionBlockedError(
                 runtime_block_reason,

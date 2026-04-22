@@ -19053,6 +19053,14 @@ class HardConstraintIntegrationTests(unittest.TestCase):
         assert preview.blocked_reason is not None
         self.assertTrue(preview.blocked_reason.strip())
         self.assertIn("可用余额不足", preview.blocked_reason)
+        # Round 72 — the R70 ``block_code`` contract requires every blocked
+        # preview produced by an in-tree builder to carry a typed code at
+        # source.  Pin the insufficient-balance case here so a future builder
+        # refactor that drops ``block_code=`` on this branch is caught by the
+        # hard-constraint suite rather than waiting for an audit regression.
+        from models import RISK_REASON_INSUFFICIENT_BALANCE  # noqa: PLC0415
+
+        self.assertEqual(preview.block_code, RISK_REASON_INSUFFICIENT_BALANCE)
 
     def test_manual_paper_order_rejects_with_409_when_risk_guard_blocks(
         self,
@@ -22564,6 +22572,101 @@ class RiskDecisionReasonCodeCoverageRound68Tests(unittest.TestCase):
             "some novel english block reason with no Chinese hints",
             RISK_REASON_PREVIEW_BLOCKED,
         )
+
+
+class ExecutionPreviewBlockCodeInvariantRound72Tests(unittest.TestCase):
+    """Round 72 pins the invariant that every blocked preview produced by an
+    in-tree builder carries a typed ``block_code`` at source.  The unit
+    targets below cover the two cheap-to-call branches of
+    :meth:`AppRepository._build_execution_preview_locked`:
+
+    * Non-Paper mode → ``RISK_REASON_ACCOUNT_MODE_UNAVAILABLE``.
+    * Paper mode + invalid request (non-positive qty / price) →
+      ``RISK_REASON_INVALID_REQUEST`` on the paper-risk tuple return.
+    * Paper mode + insufficient balance →
+      ``RISK_REASON_INSUFFICIENT_BALANCE`` (the paper starting cash is
+      250 000 USDT so a 10 BTC @ 65 000 order trips the guard cleanly).
+
+    This class does not reuse the live ``control_main.repo`` singleton — it
+    builds a fresh ``AppRepository`` against a temporary state file so the
+    assertions are hermetic.
+    """
+
+    def setUp(self) -> None:
+        import tempfile  # noqa: PLC0415
+        from pathlib import Path  # noqa: PLC0415
+        from repository import AppRepository  # noqa: PLC0415
+
+        self._tmp_dir = tempfile.mkdtemp(prefix="r72-block-code-")
+        state_path = Path(self._tmp_dir) / "state.json"
+        self._repo = AppRepository(state_path)
+
+    def tearDown(self) -> None:
+        import shutil  # noqa: PLC0415
+
+        shutil.rmtree(self._tmp_dir, ignore_errors=True)
+
+    def _preview_request(
+        self,
+        *,
+        mode: AccountMode,
+        quantity: float,
+        price: float,
+        side: Direction = Direction.BUY,
+    ):
+        from models import ExecutionPreviewRequest  # noqa: PLC0415
+
+        return ExecutionPreviewRequest(
+            symbol="BTCUSDT",
+            market="perp",
+            mode=mode,
+            side=side,
+            quantity=quantity,
+            price=price,
+            origin="manual",
+        )
+
+    def test_non_paper_mode_preview_tags_account_mode_unavailable(self) -> None:
+        from models import RISK_REASON_ACCOUNT_MODE_UNAVAILABLE  # noqa: PLC0415
+
+        request = self._preview_request(mode=AccountMode.LIVE, quantity=1.0, price=65_000.0)
+        with self._repo._lock:  # type: ignore[attr-defined]
+            preview = self._repo._build_execution_preview_locked(request)  # type: ignore[attr-defined]
+        self.assertFalse(preview.allowed)
+        self.assertEqual(preview.block_code, RISK_REASON_ACCOUNT_MODE_UNAVAILABLE)
+
+    def test_paper_invalid_request_tuple_tags_invalid_request(self) -> None:
+        from models import RISK_REASON_INVALID_REQUEST  # noqa: PLC0415
+        from risk_guards import evaluate_paper_order_risk  # noqa: PLC0415
+
+        # ``ExecutionPreviewRequest`` rejects ``quantity <= 0`` at pydantic
+        # validation time, so the precondition branch of the paper risk guard
+        # is only reachable by internal callers (strategy signal math can
+        # produce a zero-quantity input after rounding / clamping).  We probe
+        # the pure function directly to pin the tuple contract.
+        reason, code = evaluate_paper_order_risk(
+            "BTCUSDT",
+            "perp",
+            Direction.BUY,
+            0.0,
+            65_000.0,
+            ledger_snapshot={"cash_balance": 10_000.0, "positions": {}},
+            reserved_cash=0.0,
+            reserved_spot_sell_qty=0.0,
+            format_usdt=lambda value: f"{value:.2f} USDT",
+            format_quantity=lambda value, precision: f"{value:.{precision}f}",
+        )
+        self.assertIsNotNone(reason)
+        self.assertEqual(code, RISK_REASON_INVALID_REQUEST)
+
+    def test_paper_insufficient_balance_preview_tags_insufficient_balance(self) -> None:
+        from models import RISK_REASON_INSUFFICIENT_BALANCE  # noqa: PLC0415
+
+        request = self._preview_request(mode=AccountMode.PAPER, quantity=10.0, price=65_000.0)
+        with self._repo._lock:  # type: ignore[attr-defined]
+            preview = self._repo._build_execution_preview_locked(request)  # type: ignore[attr-defined]
+        self.assertFalse(preview.allowed)
+        self.assertEqual(preview.block_code, RISK_REASON_INSUFFICIENT_BALANCE)
 
 
 class RiskDecisionBlockCodeSourcePrecedenceRound70Tests(unittest.TestCase):
