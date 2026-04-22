@@ -1390,6 +1390,13 @@ RISK_REASON_EXCHANGE_CONSTRAINT = "risk.exchange_constraint"
 # precondition failures so the fallback code is reserved for truly novel
 # reasons.
 RISK_REASON_INVALID_REQUEST = "risk.invalid_request"
+# Round 71 — runtime-worker / websocket unavailability blocks.  Previously
+# these infra-level blocks (e.g. "当前策略运行线程存在异常", "私有 WS 未就绪")
+# fell through to ``risk.preview_blocked`` because they predate any typed
+# classification and share no substring with the existing account-mode hints.
+# The new code tags runtime / websocket outages so auditors can separate
+# infra outages from true risk blocks.
+RISK_REASON_RUNTIME_UNAVAILABLE = "risk.runtime_unavailable"
 RISK_REASON_PREVIEW_BLOCKED = "risk.preview_blocked"
 
 

@@ -40,6 +40,7 @@ from models import (
     RISK_REASON_INSUFFICIENT_INVENTORY,
     RISK_REASON_INVALID_REQUEST,
     RISK_REASON_PREVIEW_BLOCKED,
+    RISK_REASON_RUNTIME_UNAVAILABLE,
     RiskDecision,
 )
 
@@ -90,6 +91,16 @@ _INVALID_REQUEST_HINTS = (
     "必须大于 0",
     "必须为正",
 )
+# Round 71 — runtime worker / websocket outages used to fall through to the
+# generic ``risk.preview_blocked`` fallback.  The primary path now sets
+# :data:`models.RISK_REASON_RUNTIME_UNAVAILABLE` at source, but the probe
+# still needs to classify historical / fallback strings.
+_RUNTIME_UNAVAILABLE_HINTS = (
+    "策略运行线程",
+    "私有 WS",
+    "公共 WS",
+    "Bybit 私有账户链路",
+)
 
 
 def derive_block_reason_code(detail: str) -> str:
@@ -125,6 +136,12 @@ def derive_block_reason_code(detail: str) -> str:
     for hint in _ACCOUNT_MODE_HINTS:
         if hint in detail:
             return RISK_REASON_ACCOUNT_MODE_UNAVAILABLE
+    # Round 71 — runtime / websocket outage hints probed last so they do not
+    # shadow the more specific account-mode / exchange-constraint / inventory
+    # categories for messages that happen to mention the same infra tokens.
+    for hint in _RUNTIME_UNAVAILABLE_HINTS:
+        if hint in detail:
+            return RISK_REASON_RUNTIME_UNAVAILABLE
     return RISK_REASON_PREVIEW_BLOCKED
 
 

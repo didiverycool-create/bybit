@@ -25,6 +25,7 @@ from models import (
     RISK_REASON_EXCHANGE_CONSTRAINT,
     RISK_REASON_INSUFFICIENT_BALANCE,
     RISK_REASON_INSUFFICIENT_INVENTORY,
+    RISK_REASON_RUNTIME_UNAVAILABLE,
 )
 
 
@@ -171,6 +172,7 @@ def build_private_execution_preview(
             action="等待真实执行引擎",
             allowed=False,
             blocked_reason=str(exc),
+            block_code=RISK_REASON_RUNTIME_UNAVAILABLE,
             recommended_action="请先恢复 Bybit 私有账户链路，再重试真实交易预检。",
             warnings=["当前结果仅适用于已配置且链路可用的 Demo / Live 私有 API。"],
             current_position_size="--",

@@ -22534,6 +22534,26 @@ class RiskDecisionReasonCodeCoverageRound68Tests(unittest.TestCase):
             RISK_REASON_ACCOUNT_MODE_UNAVAILABLE,
         )
 
+    def test_runtime_unavailable_hints(self) -> None:
+        from models import RISK_REASON_RUNTIME_UNAVAILABLE  # noqa: PLC0415
+
+        # ``_runtime_worker_execution_block_reason`` — three worker states.
+        self._assert_code(
+            "当前策略运行线程存在异常，请先在设置页恢复运行线程后再执行真实策略。",
+            RISK_REASON_RUNTIME_UNAVAILABLE,
+        )
+        self._assert_code(
+            "当前策略运行线程已停滞，请先在设置页恢复运行线程并确认最新信号后再执行真实策略。",
+            RISK_REASON_RUNTIME_UNAVAILABLE,
+        )
+        self._assert_code(
+            "当前策略运行线程未运行，请先在设置页恢复运行线程后再执行真实策略。",
+            RISK_REASON_RUNTIME_UNAVAILABLE,
+        )
+        # ``build_strategy_execution_preview`` — WS outage fallback.
+        self._assert_code("私有 WS 未就绪，稍后再试。", RISK_REASON_RUNTIME_UNAVAILABLE)
+        self._assert_code("公共 WS 未就绪，稍后再试。", RISK_REASON_RUNTIME_UNAVAILABLE)
+
     def test_preview_blocked_is_fallback_only(self) -> None:
         from models import RISK_REASON_PREVIEW_BLOCKED  # noqa: PLC0415
 

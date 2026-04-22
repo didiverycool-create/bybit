@@ -151,6 +151,7 @@ from models import (
     ReconcileChangeRequestOutcome,
     ReviewDocument,
     RISK_REASON_INSUFFICIENT_BALANCE,
+    RISK_REASON_RUNTIME_UNAVAILABLE,
     RiskDecision,
     RuntimeWorkerActionPayload,
     RuntimeWorkerActionResult,
@@ -3139,7 +3140,12 @@ def _build_strategy_activity_runtime_snapshot(
     if strategy.mode != AccountMode.PAPER:
         runtime_block_reason = _runtime_worker_execution_block_reason(_build_strategy_runtime_worker_health())
         if runtime_block_reason is not None:
-            strategy_mode_preview = _build_blocked_strategy_execution_preview(runtime, strategy.mode, runtime_block_reason)
+            strategy_mode_preview = _build_blocked_strategy_execution_preview(
+                runtime,
+                strategy.mode,
+                runtime_block_reason,
+                block_code=RISK_REASON_RUNTIME_UNAVAILABLE,
+            )
         else:
             try:
                 strategy_mode_preview = _build_strategy_execution_preview_from_state(
@@ -7796,7 +7802,14 @@ def _build_blocked_strategy_execution_preview(
     snapshot: StrategyRuntimeSnapshot,
     mode: AccountMode,
     detail: str,
+    block_code: Optional[str] = None,
 ) -> ExecutionPreview:
+    """Round 71 — ``block_code`` lets callers tag the typed risk code at the
+    source (worker-health / WS outage / runtime error) so ``evaluate_risk_decision``
+    does not need to re-derive it via substring probe.  When ``None`` the
+    probe remains the fallback path.
+    """
+
     fallback_side = Direction.BUY if snapshot.signal != "short" else Direction.SELL
     return ExecutionPreview(
         symbol=snapshot.symbol,
@@ -7811,6 +7824,7 @@ def _build_blocked_strategy_execution_preview(
         action=snapshot.next_action,
         allowed=False,
         blocked_reason=detail,
+        block_code=block_code,
         recommended_action=_build_execution_preview_recommended_action(detail),
         warnings=[detail],
         current_position_side="flat",
@@ -8679,7 +8693,12 @@ def build_strategy_execution_preview(strategy_id: str, mode: Optional[AccountMod
         snapshot = next((item for item in repo.snapshot().strategy_runtime_snapshots if item.strategy_id == strategy_id), None)
         if snapshot is None:
             raise
-        return _build_blocked_strategy_execution_preview(snapshot, resolved_mode, detail)
+        return _build_blocked_strategy_execution_preview(
+            snapshot,
+            resolved_mode,
+            detail,
+            block_code=RISK_REASON_RUNTIME_UNAVAILABLE,
+        )
 
 def _apply_runtime_blocked_preview_context(
     item: StrategyRuntimeSnapshot,
@@ -8798,7 +8817,12 @@ def build_strategy_runtime_response() -> List[StrategyRuntimeSnapshot]:
                         "guard_detail": runtime_block_reason,
                     }
                 )
-            blocked_preview = _build_blocked_strategy_execution_preview(blocked_item, resolved_mode, runtime_block_reason)
+            blocked_preview = _build_blocked_strategy_execution_preview(
+                blocked_item,
+                resolved_mode,
+                runtime_block_reason,
+                block_code=RISK_REASON_RUNTIME_UNAVAILABLE,
+            )
             blocked_item = _apply_runtime_blocked_preview_context(blocked_item, blocked_preview)
             next_items.append(
                 blocked_item.model_copy(
