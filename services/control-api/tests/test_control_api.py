@@ -24263,6 +24263,178 @@ class SpotInventoryDefensiveProbeRemovalRound83Tests(unittest.TestCase):
         )
 
 
+class RecordStrategyExecutionIssueTypedKwargsRound84Tests(unittest.TestCase):
+    """Round 84 — ``_record_strategy_{manual_execution,auto_dispatch}_issue``
+    now accept typed ``market`` / ``sub_block_code`` kwargs and thread them
+    through to ``_build_{manual_execution,auto_dispatch}_recommended_action``
+    so the runtime-worker / spot-vs-perp / channel-outage sub-copy keys off
+    the typed field rather than the ``"可用保证金不足"`` / ``"私有 WS"`` /
+    ``"公共 WS"`` / ``"运行线程"`` detail probes.  The ``dispatch_strategy_signal``
+    runtime-worker pre-flight path (the canonical producer of the ``"运行线程"``
+    token) now passes ``sub_block_code=RISK_REASON_RUNTIME_UNAVAILABLE_WORKER_THREAD``
+    to both the record helper and the ``StrategyExecutionBlockedError`` raise,
+    mirroring the R80 coverage for the autonomous dispatcher's worker-outage
+    callsites.
+
+    Invariants pinned:
+
+    1. ``_record_strategy_manual_execution_issue`` with typed ``sub_block_code``
+       emits an alert whose ``suggested_action`` is the typed worker-thread
+       copy even when the detail does not carry the ``"运行线程"`` token.
+    2. Same for ``_record_strategy_auto_dispatch_issue`` with ``sub_block_code``.
+    3. Explicit ``recommended_action`` argument still takes precedence over
+       the computed recommendation (backward-compat contract).
+    4. ``market`` kwarg threads through so ``RISK_REASON_INSUFFICIENT_BALANCE``
+       sub-copy for perp reads the typed ``market="perp"`` rather than the
+       ``"可用保证金不足"`` detail probe.
+    """
+
+    def setUp(self) -> None:
+        self._account_patch = patch.object(
+            control_main, "_resolve_private_account_type_label", return_value="UNIFIED"
+        )
+        self._account_patch.start()
+        self.addCleanup(self._account_patch.stop)
+
+    def test_manual_execution_record_threads_sub_block_code_to_helper(self) -> None:
+        from models import RISK_REASON_RUNTIME_UNAVAILABLE_WORKER_THREAD  # noqa: PLC0415
+
+        captured: Dict[str, Optional[str]] = {}
+
+        def _fake_upsert(
+            *,
+            rule_key: str,
+            severity: str,
+            symbol: str,
+            title: str,
+            description: str,
+            suggested_action: Optional[str],
+            strategy_id: Optional[str],
+            reason_code: Optional[str],
+        ) -> bool:
+            captured["suggested_action"] = suggested_action
+            captured["reason_code"] = reason_code
+            return False
+
+        with patch.object(control_main.repo, "_upsert_system_alert_locked", side_effect=_fake_upsert), patch.object(control_main.repo, "_refresh_derived_state"), patch.object(control_main.repo, "_persist"):
+            control_main._record_strategy_manual_execution_issue(
+                "strategy-worker-outage",
+                "Swing BTC",
+                "BTCUSDT",
+                AccountMode.LIVE,
+                # Detail intentionally omits the ``"运行线程"`` token so only
+                # the typed sub-code can drive the worker-thread copy.
+                "后台调度未就绪，请稍后重试。",
+                sub_block_code=RISK_REASON_RUNTIME_UNAVAILABLE_WORKER_THREAD,
+            )
+        self.assertEqual(
+            captured["suggested_action"],
+            "打开设置页点击“恢复运行线程”，并确认最近审计日志与最新信号。",
+        )
+
+    def test_auto_dispatch_record_threads_sub_block_code_to_helper(self) -> None:
+        from models import RISK_REASON_RUNTIME_UNAVAILABLE_PUBLIC_CHANNEL  # noqa: PLC0415
+
+        captured: Dict[str, Optional[str]] = {}
+
+        def _fake_upsert(
+            *,
+            rule_key: str,
+            severity: str,
+            symbol: str,
+            title: str,
+            description: str,
+            suggested_action: Optional[str],
+            strategy_id: Optional[str],
+            reason_code: Optional[str],
+        ) -> bool:
+            captured["suggested_action"] = suggested_action
+            return False
+
+        with patch.object(control_main.repo, "_upsert_system_alert_locked", side_effect=_fake_upsert), patch.object(control_main.repo, "_refresh_derived_state"), patch.object(control_main.repo, "_persist"):
+            control_main._record_strategy_auto_dispatch_issue(
+                "strategy-public-outage",
+                "Swing BTC",
+                "BTCUSDT",
+                "long",
+                AccountMode.LIVE,
+                # Detail says ``"私有 WS"`` — legacy probe would pick the
+                # private copy; typed sub-code must override to public.
+                "当前 Bybit 私有 WS 未连通。",
+                sub_block_code=RISK_REASON_RUNTIME_UNAVAILABLE_PUBLIC_CHANNEL,
+            )
+        self.assertIsNotNone(captured["suggested_action"])
+        self.assertEqual(
+            captured["suggested_action"],
+            control_main._build_public_execution_channel_recommended_action(
+                "当前 Bybit 私有 WS 未连通。"
+            ),
+        )
+
+    def test_explicit_recommended_action_wins_over_typed_sub_block_code(self) -> None:
+        from models import RISK_REASON_RUNTIME_UNAVAILABLE_WORKER_THREAD  # noqa: PLC0415
+
+        captured: Dict[str, Optional[str]] = {}
+
+        def _fake_upsert(
+            *,
+            rule_key: str,
+            severity: str,
+            symbol: str,
+            title: str,
+            description: str,
+            suggested_action: Optional[str],
+            strategy_id: Optional[str],
+            reason_code: Optional[str],
+        ) -> bool:
+            captured["suggested_action"] = suggested_action
+            return False
+
+        with patch.object(control_main.repo, "_upsert_system_alert_locked", side_effect=_fake_upsert), patch.object(control_main.repo, "_refresh_derived_state"), patch.object(control_main.repo, "_persist"):
+            control_main._record_strategy_manual_execution_issue(
+                "strategy-explicit-override",
+                "Swing BTC",
+                "BTCUSDT",
+                AccountMode.LIVE,
+                "后台调度未就绪。",
+                recommended_action="自定义建议：请联系运营。",
+                sub_block_code=RISK_REASON_RUNTIME_UNAVAILABLE_WORKER_THREAD,
+            )
+        self.assertEqual(captured["suggested_action"], "自定义建议：请联系运营。")
+
+    def test_manual_execution_record_threads_market_to_helper(self) -> None:
+        captured: Dict[str, Optional[str]] = {}
+
+        def _fake_upsert(
+            *,
+            rule_key: str,
+            severity: str,
+            symbol: str,
+            title: str,
+            description: str,
+            suggested_action: Optional[str],
+            strategy_id: Optional[str],
+            reason_code: Optional[str],
+        ) -> bool:
+            captured["suggested_action"] = suggested_action
+            return False
+
+        with patch.object(control_main.repo, "_upsert_system_alert_locked", side_effect=_fake_upsert), patch.object(control_main.repo, "_refresh_derived_state"), patch.object(control_main.repo, "_persist"):
+            control_main._record_strategy_manual_execution_issue(
+                "strategy-perp-margin",
+                "Swing BTC",
+                "BTCUSDT",
+                AccountMode.LIVE,
+                # Detail says ``"可用余额不足"`` (spot-copy token); typed
+                # ``market="perp"`` must override to the margin copy.
+                "当前 Bybit 可用余额不足，当前可用 0.00 USDT。",
+                market="perp",
+            )
+        self.assertIsNotNone(captured["suggested_action"])
+        assert captured["suggested_action"] is not None
+        self.assertIn("UNIFIED 账户可用保证金", captured["suggested_action"])
+
+
 class StrategyExecutionNoopTypedExceptionRound81Tests(unittest.TestCase):
     """Round 81 — the ``auto.dispatch.noop`` verdict emitted by
     ``_classify_auto_dispatch_outcome`` now keys off the typed

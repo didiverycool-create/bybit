@@ -6631,9 +6631,18 @@ def _record_strategy_auto_dispatch_issue(
     *,
     strategy: Optional[StrategySummary] = None,
     reason_code: Optional[str] = None,
+    market: Optional[str] = None,
+    sub_block_code: Optional[str] = None,
 ) -> None:
+    # Round 84 — ``market`` / ``sub_block_code`` thread the typed
+    # discriminators through to the recommendation helper so the runtime-worker
+    # / spot-vs-perp / channel-outage sub-copy picks off the typed field
+    # rather than the ``"可用保证金不足"`` / ``"私有 WS"`` / ``"公共 WS"`` /
+    # ``"运行线程"`` detail probes.
     rule_key = f"strategy-auto-dispatch:{strategy_id}:{signal}:{mode.value}"
-    suggested_action = recommended_action or _build_auto_dispatch_recommended_action(detail)
+    suggested_action = recommended_action or _build_auto_dispatch_recommended_action(
+        detail, market=market, sub_block_code=sub_block_code
+    )
     parameter_snapshot = (
         parameter_resolver.snapshot_parameters(strategy) if strategy is not None else None
     )
@@ -6693,9 +6702,20 @@ def _record_strategy_manual_execution_issue(
     *,
     strategy: Optional[StrategySummary] = None,
     reason_code: Optional[str] = None,
+    market: Optional[str] = None,
+    sub_block_code: Optional[str] = None,
 ) -> None:
+    # Round 84 — ``market`` / ``sub_block_code`` thread the typed
+    # discriminators through to the recommendation helper so the runtime-worker
+    # / spot-vs-perp / channel-outage sub-copy picks off the typed field
+    # rather than the ``"可用保证金不足"`` / ``"私有 WS"`` / ``"公共 WS"`` /
+    # ``"运行线程"`` detail probes (the probes remain inside the helper as
+    # fallback for audit-record / legacy callers that do not yet pass a typed
+    # field).
     rule_key = f"strategy-blocked-execution:{strategy_id}:{mode.value}"
-    suggested_action = recommended_action or _build_manual_execution_recommended_action(detail)
+    suggested_action = recommended_action or _build_manual_execution_recommended_action(
+        detail, market=market, sub_block_code=sub_block_code
+    )
     parameter_snapshot = (
         parameter_resolver.snapshot_parameters(strategy) if strategy is not None else None
     )
@@ -9200,19 +9220,28 @@ def dispatch_strategy_signal(strategy_id: str, payload: StrategyExecutionRequest
                 symbol = snapshot.symbol if snapshot is not None else (strategy.symbols[0] if strategy.symbols else "")
                 watch_item = next((item for item in state.watchlist if item.symbol == symbol), None)
                 _ = watch_item
+                # Round 84 — the runtime-worker outage is the canonical
+                # producer of the ``"运行线程"`` detail substring; thread the
+                # typed ``RISK_REASON_RUNTIME_UNAVAILABLE_WORKER_THREAD``
+                # sub-code through so the recommender picks the
+                # "打开设置页…恢复运行线程" copy off the typed sub-code
+                # rather than the substring probe.
                 _record_strategy_manual_execution_issue(
                     strategy_id,
                     strategy.name,
                     symbol,
                     resolved_mode,
                     runtime_block_reason,
-                    recommended_action=_build_manual_execution_recommended_action(runtime_block_reason),
                     strategy=strategy,
                     reason_code=RISK_REASON_RUNTIME_UNAVAILABLE,
+                    sub_block_code=RISK_REASON_RUNTIME_UNAVAILABLE_WORKER_THREAD,
                 )
             raise StrategyExecutionBlockedError(
                 runtime_block_reason,
-                _build_manual_execution_recommended_action(runtime_block_reason),
+                _build_manual_execution_recommended_action(
+                    runtime_block_reason,
+                    sub_block_code=RISK_REASON_RUNTIME_UNAVAILABLE_WORKER_THREAD,
+                ),
             )
     refresh_strategy_runtime_once()
     try:
