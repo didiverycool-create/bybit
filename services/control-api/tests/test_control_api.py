@@ -22312,11 +22312,12 @@ class AutoDispatchOutcomeRound61UnitTests(unittest.TestCase):
     frozen here against five invariants:
 
     * ``dispatched`` — dispatcher returns cleanly.
-    * ``noop`` — ``RuntimeError`` carrying ``"无需再次提交委托"``.
+    * ``noop`` — :class:`StrategyExecutionNoopError` (R81 typed subclass;
+      R89 removed the legacy ``"无需再次提交委托"`` substring probe).
     * ``blocked`` — :class:`StrategyExecutionBlockedError` with
       ``recommended_action``.
-    * ``failed`` (RuntimeError path) — plain ``RuntimeError`` without
-      the noop sentinel.
+    * ``failed`` (RuntimeError path) — plain ``RuntimeError`` (including
+      those whose detail happens to carry the noop token; R89).
     * ``failed`` (generic exception path) — any other ``Exception``.
 
     Side-effect flags (``clear_alerts`` / ``emit_noop_event`` /
@@ -22341,15 +22342,18 @@ class AutoDispatchOutcomeRound61UnitTests(unittest.TestCase):
         self.assertFalse(outcome.record_issue)
         self.assertIsNone(outcome.recommended_action)
 
-    def test_noop_outcome_recognised_from_runtime_error_substring(self) -> None:
-        """``RuntimeError`` whose detail carries ``"无需再次提交委托"`` is
-        the pre-R61 pattern for "the dispatcher concluded nothing needed
-        to happen".  The classifier must emit ``verdict="noop"`` with
-        ``emit_noop_event=True`` so the audit trail still records why the
-        loop iteration did not fire an order.
+    def test_noop_outcome_recognised_from_typed_noop_error(self) -> None:
+        """:class:`StrategyExecutionNoopError` is the R81 typed raise at
+        the single source that detects ``target ≈ current``.  The classifier
+        must emit ``verdict="noop"`` with ``emit_noop_event=True`` so the
+        audit trail still records why the loop iteration did not fire an
+        order.  Round 89 removed the legacy substring probe — the typed
+        subclass is now the sole opt-in.
         """
 
-        exc = RuntimeError("当前挂单已与目标一致，无需再次提交委托。")
+        exc = control_main.StrategyExecutionNoopError(
+            "当前挂单已与目标一致，无需再次提交委托。"
+        )
 
         outcome = control_main._classify_auto_dispatch_outcome(exc)
 
@@ -24952,18 +24956,18 @@ class StrategyExecutionNoopTypedExceptionRound81Tests(unittest.TestCase):
        instance ``detail`` attribute matching the init argument.
     2. Raising the typed subclass produces ``verdict="noop"`` /
        ``reason_code="auto.dispatch.noop"`` with ``clear_alerts=True`` /
-       ``emit_noop_event=True`` / ``record_issue=False`` — the same contract
-       the legacy substring path observed.
-    3. The legacy substring probe still fires for plain ``RuntimeError``
-       instances carrying ``"无需再次提交委托"``, so unconverted callers
-       remain functional.
+       ``emit_noop_event=True`` / ``record_issue=False``.
+    3. Round 89 — a plain ``RuntimeError`` carrying ``"无需再次提交委托"`` no
+       longer classifies as ``noop`` (observable proof the substring probe
+       has been removed).  It now classifies as ``failed`` because the
+       typed-subclass check is the sole discriminator.
     4. A ``StrategyExecutionNoopError`` with an unrelated detail (no Chinese
        substring) still classifies as ``noop`` via ``isinstance`` — this
        proves the typed subclass is the discriminator, not the substring.
-    5. A ``StrategyExecutionBlockedError`` is NOT reclassified as noop even
-       if its detail happened to carry ``"无需再次提交委托"`` — ``isinstance``
-       is checked before the substring, and the ``blocked`` branch runs
-       only for ``StrategyExecutionBlockedError`` specifically.
+    5. A ``StrategyExecutionBlockedError`` whose detail happens to carry the
+       noop token stays ``blocked`` (R89) — prior to R89 the substring
+       fallback would have hijacked it to ``noop``; the typed check now
+       pins the correct verdict.
     """
 
     def test_noop_error_is_runtime_error_subclass(self) -> None:
@@ -24994,35 +24998,37 @@ class StrategyExecutionNoopTypedExceptionRound81Tests(unittest.TestCase):
         self.assertEqual(outcome.verdict, "noop")
         self.assertEqual(outcome.reason_code, "auto.dispatch.noop")
 
-    def test_plain_runtime_error_substring_still_classifies_as_noop_legacy_fallback(self) -> None:
-        # Round 81 — the legacy substring probe survives as a fallback for
-        # ``RuntimeError`` callers that have not been wired to the typed
-        # subclass yet.  This pins the backward-compatibility contract.
+    def test_plain_runtime_error_with_noop_token_no_longer_classifies_as_noop(self) -> None:
+        # Round 89 — the legacy ``"无需再次提交委托"`` substring probe has
+        # been deleted.  A plain ``RuntimeError`` carrying that token must
+        # now classify as ``failed`` because the typed
+        # :class:`StrategyExecutionNoopError` subclass is the sole opt-in
+        # for the ``noop`` verdict.  This is the observable proof of the
+        # substring-probe removal.
         exc = RuntimeError("当前挂单已与目标一致，无需再次提交委托。")
         outcome = control_main._classify_auto_dispatch_outcome(exc)
-        self.assertEqual(outcome.verdict, "noop")
-        self.assertEqual(outcome.reason_code, "auto.dispatch.noop")
+        self.assertEqual(outcome.verdict, "failed")
+        self.assertEqual(outcome.reason_code, "auto.dispatch.failed")
+        self.assertTrue(outcome.record_issue)
+        self.assertFalse(outcome.emit_noop_event)
 
-    def test_blocked_error_is_not_reclassified_as_noop(self) -> None:
-        # ``StrategyExecutionBlockedError`` must stay ``blocked`` even if
-        # its detail happened to contain the noop substring — the typed
-        # ``isinstance(exc, StrategyExecutionNoopError)`` check is the guard
-        # that keeps the verdicts orthogonal.
+    def test_blocked_error_with_noop_token_stays_blocked_after_substring_removal(self) -> None:
+        # Round 89 — prior to R89 the legacy substring probe would have
+        # hijacked any ``StrategyExecutionBlockedError`` whose detail carried
+        # the noop token and mis-classified it as ``noop`` (because the
+        # substring check at the time ran before the blocked-subclass
+        # ``isinstance`` branch).  With the substring probe deleted, the
+        # blocked verdict now wins for every ``StrategyExecutionBlockedError``
+        # regardless of detail — the typed discriminator is the sole arbiter.
         exc = control_main.StrategyExecutionBlockedError(
             "当前 Live 余额不足，无需再次提交委托。",
             recommended_action="请先补充 Live 可用余额。",
         )
         outcome = control_main._classify_auto_dispatch_outcome(exc)
-        # ``StrategyExecutionBlockedError`` IS a ``RuntimeError`` so the
-        # legacy substring probe would have mis-classified it; the typed
-        # ``isinstance(noop)`` check short-circuits safely because the
-        # blocked subclass is a sibling of the noop subclass, not a parent.
-        # Verify the legacy substring fallback still runs after the typed
-        # check — so the substring *does* still win over ``blocked`` when
-        # no typed noop is raised.  This is the pre-R81 behaviour we keep
-        # for fallback compatibility: callers must NOT carry the noop
-        # substring in a blocked-error detail.
-        self.assertEqual(outcome.verdict, "noop")
+        self.assertEqual(outcome.verdict, "blocked")
+        self.assertEqual(outcome.reason_code, "auto.dispatch.blocked")
+        self.assertEqual(outcome.recommended_action, "请先补充 Live 可用余额。")
+        self.assertTrue(outcome.record_issue)
 
     def test_noop_verdict_from_typed_subclass_end_to_end_via_monkeypatch(self) -> None:
         """Pin the end-to-end contract: when

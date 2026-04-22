@@ -8070,9 +8070,9 @@ def _auto_dispatch_strategy_signal_changes(
 # * ``noop`` / ``auto.dispatch.noop`` — a typed
 #   :class:`StrategyExecutionNoopError` (R81) raised at the single source
 #   that detects ``target ≈ current``; emit an audit noop event + clear
-#   alerts.  Legacy ``RuntimeError`` instances whose detail still carries
-#   ``"无需再次提交委托"`` classify via a substring fallback so unconverted
-#   callers stay functional.
+#   alerts.  Round 89 deleted the legacy ``"无需再次提交委托"`` substring
+#   fallback — plain ``RuntimeError`` instances carrying that token are now
+#   classified as ``failed`` (the typed subclass is the sole opt-in).
 # * ``blocked`` / ``auto.dispatch.blocked`` — a
 #   :class:`StrategyExecutionBlockedError`; record the issue carrying the
 #   attached ``recommended_action`` so the operator console can render it.
@@ -8092,11 +8092,14 @@ def _classify_auto_dispatch_outcome(exc: Optional[BaseException]) -> AutoDispatc
         )
     if isinstance(exc, RuntimeError):
         detail = str(exc)
-        # Round 81 — typed ``StrategyExecutionNoopError`` takes precedence
-        # over the legacy ``"无需再次提交委托"`` substring probe; the probe
-        # survives as a fallback for plain ``RuntimeError`` instances raised
-        # by code paths that have not been wired to the typed subclass.
-        if isinstance(exc, StrategyExecutionNoopError) or "无需再次提交委托" in detail:
+        # Round 89 — the legacy ``"无需再次提交委托"`` substring probe has been
+        # removed.  The only in-tree producer of that copy is the typed-raise
+        # site at ``_build_strategy_execution_preview_from_state``'s delta
+        # short-circuit (main.py:9035), which emits
+        # :class:`StrategyExecutionNoopError` (R81).  Plain ``RuntimeError``
+        # instances carrying the token no longer auto-classify as ``noop`` —
+        # callers must raise the typed subclass to opt into the noop verdict.
+        if isinstance(exc, StrategyExecutionNoopError):
             return AutoDispatchOutcome(
                 verdict="noop",
                 reason_code="auto.dispatch.noop",
