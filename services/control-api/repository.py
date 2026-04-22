@@ -2783,6 +2783,7 @@ class AppRepository:
             },
             symbol=symbol,
             strategy_id=strategy_id,
+            parameter_snapshot=self._resolve_strategy_parameter_snapshot_locked(strategy_id),
         )
         return True
 
@@ -2914,6 +2915,9 @@ class AppRepository:
             payload=record.model_dump(mode="json"),
             symbol=payload.payload.get("symbol"),
             strategy_id=payload.payload.get("strategy_id"),
+            parameter_snapshot=self._resolve_strategy_parameter_snapshot_locked(
+                payload.payload.get("strategy_id")
+            ),
         )
         return record
 
@@ -3080,6 +3084,9 @@ class AppRepository:
             severity=EventSeverity.INFO,
             payload=queued_event_payload,
             strategy_id=payload.context.get("strategy_id"),
+            parameter_snapshot=self._resolve_strategy_parameter_snapshot_locked(
+                payload.context.get("strategy_id")
+            ),
         )
         return record
 
@@ -3643,6 +3650,22 @@ class AppRepository:
             raise KeyError(strategy_id)
         return strategy
 
+    def _resolve_strategy_parameter_snapshot_locked(
+        self, strategy_id: Optional[str]
+    ) -> Optional[Dict[str, Any]]:
+        # Round 63 — mirror of ``main._resolve_strategy_parameter_snapshot`` so
+        # repository-level audit events can attach the canonical parameter
+        # whitelist when dispatched strictly from strategy identity.
+        if not strategy_id:
+            return None
+        strategy = next(
+            (item for item in self.state.strategies if item.id == strategy_id),
+            None,
+        )
+        if strategy is None:
+            return None
+        return parameter_resolver.snapshot_parameters(strategy)
+
     @staticmethod
     def _normalize_strategy_value(current_value: Any, next_value: Any) -> Any:
         if isinstance(current_value, bool):
@@ -3820,6 +3843,9 @@ class AppRepository:
             payload=record.model_dump(mode="json"),
             symbol=payload.get("symbol"),
             strategy_id=payload.get("strategy_id"),
+            parameter_snapshot=self._resolve_strategy_parameter_snapshot_locked(
+                payload.get("strategy_id")
+            ),
         )
         if self._should_queue_strategy_change_review(record):
             self._queue_strategy_change_review_locked(record)
@@ -4053,6 +4079,9 @@ class AppRepository:
                 severity=EventSeverity.INFO,
                 payload=retry_requested_payload,
                 strategy_id=str(job.context.get("strategy_id") or "") or None,
+                parameter_snapshot=self._resolve_strategy_parameter_snapshot_locked(
+                    str(job.context.get("strategy_id") or "") or None
+                ),
             )
             self._persist()
             return retried_job
@@ -4085,6 +4114,9 @@ class AppRepository:
                 severity=EventSeverity.INFO,
                 payload=started_event_payload,
                 strategy_id=str(next_job.context.get("strategy_id") or "") or None,
+                parameter_snapshot=self._resolve_strategy_parameter_snapshot_locked(
+                    str(next_job.context.get("strategy_id") or "") or None
+                ),
             )
             self._persist()
             return next_job.model_copy(deep=True)
@@ -4229,8 +4261,12 @@ class AppRepository:
                 severity=EventSeverity.INFO,
                 payload=completed_event_payload,
                 strategy_id=str(job.context.get("strategy_id") or "") or None,
+                parameter_snapshot=self._resolve_strategy_parameter_snapshot_locked(
+                    str(job.context.get("strategy_id") or "") or None
+                ),
             )
             if job.job_type == "review_strategy_change":
+                review_strategy_id = str(job.context.get("strategy_id") or "") or None
                 self.add_event(
                     event_type="strategy.change.review.completed",
                     source=source,
@@ -4249,9 +4285,13 @@ class AppRepository:
                         "linked_review_title": review.title if review else None,
                         "linked_review_period": review.period if review else None,
                     },
-                    strategy_id=str(job.context.get("strategy_id") or "") or None,
+                    strategy_id=review_strategy_id,
+                    parameter_snapshot=self._resolve_strategy_parameter_snapshot_locked(
+                        review_strategy_id
+                    ),
                 )
             if job.job_type == "review_strategy_issue":
+                issue_strategy_id = str(job.context.get("strategy_id") or "") or None
                 self.add_event(
                     event_type="strategy.issue.review.completed",
                     source=source,
@@ -4266,7 +4306,10 @@ class AppRepository:
                         "linked_review_title": review.title if review else None,
                         "linked_review_period": review.period if review else None,
                     },
-                    strategy_id=str(job.context.get("strategy_id") or "") or None,
+                    strategy_id=issue_strategy_id,
+                    parameter_snapshot=self._resolve_strategy_parameter_snapshot_locked(
+                        issue_strategy_id
+                    ),
                 )
             self._refresh_derived_state()
             self._persist()
@@ -4298,12 +4341,16 @@ class AppRepository:
                 result_summary=error,
             )
             self._enrich_agent_job_event_payload(failed_event_payload, job)
+            failed_strategy_id = str(job.context.get("strategy_id") or "") or None
             self.add_event(
                 event_type="openclaw.job.failed",
                 source=source,
                 severity=EventSeverity.WARNING,
                 payload=failed_event_payload,
-                strategy_id=str(job.context.get("strategy_id") or "") or None,
+                strategy_id=failed_strategy_id,
+                parameter_snapshot=self._resolve_strategy_parameter_snapshot_locked(
+                    failed_strategy_id
+                ),
             )
             if job.job_type == "review_strategy_change":
                 self.add_event(
@@ -4320,7 +4367,10 @@ class AppRepository:
                         "trigger_reason": job.context.get("trigger_reason"),
                         "error": error,
                     },
-                    strategy_id=str(job.context.get("strategy_id") or "") or None,
+                    strategy_id=failed_strategy_id,
+                    parameter_snapshot=self._resolve_strategy_parameter_snapshot_locked(
+                        failed_strategy_id
+                    ),
                 )
             if job.job_type == "review_strategy_issue":
                 self.add_event(
@@ -4333,7 +4383,10 @@ class AppRepository:
                         "strategy_id": job.context.get("strategy_id"),
                         "error": error,
                     },
-                    strategy_id=str(job.context.get("strategy_id") or "") or None,
+                    strategy_id=failed_strategy_id,
+                    parameter_snapshot=self._resolve_strategy_parameter_snapshot_locked(
+                        failed_strategy_id
+                    ),
                 )
             self._persist()
             return job.model_copy(deep=True)
@@ -4369,12 +4422,16 @@ class AppRepository:
             "summary": reason or "已由桌面控制端终止。",
         }
         self._enrich_agent_job_event_payload(cancelled_event_payload, job)
+        cancelled_strategy_id = str(job.context.get("strategy_id") or "") or None
         self.add_event(
             event_type="openclaw.job.cancelled",
             source="desktop",
             severity=EventSeverity.WARNING,
             payload=cancelled_event_payload,
-            strategy_id=str(job.context.get("strategy_id") or "") or None,
+            strategy_id=cancelled_strategy_id,
+            parameter_snapshot=self._resolve_strategy_parameter_snapshot_locked(
+                cancelled_strategy_id
+            ),
         )
 
     def set_openclaw_connection(self, connected: bool) -> None:
@@ -4484,6 +4541,9 @@ class AppRepository:
                             "detail": manual_followup_detail,
                         },
                         strategy_id=strategy_id,
+                        parameter_snapshot=self._resolve_strategy_parameter_snapshot_locked(
+                            strategy_id
+                        ),
                     )
                 elif proposal.proposal_type in {"param_update", "pause_resume", "risk_update", "publish_recommendation"}:
                     created_change_request = self._create_change_request_locked(
@@ -4528,6 +4588,9 @@ class AppRepository:
                     "created_backtest_id": created_backtest.id if created_backtest else None,
                 },
                 strategy_id=proposal.strategy_id,
+                parameter_snapshot=self._resolve_strategy_parameter_snapshot_locked(
+                    proposal.strategy_id
+                ),
             )
             self._refresh_derived_state()
             self._persist()
@@ -5298,6 +5361,7 @@ class AppRepository:
             },
             symbol=snapshot.symbol,
             strategy_id=strategy.id,
+            parameter_snapshot=parameter_resolver.snapshot_parameters(strategy),
         )
         self._upsert_system_alert_locked(
             rule_key=f"strategy-stop-loss:{strategy.id}:{snapshot.symbol}",
@@ -5361,6 +5425,7 @@ class AppRepository:
                 },
                 symbol=symbol,
                 strategy_id=strategy_id,
+                parameter_snapshot=self._resolve_strategy_parameter_snapshot_locked(strategy_id),
             )
             self._upsert_system_alert_locked(
                 rule_key=f"strategy-risk:{strategy_id}:{symbol}",
@@ -5589,6 +5654,7 @@ class AppRepository:
                         },
                         symbol=snapshot.symbol,
                         strategy_id=snapshot.strategy_id,
+                        parameter_snapshot=parameter_resolver.snapshot_parameters(strategy),
                     )
                     changed = True
                     if self._sync_strategy_signal_alert_locked(strategy, snapshot, previous):
@@ -5972,13 +6038,19 @@ class AppRepository:
                 "manual_followup_detail": record.manual_followup_detail,
                 "source": source,
             }
+            reconcile_strategy_id = (
+                record.payload.get("strategy_id") if isinstance(record.payload, dict) else None
+            )
             self.add_event(
                 event_type="change_request.reconcile_outcome",
                 source=source,
                 severity=EventSeverity.INFO,
                 payload=event_payload,
-                strategy_id=record.payload.get("strategy_id") if isinstance(record.payload, dict) else None,
+                strategy_id=reconcile_strategy_id,
                 symbol=record.payload.get("symbol") if isinstance(record.payload, dict) else None,
+                parameter_snapshot=self._resolve_strategy_parameter_snapshot_locked(
+                    reconcile_strategy_id
+                ),
             )
 
             if manual_required_changed or manual_detail_changed or summary_changed:

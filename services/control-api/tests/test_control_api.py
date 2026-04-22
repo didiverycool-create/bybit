@@ -22352,5 +22352,40 @@ class AutoDispatchOutcomeRound61UnitTests(unittest.TestCase):
         self.assertTrue(outcome.record_issue)
 
 
+class RepositoryStrategyParameterSnapshotRound63Tests(unittest.TestCase):
+    """Round 63 pins the repository-side ``parameter_snapshot`` helper —
+    ``AppRepository._resolve_strategy_parameter_snapshot_locked`` — and the
+    repository audit events that now attach the canonical snapshot via strategy
+    identity (``openclaw.job.*`` / ``strategy.{change,issue}.review.*`` /
+    ``strategy_proposal.{action}ed`` / ``change_request.{created,applied,reconcile_outcome,manual_followup_required}``
+    / ``strategy.paper_stop_loss.executed`` / ``strategy.runtime.signal_changed``).
+    The helper must mirror ``main._resolve_strategy_parameter_snapshot`` bit-for-bit
+    so auditors can correlate repo-emitted and main-emitted audits by snapshot
+    identity rather than cross-joining on timestamp.
+    """
+
+    def test_helper_returns_none_for_missing_strategy(self) -> None:
+        repo = control_main.repo
+        self.assertIsNone(repo._resolve_strategy_parameter_snapshot_locked(None))
+        self.assertIsNone(repo._resolve_strategy_parameter_snapshot_locked(""))
+        self.assertIsNone(
+            repo._resolve_strategy_parameter_snapshot_locked("strategy-does-not-exist")
+        )
+
+    def test_helper_matches_main_module_resolver_bit_for_bit(self) -> None:
+        import parameter_resolver as _pr  # noqa: PLC0415
+
+        repo = control_main.repo
+        strategy = next(
+            item for item in repo.state.strategies if item.id == "trend-btc-01"
+        )
+        repo_snapshot = repo._resolve_strategy_parameter_snapshot_locked(strategy.id)
+        main_snapshot = control_main._resolve_strategy_parameter_snapshot(strategy.id)
+        expected = _pr.snapshot_parameters(strategy)
+
+        self.assertEqual(repo_snapshot, expected)
+        self.assertEqual(repo_snapshot, main_snapshot)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
