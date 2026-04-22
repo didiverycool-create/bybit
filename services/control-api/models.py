@@ -1406,6 +1406,39 @@ RISK_REASON_RUNTIME_UNAVAILABLE = "risk.runtime_unavailable"
 RISK_REASON_PREVIEW_BLOCKED = "risk.preview_blocked"
 
 
+# Round 78 — sub-classification of Bybit exchange-order constraint violations
+# produced by ``_validate_exchange_order_constraints``.  Prior to R78 the
+# validator returned a free-form Chinese message and downstream recommendation
+# helpers re-parsed the message with a brittle substring probe (which silently
+# missed the ``min_notional`` branch because its copy says "最小下单金额" while
+# the helper searched for "最小名义价值").  The typed ``kind`` discriminator
+# makes the violation family explicit so recommendation code branches on the
+# enum rather than the Chinese copy.
+ExchangeConstraintViolationKind = Literal[
+    "min_order_qty",
+    "qty_step",
+    "tick_size",
+    "min_notional",
+]
+
+
+class ExchangeConstraintViolation(BaseModel):
+    """Typed return for ``_validate_exchange_order_constraints`` (R78).
+
+    * ``kind`` — which of the four exchange-side constraint rules tripped.
+    * ``message`` — human-readable Chinese copy kept verbatim from the
+      historical validator output so ``ExecutionPreview.blocked_reason``
+      stays wire-compatible with existing auditors and UI surfaces.
+    * ``limit_value`` — the numeric threshold the validator checked against
+      (min order qty, qty step, tick size, or min notional) so downstream
+      surfaces can render per-kind UI without re-parsing ``message``.
+    """
+
+    kind: ExchangeConstraintViolationKind
+    message: str
+    limit_value: float
+
+
 class RiskDecisionRecommendation(BaseModel):
     """Round 73 — typed recommendation attached to a :class:`RiskDecision`.
 

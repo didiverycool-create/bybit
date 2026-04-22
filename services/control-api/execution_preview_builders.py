@@ -18,6 +18,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from models import (
     Direction,
+    ExchangeConstraintViolation,
     ExecutionPreview,
     ExecutionPreviewRequest,
     OrderRecord,
@@ -116,11 +117,11 @@ def build_private_execution_preview(
     calculate_private_perp_balance_delta_notional: Callable[..., float],
     private_wallet_available_spot_quantity: Callable[..., Optional[float]],
     private_released_spot_sell_reservation: Callable[..., float],
-    validate_exchange_order_constraints: Callable[..., Optional[str]],
+    validate_exchange_order_constraints: Callable[..., Optional[ExchangeConstraintViolation]],
     build_private_insufficient_balance_reason: Callable[..., str],
     build_private_insufficient_balance_recommended_action: Callable[..., Optional[str]],
     build_private_spot_inventory_recommended_action: Callable[..., Optional[str]],
-    build_exchange_constraint_recommended_action: Callable[..., Optional[str]],
+    build_exchange_constraint_recommended_action: Callable[[Optional[ExchangeConstraintViolation]], Optional[str]],
     build_execution_preview_recommended_action: Callable[..., Optional[str]],
     private_order_reserves_private_balance: Callable[[OrderRecord], bool],
 ) -> ExecutionPreview:
@@ -266,19 +267,26 @@ def build_private_execution_preview(
             symbol=payload.symbol,
             exclude_order_id=payload.exclude_order_id,
         )
-    blocked_reason = validate_exchange_order_constraints(
+    # Round 78 — ``validate_exchange_order_constraints`` now returns a typed
+    # :class:`ExchangeConstraintViolation` carrying ``kind`` / ``message`` /
+    # ``limit_value``.  The preview still exposes the free-form Chinese
+    # message via ``blocked_reason`` for wire compatibility.
+    exchange_violation = validate_exchange_order_constraints(
         symbol=payload.symbol,
         market=payload.market,
         quantity=payload.quantity,
         price=payload.price,
     )
+    blocked_reason: Optional[str] = (
+        exchange_violation.message if exchange_violation is not None else None
+    )
     # Round 70 — track a typed ``block_code`` alongside the free-form
     # ``blocked_reason`` so ``evaluate_risk_decision`` does not have to
     # re-derive it via substring probe.
     block_code: Optional[str] = (
-        RISK_REASON_EXCHANGE_CONSTRAINT if blocked_reason is not None else None
+        RISK_REASON_EXCHANGE_CONSTRAINT if exchange_violation is not None else None
     )
-    recommended_action = build_exchange_constraint_recommended_action(blocked_reason)
+    recommended_action = build_exchange_constraint_recommended_action(exchange_violation)
     if blocked_reason is None and payload.market == "spot" and payload.side == Direction.BUY and available_before + 1e-9 < notional:
         blocked_reason = build_private_insufficient_balance_reason(
             available_balance=available_before,

@@ -23544,5 +23544,180 @@ class ExecutionPreviewRecommendedActionTypedDispatchRound77Tests(unittest.TestCa
         )
 
 
+class ExchangeConstraintViolationTypedReturnRound78Tests(unittest.TestCase):
+    """Round 78 — ``_validate_exchange_order_constraints`` now returns a typed
+    :class:`ExchangeConstraintViolation` (``kind`` / ``message`` / ``limit_value``)
+    instead of a free-form Chinese string.  Prior to R78 the downstream
+    recommendation helper re-parsed the message with a brittle substring probe
+    that silently missed the ``min_notional`` branch (copy says "最小下单金额"
+    while the probe searched for "最小名义价值") — callers with a min-notional
+    violation therefore got ``recommended_action=None`` despite being in a
+    real exchange-constraint context.  The typed return + typed helper surface
+    makes this class of breakage structurally impossible.
+
+    Invariants pinned:
+
+    1. Each of the four validator branches returns the expected
+       :class:`ExchangeConstraintViolation.kind` with the historical
+       Chinese ``message`` preserved verbatim.
+    2. ``min_notional`` branch — previously silently dropped by the helper
+       — now surfaces the canned recommendation via the typed helper.
+    3. ``_build_exchange_constraint_recommended_action(None)`` short-circuits
+       to ``None`` (non-violation inputs must never attach the canned copy).
+    4. ``_build_exchange_constraint_recommended_action(violation)`` returns
+       the canned recommendation for *every* ``kind`` — including the
+       historically-broken ``min_notional`` case — without any substring
+       gating on ``violation.message``.
+    5. ``_build_execution_preview_recommended_action`` with
+       ``block_code=RISK_REASON_EXCHANGE_CONSTRAINT`` and a ``min_notional``-
+       flavoured detail now returns the canned recommendation (closes the
+       R77 gap where typed-dispatch fell through to ``None`` because the
+       helper's internal probe didn't match).
+    """
+
+    def _patched_constraints(self, *, min_qty: str, qty_step: str, tick_size: str, min_notional: str) -> Dict[str, Any]:
+        return {
+            "symbol": "BTCUSDT",
+            "market": "spot",
+            "min_order_qty": min_qty,
+            "qty_step": qty_step,
+            "tick_size": tick_size,
+            "min_notional_value": min_notional,
+        }
+
+    def test_validator_min_order_qty_branch_returns_typed_violation(self) -> None:
+        from models import ExchangeConstraintViolation  # noqa: PLC0415
+
+        with patch.object(
+            control_main.market_data,
+            "get_instrument_constraints",
+            return_value=self._patched_constraints(
+                min_qty="0.01", qty_step="0.001", tick_size="0.1", min_notional="0"
+            ),
+        ):
+            violation = control_main._validate_exchange_order_constraints(
+                symbol="BTCUSDT", market="spot", quantity=0.001, price=50000.0
+            )
+        self.assertIsInstance(violation, ExchangeConstraintViolation)
+        assert violation is not None
+        self.assertEqual(violation.kind, "min_order_qty")
+        self.assertIn("最小下单量", violation.message)
+        self.assertAlmostEqual(violation.limit_value, 0.01)
+
+    def test_validator_qty_step_branch_returns_typed_violation(self) -> None:
+        from models import ExchangeConstraintViolation  # noqa: PLC0415
+
+        with patch.object(
+            control_main.market_data,
+            "get_instrument_constraints",
+            return_value=self._patched_constraints(
+                min_qty="0", qty_step="0.01", tick_size="0.1", min_notional="0"
+            ),
+        ):
+            violation = control_main._validate_exchange_order_constraints(
+                symbol="BTCUSDT", market="spot", quantity=0.015, price=50000.0
+            )
+        self.assertIsInstance(violation, ExchangeConstraintViolation)
+        assert violation is not None
+        self.assertEqual(violation.kind, "qty_step")
+        self.assertIn("数量步长", violation.message)
+        self.assertAlmostEqual(violation.limit_value, 0.01)
+
+    def test_validator_tick_size_branch_returns_typed_violation(self) -> None:
+        from models import ExchangeConstraintViolation  # noqa: PLC0415
+
+        with patch.object(
+            control_main.market_data,
+            "get_instrument_constraints",
+            return_value=self._patched_constraints(
+                min_qty="0", qty_step="0", tick_size="0.5", min_notional="0"
+            ),
+        ):
+            violation = control_main._validate_exchange_order_constraints(
+                symbol="BTCUSDT", market="spot", quantity=1.0, price=50000.25
+            )
+        self.assertIsInstance(violation, ExchangeConstraintViolation)
+        assert violation is not None
+        self.assertEqual(violation.kind, "tick_size")
+        self.assertIn("价格步长", violation.message)
+        self.assertAlmostEqual(violation.limit_value, 0.5)
+
+    def test_validator_min_notional_branch_returns_typed_violation(self) -> None:
+        from models import ExchangeConstraintViolation  # noqa: PLC0415
+
+        with patch.object(
+            control_main.market_data,
+            "get_instrument_constraints",
+            return_value=self._patched_constraints(
+                min_qty="0", qty_step="0", tick_size="0", min_notional="100"
+            ),
+        ):
+            violation = control_main._validate_exchange_order_constraints(
+                symbol="BTCUSDT", market="spot", quantity=0.001, price=50.0
+            )
+        self.assertIsInstance(violation, ExchangeConstraintViolation)
+        assert violation is not None
+        self.assertEqual(violation.kind, "min_notional")
+        # Historical copy preserved for wire compatibility.
+        self.assertIn("名义价值", violation.message)
+        self.assertIn("最小下单金额", violation.message)
+        self.assertAlmostEqual(violation.limit_value, 100.0)
+
+    def test_validator_returns_none_when_no_constraint_trips(self) -> None:
+        with patch.object(
+            control_main.market_data,
+            "get_instrument_constraints",
+            return_value=self._patched_constraints(
+                min_qty="0.001", qty_step="0.001", tick_size="0.1", min_notional="5"
+            ),
+        ):
+            violation = control_main._validate_exchange_order_constraints(
+                symbol="BTCUSDT", market="spot", quantity=0.01, price=50000.0
+            )
+        self.assertIsNone(violation)
+
+    def test_recommended_action_helper_short_circuits_on_none(self) -> None:
+        self.assertIsNone(control_main._build_exchange_constraint_recommended_action(None))
+
+    def test_recommended_action_helper_returns_canned_copy_for_every_kind(self) -> None:
+        from models import ExchangeConstraintViolation  # noqa: PLC0415
+
+        canned = (
+            "请按 Bybit 的最小下单量、数量步长、价格步长和最小名义价值调整参数后再重试。"
+        )
+        for kind, message in (
+            ("min_order_qty", "当前委托数量低于 Bybit 最小下单量 0.01，请调整数量后再提交。"),
+            ("qty_step", "当前委托数量不符合 Bybit 数量步长 0.01，请按交易所步长调整后再提交。"),
+            ("tick_size", "当前委托价格不符合 Bybit 价格步长 0.5，请按交易所报价精度调整后再提交。"),
+            ("min_notional", "当前委托名义价值低于 Bybit 最小下单金额 100，请提高价格或数量后再提交。"),
+        ):
+            with self.subTest(kind=kind):
+                violation = ExchangeConstraintViolation(
+                    kind=kind,  # type: ignore[arg-type]
+                    message=message,
+                    limit_value=1.0,
+                )
+                self.assertEqual(
+                    control_main._build_exchange_constraint_recommended_action(violation),
+                    canned,
+                )
+
+    def test_typed_dispatch_recovers_min_notional_recommendation_previously_dropped(self) -> None:
+        from models import RISK_REASON_EXCHANGE_CONSTRAINT  # noqa: PLC0415
+
+        # Pre-R78 the R77 EXCHANGE_CONSTRAINT branch called the helper with
+        # this detail string; the helper's probe searched for "最小名义价值"
+        # which never matched, so the recommendation silently dropped to
+        # ``None``.  The typed dispatch now returns the canned copy.
+        result = control_main._build_execution_preview_recommended_action(
+            "当前委托名义价值低于 Bybit 最小下单金额 10，请提高价格或数量后再提交。",
+            block_code=RISK_REASON_EXCHANGE_CONSTRAINT,
+        )
+        self.assertEqual(
+            result,
+            "请按 Bybit 的最小下单量、数量步长、价格步长和最小名义价值调整参数后再重试。",
+        )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

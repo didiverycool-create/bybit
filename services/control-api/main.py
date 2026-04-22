@@ -130,6 +130,7 @@ from models import (
     ClosePaperPositionPayload,
     Direction,
     ExecutionImpactRecord,
+    ExchangeConstraintViolation,
     ExecutionIntent,
     ExecutionPreview,
     ExecutionPreviewRequest,
@@ -810,12 +811,22 @@ def _build_private_spot_inventory_recommended_action(symbol: str) -> str:
     return f"请先撤销 {symbol.upper()} 相关未成交卖单，或降低卖出数量后再重试。"
 
 
-def _build_exchange_constraint_recommended_action(blocked_reason: Optional[str]) -> Optional[str]:
-    if not blocked_reason:
+def _build_exchange_constraint_recommended_action(
+    violation: Optional[ExchangeConstraintViolation],
+) -> Optional[str]:
+    # Round 78 — the historical implementation took the free-form Chinese
+    # ``blocked_reason`` string and probed it for four substrings.  The probe
+    # silently missed the ``min_notional`` branch (whose copy says
+    # "最小下单金额" while the probe searched for "最小名义价值") and was
+    # redundant at every caller because the caller already knew it was in an
+    # exchange-constraint context.  The helper now takes the typed
+    # :class:`ExchangeConstraintViolation` and returns the canned copy
+    # whenever a violation is present.  Keeping a single return string rather
+    # than per-kind copy preserves today's wire format; a future round may
+    # subdivide if UX calls for it.
+    if violation is None:
         return None
-    if any(keyword in blocked_reason for keyword in ("最小下单量", "数量步长", "价格步长", "最小名义价值")):
-        return "请按 Bybit 的最小下单量、数量步长、价格步长和最小名义价值调整参数后再重试。"
-    return None
+    return "请按 Bybit 的最小下单量、数量步长、价格步长和最小名义价值调整参数后再重试。"
 
 
 def _resolve_private_account_type_label(default: str = "Bybit") -> str:
@@ -977,9 +988,14 @@ def _build_execution_preview_recommended_action(
     if resolved_code == RISK_REASON_INSUFFICIENT_INVENTORY:
         return "请先撤销相关未成交卖单，或降低卖出数量后再重试。"
     if resolved_code == RISK_REASON_EXCHANGE_CONSTRAINT:
-        constraint_action = _build_exchange_constraint_recommended_action(detail)
-        if constraint_action is not None:
-            return constraint_action
+        # Round 78 — the typed EXCHANGE_CONSTRAINT branch no longer needs to
+        # round-trip through ``_build_exchange_constraint_recommended_action``
+        # because the only reason that helper exists is to attach the canned
+        # copy at preview-builder source when a typed violation is in scope.
+        # Here at the R77 post-hoc path we only have the detail string, so
+        # emit the canned copy directly — matching the helper's behaviour
+        # without re-parsing the detail.
+        return "请按 Bybit 的最小下单量、数量步长、价格步长和最小名义价值调整参数后再重试。"
     if resolved_code == RISK_REASON_RUNTIME_UNAVAILABLE:
         # Sub-distinguish private WS / public WS / runtime-worker thread
         # inside the RUNTIME_UNAVAILABLE branch — the typed code alone is
@@ -1764,7 +1780,7 @@ def _validate_exchange_order_constraints(
     market: str,
     quantity: float,
     price: float,
-) -> Optional[str]:
+) -> Optional[ExchangeConstraintViolation]:
     if quantity <= 0 or price <= 0:
         return None
     constraints = _get_exchange_order_constraints(symbol, market)
@@ -1779,24 +1795,40 @@ def _validate_exchange_order_constraints(
     min_notional_value = constraints.get("min_notional_value", Decimal("0"))
 
     if min_order_qty > 0 and qty_decimal < min_order_qty:
-        return (
-            f"当前委托数量低于 Bybit 最小下单量 {normalize_number(float(min_order_qty), 8)}，"
-            "请调整数量后再提交。"
+        return ExchangeConstraintViolation(
+            kind="min_order_qty",
+            message=(
+                f"当前委托数量低于 Bybit 最小下单量 {normalize_number(float(min_order_qty), 8)}，"
+                "请调整数量后再提交。"
+            ),
+            limit_value=float(min_order_qty),
         )
     if qty_step > 0 and not _is_decimal_multiple(qty_decimal, qty_step):
-        return (
-            f"当前委托数量不符合 Bybit 数量步长 {normalize_number(float(qty_step), 8)}，"
-            "请按交易所步长调整后再提交。"
+        return ExchangeConstraintViolation(
+            kind="qty_step",
+            message=(
+                f"当前委托数量不符合 Bybit 数量步长 {normalize_number(float(qty_step), 8)}，"
+                "请按交易所步长调整后再提交。"
+            ),
+            limit_value=float(qty_step),
         )
     if tick_size > 0 and not _is_decimal_multiple(price_decimal, tick_size):
-        return (
-            f"当前委托价格不符合 Bybit 价格步长 {normalize_number(float(tick_size), 8)}，"
-            "请按交易所报价精度调整后再提交。"
+        return ExchangeConstraintViolation(
+            kind="tick_size",
+            message=(
+                f"当前委托价格不符合 Bybit 价格步长 {normalize_number(float(tick_size), 8)}，"
+                "请按交易所报价精度调整后再提交。"
+            ),
+            limit_value=float(tick_size),
         )
     if min_notional_value > 0 and qty_decimal * price_decimal < min_notional_value:
-        return (
-            f"当前委托名义价值低于 Bybit 最小下单金额 {normalize_number(float(min_notional_value), 8)}，"
-            "请提高价格或数量后再提交。"
+        return ExchangeConstraintViolation(
+            kind="min_notional",
+            message=(
+                f"当前委托名义价值低于 Bybit 最小下单金额 {normalize_number(float(min_notional_value), 8)}，"
+                "请提高价格或数量后再提交。"
+            ),
+            limit_value=float(min_notional_value),
         )
     return None
 
