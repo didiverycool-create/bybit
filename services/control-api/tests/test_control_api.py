@@ -24435,6 +24435,142 @@ class RecordStrategyExecutionIssueTypedKwargsRound84Tests(unittest.TestCase):
         self.assertIn("UNIFIED 账户可用保证金", captured["suggested_action"])
 
 
+class DispatchStrategySignalExcTypedKwargsRound86Tests(unittest.TestCase):
+    """Round 86 — the ``dispatch_strategy_signal`` ``except RuntimeError``
+    branch (main.py:9290) historically re-recorded the manual-execution
+    issue with ``str(exc)`` but dropped the typed ``block_code`` /
+    ``sub_block_code`` attributes carried by ``StrategyExecutionChannelOutageError``
+    (R74/R80).  Thread ``getattr(exc, "block_code", None)`` /
+    ``getattr(exc, "sub_block_code", None)`` through so the record helper
+    forwards the typed sub-code to the recommender.
+
+    Also short-circuit ``StrategyExecutionNoopError`` — a "target already
+    matches current position" signal rather than a real block — so the
+    manual-dispatch route does not spam the blocked-execution audit feed
+    with a pseudo-block.
+
+    Invariants pinned:
+
+    1. Re-raise of ``StrategyExecutionChannelOutageError`` forwards both
+       ``block_code=RISK_REASON_RUNTIME_UNAVAILABLE`` and the channel
+       sub-code onto the emitted alert.
+    2. Re-raise of plain ``RuntimeError`` forwards ``reason_code=None`` /
+       ``sub_block_code=None`` (no typed attrs to read).
+    3. ``StrategyExecutionNoopError`` propagates without recording an
+       issue (no ``_record_strategy_manual_execution_issue`` call).
+    4. ``StrategyExecutionBlockedError.recommended_action`` continues to
+       take precedence over the typed-computed recommendation.
+    """
+
+    def _prepare_dispatch_state(self) -> Any:
+        from models import StrategySummary  # noqa: PLC0415
+
+        strategy = StrategySummary(
+            id="dispatch-exc",
+            name="Dispatch Exception",
+            category="template",
+            status="running",
+            symbols=["BTCUSDT"],
+            mode=AccountMode.LIVE,
+            version="v1",
+            pnl_7d="+0.0%",
+            max_drawdown="-0.0%",
+            risk_budget="18%",
+            description="dispatch exc unit test",
+            parameters=[],
+        )
+        snapshot = StrategyRuntimeSnapshot(
+            strategy_id=strategy.id,
+            strategy_name=strategy.name,
+            symbol="BTCUSDT",
+            market="perp",
+            mode=AccountMode.LIVE,
+            runtime_status="running",
+            signal="long",
+            confidence=0.5,
+            last_price=70000.0,
+            reference_price=70000.0,
+            change_24h=0.0,
+            note="",
+            next_action="",
+            last_evaluated_at="2026-04-23T00:00:00+08:00",
+        )
+
+        class _StubState:
+            strategies = [strategy]
+            strategy_runtime_snapshots = [snapshot]
+            watchlist: List[Any] = []
+            workspace_preferences = control_main.repo.snapshot().workspace_preferences
+
+        return _StubState
+
+    def _run_dispatch_expecting(self, exc_to_raise: RuntimeError) -> Dict[str, Any]:
+        from models import StrategyExecutionRequest  # noqa: PLC0415
+
+        stub_state_cls = self._prepare_dispatch_state()
+        captured: Dict[str, Any] = {}
+
+        def _fake_record(*args: Any, **kwargs: Any) -> None:
+            captured["called"] = True
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+
+        def _raise_exc(*_args: Any, **_kwargs: Any) -> None:
+            raise exc_to_raise
+
+        with patch.object(control_main.repo, "snapshot", return_value=stub_state_cls()), \
+                patch.object(control_main, "refresh_strategy_runtime_once"), \
+                patch.object(control_main, "_dispatch_strategy_signal_from_state", side_effect=_raise_exc), \
+                patch.object(control_main, "_runtime_worker_execution_block_reason", return_value=None), \
+                patch.object(control_main, "_record_strategy_manual_execution_issue", side_effect=_fake_record):
+            payload = StrategyExecutionRequest(mode=AccountMode.LIVE)
+            with self.assertRaises(type(exc_to_raise)):
+                control_main.dispatch_strategy_signal("dispatch-exc", payload)
+        return captured
+
+    def test_channel_outage_exc_threads_typed_sub_block_code(self) -> None:
+        from models import (  # noqa: PLC0415
+            RISK_REASON_RUNTIME_UNAVAILABLE,
+            RISK_REASON_RUNTIME_UNAVAILABLE_PUBLIC_CHANNEL,
+        )
+
+        exc = control_main.StrategyExecutionChannelOutageError(
+            "当前 Bybit 公共 WS 行情已断线。",
+            channel="public",
+        )
+        captured = self._run_dispatch_expecting(exc)
+        self.assertTrue(captured.get("called"))
+        kwargs = captured["kwargs"]
+        self.assertEqual(kwargs.get("reason_code"), RISK_REASON_RUNTIME_UNAVAILABLE)
+        self.assertEqual(
+            kwargs.get("sub_block_code"),
+            RISK_REASON_RUNTIME_UNAVAILABLE_PUBLIC_CHANNEL,
+        )
+
+    def test_plain_runtime_error_threads_none_typed_kwargs(self) -> None:
+        exc = RuntimeError("当前 Bybit 返回异常。")
+        captured = self._run_dispatch_expecting(exc)
+        self.assertTrue(captured.get("called"))
+        kwargs = captured["kwargs"]
+        self.assertIsNone(kwargs.get("reason_code"))
+        self.assertIsNone(kwargs.get("sub_block_code"))
+
+    def test_noop_error_short_circuits_without_recording(self) -> None:
+        exc = control_main.StrategyExecutionNoopError("当前真实持仓已经与策略目标一致。")
+        captured = self._run_dispatch_expecting(exc)
+        self.assertFalse(captured.get("called", False))
+
+    def test_blocked_error_recommended_action_still_forwarded(self) -> None:
+        exc = control_main.StrategyExecutionBlockedError(
+            "当前 Bybit 余额不足。",
+            recommended_action="自定义建议：请联系运营。",
+        )
+        captured = self._run_dispatch_expecting(exc)
+        self.assertTrue(captured.get("called"))
+        kwargs = captured["kwargs"]
+        self.assertEqual(kwargs.get("recommended_action"), "自定义建议：请联系运营。")
+
+
 class AlertSubBlockCodeMappingRound85Tests(unittest.TestCase):
     """Round 85 — ``_resolve_alert_sub_block_code`` maps the typed
     ``AUTO_DISPATCH_GATE_REASON_{PRIVATE,PUBLIC}_CHANNEL_OUTAGE`` codes on an

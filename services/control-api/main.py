@@ -9287,12 +9287,27 @@ def dispatch_strategy_signal(strategy_id: str, payload: StrategyExecutionRequest
     refresh_strategy_runtime_once()
     try:
         return _dispatch_strategy_signal_from_state(strategy_id, payload)
+    except StrategyExecutionNoopError:
+        # Round 86 — noop is a "target already matches, nothing to submit"
+        # signal rather than an error; propagate without recording an issue
+        # so the manual-dispatch route does not spam the blocked-execution
+        # audit feed with a pseudo-block.
+        raise
     except RuntimeError as exc:
         if resolved_mode != AccountMode.PAPER:
             strategy = next((item for item in repo.snapshot().strategies if item.id == strategy_id), None)
             snapshot = next((item for item in repo.snapshot().strategy_runtime_snapshots if item.strategy_id == strategy_id), None)
             if strategy is not None:
                 symbol = snapshot.symbol if snapshot is not None else (strategy.symbols[0] if strategy.symbols else "")
+                # Round 86 — ``StrategyExecutionChannelOutageError`` carries the
+                # typed ``block_code`` / ``sub_block_code`` discriminators; read
+                # them off the instance so the record helper can forward the
+                # typed sub-code to ``_build_manual_execution_recommended_action``
+                # instead of leaning on the ``"私有 WS"`` / ``"公共 WS"``
+                # substring probe.  Plain ``RuntimeError`` instances carry
+                # neither attr so ``getattr(..., None)`` falls back cleanly.
+                exc_block_code = getattr(exc, "block_code", None)
+                exc_sub_block_code = getattr(exc, "sub_block_code", None)
                 _record_strategy_manual_execution_issue(
                     strategy_id,
                     strategy.name,
@@ -9301,6 +9316,8 @@ def dispatch_strategy_signal(strategy_id: str, payload: StrategyExecutionRequest
                     str(exc),
                     recommended_action=exc.recommended_action if isinstance(exc, StrategyExecutionBlockedError) else None,
                     strategy=strategy,
+                    reason_code=exc_block_code,
+                    sub_block_code=exc_sub_block_code,
                 )
         raise
 
