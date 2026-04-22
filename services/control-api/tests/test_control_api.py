@@ -7553,6 +7553,15 @@ class ControlApiIntegrationTests(unittest.TestCase):
         assert blocked_event is not None
         self.assertIn("当前 Bybit 可用余额不足", blocked_event["payload"]["detail"])
         self.assertIn("UNIFIED 账户可用余额", blocked_event["payload"]["recommended_action"])
+        # Round 69 — the audit payload now carries the typed ``reason_code``
+        # derived from the ``RiskDecision`` wrapper so auditors can filter
+        # ``strategy.execution.blocked`` by typed category the same way they
+        # can for ``risk.blocked_order`` (R66).
+        from models import RISK_REASON_INSUFFICIENT_BALANCE  # noqa: PLC0415
+        self.assertEqual(
+            blocked_event["payload"]["reason_code"],
+            RISK_REASON_INSUFFICIENT_BALANCE,
+        )
 
         alerts_status, alerts_payload = self._get("/api/alerts")
         self.assertEqual(alerts_status, 200)

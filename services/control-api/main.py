@@ -248,7 +248,7 @@ from execution_preview_builders import (
     private_released_order_reservation as _private_released_order_reservation_impl,
     private_reserved_spot_sell_quantity as _private_reserved_spot_sell_quantity_impl,
 )
-from risk_decision import evaluate_risk_decision
+from risk_decision import derive_block_reason_code, evaluate_risk_decision
 
 
 app = FastAPI(title="Bybit 控制端本地服务", version="0.1.0")
@@ -6448,12 +6448,21 @@ def _record_strategy_manual_execution_issue(
     recommended_action: Optional[str] = None,
     *,
     strategy: Optional[StrategySummary] = None,
+    reason_code: Optional[str] = None,
 ) -> None:
     rule_key = f"strategy-blocked-execution:{strategy_id}:{mode.value}"
     suggested_action = recommended_action or _build_manual_execution_recommended_action(detail)
     parameter_snapshot = (
         parameter_resolver.snapshot_parameters(strategy) if strategy is not None else None
     )
+    # Round 69 — attach the typed ``reason_code`` to the strategy-execution
+    # blocked audit payloads (mirrors the R66 ``risk.blocked_order`` coverage)
+    # so auditors can correlate preview-derived blocks with runtime-worker or
+    # exception-path blocks without parsing Chinese substrings.  Callers that
+    # already have a ``RiskDecision.reason_code`` pass it in; callers that
+    # only carry a free-form reason string fall back to
+    # ``derive_block_reason_code`` at emit time.
+    resolved_reason_code = reason_code or derive_block_reason_code(detail)
     with repo._lock:  # type: ignore[attr-defined]
         changed = repo._upsert_system_alert_locked(  # type: ignore[attr-defined]
             rule_key=rule_key,
@@ -6474,6 +6483,7 @@ def _record_strategy_manual_execution_issue(
                 "symbol": symbol,
                 "mode": mode.value,
                 "detail": detail,
+                "reason_code": resolved_reason_code,
                 "recommended_action": suggested_action,
             },
             symbol=symbol,
@@ -6501,6 +6511,7 @@ def _record_strategy_manual_execution_issue(
                     "symbol": symbol,
                     "mode": mode.value,
                     "detail": detail,
+                    "reason_code": resolved_reason_code,
                     "recommended_action": suggested_action,
                 },
                 symbol=symbol,
@@ -7328,12 +7339,18 @@ def _dispatch_strategy_signal_from_state(strategy_id: str, payload: StrategyExec
         raise RuntimeError("当前策略运行态尚未准备好，请先刷新策略页后再试。")
 
     if decision.verdict != "allow":
+        # Round 69 — the ``RiskDecision`` wrapper already computes a
+        # Chinese ``reason_detail`` (preview.blocked_reason with a generic
+        # Chinese fallback); reuse it directly instead of re-deriving the
+        # same OR chain here.  The mode-specific fallback only applies when
+        # the decision carries an empty detail, which cannot happen for
+        # ``verdict != "allow"`` today but is kept as defence-in-depth.
         default_detail = (
             "当前策略 Paper 执行预检未通过。"
             if resolved_mode == AccountMode.PAPER
             else "当前策略真实模式执行预检未通过。"
         )
-        detail = preview.blocked_reason or decision.reason_detail or default_detail
+        detail = decision.reason_detail or default_detail
         _record_strategy_manual_execution_issue(
             strategy_id,
             strategy.name,
@@ -7342,6 +7359,7 @@ def _dispatch_strategy_signal_from_state(strategy_id: str, payload: StrategyExec
             detail,
             recommended_action=preview.recommended_action,
             strategy=strategy,
+            reason_code=decision.reason_code,
         )
         raise StrategyExecutionBlockedError(detail, preview.recommended_action)
 
