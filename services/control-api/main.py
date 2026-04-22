@@ -315,6 +315,23 @@ class StrategyExecutionChannelOutageError(RuntimeError):
         self.sub_block_code = _CHANNEL_SUB_BLOCK_CODE.get(channel) if channel else None
 
 
+# Round 81 — typed ``RuntimeError`` subclass raised by
+# ``_build_strategy_execution_preview_from_state`` when the current real
+# position already matches the strategy's target so no new order needs to be
+# submitted.  ``_classify_auto_dispatch_outcome`` previously routed this to
+# the ``auto.dispatch.noop`` verdict via an
+# ``if "无需再次提交委托" in detail:`` substring probe; the subclass lets the
+# classifier branch on ``isinstance(exc, StrategyExecutionNoopError)``.
+# This is a "nothing to do" signal rather than a real error, so the dispatch
+# loop clears auto-dispatch alerts and emits a noop audit event.  Plain
+# ``RuntimeError`` instances carrying the same Chinese string still classify
+# via the substring probe for callers that have not been migrated yet.
+class StrategyExecutionNoopError(RuntimeError):
+    def __init__(self, detail: str) -> None:
+        super().__init__(detail)
+        self.detail = detail
+
+
 repo = AppRepository()
 openclaw = OpenClawGatewayClient()
 market_data = BybitPublicMarketClient(repo.snapshot().settings.api_base_url)
@@ -7933,8 +7950,12 @@ def _auto_dispatch_strategy_signal_changes(
 #
 # * ``dispatched`` / ``auto.dispatch.success`` — dispatcher returned without
 #   raising; clear any lingering auto-dispatch alerts.
-# * ``noop`` / ``auto.dispatch.noop`` — ``RuntimeError`` whose detail carries
-#   ``"无需再次提交委托"``; emit an audit noop event + clear alerts.
+# * ``noop`` / ``auto.dispatch.noop`` — a typed
+#   :class:`StrategyExecutionNoopError` (R81) raised at the single source
+#   that detects ``target ≈ current``; emit an audit noop event + clear
+#   alerts.  Legacy ``RuntimeError`` instances whose detail still carries
+#   ``"无需再次提交委托"`` classify via a substring fallback so unconverted
+#   callers stay functional.
 # * ``blocked`` / ``auto.dispatch.blocked`` — a
 #   :class:`StrategyExecutionBlockedError`; record the issue carrying the
 #   attached ``recommended_action`` so the operator console can render it.
@@ -7954,7 +7975,11 @@ def _classify_auto_dispatch_outcome(exc: Optional[BaseException]) -> AutoDispatc
         )
     if isinstance(exc, RuntimeError):
         detail = str(exc)
-        if "无需再次提交委托" in detail:
+        # Round 81 — typed ``StrategyExecutionNoopError`` takes precedence
+        # over the legacy ``"无需再次提交委托"`` substring probe; the probe
+        # survives as a fallback for plain ``RuntimeError`` instances raised
+        # by code paths that have not been wired to the typed subclass.
+        if isinstance(exc, StrategyExecutionNoopError) or "无需再次提交委托" in detail:
             return AutoDispatchOutcome(
                 verdict="noop",
                 reason_code="auto.dispatch.noop",
@@ -8886,7 +8911,13 @@ def _build_strategy_execution_preview_from_state(
             generated_at=datetime.now(timezone.utc).astimezone().isoformat(),
         )
     if abs(delta_signed_qty) <= 1e-9:
-        raise RuntimeError("当前真实持仓已经与策略目标一致，无需再次提交委托。")
+        # Round 81 — typed subclass lets ``_classify_auto_dispatch_outcome``
+        # dispatch via ``isinstance`` instead of substring-probing the detail
+        # string.  Raising the subclass at the single source that emits the
+        # "无需再次提交委托" copy is the only producer of this noop verdict.
+        raise StrategyExecutionNoopError(
+            "当前真实持仓已经与策略目标一致，无需再次提交委托。"
+        )
     side = Direction.BUY if delta_signed_qty > 0 else Direction.SELL
     price, price_adjustment_warning = _align_strategy_limit_price_to_exchange_constraints(
         hint["symbol"],
