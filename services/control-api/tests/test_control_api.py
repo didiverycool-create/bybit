@@ -22429,5 +22429,113 @@ class RepositoryStrategyParameterSnapshotRound63Tests(unittest.TestCase):
         self.assertEqual(repo_snapshot, main_snapshot)
 
 
+class RiskDecisionReasonCodeCoverageRound68Tests(unittest.TestCase):
+    """Round 68 pins the mapping from every ``blocked_reason`` string produced
+    by the in-tree preview / risk-guard builders onto a specific
+    ``risk.*`` reason code.  The generic ``risk.preview_blocked`` fallback must
+    only fire for strings no in-tree builder produces, so a future builder
+    that adds a new Chinese reason surface is flagged by this test rather
+    than silently bucketing into the fallback.
+    """
+
+    def _assert_code(self, reason: str, expected: str) -> None:
+        from risk_decision import derive_block_reason_code  # noqa: PLC0415
+
+        self.assertEqual(
+            derive_block_reason_code(reason),
+            expected,
+            f"reason string {reason!r} should map to {expected}",
+        )
+
+    def test_invalid_request_hints(self) -> None:
+        from models import RISK_REASON_INVALID_REQUEST  # noqa: PLC0415
+
+        # ``evaluate_paper_order_risk`` — precondition failure.
+        self._assert_code("数量和价格必须大于 0。", RISK_REASON_INVALID_REQUEST)
+
+    def test_insufficient_balance_hints(self) -> None:
+        from models import RISK_REASON_INSUFFICIENT_BALANCE  # noqa: PLC0415
+
+        # ``evaluate_paper_order_risk`` — paper cash shortage.
+        self._assert_code(
+            "Paper 可用余额不足，当前仅剩 100 USDT。",
+            RISK_REASON_INSUFFICIENT_BALANCE,
+        )
+        # ``_build_private_insufficient_balance_reason`` — private spot buy.
+        self._assert_code(
+            "当前 Bybit 可用余额不足，当前可用 100 USDT，按该价格提交本次买入约需 200 USDT。",
+            RISK_REASON_INSUFFICIENT_BALANCE,
+        )
+        # ``_build_private_insufficient_balance_reason`` — private perp margin.
+        self._assert_code(
+            "当前可用保证金不足，当前可用 100 USDT，按该价格提交本次委托约需 200 USDT。",
+            RISK_REASON_INSUFFICIENT_BALANCE,
+        )
+
+    def test_insufficient_inventory_hints(self) -> None:
+        from models import RISK_REASON_INSUFFICIENT_INVENTORY  # noqa: PLC0415
+
+        # ``evaluate_paper_order_risk`` — paper spot sell inventory shortage.
+        self._assert_code(
+            "BTCUSDT 当前 Paper 现货可卖数量不足，最多可卖 0.5。",
+            RISK_REASON_INSUFFICIENT_INVENTORY,
+        )
+        # ``build_private_execution_preview`` — private spot sell shortage.
+        self._assert_code(
+            "当前 Bybit 现货可卖数量不足，扣除未成交卖单占用后最多可卖 0.5。",
+            RISK_REASON_INSUFFICIENT_INVENTORY,
+        )
+
+    def test_exchange_constraint_hints(self) -> None:
+        from models import RISK_REASON_EXCHANGE_CONSTRAINT  # noqa: PLC0415
+
+        # ``_validate_exchange_order_constraints`` — all four branches.
+        self._assert_code(
+            "当前委托数量低于 Bybit 最小下单量 0.001，请调整数量后再提交。",
+            RISK_REASON_EXCHANGE_CONSTRAINT,
+        )
+        self._assert_code(
+            "当前委托数量不符合 Bybit 数量步长 0.001，请按交易所步长调整后再提交。",
+            RISK_REASON_EXCHANGE_CONSTRAINT,
+        )
+        self._assert_code(
+            "当前委托价格不符合 Bybit 价格步长 0.01，请按交易所报价精度调整后再提交。",
+            RISK_REASON_EXCHANGE_CONSTRAINT,
+        )
+        self._assert_code(
+            "当前委托名义价值低于 Bybit 最小下单金额 10，请提高价格或数量后再提交。",
+            RISK_REASON_EXCHANGE_CONSTRAINT,
+        )
+
+    def test_account_mode_hints(self) -> None:
+        from models import RISK_REASON_ACCOUNT_MODE_UNAVAILABLE  # noqa: PLC0415
+
+        # ``_build_execution_preview_locked`` — non-paper mode guard.
+        self._assert_code(
+            "当前统一执行预检仅开放 Paper 模式；Demo / Live 待真实执行引擎接通后再开放。",
+            RISK_REASON_ACCOUNT_MODE_UNAVAILABLE,
+        )
+        # ``resolve_private_mode_access`` — private API missing / mismatched.
+        self._assert_code(
+            "当前未检测到 Bybit 私有 API 配置，无法提交真实委托。",
+            RISK_REASON_ACCOUNT_MODE_UNAVAILABLE,
+        )
+        self._assert_code(
+            "当前私有 API 指向 DEMO 模式，和当前 LIVE 不一致，请切换程序侧 API 域名后再试。",
+            RISK_REASON_ACCOUNT_MODE_UNAVAILABLE,
+        )
+
+    def test_preview_blocked_is_fallback_only(self) -> None:
+        from models import RISK_REASON_PREVIEW_BLOCKED  # noqa: PLC0415
+
+        # Empty / whitespace — must fall back.
+        self._assert_code("", RISK_REASON_PREVIEW_BLOCKED)
+        # Truly novel reason — no in-tree producer emits this string.
+        self._assert_code(
+            "some novel english block reason with no Chinese hints",
+            RISK_REASON_PREVIEW_BLOCKED,
+        )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

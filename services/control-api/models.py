@@ -1376,6 +1376,14 @@ RISK_REASON_ACCOUNT_MODE_UNAVAILABLE = "risk.account_mode_unavailable"
 RISK_REASON_INSUFFICIENT_BALANCE = "risk.insufficient_balance"
 RISK_REASON_INSUFFICIENT_INVENTORY = "risk.insufficient_inventory"
 RISK_REASON_EXCHANGE_CONSTRAINT = "risk.exchange_constraint"
+# Round 68 — precondition-validation failures (e.g. non-positive quantity /
+# price) are conceptually distinct from risk rejections and from
+# exchange-side step / min-notional constraints.  They used to fall through
+# to ``risk.preview_blocked`` which made it impossible for auditors to tell
+# invalid-input blocks from genuine risk blocks.  The new code tags those
+# precondition failures so the fallback code is reserved for truly novel
+# reasons.
+RISK_REASON_INVALID_REQUEST = "risk.invalid_request"
 RISK_REASON_PREVIEW_BLOCKED = "risk.preview_blocked"
 
 

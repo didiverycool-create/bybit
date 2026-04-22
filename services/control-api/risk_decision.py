@@ -38,6 +38,7 @@ from models import (
     RISK_REASON_EXCHANGE_CONSTRAINT,
     RISK_REASON_INSUFFICIENT_BALANCE,
     RISK_REASON_INSUFFICIENT_INVENTORY,
+    RISK_REASON_INVALID_REQUEST,
     RISK_REASON_PREVIEW_BLOCKED,
     RiskDecision,
 )
@@ -63,6 +64,12 @@ _EXCHANGE_CONSTRAINT_HINTS = (
     "最小名义",
     "下单精度",
     "下单步长",
+    # Round 68 — tighten coverage for the ``_validate_exchange_order_constraints``
+    # qty-step / tick-size / min-notional branches that used to fall through
+    # to ``risk.preview_blocked``.
+    "数量步长",
+    "价格步长",
+    "名义价值",
     "交易所",
     "Bybit 返回",
     "tick size",
@@ -74,6 +81,14 @@ _ACCOUNT_MODE_HINTS = (
     "Demo / Live",
     "私有 API",
     "私有账户",
+)
+# Round 68 — precondition-validation failures raised by
+# ``evaluate_paper_order_risk`` before any risk math runs (e.g. non-positive
+# quantity / price).  Mapped to :data:`RISK_REASON_INVALID_REQUEST` so
+# auditors can distinguish invalid-input blocks from real risk blocks.
+_INVALID_REQUEST_HINTS = (
+    "必须大于 0",
+    "必须为正",
 )
 
 
@@ -92,6 +107,12 @@ def derive_block_reason_code(detail: str) -> str:
 
     if not detail:
         return RISK_REASON_PREVIEW_BLOCKED
+    # Round 68 — probe the precondition-validation hints first so a reason
+    # like "数量和价格必须大于 0。" does not get conflated with a real risk
+    # block (insufficient balance, exchange-constraint, …) on the audit feed.
+    for hint in _INVALID_REQUEST_HINTS:
+        if hint in detail:
+            return RISK_REASON_INVALID_REQUEST
     for hint in _INSUFFICIENT_BALANCE_HINTS:
         if hint in detail:
             return RISK_REASON_INSUFFICIENT_BALANCE
