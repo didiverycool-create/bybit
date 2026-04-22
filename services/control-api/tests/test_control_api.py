@@ -24435,6 +24435,109 @@ class RecordStrategyExecutionIssueTypedKwargsRound84Tests(unittest.TestCase):
         self.assertIn("UNIFIED 账户可用保证金", captured["suggested_action"])
 
 
+class AlertSubBlockCodeMappingRound85Tests(unittest.TestCase):
+    """Round 85 — ``_resolve_alert_sub_block_code`` maps the typed
+    ``AUTO_DISPATCH_GATE_REASON_{PRIVATE,PUBLIC}_CHANNEL_OUTAGE`` codes on an
+    ``AlertRecord`` to the R80 ``RISK_REASON_RUNTIME_UNAVAILABLE_*`` sub-codes
+    so ``_resolve_auto_dispatch_top_issue_recommended_action`` can thread a
+    typed ``sub_block_code`` into the fallback recommender rather than
+    leaning on the ``"私有 WS"`` / ``"公共 WS"`` detail-substring probe
+    inside ``_build_execution_preview_recommended_action``.
+
+    Invariants pinned:
+
+    1. ``None`` alert / alert without ``reason_code`` → mapping returns ``None``.
+    2. Private channel-outage alert → ``RISK_REASON_RUNTIME_UNAVAILABLE_PRIVATE_CHANNEL``.
+    3. Public channel-outage alert → ``RISK_REASON_RUNTIME_UNAVAILABLE_PUBLIC_CHANNEL``.
+    4. Scheduler-gate alert (non-channel) → mapping returns ``None`` (orthogonal taxonomies).
+    5. End-to-end: ``_resolve_auto_dispatch_top_issue_recommended_action``
+       returns the typed private-channel recovery copy even when the alert
+       description omits the legacy substring (typed-first dispatch).
+    """
+
+    def _build_alert(self, reason_code: Optional[str], description: str = "") -> AlertRecord:
+        return AlertRecord(
+            id="alert-1",
+            severity="P1",
+            symbol="BTCUSDT",
+            title="auto-dispatch blocked",
+            description=description,
+            triggered_at="2026-04-23T00:00:00+08:00",
+            suggested_action="",
+            acknowledged=False,
+            rule_key="strategy-auto-dispatch:s1:long:live",
+            reason_code=reason_code,
+        )
+
+    def test_none_alert_returns_none(self) -> None:
+        self.assertIsNone(control_main._resolve_alert_sub_block_code(None))
+
+    def test_alert_without_reason_code_returns_none(self) -> None:
+        alert = self._build_alert(reason_code=None)
+        self.assertIsNone(control_main._resolve_alert_sub_block_code(alert))
+
+    def test_private_channel_outage_maps_to_private_sub_code(self) -> None:
+        from models import (  # noqa: PLC0415
+            AUTO_DISPATCH_GATE_REASON_PRIVATE_CHANNEL_OUTAGE,
+            RISK_REASON_RUNTIME_UNAVAILABLE_PRIVATE_CHANNEL,
+        )
+
+        alert = self._build_alert(reason_code=AUTO_DISPATCH_GATE_REASON_PRIVATE_CHANNEL_OUTAGE)
+        self.assertEqual(
+            control_main._resolve_alert_sub_block_code(alert),
+            RISK_REASON_RUNTIME_UNAVAILABLE_PRIVATE_CHANNEL,
+        )
+
+    def test_public_channel_outage_maps_to_public_sub_code(self) -> None:
+        from models import (  # noqa: PLC0415
+            AUTO_DISPATCH_GATE_REASON_PUBLIC_CHANNEL_OUTAGE,
+            RISK_REASON_RUNTIME_UNAVAILABLE_PUBLIC_CHANNEL,
+        )
+
+        alert = self._build_alert(reason_code=AUTO_DISPATCH_GATE_REASON_PUBLIC_CHANNEL_OUTAGE)
+        self.assertEqual(
+            control_main._resolve_alert_sub_block_code(alert),
+            RISK_REASON_RUNTIME_UNAVAILABLE_PUBLIC_CHANNEL,
+        )
+
+    def test_scheduler_gate_alert_does_not_map_to_risk_sub_code(self) -> None:
+        from models import AUTO_DISPATCH_GATE_REASON_SCHEDULER_PAUSED  # noqa: PLC0415
+
+        # Scheduler-gate codes have no preview-side RUNTIME_UNAVAILABLE sub-code
+        # counterpart; the mapping must return ``None`` rather than guess.
+        alert = self._build_alert(reason_code=AUTO_DISPATCH_GATE_REASON_SCHEDULER_PAUSED)
+        self.assertIsNone(control_main._resolve_alert_sub_block_code(alert))
+
+    def test_top_issue_recommender_uses_typed_sub_code_without_substring(self) -> None:
+        from models import AUTO_DISPATCH_GATE_REASON_PRIVATE_CHANNEL_OUTAGE  # noqa: PLC0415
+
+        # Description intentionally omits the ``"私有 WS"`` token so only the
+        # typed ``reason_code`` → ``sub_block_code`` mapping can drive the
+        # private-channel recovery copy.
+        alert = self._build_alert(
+            reason_code=AUTO_DISPATCH_GATE_REASON_PRIVATE_CHANNEL_OUTAGE,
+            description="当前实时链路出现异常，请稍后重试。",
+        )
+
+        class _StubStrategy:
+            id = "strategy-1"
+            symbols: List[str] = []
+            mode = AccountMode.LIVE
+
+        class _StubState:
+            strategies: List[Any] = []
+            strategy_runtime_snapshots: List[Any] = []
+            watchlist: List[Any] = []
+
+        result = control_main._resolve_auto_dispatch_top_issue_recommended_action(
+            _StubState(), _StubStrategy(), alert
+        )
+        self.assertEqual(
+            result,
+            control_main._build_private_execution_channel_recommended_action(alert.description),
+        )
+
+
 class StrategyExecutionNoopTypedExceptionRound81Tests(unittest.TestCase):
     """Round 81 — the ``auto.dispatch.noop`` verdict emitted by
     ``_classify_auto_dispatch_outcome`` now keys off the typed

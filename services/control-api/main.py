@@ -2120,8 +2120,9 @@ def _resolve_auto_dispatch_top_issue_recommended_action(
     alert: Optional[AlertRecord],
 ) -> Optional[str]:
     symbol = strategy.symbols[0] if getattr(strategy, "symbols", None) else None
+    resolved_market: Optional[str] = None
     if symbol:
-        market = _resolve_strategy_primary_market(state, strategy)
+        resolved_market = _resolve_strategy_primary_market(state, strategy)
         (
             last_event_type,
             _last_event_at,
@@ -2131,14 +2132,23 @@ def _resolve_auto_dispatch_top_issue_recommended_action(
         ) = _build_strategy_last_execution_summary(
             strategy.id,
             symbol,
-            market,
+            resolved_market,
             strategy.mode,
         )
         if last_event_type == "strategy.exchange_order.auto_blocked" and last_event_recommended_action:
             return last_event_recommended_action
     if alert and alert.suggested_action:
         return alert.suggested_action
-    return _build_auto_dispatch_recommended_action(alert.description if alert else None)
+    # Round 85 — map ``alert.reason_code`` onto the typed
+    # :data:`RISK_REASON_RUNTIME_UNAVAILABLE_*` sub-code so the
+    # auto-dispatch fallback recommender picks the channel-outage copy off
+    # the typed discriminator rather than the ``"私有 WS"`` / ``"公共 WS"``
+    # detail probe inside ``_build_execution_preview_recommended_action``.
+    return _build_auto_dispatch_recommended_action(
+        alert.description if alert else None,
+        market=resolved_market,
+        sub_block_code=_resolve_alert_sub_block_code(alert),
+    )
 
 
 def _build_execution_health_top_issue_context(
@@ -6618,6 +6628,37 @@ def _classify_strategy_auto_dispatch_alert_kind(detail: Optional[str]) -> Option
     if "公共 WS" in detail or "公共实时链路" in detail:
         return AUTO_DISPATCH_GATE_REASON_PUBLIC_CHANNEL_OUTAGE
     return None
+
+
+# Round 85 — map the auto-dispatch gate's typed channel-outage codes onto the
+# R80 ``RISK_REASON_RUNTIME_UNAVAILABLE_*`` sub-codes so ``AlertRecord``-based
+# fallback recommenders (``_resolve_auto_dispatch_top_issue_recommended_action``)
+# can dispatch on the typed sub-discriminator without re-parsing the Chinese
+# alert description.  The two taxonomies are orthogonal by design (one keys
+# the auto-dispatch gate, the other keys the risk-decision preview), so the
+# mapping only covers the channel-outage overlap.  Scheduler-manual-override /
+# paused / freeze-publish gate reasons do not have a preview-side counterpart
+# and are intentionally not mapped.
+_AUTO_DISPATCH_TO_RISK_SUB_BLOCK_CODE: Dict[str, str] = {
+    AUTO_DISPATCH_GATE_REASON_PRIVATE_CHANNEL_OUTAGE: RISK_REASON_RUNTIME_UNAVAILABLE_PRIVATE_CHANNEL,
+    AUTO_DISPATCH_GATE_REASON_PUBLIC_CHANNEL_OUTAGE: RISK_REASON_RUNTIME_UNAVAILABLE_PUBLIC_CHANNEL,
+}
+
+
+def _resolve_alert_sub_block_code(alert: Optional[AlertRecord]) -> Optional[str]:
+    """Return the :data:`RISK_REASON_RUNTIME_UNAVAILABLE_*` sub-code that
+    matches ``alert.reason_code``, or ``None`` if the alert carries a
+    non-channel reason code (scheduler gate, unclassified, or no alert).
+
+    Callers use this to thread a typed ``sub_block_code`` into the
+    recommendation helpers so the canonical channel-outage recovery copy
+    comes from the typed taxonomy rather than a ``"私有 WS"`` / ``"公共 WS"``
+    detail substring probe.
+    """
+
+    if alert is None or alert.reason_code is None:
+        return None
+    return _AUTO_DISPATCH_TO_RISK_SUB_BLOCK_CODE.get(alert.reason_code)
 
 
 def _record_strategy_auto_dispatch_issue(
