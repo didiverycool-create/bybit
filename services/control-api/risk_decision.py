@@ -29,7 +29,7 @@ a best-effort ``reason_code``, and no new rejection paths are introduced.
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Optional
 
 from models import (
     ExecutionPreview,
@@ -42,6 +42,7 @@ from models import (
     RISK_REASON_PREVIEW_BLOCKED,
     RISK_REASON_RUNTIME_UNAVAILABLE,
     RiskDecision,
+    RiskDecisionRecommendation,
 )
 
 
@@ -148,7 +149,7 @@ def derive_block_reason_code(detail: str) -> str:
 def evaluate_risk_decision(
     preview: ExecutionPreview,
     *,
-    recommended_action: Optional[Dict[str, Any]] = None,
+    recommended_action: Optional[RiskDecisionRecommendation] = None,
 ) -> RiskDecision:
     """Wrap ``preview`` in a :class:`RiskDecision` with an explicit verdict.
 
@@ -158,11 +159,17 @@ def evaluate_risk_decision(
       reason code derived from ``preview.blocked_reason``.
 
     ``recommended_action`` is an optional structured hint supplied by the
-    caller (e.g. ``{"retry_after_seconds": 30}`` for a ``"wait"`` verdict or
-    ``{"size_multiplier": 0.5}`` for ``"degrade"``).  When ``None`` and the
-    preview carries a free-form ``recommended_action`` string, that string is
-    echoed back under the ``"recommendation"`` key so downstream UI can keep
-    rendering it without a second fetch.
+    caller — pass a :class:`~models.RiskDecisionRecommendation` whose
+    ``retry_after_seconds`` field is populated for a ``"wait"`` verdict, or
+    whose ``size_multiplier`` is populated for ``"degrade"``.  When ``None``
+    and the preview carries a free-form ``recommended_action`` string, that
+    string is echoed back under the ``recommendation`` field so downstream UI
+    can keep rendering it without a second fetch.
+
+    Round 73 — the typed :class:`~models.RiskDecisionRecommendation` replaces
+    the historical ``Dict[str, Any]`` surface.  Pydantic coerces dict-shaped
+    inputs into the model so existing callers that still pass a dict (e.g.
+    deserialised JSON payloads) keep working without code change.
     """
 
     if preview.allowed:
@@ -177,7 +184,7 @@ def evaluate_risk_decision(
     detail = preview.blocked_reason or "当前执行预检未通过风控校验。"
     action = recommended_action
     if action is None and preview.recommended_action:
-        action = {"recommendation": preview.recommended_action}
+        action = RiskDecisionRecommendation(recommendation=preview.recommended_action)
     # Round 70 — prefer the typed ``block_code`` produced at the preview-builder
     # source; only fall back to the substring-probe ``derive_block_reason_code``
     # when a preview arrived without a typed code (older callers / future

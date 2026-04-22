@@ -21397,7 +21397,11 @@ class RiskDecisionRound58UnitTests(unittest.TestCase):
         self.assertEqual(decision.verdict, "degrade")
         self.assertEqual(decision.reason_code, "risk.exposure_cap")
         assert decision.recommended_action is not None
-        self.assertEqual(decision.recommended_action.get("size_multiplier"), 0.5)
+        # Round 73 — ``recommended_action`` is now the typed
+        # :class:`RiskDecisionRecommendation`; attribute access replaces the
+        # old ``.get("size_multiplier")`` dict-style read.  Pydantic coerces
+        # the dict argument above into the model transparently.
+        self.assertEqual(decision.recommended_action.size_multiplier, 0.5)
         self.assertIsNotNone(decision.timestamp)
 
         payload = decision.model_dump_json()
@@ -21447,7 +21451,7 @@ class RiskDecisionRound58UnitTests(unittest.TestCase):
         self.assertIn("可用余额不足", decision.reason_detail)
         assert decision.recommended_action is not None
         self.assertEqual(
-            decision.recommended_action.get("recommendation"),
+            decision.recommended_action.recommendation,
             "请先补充 Paper 可用余额。",
         )
 
@@ -22572,6 +22576,92 @@ class RiskDecisionReasonCodeCoverageRound68Tests(unittest.TestCase):
             "some novel english block reason with no Chinese hints",
             RISK_REASON_PREVIEW_BLOCKED,
         )
+
+
+class RiskDecisionRecommendationTypedModelRound73Tests(unittest.TestCase):
+    """Round 73 — ``RiskDecision.recommended_action`` is now the typed
+    :class:`RiskDecisionRecommendation` instead of a free-form ``Dict``.
+    The tests below pin three contracts:
+
+    1. Dict inputs are coerced transparently so legacy JSON payloads round-trip.
+    2. The model exposes attribute access for every documented field.
+    3. ``evaluate_risk_decision`` synthesises the ``recommendation`` field
+       from ``preview.recommended_action`` when no explicit hint was supplied
+       (mirrors the pre-R73 ``{"recommendation": …}`` behaviour).
+    """
+
+    def _blocked_preview(self, recommended_action: Optional[str] = None):
+        from datetime import datetime, timezone  # noqa: PLC0415
+        from models import ExecutionPreview  # noqa: PLC0415
+
+        return ExecutionPreview(
+            symbol="BTCUSDT",
+            market="spot",
+            mode=AccountMode.PAPER,
+            side=Direction.BUY,
+            origin="manual",
+            quantity=1.0,
+            price=100.0,
+            notional="100.00 USDT",
+            action="买入",
+            allowed=False,
+            blocked_reason="Paper 可用余额不足，当前仅剩 50 USDT。",
+            recommended_action=recommended_action,
+            current_position_size="--",
+            current_avg_price="--",
+            projected_position_size="--",
+            projected_avg_price="--",
+            available_balance_before="--",
+            available_balance_after="--",
+            estimated_realized_pnl="--",
+            generated_at=datetime.now(timezone.utc).astimezone().isoformat(),
+        )
+
+    def test_dict_input_is_coerced_and_exposes_attributes(self) -> None:
+        from models import RiskDecision, RiskDecisionRecommendation  # noqa: PLC0415
+
+        preview = self._blocked_preview()
+        decision = RiskDecision(
+            verdict="wait",
+            reason_code="risk.retry_after_cooldown",
+            reason_detail="当前冷却中，请稍后再试。",
+            recommended_action={"retry_after_seconds": 30},
+            preview=preview,
+        )
+        self.assertIsInstance(
+            decision.recommended_action, RiskDecisionRecommendation
+        )
+        assert decision.recommended_action is not None  # for type narrowing
+        self.assertEqual(decision.recommended_action.retry_after_seconds, 30)
+        self.assertIsNone(decision.recommended_action.size_multiplier)
+        self.assertIsNone(decision.recommended_action.recommendation)
+
+    def test_evaluate_risk_decision_synthesises_recommendation_from_preview(
+        self,
+    ) -> None:
+        from risk_decision import evaluate_risk_decision  # noqa: PLC0415
+
+        preview = self._blocked_preview(recommended_action="请先补充余额。")
+        decision = evaluate_risk_decision(preview)
+        assert decision.recommended_action is not None
+        self.assertEqual(
+            decision.recommended_action.recommendation, "请先补充余额。"
+        )
+
+    def test_json_round_trip_preserves_typed_recommendation(self) -> None:
+        from models import RiskDecision, RiskDecisionRecommendation  # noqa: PLC0415
+
+        preview = self._blocked_preview()
+        decision = RiskDecision(
+            verdict="degrade",
+            reason_code="risk.exposure_cap",
+            reason_detail="当前敞口已接近上限。",
+            recommended_action=RiskDecisionRecommendation(size_multiplier=0.5),
+            preview=preview,
+        )
+        restored = RiskDecision.model_validate_json(decision.model_dump_json())
+        assert restored.recommended_action is not None
+        self.assertEqual(restored.recommended_action.size_multiplier, 0.5)
 
 
 class ExecutionPreviewBlockCodeInvariantRound72Tests(unittest.TestCase):

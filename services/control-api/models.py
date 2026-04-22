@@ -1400,15 +1400,38 @@ RISK_REASON_RUNTIME_UNAVAILABLE = "risk.runtime_unavailable"
 RISK_REASON_PREVIEW_BLOCKED = "risk.preview_blocked"
 
 
+class RiskDecisionRecommendation(BaseModel):
+    """Round 73 — typed recommendation attached to a :class:`RiskDecision`.
+
+    Historical callers passed a free-form ``Dict[str, Any]`` and downstream
+    consumers read it with ``.get("recommendation" / "size_multiplier" / …)``.
+    The three keys below cover every production and test usage today; the
+    model accepts *and* serialises dict-shaped inputs unchanged so existing
+    JSON-round-trip consumers keep working.
+
+    * ``recommendation`` — free-form Chinese string echoed from
+      ``preview.recommended_action`` on the block path so downstream UI can
+      render it without a second fetch.
+    * ``size_multiplier`` — fraction (``0 < x <= 1``) suggested for ``degrade``
+      verdicts (future expansion; no production caller sets this today).
+    * ``retry_after_seconds`` — integer delay suggested for ``wait`` verdicts
+      (future expansion; no production caller sets this today).
+    """
+
+    recommendation: Optional[str] = None
+    size_multiplier: Optional[float] = None
+    retry_after_seconds: Optional[int] = None
+
+
 class RiskDecision(BaseModel):
     """Structured risk verdict wrapping an :class:`ExecutionPreview`.
 
     * ``allow`` — proceed with the embedded preview as planned.
     * ``block`` — reject outright; ``reason_code`` and ``reason_detail`` explain why.
     * ``degrade`` — proceed with reduced size / adjusted params;
-      ``recommended_action`` carries the delta (e.g. ``{"size_multiplier": 0.5}``).
+      ``recommended_action`` carries the delta (e.g. ``size_multiplier=0.5``).
     * ``wait`` — retry later; ``recommended_action`` carries e.g.
-      ``{"retry_after_seconds": 30}``.
+      ``retry_after_seconds=30``.
 
     The wrapped ``preview`` is kept intact so callers can still read numeric
     fields such as ``preview.notional`` or ``preview.projected_position_size``.
@@ -1417,7 +1440,7 @@ class RiskDecision(BaseModel):
     verdict: RiskVerdict
     reason_code: str
     reason_detail: str
-    recommended_action: Optional[Dict[str, Any]] = None
+    recommended_action: Optional[RiskDecisionRecommendation] = None
     preview: ExecutionPreview
     timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
