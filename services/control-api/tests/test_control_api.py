@@ -17087,6 +17087,32 @@ class ControlApiIntegrationTests(unittest.TestCase):
         resolved_event = next((item for item in audit_events if item["event_type"] == "public.execution.channel.resolved"), None)
         self.assertIsNotNone(resolved_event)
 
+        # Round 64 — the ``alerted`` side must also carry the canonical parameter
+        # whitelist so auditors can correlate the alert/resolve pair by snapshot
+        # identity (see R62/R63 for the symmetrical resolve path and repository
+        # surface).  Before R64 this site was the last strategy-attributed audit
+        # event emitted from ``alert_and_guard_sync.py`` without a snapshot kwarg.
+        import parameter_resolver as _pr  # noqa: PLC0415
+
+        alerted_strategy = next(
+            item for item in control_main.repo.state.strategies if item.id == "trend-btc-01"
+        )
+        alerted_event = next(
+            (
+                item
+                for item in audit_events
+                if item["event_type"] == "public.execution.channel.alerted"
+                and item.get("strategy_id") == "trend-btc-01"
+            ),
+            None,
+        )
+        self.assertIsNotNone(alerted_event)
+        assert alerted_event is not None
+        self.assertEqual(
+            alerted_event["parameter_snapshot"],
+            _pr.snapshot_parameters(alerted_strategy),
+        )
+
     def test_restart_strategy_runtime_worker_endpoint_clears_error_and_starts_loop(self) -> None:
         original_refresh = control_main.refresh_strategy_runtime_once
 

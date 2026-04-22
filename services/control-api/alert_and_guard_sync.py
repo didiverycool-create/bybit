@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+import parameter_resolver
 from models import AccountMode, EventSeverity
 
 
@@ -246,6 +247,7 @@ def sync_public_execution_channel_alerts(
                     },
                     symbol=symbol,
                     strategy_id=strategy.id,
+                    parameter_snapshot=parameter_resolver.snapshot_parameters(strategy),
                 )
                 repo._refresh_derived_state()  # type: ignore[attr-defined]
                 repo._persist()  # type: ignore[attr-defined]
