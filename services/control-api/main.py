@@ -7905,6 +7905,14 @@ def _auto_dispatch_strategy_signal_changes(
                 # ``AUTO_DISPATCH_GATE_REASON_*`` constants) flows through to
                 # the emitted ``AlertRecord.reason_code`` so the
                 # runtime-snapshot decoration can branch on it directly.
+                # Round 91 — thread the matching
+                # :data:`RISK_REASON_RUNTIME_UNAVAILABLE_*` sub-code via the
+                # R85 cross-taxonomy mapping so the record helper does not
+                # need to re-classify the detail string through the R88
+                # ``_derive_sub_block_code_from_detail`` fallback.  Scheduler
+                # gate codes have no preview-side counterpart and map to
+                # ``None`` (the helper's ``or …`` short-circuits covers
+                # the rest).
                 _record_strategy_auto_dispatch_issue(
                     snapshot.strategy_id,
                     snapshot.strategy_name,
@@ -7914,6 +7922,11 @@ def _auto_dispatch_strategy_signal_changes(
                     gate.reason_detail,
                     strategy=strategy,
                     reason_code=gate.sub_reason_code,
+                    sub_block_code=(
+                        _AUTO_DISPATCH_TO_RISK_SUB_BLOCK_CODE.get(gate.sub_reason_code)
+                        if gate.sub_reason_code is not None
+                        else None
+                    ),
                 )
             continue
         active_order_count, active_order = _build_strategy_active_order_summary(

@@ -25197,5 +25197,185 @@ class StrategyExecutionNoopTypedExceptionRound81Tests(unittest.TestCase):
         self.assertNotIn("无需再次提交委托", outcome.reason_detail)
 
 
+class GateRejectedTypedSubBlockCodeRound91Tests(unittest.TestCase):
+    """Round 91 — the gate-rejected callsite inside
+    ``_auto_dispatch_strategy_signal_changes`` (main.py:7916-7930) forwards
+    ``gate.sub_reason_code`` onto ``_record_strategy_auto_dispatch_issue``'s
+    ``reason_code`` kwarg, but until R91 it relied on the R88
+    ``_derive_sub_block_code_from_detail`` classifier inside the helper to
+    pull the matching ``RISK_REASON_RUNTIME_UNAVAILABLE_*`` sub-code off the
+    Chinese detail string.  That meant the typed sub-code round-tripped
+    through a substring probe even though the typed
+    :data:`_AUTO_DISPATCH_TO_RISK_SUB_BLOCK_CODE` cross-taxonomy mapping
+    was already available at the callsite.
+
+    R91 threads ``sub_block_code=_AUTO_DISPATCH_TO_RISK_SUB_BLOCK_CODE.get(
+    gate.sub_reason_code)`` directly so the typed taxonomy drives the sub-code.
+
+    Invariants pinned (spy-style on ``_record_strategy_auto_dispatch_issue``):
+
+    1. Gate with ``sub_reason_code=AUTO_DISPATCH_GATE_REASON_PRIVATE_CHANNEL_OUTAGE``
+       threads ``sub_block_code=RISK_REASON_RUNTIME_UNAVAILABLE_PRIVATE_CHANNEL``.
+    2. Gate with ``sub_reason_code=AUTO_DISPATCH_GATE_REASON_PUBLIC_CHANNEL_OUTAGE``
+       threads ``sub_block_code=RISK_REASON_RUNTIME_UNAVAILABLE_PUBLIC_CHANNEL``.
+    3. Gate with a scheduler ``sub_reason_code`` (no preview-side counterpart
+       in the cross-taxonomy mapping) threads ``sub_block_code=None``.
+    4. Gate with ``sub_reason_code=None`` threads ``sub_block_code=None``.
+    """
+
+    def _strategy(self):
+        from models import StrategyParameter, StrategySummary
+
+        return StrategySummary(
+            id="gate-r91-01",
+            name="GateR91Harness",
+            category="template",
+            status="running",
+            symbols=["BTCUSDT"],
+            mode=AccountMode.LIVE,
+            version="v1",
+            pnl_7d="+0.0%",
+            max_drawdown="-0.0%",
+            risk_budget="10%",
+            description="R91 gate harness",
+            parameters=[StrategyParameter(key="noop", label="noop", value=0.0)],
+        )
+
+    def _snapshot(self):
+        return StrategyRuntimeSnapshot(
+            strategy_id="gate-r91-01",
+            strategy_name="GateR91Harness",
+            symbol="BTCUSDT",
+            market="perp",
+            mode=AccountMode.LIVE,
+            runtime_status="running",
+            signal="long",
+            confidence=42.0,
+            last_price=42_000.0,
+            reference_price=42_000.0,
+            change_24h=0.0,
+            note="",
+            next_action="",
+            last_evaluated_at="2026-04-23T00:00:00+08:00",
+        )
+
+    def _run_with_gate(self, gate: Any) -> Dict[str, Any]:
+        snapshot = self._snapshot()
+        strategy = self._strategy()
+        captured: Dict[str, Any] = {}
+
+        def _spy(*args: Any, **kwargs: Any) -> None:
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+
+        base_state = control_main.repo.snapshot()
+        stub_state = base_state.model_copy(update={"strategies": [strategy]})
+
+        with patch.object(control_main.repo, "snapshot", return_value=stub_state), \
+                patch.object(control_main, "_evaluate_strategy_auto_dispatch_gate", return_value=gate), \
+                patch.object(control_main, "_has_active_strategy_auto_dispatch_alert", return_value=False), \
+                patch.object(control_main, "_record_strategy_auto_dispatch_issue", side_effect=_spy):
+            control_main._auto_dispatch_strategy_signal_changes({}, [snapshot])
+        return captured
+
+    def test_private_channel_outage_gate_threads_typed_sub_block_code(self) -> None:
+        from models import (  # noqa: PLC0415
+            AUTO_DISPATCH_GATE_REASON_PRIVATE_CHANNEL_OUTAGE,
+            AutoDispatchGate,
+            RISK_REASON_RUNTIME_UNAVAILABLE_PRIVATE_CHANNEL,
+        )
+
+        gate = AutoDispatchGate(
+            verdict="block",
+            reason_code="auto.scheduler_or_channel_gate",
+            reason_detail="当前 Bybit 私有 WS 下单链路未就绪。",
+            record_issue=True,
+            sub_reason_code=AUTO_DISPATCH_GATE_REASON_PRIVATE_CHANNEL_OUTAGE,
+        )
+        captured = self._run_with_gate(gate)
+        self.assertIn("kwargs", captured)
+        kwargs = captured["kwargs"]
+        self.assertEqual(
+            kwargs.get("sub_block_code"),
+            RISK_REASON_RUNTIME_UNAVAILABLE_PRIVATE_CHANNEL,
+        )
+        self.assertEqual(
+            kwargs.get("reason_code"),
+            AUTO_DISPATCH_GATE_REASON_PRIVATE_CHANNEL_OUTAGE,
+        )
+
+    def test_public_channel_outage_gate_threads_typed_sub_block_code(self) -> None:
+        from models import (  # noqa: PLC0415
+            AUTO_DISPATCH_GATE_REASON_PUBLIC_CHANNEL_OUTAGE,
+            AutoDispatchGate,
+            RISK_REASON_RUNTIME_UNAVAILABLE_PUBLIC_CHANNEL,
+        )
+
+        gate = AutoDispatchGate(
+            verdict="block",
+            reason_code="auto.scheduler_or_channel_gate",
+            reason_detail="当前 Bybit 公共 WS 行情已断线。",
+            record_issue=True,
+            sub_reason_code=AUTO_DISPATCH_GATE_REASON_PUBLIC_CHANNEL_OUTAGE,
+        )
+        captured = self._run_with_gate(gate)
+        self.assertIn("kwargs", captured)
+        kwargs = captured["kwargs"]
+        self.assertEqual(
+            kwargs.get("sub_block_code"),
+            RISK_REASON_RUNTIME_UNAVAILABLE_PUBLIC_CHANNEL,
+        )
+        self.assertEqual(
+            kwargs.get("reason_code"),
+            AUTO_DISPATCH_GATE_REASON_PUBLIC_CHANNEL_OUTAGE,
+        )
+
+    def test_scheduler_gate_reason_threads_none_sub_block_code(self) -> None:
+        # Scheduler codes (manual override / paused / freeze publish) have no
+        # preview-side counterpart, so the cross-taxonomy mapping returns
+        # ``None`` — the callsite must forward that ``None`` verbatim rather
+        # than fabricating a channel sub-code.
+        from models import (  # noqa: PLC0415
+            AUTO_DISPATCH_GATE_REASON_SCHEDULER_PAUSED,
+            AutoDispatchGate,
+        )
+
+        gate = AutoDispatchGate(
+            verdict="block",
+            reason_code="auto.scheduler_or_channel_gate",
+            reason_detail="策略调度器处于暂停状态。",
+            record_issue=True,
+            sub_reason_code=AUTO_DISPATCH_GATE_REASON_SCHEDULER_PAUSED,
+        )
+        captured = self._run_with_gate(gate)
+        self.assertIn("kwargs", captured)
+        kwargs = captured["kwargs"]
+        self.assertIsNone(kwargs.get("sub_block_code"))
+        self.assertEqual(
+            kwargs.get("reason_code"),
+            AUTO_DISPATCH_GATE_REASON_SCHEDULER_PAUSED,
+        )
+
+    def test_gate_without_sub_reason_code_threads_none_sub_block_code(self) -> None:
+        # When the gate carries no ``sub_reason_code`` (older gate codes like
+        # ``auto.paper_or_paused_strategy`` / ``auto.runtime_not_running``),
+        # the callsite short-circuits ``_AUTO_DISPATCH_TO_RISK_SUB_BLOCK_CODE.get``
+        # and forwards ``sub_block_code=None`` directly.
+        from models import AutoDispatchGate  # noqa: PLC0415
+
+        gate = AutoDispatchGate(
+            verdict="block",
+            reason_code="auto.paper_or_paused_strategy",
+            reason_detail="当前策略处于 Paper 模式。",
+            record_issue=True,
+            sub_reason_code=None,
+        )
+        captured = self._run_with_gate(gate)
+        self.assertIn("kwargs", captured)
+        kwargs = captured["kwargs"]
+        self.assertIsNone(kwargs.get("sub_block_code"))
+        self.assertIsNone(kwargs.get("reason_code"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
