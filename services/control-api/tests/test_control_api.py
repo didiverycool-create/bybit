@@ -25377,5 +25377,196 @@ class GateRejectedTypedSubBlockCodeRound91Tests(unittest.TestCase):
         self.assertIsNone(kwargs.get("reason_code"))
 
 
+class OutcomeRecordTypedExcAttrsRound92Tests(unittest.TestCase):
+    """Round 92 — the outcome-record callsite inside
+    ``_auto_dispatch_strategy_signal_changes`` (main.py:8078+) forwards
+    ``outcome.reason_detail`` / ``outcome.recommended_action`` onto
+    ``_record_strategy_auto_dispatch_issue`` but, until R92, did not thread
+    ``reason_code=`` / ``sub_block_code=``.  The record helper then fell
+    back to its internal substring classifiers
+    (``_classify_strategy_auto_dispatch_alert_kind`` for ``reason_code``
+    and ``_derive_sub_block_code_from_detail`` for ``sub_block_code``)
+    which key off the Chinese ``"私有 WS"`` / ``"公共 WS"`` tokens inside
+    the detail.
+
+    When the dispatch call raises
+    :class:`StrategyExecutionChannelOutageError(channel="public"|"private")`,
+    the typed exception carries ``sub_block_code=
+    RISK_REASON_RUNTIME_UNAVAILABLE_{PUBLIC,PRIVATE}_CHANNEL`` as an instance
+    attribute (R80).  R92 reads ``getattr(caught, "sub_block_code", None)``
+    at the callsite and:
+
+    * threads the typed ``sub_block_code`` directly;
+    * maps it onto the ``AlertRecord.reason_code`` taxonomy via the new
+      reverse ``_RISK_SUB_BLOCK_TO_AUTO_DISPATCH_GATE_REASON`` dict so the
+      record helper receives a typed ``reason_code`` without running the
+      substring classifier.
+
+    Plain ``RuntimeError`` / ``StrategyExecutionBlockedError`` instances
+    do not carry ``sub_block_code``; ``getattr(..., None)`` returns
+    ``None`` and the helper's substring classifier still runs for those
+    cases (behaviour preserved).
+
+    Invariants pinned (spy-style on ``_record_strategy_auto_dispatch_issue``):
+
+    1. ``StrategyExecutionChannelOutageError(channel="private")`` raised
+       from the dispatch call threads ``sub_block_code=
+       RISK_REASON_RUNTIME_UNAVAILABLE_PRIVATE_CHANNEL`` +
+       ``reason_code=AUTO_DISPATCH_GATE_REASON_PRIVATE_CHANNEL_OUTAGE``.
+    2. Same for ``channel="public"``.
+    3. Plain ``RuntimeError`` raised → ``sub_block_code=None`` +
+       ``reason_code=None`` (typed attrs absent; helper fallback fires).
+    4. ``StrategyExecutionBlockedError`` raised → same as plain
+       ``RuntimeError`` (typed subclass has no ``sub_block_code`` attr).
+    """
+
+    def _strategy(self):
+        from models import StrategyParameter, StrategySummary
+
+        return StrategySummary(
+            id="outcome-r92-01",
+            name="OutcomeR92Harness",
+            category="template",
+            status="running",
+            symbols=["BTCUSDT"],
+            mode=AccountMode.LIVE,
+            version="v1",
+            pnl_7d="+0.0%",
+            max_drawdown="-0.0%",
+            risk_budget="10%",
+            description="R92 outcome harness",
+            parameters=[StrategyParameter(key="noop", label="noop", value=0.0)],
+        )
+
+    def _snapshot(self):
+        return StrategyRuntimeSnapshot(
+            strategy_id="outcome-r92-01",
+            strategy_name="OutcomeR92Harness",
+            symbol="BTCUSDT",
+            market="perp",
+            mode=AccountMode.LIVE,
+            runtime_status="running",
+            signal="long",
+            confidence=42.0,
+            last_price=42_000.0,
+            reference_price=42_000.0,
+            change_24h=0.0,
+            note="",
+            next_action="",
+            last_evaluated_at="2026-04-23T00:00:00+08:00",
+        )
+
+    def _run_with_dispatch_exc(self, exc: BaseException) -> Dict[str, Any]:
+        from models import AutoDispatchGate  # noqa: PLC0415
+
+        snapshot = self._snapshot()
+        strategy = self._strategy()
+        # Need a ``previous`` snapshot with a different signal so the
+        # "signal unchanged" reconcile branch is skipped and the loop
+        # reaches the actual dispatch call.  Copy the snapshot and flip
+        # the signal.
+        previous = snapshot.model_copy(update={"signal": "flat"})
+        captured: Dict[str, Any] = {}
+
+        def _spy(*args: Any, **kwargs: Any) -> None:
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+
+        def _raise_exc(*_args: Any, **_kwargs: Any) -> None:
+            raise exc
+
+        allow_gate = AutoDispatchGate(
+            verdict="allow",
+            reason_code="auto.ready",
+            reason_detail="",
+            record_issue=False,
+            sub_reason_code=None,
+        )
+
+        base_state = control_main.repo.snapshot()
+        stub_state = base_state.model_copy(update={"strategies": [strategy]})
+
+        with patch.object(control_main.repo, "snapshot", return_value=stub_state), \
+                patch.object(control_main, "_evaluate_strategy_auto_dispatch_gate", return_value=allow_gate), \
+                patch.object(control_main, "_has_active_strategy_auto_dispatch_alert", return_value=False), \
+                patch.object(control_main, "_build_strategy_active_order_summary", return_value=(0, None)), \
+                patch.object(control_main, "_dispatch_strategy_signal_from_state", side_effect=_raise_exc), \
+                patch.object(control_main, "_record_strategy_auto_dispatch_issue", side_effect=_spy):
+            control_main._auto_dispatch_strategy_signal_changes(
+                {snapshot.strategy_id: previous}, [snapshot]
+            )
+        return captured
+
+    def test_private_channel_outage_exc_threads_typed_discriminators(self) -> None:
+        from models import (  # noqa: PLC0415
+            AUTO_DISPATCH_GATE_REASON_PRIVATE_CHANNEL_OUTAGE,
+            RISK_REASON_RUNTIME_UNAVAILABLE_PRIVATE_CHANNEL,
+        )
+
+        exc = control_main.StrategyExecutionChannelOutageError(
+            "当前 Bybit 私有 WS 下单链路未就绪。",
+            channel="private",
+        )
+        captured = self._run_with_dispatch_exc(exc)
+        self.assertIn("kwargs", captured)
+        kwargs = captured["kwargs"]
+        self.assertEqual(
+            kwargs.get("sub_block_code"),
+            RISK_REASON_RUNTIME_UNAVAILABLE_PRIVATE_CHANNEL,
+        )
+        self.assertEqual(
+            kwargs.get("reason_code"),
+            AUTO_DISPATCH_GATE_REASON_PRIVATE_CHANNEL_OUTAGE,
+        )
+
+    def test_public_channel_outage_exc_threads_typed_discriminators(self) -> None:
+        from models import (  # noqa: PLC0415
+            AUTO_DISPATCH_GATE_REASON_PUBLIC_CHANNEL_OUTAGE,
+            RISK_REASON_RUNTIME_UNAVAILABLE_PUBLIC_CHANNEL,
+        )
+
+        exc = control_main.StrategyExecutionChannelOutageError(
+            "当前 Bybit 公共 WS 行情已断线。",
+            channel="public",
+        )
+        captured = self._run_with_dispatch_exc(exc)
+        self.assertIn("kwargs", captured)
+        kwargs = captured["kwargs"]
+        self.assertEqual(
+            kwargs.get("sub_block_code"),
+            RISK_REASON_RUNTIME_UNAVAILABLE_PUBLIC_CHANNEL,
+        )
+        self.assertEqual(
+            kwargs.get("reason_code"),
+            AUTO_DISPATCH_GATE_REASON_PUBLIC_CHANNEL_OUTAGE,
+        )
+
+    def test_plain_runtime_error_threads_none_typed_discriminators(self) -> None:
+        # Plain ``RuntimeError`` carries neither ``sub_block_code`` nor
+        # ``block_code``, so ``getattr(..., None)`` falls back to ``None``
+        # and the helper's internal classifier remains free to parse the
+        # detail (behaviour preserved for non-channel-outage failures).
+        exc = RuntimeError("当前 Bybit 返回异常。")
+        captured = self._run_with_dispatch_exc(exc)
+        self.assertIn("kwargs", captured)
+        kwargs = captured["kwargs"]
+        self.assertIsNone(kwargs.get("sub_block_code"))
+        self.assertIsNone(kwargs.get("reason_code"))
+
+    def test_blocked_error_threads_none_typed_discriminators(self) -> None:
+        # ``StrategyExecutionBlockedError`` does not define ``sub_block_code``;
+        # ``getattr(..., None)`` returns ``None`` so the typed path is
+        # correctly skipped and the helper's fallback classifier fires.
+        exc = control_main.StrategyExecutionBlockedError(
+            "当前可用保证金不足，当前可用 0.00 USDT。",
+            recommended_action="请先补充 Live 可用保证金。",
+        )
+        captured = self._run_with_dispatch_exc(exc)
+        self.assertIn("kwargs", captured)
+        kwargs = captured["kwargs"]
+        self.assertIsNone(kwargs.get("sub_block_code"))
+        self.assertIsNone(kwargs.get("reason_code"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -6666,6 +6666,21 @@ _AUTO_DISPATCH_TO_RISK_SUB_BLOCK_CODE: Dict[str, str] = {
     AUTO_DISPATCH_GATE_REASON_PUBLIC_CHANNEL_OUTAGE: RISK_REASON_RUNTIME_UNAVAILABLE_PUBLIC_CHANNEL,
 }
 
+# Round 92 — reverse of :data:`_AUTO_DISPATCH_TO_RISK_SUB_BLOCK_CODE` used by
+# the outcome-record callsite inside ``_auto_dispatch_strategy_signal_changes``
+# (main.py:8078).  The dispatch call's raised ``StrategyExecutionChannelOutageError``
+# carries a typed ``sub_block_code`` (one of the ``RISK_REASON_RUNTIME_UNAVAILABLE_*``
+# sub-codes); this dict maps it back onto the ``AlertRecord.reason_code``
+# taxonomy so the record helper receives both typed discriminators directly
+# and skips the ``_classify_strategy_auto_dispatch_alert_kind`` /
+# ``_derive_sub_block_code_from_detail`` substring fallbacks.  Declared
+# explicitly rather than inverting the forward dict at import time so adding
+# a many-to-one entry to the forward map will not silently drop entries here.
+_RISK_SUB_BLOCK_TO_AUTO_DISPATCH_GATE_REASON: Dict[str, str] = {
+    RISK_REASON_RUNTIME_UNAVAILABLE_PRIVATE_CHANNEL: AUTO_DISPATCH_GATE_REASON_PRIVATE_CHANNEL_OUTAGE,
+    RISK_REASON_RUNTIME_UNAVAILABLE_PUBLIC_CHANNEL: AUTO_DISPATCH_GATE_REASON_PUBLIC_CHANNEL_OUTAGE,
+}
+
 
 def _resolve_alert_sub_block_code(alert: Optional[AlertRecord]) -> Optional[str]:
     """Return the :data:`RISK_REASON_RUNTIME_UNAVAILABLE_*` sub-code that
@@ -8075,6 +8090,18 @@ def _auto_dispatch_strategy_signal_changes(
             )
             repo._persist()  # type: ignore[attr-defined]
         if outcome.record_issue:
+            # Round 92 — thread typed ``sub_block_code`` / ``reason_code`` from
+            # the caught exception so ``StrategyExecutionChannelOutageError``
+            # instances (carrying ``sub_block_code=RISK_REASON_RUNTIME_UNAVAILABLE_{PUBLIC,PRIVATE}_CHANNEL``
+            # from R80) drive the typed discriminators directly rather than
+            # letting ``_record_strategy_auto_dispatch_issue``'s internal
+            # ``_classify_strategy_auto_dispatch_alert_kind`` /
+            # ``_derive_sub_block_code_from_detail`` substring fallbacks parse
+            # the detail.  Plain ``RuntimeError`` / ``StrategyExecutionBlockedError``
+            # instances do not carry ``sub_block_code``, so ``getattr(..., None)``
+            # falls back cleanly and the helper's fallback classifier still fires
+            # for them (preserves behaviour for the non-channel-outage branches).
+            exc_sub_block_code = getattr(caught, "sub_block_code", None)
             _record_strategy_auto_dispatch_issue(
                 snapshot.strategy_id,
                 snapshot.strategy_name,
@@ -8084,6 +8111,10 @@ def _auto_dispatch_strategy_signal_changes(
                 outcome.reason_detail,
                 recommended_action=outcome.recommended_action,
                 strategy=strategy,
+                reason_code=_RISK_SUB_BLOCK_TO_AUTO_DISPATCH_GATE_REASON.get(exc_sub_block_code)
+                if exc_sub_block_code is not None
+                else None,
+                sub_block_code=exc_sub_block_code,
             )
 
 
