@@ -22546,5 +22546,77 @@ class RiskDecisionReasonCodeCoverageRound68Tests(unittest.TestCase):
         )
 
 
+class RiskDecisionBlockCodeSourcePrecedenceRound70Tests(unittest.TestCase):
+    """Round 70 — the preview builder now emits ``block_code`` at source.
+    ``evaluate_risk_decision`` must prefer that typed code over the
+    substring-probe fallback so a preview whose ``block_code`` disagrees with
+    what the probe would infer still surfaces the source-of-truth code.
+    """
+
+    def _make_blocked_preview(
+        self,
+        *,
+        blocked_reason: str,
+        block_code: Optional[str],
+    ):
+        from datetime import datetime, timezone  # noqa: PLC0415
+        from models import ExecutionPreview  # noqa: PLC0415
+
+        return ExecutionPreview(
+            symbol="BTCUSDT",
+            market="spot",
+            mode=AccountMode.PAPER,
+            side=Direction.BUY,
+            origin="manual",
+            quantity=1.0,
+            price=100.0,
+            notional="100.00 USDT",
+            action="买入",
+            allowed=False,
+            blocked_reason=blocked_reason,
+            block_code=block_code,
+            current_position_size="--",
+            current_avg_price="--",
+            projected_position_size="--",
+            projected_avg_price="--",
+            available_balance_before="--",
+            available_balance_after="--",
+            estimated_realized_pnl="--",
+            generated_at=datetime.now(timezone.utc).astimezone().isoformat(),
+        )
+
+    def test_block_code_from_source_wins_over_substring_probe(self) -> None:
+        from models import (  # noqa: PLC0415
+            RISK_REASON_EXCHANGE_CONSTRAINT,
+            RISK_REASON_INSUFFICIENT_BALANCE,
+        )
+        from risk_decision import evaluate_risk_decision  # noqa: PLC0415
+
+        # The free-form reason string here would be classified as
+        # ``risk.insufficient_balance`` by the substring probe, but the
+        # preview builder explicitly tagged it as an exchange-constraint
+        # block.  ``evaluate_risk_decision`` must honour the source.
+        preview = self._make_blocked_preview(
+            blocked_reason="Paper 可用余额不足，当前仅剩 100 USDT。",
+            block_code=RISK_REASON_EXCHANGE_CONSTRAINT,
+        )
+        decision = evaluate_risk_decision(preview)
+        self.assertEqual(decision.verdict, "block")
+        self.assertEqual(decision.reason_code, RISK_REASON_EXCHANGE_CONSTRAINT)
+        self.assertNotEqual(decision.reason_code, RISK_REASON_INSUFFICIENT_BALANCE)
+
+    def test_missing_block_code_falls_back_to_substring_probe(self) -> None:
+        from models import RISK_REASON_INSUFFICIENT_BALANCE  # noqa: PLC0415
+        from risk_decision import evaluate_risk_decision  # noqa: PLC0415
+
+        preview = self._make_blocked_preview(
+            blocked_reason="Paper 可用余额不足，当前仅剩 100 USDT。",
+            block_code=None,
+        )
+        decision = evaluate_risk_decision(preview)
+        self.assertEqual(decision.verdict, "block")
+        self.assertEqual(decision.reason_code, RISK_REASON_INSUFFICIENT_BALANCE)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

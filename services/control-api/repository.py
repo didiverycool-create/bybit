@@ -5,7 +5,7 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import RLock
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from uuid import uuid4
 
 from models import (
@@ -42,6 +42,8 @@ from models import (
     NewsEvent,
     OrderRecord,
     PositionRecord,
+    RISK_REASON_ACCOUNT_MODE_UNAVAILABLE,
+    RISK_REASON_INVALID_REQUEST,
     SchedulerCommand,
     SchedulerCommandType,
     StrategyParameter,
@@ -1957,6 +1959,7 @@ class AppRepository:
                 action="等待真实执行引擎",
                 allowed=False,
                 blocked_reason="当前统一执行预检仅开放 Paper 模式；Demo / Live 待真实执行引擎接通后再开放。",
+                block_code=RISK_REASON_ACCOUNT_MODE_UNAVAILABLE,
                 warnings=["当前结果仅适用于 Paper 执行链路。"],
                 current_position_size="--",
                 current_avg_price="--",
@@ -1998,7 +2001,7 @@ class AppRepository:
             projected_avg = payload.price
 
         available_after = available_cash - (signed_qty * payload.price)
-        blocked_reason = self._evaluate_paper_order_risk_locked(
+        blocked_reason, block_code = self._evaluate_paper_order_risk_locked(
             payload.symbol,
             payload.market,
             payload.side,
@@ -2017,6 +2020,7 @@ class AppRepository:
             action=self._describe_execution_action_locked(payload.market, payload.side, current_qty, next_qty),
             allowed=blocked_reason is None,
             blocked_reason=blocked_reason,
+            block_code=block_code,
             warnings=warnings,
             current_position_side=self._classify_position_side(current_qty),
             current_position_size=self._format_quantity(abs(current_qty), 6),
@@ -2176,12 +2180,16 @@ class AppRepository:
         quantity: float,
         price: float,
         exclude_order_id: Optional[str] = None,
-    ) -> Optional[str]:
+    ) -> Tuple[Optional[str], Optional[str]]:
         # Cheap pre-check first so we avoid building the ledger snapshot for
         # obviously invalid inputs; ``evaluate_paper_order_risk`` repeats the
         # check but exits in O(1) with no snapshot touched.
+        # Round 70 — returns the same ``(reason, block_code)`` shape as the
+        # underlying ``evaluate_paper_order_risk`` so callers can attach a
+        # typed code to the preview / audit payloads without re-running
+        # ``derive_block_reason_code``.
         if quantity <= 0 or price <= 0:
-            return "数量和价格必须大于 0。"
+            return "数量和价格必须大于 0。", RISK_REASON_INVALID_REQUEST
 
         ledger_snapshot = self._build_paper_ledger_locked()
         reserved_cash = self._paper_reserved_cash_locked(exclude_order_id)
@@ -4976,7 +4984,7 @@ class AppRepository:
 
     def create_paper_order(self, payload: ManualOrderRequest) -> OrderRecord:
         with self._lock:
-            blocked_reason = self._evaluate_paper_order_risk_locked(
+            blocked_reason, block_code = self._evaluate_paper_order_risk_locked(
                 payload.symbol,
                 payload.market,
                 payload.side,
@@ -4984,10 +4992,11 @@ class AppRepository:
                 payload.price,
             )
             if blocked_reason is not None:
-                # Round 66 — attach a stable machine-readable ``reason_code``
-                # derived from the free-form ``blocked_reason`` so audit
-                # consumers can filter by typed risk category without parsing
-                # Chinese substrings.
+                # Round 70 — the typed ``reason_code`` is produced at the
+                # risk-guard source and no longer needs ``derive_block_reason_code``'s
+                # substring probe.  ``block_code`` may still be ``None`` for
+                # unclassified futures hints — fall back to the substring probe
+                # so audit consumers always see *some* typed code.
                 self.add_event(
                     event_type="risk.blocked_order",
                     source="quant-core",
@@ -5000,7 +5009,7 @@ class AppRepository:
                         "quantity": payload.quantity,
                         "price": payload.price,
                         "reason": blocked_reason,
-                        "reason_code": derive_block_reason_code(blocked_reason),
+                        "reason_code": block_code or derive_block_reason_code(blocked_reason),
                         "stage": "paper_order_create",
                     },
                     symbol=payload.symbol,
@@ -5070,7 +5079,7 @@ class AppRepository:
                 raise KeyError(order_id)
 
             order = self.state.paper_orders[target_index]
-            blocked_reason = self._evaluate_paper_order_risk_locked(
+            blocked_reason, block_code = self._evaluate_paper_order_risk_locked(
                 order.symbol,
                 order.market,
                 order.side,
@@ -5079,9 +5088,9 @@ class AppRepository:
                 exclude_order_id=order_id,
             )
             if blocked_reason is not None:
-                # Round 66 — attach the typed ``reason_code`` alongside the
-                # free-form ``reason`` string so the replace-side audit payload
-                # matches the create-side schema.
+                # Round 70 — ``block_code`` originates at the risk-guard source;
+                # fall back to ``derive_block_reason_code`` only when the source
+                # could not classify the reason (never should happen today).
                 self.add_event(
                     event_type="risk.blocked_order",
                     source="quant-core",
@@ -5095,7 +5104,7 @@ class AppRepository:
                         "quantity": quantity,
                         "price": price,
                         "reason": blocked_reason,
-                        "reason_code": derive_block_reason_code(blocked_reason),
+                        "reason_code": block_code or derive_block_reason_code(blocked_reason),
                         "stage": "paper_order_replace",
                     },
                     symbol=order.symbol,
@@ -5535,7 +5544,7 @@ class AppRepository:
         else:
             projected_avg = snapshot.last_price
 
-        blocked_reason = self._evaluate_paper_order_risk_locked(
+        blocked_reason, block_code = self._evaluate_paper_order_risk_locked(
             snapshot.symbol,
             snapshot.market,
             side,
@@ -5563,6 +5572,7 @@ class AppRepository:
             action=self._describe_execution_action_locked(snapshot.market, side, current_qty, next_qty),
             allowed=blocked_reason is None,
             blocked_reason=blocked_reason,
+            block_code=block_code,
             warnings=warnings,
             current_position_side=self._classify_position_side(current_qty),
             current_position_size=self._format_quantity(abs(current_qty), 6),

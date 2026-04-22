@@ -21,6 +21,10 @@ from models import (
     ExecutionPreview,
     ExecutionPreviewRequest,
     OrderRecord,
+    RISK_REASON_ACCOUNT_MODE_UNAVAILABLE,
+    RISK_REASON_EXCHANGE_CONSTRAINT,
+    RISK_REASON_INSUFFICIENT_BALANCE,
+    RISK_REASON_INSUFFICIENT_INVENTORY,
 )
 
 
@@ -146,6 +150,7 @@ def build_private_execution_preview(
             action="等待真实执行引擎",
             allowed=False,
             blocked_reason=access_error,
+            block_code=RISK_REASON_ACCOUNT_MODE_UNAVAILABLE,
             recommended_action=build_execution_preview_recommended_action(access_error),
             warnings=["当前结果仅适用于已配置且模式一致的 Demo / Live 私有 API。"],
             current_position_size="--",
@@ -265,6 +270,12 @@ def build_private_execution_preview(
         quantity=payload.quantity,
         price=payload.price,
     )
+    # Round 70 — track a typed ``block_code`` alongside the free-form
+    # ``blocked_reason`` so ``evaluate_risk_decision`` does not have to
+    # re-derive it via substring probe.
+    block_code: Optional[str] = (
+        RISK_REASON_EXCHANGE_CONSTRAINT if blocked_reason is not None else None
+    )
     recommended_action = build_exchange_constraint_recommended_action(blocked_reason)
     if blocked_reason is None and payload.market == "spot" and payload.side == Direction.BUY and available_before + 1e-9 < notional:
         blocked_reason = build_private_insufficient_balance_reason(
@@ -272,6 +283,7 @@ def build_private_execution_preview(
             required_notional=notional,
             buy_order=True,
         )
+        block_code = RISK_REASON_INSUFFICIENT_BALANCE
         recommended_action = build_private_insufficient_balance_recommended_action(
             account_type=status.account_type,
             available_balance=available_before,
@@ -288,6 +300,7 @@ def build_private_execution_preview(
                 "当前 Bybit 现货可卖数量不足，"
                 f"扣除未成交卖单占用后最多可卖 {repo._format_quantity(available_spot_qty, 6)}。"
             )
+            block_code = RISK_REASON_INSUFFICIENT_INVENTORY
             recommended_action = build_private_spot_inventory_recommended_action(payload.symbol)
     elif blocked_reason is None and payload.market == "perp" and available_before + 1e-9 < perp_additional_required_notional:
         blocked_reason = build_private_insufficient_balance_reason(
@@ -295,6 +308,7 @@ def build_private_execution_preview(
             required_notional=perp_additional_required_notional,
             buy_order=False,
         )
+        block_code = RISK_REASON_INSUFFICIENT_BALANCE
         recommended_action = build_private_insufficient_balance_recommended_action(
             account_type=status.account_type,
             available_balance=available_before,
@@ -328,6 +342,7 @@ def build_private_execution_preview(
         action=repo._describe_execution_action_locked(payload.market, payload.side, current_qty, next_qty),  # type: ignore[attr-defined]
         allowed=blocked_reason is None,
         blocked_reason=blocked_reason,
+        block_code=block_code,
         recommended_action=recommended_action,
         warnings=warnings,
         current_position_side=repo._classify_position_side(current_qty),  # type: ignore[attr-defined]

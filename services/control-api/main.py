@@ -150,6 +150,7 @@ from models import (
     PaperPositionBulkCloseResult,
     ReconcileChangeRequestOutcome,
     ReviewDocument,
+    RISK_REASON_INSUFFICIENT_BALANCE,
     RiskDecision,
     RuntimeWorkerActionPayload,
     RuntimeWorkerActionResult,
@@ -608,6 +609,11 @@ def _resolve_balance_linked_strategy_target_signed_qty(
         "display_target_signed_qty": raw_target_signed_qty,
         "warnings": [],
         "blocked_reason": None,
+        # Round 70 — resolved block reasons in this helper all map to
+        # ``risk.insufficient_balance`` (either no-capacity or target-too-small
+        # after balance linkage); track the typed code alongside the free-form
+        # Chinese string so the preview builder can surface it verbatim.
+        "block_code": None,
         "recommended_action": None,
         "sizing_risk_budget": None,
         "sizing_budget_notional": None,
@@ -676,6 +682,7 @@ def _resolve_balance_linked_strategy_target_signed_qty(
             risk_budget_label=risk_budget_label,
             current_signed_qty=current_signed_qty,
         )
+        resolution["block_code"] = RISK_REASON_INSUFFICIENT_BALANCE
         resolution["recommended_action"] = _build_balance_linked_strategy_target_too_small_recommended_action(
             account_type=status.account_type,
             available_balance=available_balance,
@@ -711,6 +718,7 @@ def _resolve_balance_linked_strategy_target_signed_qty(
             balance_linked_target_signed_qty=balance_linked_target_signed_qty,
             minimum_order_qty=minimum_order_qty,
         )
+        resolution["block_code"] = RISK_REASON_INSUFFICIENT_BALANCE
         resolution["recommended_action"] = _build_balance_linked_strategy_target_too_small_recommended_action(
             account_type=status.account_type,
             available_balance=available_balance,
@@ -8557,6 +8565,7 @@ def _build_strategy_execution_preview_from_state(
             action=hint["note"] or "等待真实执行引擎",
             allowed=False,
             blocked_reason=str(target_resolution["blocked_reason"]),
+            block_code=target_resolution.get("block_code"),
             recommended_action=target_resolution["recommended_action"],
             sizing_risk_budget=target_resolution["sizing_risk_budget"],
             sizing_budget_notional=target_resolution["sizing_budget_notional"],

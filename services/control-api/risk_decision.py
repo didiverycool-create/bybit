@@ -161,9 +161,14 @@ def evaluate_risk_decision(
     action = recommended_action
     if action is None and preview.recommended_action:
         action = {"recommendation": preview.recommended_action}
+    # Round 70 — prefer the typed ``block_code`` produced at the preview-builder
+    # source; only fall back to the substring-probe ``derive_block_reason_code``
+    # when a preview arrived without a typed code (older callers / future
+    # builders that haven't been migrated yet).
+    reason_code = preview.block_code or derive_block_reason_code(detail)
     return RiskDecision(
         verdict="block",
-        reason_code=derive_block_reason_code(detail),
+        reason_code=reason_code,
         reason_detail=detail,
         recommended_action=action,
         preview=preview,

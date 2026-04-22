@@ -17,9 +17,14 @@ stay unchanged and the outer lock is still held by the caller.
 
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Tuple
 
-from models import Direction
+from models import (
+    Direction,
+    RISK_REASON_INSUFFICIENT_BALANCE,
+    RISK_REASON_INSUFFICIENT_INVENTORY,
+    RISK_REASON_INVALID_REQUEST,
+)
 
 
 def evaluate_paper_order_risk(
@@ -34,8 +39,15 @@ def evaluate_paper_order_risk(
     reserved_spot_sell_qty: float,
     format_usdt: Callable[[float], str],
     format_quantity: Callable[[float, int], str],
-) -> Optional[str]:
-    """Return a blocked-reason string when a paper order violates risk limits.
+) -> Tuple[Optional[str], Optional[str]]:
+    """Return a ``(blocked_reason, block_code)`` tuple when a paper order
+    violates risk limits, or ``(None, None)`` when the order passes all
+    risk gates.
+
+    Round 70 — the typed ``block_code`` is produced at source alongside
+    the free-form Chinese ``blocked_reason`` so downstream consumers can
+    tag audits / the :class:`~models.RiskDecision` without re-running
+    ``derive_block_reason_code``'s substring probe.
 
     Parameters mirror :meth:`AppRepository._evaluate_paper_order_risk_locked`
     but the dependencies that previously came from ``self`` are now passed in
@@ -61,7 +73,7 @@ def evaluate_paper_order_risk(
     """
 
     if quantity <= 0 or price <= 0:
-        return "数量和价格必须大于 0。"
+        return "数量和价格必须大于 0。", RISK_REASON_INVALID_REQUEST
 
     cash_balance = float(ledger_snapshot["cash_balance"])
     available_cash = cash_balance - reserved_cash
@@ -71,7 +83,10 @@ def evaluate_paper_order_risk(
     current_qty = float(symbol_state.get("qty") or 0.0)
 
     if side == Direction.BUY and notional > available_cash + 1e-9:
-        return f"Paper 可用余额不足，当前仅剩 {format_usdt(available_cash)}。"
+        return (
+            f"Paper 可用余额不足，当前仅剩 {format_usdt(available_cash)}。",
+            RISK_REASON_INSUFFICIENT_BALANCE,
+        )
 
     if (
         market == "spot"
@@ -80,7 +95,8 @@ def evaluate_paper_order_risk(
     ):
         return (
             f"{symbol} 当前 Paper 现货可卖数量不足，"
-            f"最多可卖 {format_quantity(max(current_qty - reserved_spot_sell_qty, 0.0), 6)}。"
+            f"最多可卖 {format_quantity(max(current_qty - reserved_spot_sell_qty, 0.0), 6)}。",
+            RISK_REASON_INSUFFICIENT_INVENTORY,
         )
 
-    return None
+    return None, None

@@ -1338,6 +1338,12 @@ class ExecutionPreview(BaseModel):
     action: str
     allowed: bool
     blocked_reason: Optional[str] = None
+    # Round 70 — optional typed ``block_code`` produced at the risk-guard /
+    # preview-builder source alongside the free-form Chinese ``blocked_reason``.
+    # ``evaluate_risk_decision`` (see ``risk_decision.py``) prefers this field
+    # when set and only falls back to the substring-probe helper
+    # ``derive_block_reason_code`` when a preview arrived without a typed code.
+    block_code: Optional[str] = None
     recommended_action: Optional[str] = None
     sizing_risk_budget: Optional[str] = None
     sizing_budget_notional: Optional[str] = None
