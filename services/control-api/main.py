@@ -3372,7 +3372,20 @@ def _build_strategy_activity_runtime_snapshot(
                     runtime_snapshot_override=runtime,
                 )
             except RuntimeError as exc:
-                strategy_mode_preview = _build_blocked_strategy_execution_preview(runtime, strategy.mode, str(exc))
+                # Round 90 — thread typed ``block_code`` / ``sub_block_code``
+                # attrs (carried by :class:`StrategyExecutionChannelOutageError`
+                # / other typed subclasses) through to the blocked preview so
+                # the recommender's typed sub-dispatch fires instead of
+                # needing a fresh classifier probe downstream.  Plain
+                # ``RuntimeError`` instances carry neither attr so
+                # ``getattr(..., None)`` falls back cleanly.
+                strategy_mode_preview = _build_blocked_strategy_execution_preview(
+                    runtime,
+                    strategy.mode,
+                    str(exc),
+                    block_code=getattr(exc, "block_code", None),
+                    sub_block_code=getattr(exc, "sub_block_code", None),
+                )
             except ValueError as exc:
                 strategy_mode_preview = _build_blocked_strategy_execution_preview(runtime, strategy.mode, str(exc))
     else:
@@ -9294,7 +9307,19 @@ def build_strategy_runtime_response() -> List[StrategyRuntimeSnapshot]:
         try:
             preview = _build_strategy_execution_preview_from_state(item.strategy_id, resolved_mode)
         except RuntimeError as exc:
-            preview = _build_blocked_strategy_execution_preview(item, resolved_mode, str(exc))
+            # Round 90 — thread typed ``block_code`` / ``sub_block_code``
+            # attrs (carried by :class:`StrategyExecutionChannelOutageError`
+            # / other typed subclasses) through to the blocked preview so
+            # the recommender's typed sub-dispatch fires on the snapshot's
+            # execution_preview.  Plain ``RuntimeError`` carries neither
+            # attr so ``getattr(..., None)`` falls back cleanly.
+            preview = _build_blocked_strategy_execution_preview(
+                item,
+                resolved_mode,
+                str(exc),
+                block_code=getattr(exc, "block_code", None),
+                sub_block_code=getattr(exc, "sub_block_code", None),
+            )
         except ValueError as exc:
             preview = _build_blocked_strategy_execution_preview(item, resolved_mode, str(exc))
         item = _apply_runtime_blocked_preview_context(item, preview)

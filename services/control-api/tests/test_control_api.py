@@ -24583,6 +24583,157 @@ class DispatchStrategySignalExcTypedKwargsRound86Tests(unittest.TestCase):
         self.assertEqual(kwargs.get("recommended_action"), "自定义建议：请联系运营。")
 
 
+class StrategyPreviewBuildExceptTypedAttrsRound90Tests(unittest.TestCase):
+    """Round 90 — two ``except RuntimeError`` sites that wrap
+    ``_build_strategy_execution_preview_from_state`` calls were still
+    calling ``_build_blocked_strategy_execution_preview(snapshot, mode,
+    str(exc))`` without threading the typed ``block_code`` /
+    ``sub_block_code`` attributes carried by
+    :class:`StrategyExecutionChannelOutageError` (R74/R80).
+
+    The two sites are:
+
+    * ``_build_strategy_activity_runtime_snapshot`` (main.py:3374-3377) —
+      builds the auto-dispatch activity snapshot with a blocked preview
+      when the real preview build raises.
+    * ``build_strategy_runtime_response`` (main.py:9307-9328) — builds
+      the runtime snapshot surfaced to the desktop control UI.
+
+    Both sites now forward ``getattr(exc, "block_code", None)`` /
+    ``getattr(exc, "sub_block_code", None)`` so a
+    :class:`StrategyExecutionChannelOutageError(channel="public")` /
+    ``(channel="private")`` raised from the underlying preview builder
+    flows through to the resulting
+    ``ExecutionPreview.{block_code,sub_block_code}`` — which then lets
+    the recommender's R80 typed sub-dispatch pick the private / public
+    channel-outage recovery copy off the typed discriminator instead of
+    a substring probe.
+
+    Invariants pinned (spy-style via a patched
+    ``_build_blocked_strategy_execution_preview`` so the test observes
+    the actual kwargs passed at the call site):
+
+    1. ``build_strategy_runtime_response`` catches
+       ``StrategyExecutionChannelOutageError(channel="public")`` and
+       threads ``block_code=RISK_REASON_RUNTIME_UNAVAILABLE`` +
+       ``sub_block_code=RISK_REASON_RUNTIME_UNAVAILABLE_PUBLIC_CHANNEL``.
+    2. Same for ``channel="private"`` →
+       ``RISK_REASON_RUNTIME_UNAVAILABLE_PRIVATE_CHANNEL``.
+    3. Plain ``RuntimeError`` threads ``block_code=None`` /
+       ``sub_block_code=None`` (no typed attrs to read).
+    """
+
+    def _build_runtime_snapshot(self) -> StrategyRuntimeSnapshot:
+        return StrategyRuntimeSnapshot(
+            strategy_id="preview-build-exc",
+            strategy_name="Preview Build Exception",
+            symbol="BTCUSDT",
+            market="perp",
+            mode=AccountMode.LIVE,
+            runtime_status="running",
+            signal="long",
+            confidence=0.5,
+            last_price=70000.0,
+            reference_price=70000.0,
+            change_24h=0.0,
+            note="",
+            next_action="",
+            last_evaluated_at="2026-04-23T00:00:00+08:00",
+        )
+
+    def _run_with_exc(self, exc: BaseException) -> Dict[str, Any]:
+        snapshot = self._build_runtime_snapshot()
+        captured: Dict[str, Any] = {}
+
+        # Spy preserves original behaviour so downstream code still gets
+        # a valid preview; we only care about capturing the kwargs.
+        original = control_main._build_blocked_strategy_execution_preview
+
+        def _spy(*args: Any, **kwargs: Any) -> Any:
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+            return original(*args, **kwargs)
+
+        def _raise_exc(*_args: Any, **_kwargs: Any) -> None:
+            raise exc
+
+        # Force LIVE selected_mode so the runtime-response loop reaches
+        # the ``_build_strategy_execution_preview_from_state`` try/except
+        # (the PAPER branch short-circuits with a ``continue``).
+        base_preferences = control_main.repo.snapshot().workspace_preferences
+        workspace_preferences = base_preferences.model_copy(
+            update={"selected_mode": AccountMode.LIVE}
+        )
+
+        class _StubState:
+            strategy_runtime_snapshots: List[StrategyRuntimeSnapshot] = []
+            watchlist: List[Any] = []
+
+        stub_state = _StubState()
+        stub_state.workspace_preferences = workspace_preferences
+
+        with patch.object(control_main, "refresh_strategy_runtime_once", return_value=[snapshot]), \
+                patch.object(control_main.repo, "snapshot", return_value=stub_state), \
+                patch.object(control_main, "_runtime_worker_execution_block_reason", return_value=None), \
+                patch.object(control_main, "_decorate_strategy_runtime_item", side_effect=lambda item: item), \
+                patch.object(control_main, "_build_strategy_active_order_summary", return_value=(0, None)), \
+                patch.object(control_main, "_build_strategy_last_execution_summary", return_value=(None, None, None, None, None)), \
+                patch.object(control_main, "_build_strategy_position_alignment_summary", return_value=(None, None, "aligned", None)), \
+                patch.object(control_main, "_build_strategy_current_position_summary", return_value=(None, None, None)), \
+                patch.object(control_main, "_sync_strategy_position_drift_issue"), \
+                patch.object(control_main, "parse_order_history", return_value=[]), \
+                patch.object(control_main, "_build_strategy_execution_preview_from_state", side_effect=_raise_exc), \
+                patch.object(control_main, "_build_blocked_strategy_execution_preview", side_effect=_spy):
+            control_main.build_strategy_runtime_response()
+        return captured
+
+    def test_public_channel_outage_exc_threads_typed_sub_code(self) -> None:
+        from models import (  # noqa: PLC0415
+            RISK_REASON_RUNTIME_UNAVAILABLE,
+            RISK_REASON_RUNTIME_UNAVAILABLE_PUBLIC_CHANNEL,
+        )
+
+        exc = control_main.StrategyExecutionChannelOutageError(
+            "当前 Bybit 公共 WS 行情已断线。",
+            channel="public",
+        )
+        captured = self._run_with_exc(exc)
+        self.assertIn("kwargs", captured)
+        kwargs = captured["kwargs"]
+        self.assertEqual(kwargs.get("block_code"), RISK_REASON_RUNTIME_UNAVAILABLE)
+        self.assertEqual(
+            kwargs.get("sub_block_code"),
+            RISK_REASON_RUNTIME_UNAVAILABLE_PUBLIC_CHANNEL,
+        )
+
+    def test_private_channel_outage_exc_threads_typed_sub_code(self) -> None:
+        from models import (  # noqa: PLC0415
+            RISK_REASON_RUNTIME_UNAVAILABLE,
+            RISK_REASON_RUNTIME_UNAVAILABLE_PRIVATE_CHANNEL,
+        )
+
+        exc = control_main.StrategyExecutionChannelOutageError(
+            "当前 Bybit 私有 WS 下单链路未就绪。",
+            channel="private",
+        )
+        captured = self._run_with_exc(exc)
+        self.assertIn("kwargs", captured)
+        kwargs = captured["kwargs"]
+        self.assertEqual(kwargs.get("block_code"), RISK_REASON_RUNTIME_UNAVAILABLE)
+        self.assertEqual(
+            kwargs.get("sub_block_code"),
+            RISK_REASON_RUNTIME_UNAVAILABLE_PRIVATE_CHANNEL,
+        )
+
+    def test_plain_runtime_error_threads_none_typed_kwargs(self) -> None:
+        exc = RuntimeError("当前 Bybit 返回异常。")
+        captured = self._run_with_exc(exc)
+        self.assertIn("kwargs", captured)
+        kwargs = captured["kwargs"]
+        self.assertIsNone(kwargs.get("block_code"))
+        self.assertIsNone(kwargs.get("sub_block_code"))
+
+
 class InsufficientBalanceMarketSubstringRemovalRound87Tests(unittest.TestCase):
     """Round 87 — the ``"可用保证金不足"`` / ``"保证金不足"`` substring
     fallback inside the ``RISK_REASON_INSUFFICIENT_BALANCE`` branch of
