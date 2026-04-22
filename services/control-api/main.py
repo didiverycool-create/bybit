@@ -1065,18 +1065,22 @@ def _build_execution_preview_recommended_action(
         # without re-parsing the detail.
         return "请按 Bybit 的最小下单量、数量步长、价格步长和最小名义价值调整参数后再重试。"
     if resolved_code == RISK_REASON_RUNTIME_UNAVAILABLE:
-        # Round 80 — typed sub-dispatch already fired above (pre-umbrella
-        # early-return); this branch only runs when the caller passed the
-        # umbrella ``block_code`` without a typed ``sub_block_code``, so we
-        # fall back to the ``"私有 WS"`` / ``"公共 WS"`` / ``"运行线程"``
-        # substring probe to classify the detail.  New call sites should
-        # always pass ``sub_block_code`` so the probe never fires.
-        if "私有 WS" in detail:
-            return _build_private_execution_channel_recommended_action(detail)
-        if "公共 WS" in detail or "公共实时链路" in detail:
-            return _build_public_execution_channel_recommended_action(detail)
-        if "运行线程" in detail:
-            return "打开设置页点击“恢复运行线程”，并确认最近审计日志与最新信号。"
+        # Round 88 — the ``"私有 WS"`` / ``"公共 WS"`` / ``"运行线程"``
+        # substring fallback (R80) has been removed.  The typed sub-dispatch
+        # at the top of the function already picks off the three recovery
+        # copies via :data:`RISK_REASON_RUNTIME_UNAVAILABLE_*` sub-codes, and
+        # every in-tree caller now threads ``sub_block_code`` through:
+        # preview-builder raise sites (``StrategyExecutionChannelOutageError``
+        # with ``channel=`` R74/R80), blocked-preview builders
+        # (``_build_blocked_strategy_execution_preview`` / the runtime-worker
+        # paths at main.py:3356 / 9225 / 9270), and the record helpers
+        # (R84 + R88 ``_derive_sub_block_code_from_detail`` auto-classifier).
+        # Callers that land in this branch without ``sub_block_code`` are
+        # either externally-built audit strings or intentional umbrella
+        # blocks with no sub-classification available; returning ``None`` lets
+        # the caller's ``or item.next_action`` / ``or fallback_action``
+        # short-circuit cover them without a fresh substring probe here.
+        return None
     # Round 82 — typed stop-loss-guard dispatch.  ``_build_strategy_execution_preview_from_state``
     # tags the stop-loss-guard block with ``RISK_REASON_STOP_LOSS_GUARD`` at
     # source and ``derive_block_reason_code`` classifies legacy ``"止损保护"``
@@ -6666,6 +6670,34 @@ def _resolve_alert_sub_block_code(alert: Optional[AlertRecord]) -> Optional[str]
     return _AUTO_DISPATCH_TO_RISK_SUB_BLOCK_CODE.get(alert.reason_code)
 
 
+def _derive_sub_block_code_from_detail(detail: Optional[str]) -> Optional[str]:
+    """Classify ``detail`` onto a :data:`RISK_REASON_RUNTIME_UNAVAILABLE_*`
+    sub-code via ``_classify_strategy_auto_dispatch_alert_kind`` +
+    :data:`_AUTO_DISPATCH_TO_RISK_SUB_BLOCK_CODE`.
+
+    Round 88 — used by the two ``_record_strategy_{auto_dispatch,manual_execution}_issue``
+    helpers to forward a typed ``sub_block_code`` into
+    ``_build_execution_preview_recommended_action`` even when the caller did
+    not supply one.  Together with the explicit ``sub_block_code=`` threading
+    on the in-tree preview-emission paths (R80/R84) this closes the last
+    channel-outage blind spot before the umbrella substring fallback inside
+    ``_build_execution_preview_recommended_action`` is deleted.
+
+    Worker-thread blocks are always raised from in-tree callers that pass
+    ``sub_block_code=RISK_REASON_RUNTIME_UNAVAILABLE_WORKER_THREAD`` directly
+    (R84), so this helper does not classify ``"运行线程"`` tokens — it
+    returns ``None`` and the caller's ``sub_block_code`` stays unset.  The
+    recommender then returns ``None`` for the umbrella branch, and the
+    downstream ``or item.next_action`` fallback covers externally-built
+    audit strings without a typed sub-code.
+    """
+
+    alert_kind = _classify_strategy_auto_dispatch_alert_kind(detail)
+    if alert_kind is None:
+        return None
+    return _AUTO_DISPATCH_TO_RISK_SUB_BLOCK_CODE.get(alert_kind)
+
+
 def _record_strategy_auto_dispatch_issue(
     strategy_id: str,
     strategy_name: str,
@@ -6685,9 +6717,15 @@ def _record_strategy_auto_dispatch_issue(
     # / spot-vs-perp / channel-outage sub-copy picks off the typed field
     # rather than the ``"可用保证金不足"`` / ``"私有 WS"`` / ``"公共 WS"`` /
     # ``"运行线程"`` detail probes.
+    # Round 88 — when the caller does not pass ``sub_block_code`` explicitly
+    # (the gate-rejected channel-outage path at main.py:7845 predates R84),
+    # derive it from the detail so the umbrella RUNTIME_UNAVAILABLE substring
+    # probe inside ``_build_execution_preview_recommended_action`` can be
+    # deleted without regressing that call site.
     rule_key = f"strategy-auto-dispatch:{strategy_id}:{signal}:{mode.value}"
+    resolved_sub_block_code = sub_block_code or _derive_sub_block_code_from_detail(detail)
     suggested_action = recommended_action or _build_auto_dispatch_recommended_action(
-        detail, market=market, sub_block_code=sub_block_code
+        detail, market=market, sub_block_code=resolved_sub_block_code
     )
     parameter_snapshot = (
         parameter_resolver.snapshot_parameters(strategy) if strategy is not None else None
@@ -6755,12 +6793,19 @@ def _record_strategy_manual_execution_issue(
     # discriminators through to the recommendation helper so the runtime-worker
     # / spot-vs-perp / channel-outage sub-copy picks off the typed field
     # rather than the ``"可用保证金不足"`` / ``"私有 WS"`` / ``"公共 WS"`` /
-    # ``"运行线程"`` detail probes (the probes remain inside the helper as
-    # fallback for audit-record / legacy callers that do not yet pass a typed
-    # field).
+    # ``"运行线程"`` detail probes.
+    # Round 88 — when the caller does not pass ``sub_block_code`` explicitly,
+    # derive it from the detail's channel-outage tokens so the umbrella
+    # RUNTIME_UNAVAILABLE substring probe inside
+    # ``_build_execution_preview_recommended_action`` can be deleted without
+    # regressing audit-record call sites (e.g. the ``except RuntimeError``
+    # branch at ``dispatch_strategy_signal`` for plain ``RuntimeError``
+    # instances that happen to carry the ``"私有 WS"`` / ``"公共 WS"`` token
+    # without being ``StrategyExecutionChannelOutageError`` instances).
     rule_key = f"strategy-blocked-execution:{strategy_id}:{mode.value}"
+    resolved_sub_block_code = sub_block_code or _derive_sub_block_code_from_detail(detail)
     suggested_action = recommended_action or _build_manual_execution_recommended_action(
-        detail, market=market, sub_block_code=sub_block_code
+        detail, market=market, sub_block_code=resolved_sub_block_code
     )
     parameter_snapshot = (
         parameter_resolver.snapshot_parameters(strategy) if strategy is not None else None

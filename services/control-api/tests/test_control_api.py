@@ -23458,12 +23458,20 @@ class ExecutionPreviewRecommendedActionTypedDispatchRound77Tests(unittest.TestCa
         self.assertIn("数量步长", result)
 
     def test_typed_runtime_unavailable_with_private_ws_detail_returns_private_recommendation(self) -> None:
-        from models import RISK_REASON_RUNTIME_UNAVAILABLE  # noqa: PLC0415
+        from models import (  # noqa: PLC0415
+            RISK_REASON_RUNTIME_UNAVAILABLE,
+            RISK_REASON_RUNTIME_UNAVAILABLE_PRIVATE_CHANNEL,
+        )
 
+        # Round 88 — the ``"私有 WS"`` substring fallback was removed; the
+        # typed ``sub_block_code`` is now the only way to drive the
+        # private-channel recovery copy for callers that only have the
+        # umbrella ``block_code``.
         detail = "当前 Bybit 私有 WS 未连通，无法安全执行真实策略委托。"
         result = control_main._build_execution_preview_recommended_action(
             detail,
             block_code=RISK_REASON_RUNTIME_UNAVAILABLE,
+            sub_block_code=RISK_REASON_RUNTIME_UNAVAILABLE_PRIVATE_CHANNEL,
         )
         self.assertEqual(
             result,
@@ -23471,12 +23479,16 @@ class ExecutionPreviewRecommendedActionTypedDispatchRound77Tests(unittest.TestCa
         )
 
     def test_typed_runtime_unavailable_with_public_ws_detail_returns_public_recommendation(self) -> None:
-        from models import RISK_REASON_RUNTIME_UNAVAILABLE  # noqa: PLC0415
+        from models import (  # noqa: PLC0415
+            RISK_REASON_RUNTIME_UNAVAILABLE,
+            RISK_REASON_RUNTIME_UNAVAILABLE_PUBLIC_CHANNEL,
+        )
 
         detail = "当前 Bybit 公共 WS 行情断线，公共实时链路暂停。"
         result = control_main._build_execution_preview_recommended_action(
             detail,
             block_code=RISK_REASON_RUNTIME_UNAVAILABLE,
+            sub_block_code=RISK_REASON_RUNTIME_UNAVAILABLE_PUBLIC_CHANNEL,
         )
         self.assertEqual(
             result,
@@ -23484,11 +23496,15 @@ class ExecutionPreviewRecommendedActionTypedDispatchRound77Tests(unittest.TestCa
         )
 
     def test_typed_runtime_unavailable_with_runtime_thread_detail_returns_thread_recovery_copy(self) -> None:
-        from models import RISK_REASON_RUNTIME_UNAVAILABLE  # noqa: PLC0415
+        from models import (  # noqa: PLC0415
+            RISK_REASON_RUNTIME_UNAVAILABLE,
+            RISK_REASON_RUNTIME_UNAVAILABLE_WORKER_THREAD,
+        )
 
         result = control_main._build_execution_preview_recommended_action(
             "当前策略运行线程存在异常，请先在设置页恢复运行线程后再执行真实策略。",
             block_code=RISK_REASON_RUNTIME_UNAVAILABLE,
+            sub_block_code=RISK_REASON_RUNTIME_UNAVAILABLE_WORKER_THREAD,
         )
         self.assertEqual(
             result,
@@ -23534,12 +23550,18 @@ class ExecutionPreviewRecommendedActionTypedDispatchRound77Tests(unittest.TestCa
             next_action="",
             last_evaluated_at="2026-04-22T00:00:00+08:00",
         )
+        # Round 88 — pass ``sub_block_code`` explicitly now that the
+        # ``"私有 WS"`` substring fallback has been removed.  Typed sub-code
+        # is the only way to drive the private-channel recovery copy.
+        from models import RISK_REASON_RUNTIME_UNAVAILABLE_PRIVATE_CHANNEL  # noqa: PLC0415
+
         detail = "当前 Bybit 私有 WS 未连通，无法安全执行真实策略委托。"
         preview = control_main._build_blocked_strategy_execution_preview(
             snapshot,
             AccountMode.LIVE,
             detail,
             block_code=RISK_REASON_RUNTIME_UNAVAILABLE,
+            sub_block_code=RISK_REASON_RUNTIME_UNAVAILABLE_PRIVATE_CHANNEL,
         )
         self.assertEqual(preview.block_code, RISK_REASON_RUNTIME_UNAVAILABLE)
         self.assertEqual(
@@ -23961,29 +23983,30 @@ class RuntimeUnavailableSubBlockCodeRound80Tests(unittest.TestCase):
             "打开设置页点击“恢复运行线程”，并确认最近审计日志与最新信号。",
         )
 
-    def test_sub_code_omitted_falls_back_to_legacy_substring(self) -> None:
+    def test_sub_code_omitted_returns_none_after_substring_removal(self) -> None:
+        """Round 88 — the R80 substring fallback inside the RUNTIME_UNAVAILABLE
+        umbrella branch was removed.  When the caller passes only the umbrella
+        ``block_code`` without a typed ``sub_block_code``, the helper now
+        returns ``None`` so the downstream ``or fallback`` short-circuit
+        decides the recovery copy.  The three legacy substring probes
+        (``"私有 WS"`` / ``"公共 WS"`` / ``"运行线程"``) are no longer consulted.
+        """
+
         from models import RISK_REASON_RUNTIME_UNAVAILABLE  # noqa: PLC0415
 
-        # No ``sub_block_code`` kwarg — the substring probe still classifies
-        # the detail so unconverted callers (audit records) stay functional.
-        result_private = control_main._build_execution_preview_recommended_action(
+        for detail in (
             "私有 WS 下单链路未就绪，请先恢复连接。",
-            block_code=RISK_REASON_RUNTIME_UNAVAILABLE,
-        )
-        self.assertIsNotNone(result_private)
-        result_public = control_main._build_execution_preview_recommended_action(
             "公共 WS 行情已断线，请先恢复连接。",
-            block_code=RISK_REASON_RUNTIME_UNAVAILABLE,
-        )
-        self.assertIsNotNone(result_public)
-        result_worker = control_main._build_execution_preview_recommended_action(
             "当前策略运行线程已停滞，请先在设置页恢复运行线程。",
-            block_code=RISK_REASON_RUNTIME_UNAVAILABLE,
-        )
-        self.assertEqual(
-            result_worker,
-            "打开设置页点击“恢复运行线程”，并确认最近审计日志与最新信号。",
-        )
+        ):
+            result = control_main._build_execution_preview_recommended_action(
+                detail,
+                block_code=RISK_REASON_RUNTIME_UNAVAILABLE,
+            )
+            self.assertIsNone(
+                result,
+                msg=f"unexpected recommendation for detail {detail!r} after R88 substring removal",
+            )
 
     def test_blocked_strategy_execution_preview_surfaces_sub_block_code(self) -> None:
         from models import (  # noqa: PLC0415
@@ -24657,6 +24680,159 @@ class InsufficientBalanceMarketSubstringRemovalRound87Tests(unittest.TestCase):
         assert result is not None
         self.assertIn("UNIFIED 账户可用余额", result)
         self.assertNotIn("可用保证金", result)
+
+
+class RuntimeUnavailableUmbrellaSubstringRemovalRound88Tests(unittest.TestCase):
+    """Round 88 — the ``"私有 WS"`` / ``"公共 WS"`` / ``"运行线程"`` substring
+    fallback inside the ``RISK_REASON_RUNTIME_UNAVAILABLE`` branch of
+    ``_build_execution_preview_recommended_action`` has been deleted.  Every
+    in-tree caller either:
+
+    (a) threads ``sub_block_code=`` from the preview-builder source
+        (``StrategyExecutionChannelOutageError`` carries ``channel=`` which
+        maps to the RUNTIME_UNAVAILABLE_{PRIVATE,PUBLIC}_CHANNEL sub-codes,
+        and the runtime-worker pre-flights pass
+        ``RISK_REASON_RUNTIME_UNAVAILABLE_WORKER_THREAD`` explicitly), or
+    (b) lands in one of the two ``_record_strategy_{auto_dispatch,manual_execution}_issue``
+        record helpers, which now auto-derive ``sub_block_code`` from the
+        detail's channel-outage tokens via ``_derive_sub_block_code_from_detail``
+        when the caller omits it.
+
+    The umbrella branch therefore only sees callers that intentionally want
+    the ``None`` fallback (the ``or item.next_action`` / ``or fallback_action``
+    short-circuit decides the copy).  This round deletes the substring probe
+    and pins the removal with four observable invariants.
+
+    Invariants pinned:
+
+    1. ``_derive_sub_block_code_from_detail`` classifies ``"私有 WS"`` details
+       onto :data:`RISK_REASON_RUNTIME_UNAVAILABLE_PRIVATE_CHANNEL`.
+    2. Same for ``"公共 WS"`` → :data:`RISK_REASON_RUNTIME_UNAVAILABLE_PUBLIC_CHANNEL`.
+    3. ``"运行线程"`` token is NOT auto-derived (returns ``None``): the
+       canonical emitter already passes ``RISK_REASON_RUNTIME_UNAVAILABLE_WORKER_THREAD``
+       explicitly (R84), and we intentionally keep this helper narrow so a
+       bare worker-thread string does not accidentally flip to a channel copy.
+    4. ``_record_strategy_auto_dispatch_issue`` without an explicit
+       ``sub_block_code`` produces the typed private-channel recovery copy
+       when the detail carries ``"私有 WS"`` — proves the auto-derivation
+       path is wired end-to-end so the umbrella substring probe is truly
+       unreachable.
+    """
+
+    def setUp(self) -> None:
+        self._account_patch = patch.object(
+            control_main, "_resolve_private_account_type_label", return_value="UNIFIED"
+        )
+        self._account_patch.start()
+        self.addCleanup(self._account_patch.stop)
+
+    def test_derive_sub_block_code_maps_private_channel_token(self) -> None:
+        from models import RISK_REASON_RUNTIME_UNAVAILABLE_PRIVATE_CHANNEL  # noqa: PLC0415
+
+        self.assertEqual(
+            control_main._derive_sub_block_code_from_detail(
+                "私有 WS 下单链路未就绪，请先恢复连接。"
+            ),
+            RISK_REASON_RUNTIME_UNAVAILABLE_PRIVATE_CHANNEL,
+        )
+
+    def test_derive_sub_block_code_maps_public_channel_token(self) -> None:
+        from models import RISK_REASON_RUNTIME_UNAVAILABLE_PUBLIC_CHANNEL  # noqa: PLC0415
+
+        self.assertEqual(
+            control_main._derive_sub_block_code_from_detail(
+                "公共 WS 行情已断线，请先恢复连接。"
+            ),
+            RISK_REASON_RUNTIME_UNAVAILABLE_PUBLIC_CHANNEL,
+        )
+
+    def test_derive_sub_block_code_does_not_classify_worker_thread_token(self) -> None:
+        # Worker-thread blocks are raised from in-tree callers that always
+        # pass ``sub_block_code=RISK_REASON_RUNTIME_UNAVAILABLE_WORKER_THREAD``
+        # explicitly (R84).  The helper stays narrow on purpose.
+        self.assertIsNone(
+            control_main._derive_sub_block_code_from_detail(
+                "当前策略运行线程已停滞，请先在设置页恢复运行线程。"
+            )
+        )
+
+    def test_derive_sub_block_code_handles_empty_detail(self) -> None:
+        self.assertIsNone(control_main._derive_sub_block_code_from_detail(None))
+        self.assertIsNone(control_main._derive_sub_block_code_from_detail(""))
+
+    def test_auto_dispatch_record_auto_derives_sub_block_code_from_private_ws_token(self) -> None:
+        captured: Dict[str, Optional[str]] = {}
+
+        def _fake_upsert(
+            *,
+            rule_key: str,
+            severity: str,
+            symbol: str,
+            title: str,
+            description: str,
+            suggested_action: Optional[str],
+            strategy_id: Optional[str],
+            reason_code: Optional[str],
+        ) -> bool:
+            captured["suggested_action"] = suggested_action
+            return False
+
+        with patch.object(control_main.repo, "_upsert_system_alert_locked", side_effect=_fake_upsert), patch.object(control_main.repo, "_refresh_derived_state"), patch.object(control_main.repo, "_persist"):
+            # Caller intentionally omits ``sub_block_code`` — the record helper
+            # must auto-derive it from the detail so the typed private-channel
+            # recovery copy still fires without the umbrella substring probe.
+            control_main._record_strategy_auto_dispatch_issue(
+                "strategy-auto-private-outage",
+                "Swing BTC",
+                "BTCUSDT",
+                "long",
+                AccountMode.LIVE,
+                "当前 Bybit 私有 WS 未连通，请先恢复连接。",
+            )
+        self.assertIsNotNone(captured["suggested_action"])
+        # The typed private-channel recommender copy is the authoritative
+        # proof that auto-derivation ran: if the umbrella substring probe had
+        # been the provider, this test would continue to pass after R88,
+        # masking the deletion.  Compare against the typed builder directly.
+        self.assertEqual(
+            captured["suggested_action"],
+            control_main._build_private_execution_channel_recommended_action(
+                "当前 Bybit 私有 WS 未连通，请先恢复连接。"
+            ),
+        )
+
+    def test_manual_execution_record_auto_derives_sub_block_code_from_public_ws_token(self) -> None:
+        captured: Dict[str, Optional[str]] = {}
+
+        def _fake_upsert(
+            *,
+            rule_key: str,
+            severity: str,
+            symbol: str,
+            title: str,
+            description: str,
+            suggested_action: Optional[str],
+            strategy_id: Optional[str],
+            reason_code: Optional[str],
+        ) -> bool:
+            captured["suggested_action"] = suggested_action
+            return False
+
+        with patch.object(control_main.repo, "_upsert_system_alert_locked", side_effect=_fake_upsert), patch.object(control_main.repo, "_refresh_derived_state"), patch.object(control_main.repo, "_persist"):
+            control_main._record_strategy_manual_execution_issue(
+                "strategy-manual-public-outage",
+                "Swing BTC",
+                "BTCUSDT",
+                AccountMode.LIVE,
+                "当前 Bybit 公共 WS 行情已断线，请先恢复连接。",
+            )
+        self.assertIsNotNone(captured["suggested_action"])
+        self.assertEqual(
+            captured["suggested_action"],
+            control_main._build_public_execution_channel_recommended_action(
+                "当前 Bybit 公共 WS 行情已断线，请先恢复连接。"
+            ),
+        )
 
 
 class AlertSubBlockCodeMappingRound85Tests(unittest.TestCase):
