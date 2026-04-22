@@ -23076,5 +23076,281 @@ class AutoDispatchGateReasonContextTypedReturnRound75Tests(unittest.TestCase):
         self.assertIn("私有 WS", context.detail)
 
 
+class AlertRecordTypedReasonCodeRound76Tests(unittest.TestCase):
+    """Round 76 — ``AlertRecord`` now carries a typed ``reason_code`` that
+    alert emitters populate at source and consumers read directly, replacing
+    the historical substring probe ``"私有 WS" in alert.description`` /
+    ``"公共 WS" in alert.description`` in the runtime-snapshot decoration.
+
+    Six invariants pinned:
+
+    1. ``_classify_strategy_auto_dispatch_alert_kind`` maps a private-WS
+       detail to :data:`AUTO_DISPATCH_GATE_REASON_PRIVATE_CHANNEL_OUTAGE`.
+    2. ``_classify_strategy_auto_dispatch_alert_kind`` maps a public-WS
+       detail to :data:`AUTO_DISPATCH_GATE_REASON_PUBLIC_CHANNEL_OUTAGE`.
+    3. ``_classify_strategy_auto_dispatch_alert_kind`` returns ``None`` for
+       an unrelated detail so the caller can skip tagging the alert.
+    4. ``_record_strategy_auto_dispatch_issue`` with an explicit
+       ``reason_code`` kwarg tags the emitted ``AlertRecord.reason_code``
+       without re-classifying the free-form detail.
+    5. ``_evaluate_strategy_auto_dispatch_gate`` surfaces the typed
+       ``sub_reason_code`` on the gate when the channel-gate branch fires,
+       so the caller can thread it into ``_record_strategy_auto_dispatch_issue``.
+    6. ``_decorate_strategy_runtime_item`` branches on the typed
+       ``alert.reason_code`` (not ``alert.description``) — an alert tagged
+       as a private-channel outage drives the private-channel recommendation
+       even if the description does not mention ``"私有 WS"`` verbatim.
+    """
+
+    def test_classifier_maps_private_ws_detail_to_private_outage_code(self) -> None:
+        from models import AUTO_DISPATCH_GATE_REASON_PRIVATE_CHANNEL_OUTAGE  # noqa: PLC0415
+
+        self.assertEqual(
+            control_main._classify_strategy_auto_dispatch_alert_kind(
+                "当前 Bybit 私有 WS 未连通，无法安全执行真实策略委托。"
+            ),
+            AUTO_DISPATCH_GATE_REASON_PRIVATE_CHANNEL_OUTAGE,
+        )
+
+    def test_classifier_maps_public_ws_detail_to_public_outage_code(self) -> None:
+        from models import AUTO_DISPATCH_GATE_REASON_PUBLIC_CHANNEL_OUTAGE  # noqa: PLC0415
+
+        self.assertEqual(
+            control_main._classify_strategy_auto_dispatch_alert_kind(
+                "当前 Bybit 公共 WS 行情断线，公共实时链路暂停。"
+            ),
+            AUTO_DISPATCH_GATE_REASON_PUBLIC_CHANNEL_OUTAGE,
+        )
+
+    def test_classifier_returns_none_for_unrelated_detail(self) -> None:
+        self.assertIsNone(
+            control_main._classify_strategy_auto_dispatch_alert_kind(
+                "当前 Bybit 可用余额不足，按该价格提交本次买入约需 1,014.87 USDT。"
+            )
+        )
+        self.assertIsNone(control_main._classify_strategy_auto_dispatch_alert_kind(""))
+        self.assertIsNone(control_main._classify_strategy_auto_dispatch_alert_kind(None))
+
+    def test_record_auto_dispatch_issue_tags_alert_with_explicit_reason_code(self) -> None:
+        from models import AUTO_DISPATCH_GATE_REASON_PRIVATE_CHANNEL_OUTAGE  # noqa: PLC0415
+
+        control_main.repo.state.alerts = []
+        try:
+            control_main._record_strategy_auto_dispatch_issue(
+                "trend-btc-01",
+                "BTC 趋势跟随",
+                "BTCUSDT",
+                "long",
+                AccountMode.LIVE,
+                # Intentionally omit any WS token so the explicit kwarg is the
+                # only source of the typed classification — pins that an
+                # explicit ``reason_code`` overrides the detail-based fallback.
+                "regression: typed reason_code overrides detail classification",
+                reason_code=AUTO_DISPATCH_GATE_REASON_PRIVATE_CHANNEL_OUTAGE,
+            )
+
+            alert = next(
+                (
+                    entry
+                    for entry in control_main.repo.state.alerts
+                    if str(getattr(entry, "rule_key", None) or "").startswith(
+                        "strategy-auto-dispatch:trend-btc-01:"
+                    )
+                ),
+                None,
+            )
+            self.assertIsNotNone(alert)
+            assert alert is not None
+            self.assertEqual(alert.reason_code, AUTO_DISPATCH_GATE_REASON_PRIVATE_CHANNEL_OUTAGE)
+        finally:
+            control_main.repo.state.alerts = []
+
+    def test_gate_surfaces_sub_reason_code_on_channel_outage_branch(self) -> None:
+        from contextlib import ExitStack  # noqa: PLC0415
+        from models import (  # noqa: PLC0415
+            AUTO_DISPATCH_GATE_REASON_PRIVATE_CHANNEL_OUTAGE,
+            AutoDispatchGateReasonContext,
+        )
+
+        strategy = MagicMock(
+            id="trend-btc-01",
+            mode=AccountMode.LIVE,
+            symbols=["BTCUSDT"],
+            status="running",
+        )
+        snapshot = StrategyRuntimeSnapshot(
+            strategy_id="trend-btc-01",
+            strategy_name="BTC 趋势跟随",
+            symbol="BTCUSDT",
+            market="perp",
+            mode=AccountMode.LIVE,
+            runtime_status="running",
+            signal="long",
+            confidence=42.0,
+            last_price=66800.0,
+            reference_price=66720.0,
+            change_24h=0.6,
+            note="",
+            next_action="",
+            last_evaluated_at="2026-04-22T00:00:00+08:00",
+        )
+
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(
+                control_main,
+                "_strategy_live_stop_loss_cooldown_remaining_minutes",
+                return_value=None,
+            ))
+            stack.enter_context(patch.object(
+                control_main,
+                "_has_active_strategy_live_stop_loss_alert",
+                return_value=False,
+            ))
+            stack.enter_context(patch.object(
+                control_main,
+                "_strategy_exchange_rejection_guard_remaining_minutes",
+                return_value=None,
+            ))
+            stack.enter_context(patch.object(
+                control_main,
+                "_strategy_auto_dispatch_gate_reason",
+                return_value=AutoDispatchGateReasonContext(
+                    reason_code=AUTO_DISPATCH_GATE_REASON_PRIVATE_CHANNEL_OUTAGE,
+                    detail="当前 Bybit 私有 WS 未连通，无法安全执行真实策略委托。",
+                    cancel_existing=True,
+                ),
+            ))
+            gate = control_main._evaluate_strategy_auto_dispatch_gate(strategy, snapshot)
+
+        self.assertEqual(gate.verdict, "block")
+        self.assertEqual(gate.reason_code, "auto.scheduler_or_channel_gate")
+        self.assertEqual(gate.sub_reason_code, AUTO_DISPATCH_GATE_REASON_PRIVATE_CHANNEL_OUTAGE)
+        self.assertTrue(gate.record_issue)
+
+    def test_runtime_decoration_branches_on_typed_reason_code_not_description(self) -> None:
+        """The consumer must pick the private-channel recommendation path when
+        ``alert.reason_code == AUTO_DISPATCH_GATE_REASON_PRIVATE_CHANNEL_OUTAGE``
+        even if ``alert.description`` does not contain the legacy ``"私有 WS"``
+        substring — this pins that R76's typed branch is the only source of
+        truth.  An alert with ``reason_code=None`` must fall back to the
+        generic default copy (no channel-specific recommendation).
+        """
+
+        from models import (  # noqa: PLC0415
+            AUTO_DISPATCH_GATE_REASON_PRIVATE_CHANNEL_OUTAGE,
+        )
+
+        alert_description = (
+            "BTC 趋势跟随 在 LIVE 自动执行时被阻断。实时链路降级已触发。"
+        )
+        typed_alert = AlertRecord(
+            id="alert-system-r76a",
+            severity="P1",
+            symbol="BTCUSDT",
+            title="BTCUSDT 自动执行被拦截",
+            description=alert_description,
+            triggered_at="2026-04-22T00:00:00+08:00",
+            suggested_action="",  # force the consumer to fall back to the builder.
+            acknowledged=False,
+            source_type="system",
+            rule_key="strategy-auto-dispatch:trend-btc-01:long:live",
+            reason_code=AUTO_DISPATCH_GATE_REASON_PRIVATE_CHANNEL_OUTAGE,
+        )
+        untyped_alert = AlertRecord(
+            id="alert-system-r76b",
+            severity="P1",
+            symbol="ETHUSDT",
+            title="ETHUSDT 自动执行被拦截",
+            description="ETH 趋势跟随 在 LIVE 自动执行时被阻断。现货可用数量不足。",
+            triggered_at="2026-04-22T00:00:00+08:00",
+            suggested_action="",
+            acknowledged=False,
+            source_type="system",
+            rule_key="strategy-auto-dispatch:trend-eth-01:long:live",
+            reason_code=None,
+        )
+
+        original_alerts = list(control_main.repo.state.alerts)
+        control_main.repo.state.alerts = [typed_alert, untyped_alert]
+        try:
+            typed_snapshot = StrategyRuntimeSnapshot(
+                strategy_id="trend-btc-01",
+                strategy_name="BTC 趋势跟随",
+                symbol="BTCUSDT",
+                market="perp",
+                mode=AccountMode.LIVE,
+                runtime_status="running",
+                signal="long",
+                confidence=42.0,
+                last_price=66800.0,
+                reference_price=66720.0,
+                change_24h=0.6,
+                note="",
+                next_action="",
+                last_evaluated_at="2026-04-22T00:00:00+08:00",
+            )
+            untyped_snapshot = typed_snapshot.model_copy(
+                update={
+                    "strategy_id": "trend-eth-01",
+                    "strategy_name": "ETH 趋势跟随",
+                    "symbol": "ETHUSDT",
+                }
+            )
+
+            with patch.object(
+                control_main,
+                "_has_active_strategy_live_stop_loss_alert",
+                return_value=False,
+            ), patch.object(
+                control_main,
+                "_strategy_live_stop_loss_cooldown_remaining_minutes",
+                return_value=None,
+            ), patch.object(
+                control_main,
+                "_strategy_exchange_rejection_guard_remaining_minutes",
+                return_value=None,
+            ), patch.object(
+                control_main,
+                "_has_active_strategy_auto_dispatch_alert",
+                return_value=True,
+            ), patch.object(
+                control_main,
+                "get_public_execution_channel_issue",
+                return_value=None,
+            ), patch.object(
+                control_main,
+                "get_private_execution_channel_issue",
+                return_value=None,
+            ):
+                typed_decorated = control_main._decorate_strategy_runtime_item(typed_snapshot)
+                untyped_decorated = control_main._decorate_strategy_runtime_item(untyped_snapshot)
+
+            # Typed private-channel-outage alert → consumer copies the alert
+            # description into the guard detail and builds the
+            # private-channel recommended action even though the description
+            # does not literally contain "私有 WS".
+            self.assertEqual(typed_decorated.guard_state, "auto_dispatch_blocked")
+            self.assertEqual(typed_decorated.guard_detail, alert_description)
+            self.assertEqual(typed_decorated.note, alert_description)
+            private_recommendation = (
+                control_main._build_private_execution_channel_recommended_action(alert_description)
+            )
+            self.assertEqual(typed_decorated.next_action, private_recommendation)
+
+            # Untyped alert → consumer falls back to the default copy (no
+            # private / public specific recommendation leaked through).
+            self.assertEqual(untyped_decorated.guard_state, "auto_dispatch_blocked")
+            self.assertEqual(
+                untyped_decorated.guard_detail,
+                "当前自动执行被系统拦截，请先查看执行预检和当前委托。",
+            )
+            self.assertEqual(
+                untyped_decorated.next_action,
+                "必要时进入人工接管，确认处理完成后再恢复自动执行。",
+            )
+        finally:
+            control_main.repo.state.alerts = original_alerts
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

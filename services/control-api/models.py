@@ -1193,6 +1193,12 @@ class AlertRecord(BaseModel):
     rule_key: Optional[str] = None
     trigger_value: Optional[float] = None
     threshold_value: Optional[float] = None
+    # Round 76 — typed discriminator set by the alert emitter (e.g.
+    # ``AUTO_DISPATCH_GATE_REASON_PRIVATE_CHANNEL_OUTAGE``, a
+    # ``RISK_REASON_*`` code, or any other stable machine-readable tag).
+    # Consumers that need to branch on "what kind of alert is this" should
+    # inspect this field instead of substring-probing ``description``.
+    reason_code: Optional[str] = None
 
 
 class AlertRule(BaseModel):
@@ -1530,6 +1536,13 @@ class AutoDispatchGate(BaseModel):
     cancel_existing_orders: bool = False
     clear_alerts: bool = False
     record_issue: bool = False
+    # Round 76 — finer-grained discriminator surfaced when ``reason_code`` is
+    # the umbrella ``auto.scheduler_or_channel_gate``; carries the typed
+    # ``AutoDispatchGateReasonContext.reason_code`` (one of the
+    # ``AUTO_DISPATCH_GATE_REASON_*`` constants) so alert emitters can tag
+    # the resulting ``AlertRecord.reason_code`` without re-classifying the
+    # free-form ``reason_detail`` string.
+    sub_reason_code: Optional[str] = None
     timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 

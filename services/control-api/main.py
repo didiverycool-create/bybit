@@ -6419,6 +6419,31 @@ def _queue_strategy_issue_review_locked(
         source="mock-orchestrator",
     )
 
+def _classify_strategy_auto_dispatch_alert_kind(detail: Optional[str]) -> Optional[str]:
+    """Classify ``detail`` into the typed channel-outage reason code.
+
+    Round 76 — returns the typed ``AUTO_DISPATCH_GATE_REASON_*`` constant for
+    the two realtime-channel outage families that the runtime-snapshot
+    decoration (``_apply_strategy_auto_dispatch_alert_guard``) currently
+    distinguishes via substring matching on ``AlertRecord.description``.  The
+    helper centralises the probe so it only lives at the alert-emission
+    boundary; the consumer can then read ``alert.reason_code`` directly.
+
+    Returns ``None`` when no channel-outage hint is present, so the caller
+    leaves ``reason_code`` unset on the alert (callers that already know the
+    typed code — e.g. the gate path — pass it in explicitly and skip this
+    fallback).
+    """
+
+    if not detail:
+        return None
+    if "私有 WS" in detail or "私有实时链路" in detail:
+        return AUTO_DISPATCH_GATE_REASON_PRIVATE_CHANNEL_OUTAGE
+    if "公共 WS" in detail or "公共实时链路" in detail:
+        return AUTO_DISPATCH_GATE_REASON_PUBLIC_CHANNEL_OUTAGE
+    return None
+
+
 def _record_strategy_auto_dispatch_issue(
     strategy_id: str,
     strategy_name: str,
@@ -6429,12 +6454,17 @@ def _record_strategy_auto_dispatch_issue(
     recommended_action: Optional[str] = None,
     *,
     strategy: Optional[StrategySummary] = None,
+    reason_code: Optional[str] = None,
 ) -> None:
     rule_key = f"strategy-auto-dispatch:{strategy_id}:{signal}:{mode.value}"
     suggested_action = recommended_action or _build_auto_dispatch_recommended_action(detail)
     parameter_snapshot = (
         parameter_resolver.snapshot_parameters(strategy) if strategy is not None else None
     )
+    # Round 76 — explicit ``reason_code`` from a caller that already has the
+    # typed discriminator (e.g. ``AutoDispatchGate.sub_reason_code``) takes
+    # precedence over the detail-based classifier fallback.
+    resolved_reason_code = reason_code or _classify_strategy_auto_dispatch_alert_kind(detail)
     with repo._lock:  # type: ignore[attr-defined]
         changed = repo._upsert_system_alert_locked(  # type: ignore[attr-defined]
             rule_key=rule_key,
@@ -6444,6 +6474,7 @@ def _record_strategy_auto_dispatch_issue(
             description=f"{strategy_name} 在 {mode.value.upper()} 自动执行时被阻断。{detail}",
             suggested_action=suggested_action,
             strategy_id=strategy_id,
+            reason_code=resolved_reason_code,
         )
         if changed:
             _queue_strategy_issue_review_locked(
@@ -6501,6 +6532,9 @@ def _record_strategy_manual_execution_issue(
     # ``derive_block_reason_code`` at emit time.
     resolved_reason_code = reason_code or derive_block_reason_code(detail)
     with repo._lock:  # type: ignore[attr-defined]
+        # Round 76 — propagate the typed reason code onto the emitted
+        # ``AlertRecord`` so downstream consumers can branch on
+        # ``alert.reason_code`` without re-deriving it from the description.
         changed = repo._upsert_system_alert_locked(  # type: ignore[attr-defined]
             rule_key=rule_key,
             severity="P1",
@@ -6509,6 +6543,7 @@ def _record_strategy_manual_execution_issue(
             description=f"{strategy_name} 在 {mode.value.upper()} 手动执行时被阻断。{detail}",
             suggested_action=suggested_action,
             strategy_id=strategy_id,
+            reason_code=resolved_reason_code,
         )
         repo.add_event(
             event_type="strategy.execution.blocked",
@@ -7509,6 +7544,9 @@ def _evaluate_strategy_auto_dispatch_gate(
         # ``reason_code`` remains ``auto.scheduler_or_channel_gate`` so the
         # ``AutoDispatchGate`` API surface is unchanged; finer-grained
         # sub-classification is carried on ``gate_reason_context.reason_code``.
+        # Round 76 — surface the typed sub-reason on the gate so the alert
+        # emitter can tag ``AlertRecord.reason_code`` without re-classifying
+        # the free-form detail.
         return AutoDispatchGate(
             verdict="block",
             reason_code="auto.scheduler_or_channel_gate",
@@ -7516,6 +7554,7 @@ def _evaluate_strategy_auto_dispatch_gate(
             cancel_existing_orders=gate_reason_context.cancel_existing,
             clear_alerts=False,
             record_issue=True,
+            sub_reason_code=gate_reason_context.reason_code,
         )
     if snapshot.runtime_status != "running":
         return AutoDispatchGate(
@@ -7562,6 +7601,10 @@ def _auto_dispatch_strategy_signal_changes(
             if gate.clear_alerts:
                 _clear_strategy_auto_dispatch_alerts(snapshot.strategy_id)
             if gate.record_issue:
+                # Round 76 — the typed ``sub_reason_code`` (one of the
+                # ``AUTO_DISPATCH_GATE_REASON_*`` constants) flows through to
+                # the emitted ``AlertRecord.reason_code`` so the
+                # runtime-snapshot decoration can branch on it directly.
                 _record_strategy_auto_dispatch_issue(
                     snapshot.strategy_id,
                     snapshot.strategy_name,
@@ -7570,6 +7613,7 @@ def _auto_dispatch_strategy_signal_changes(
                     strategy.mode,
                     gate.reason_detail,
                     strategy=strategy,
+                    reason_code=gate.sub_reason_code,
                 )
             continue
         active_order_count, active_order = _build_strategy_active_order_summary(
@@ -7976,10 +8020,15 @@ def _decorate_strategy_runtime_item(item: StrategyRuntimeSnapshot) -> StrategyRu
         alert = _find_latest_active_system_alert_by_prefix(state, f"strategy-auto-dispatch:{item.strategy_id}:")
         detail = "当前自动执行被系统拦截，请先查看执行预检和当前委托。"
         next_action = "必要时进入人工接管，确认处理完成后再恢复自动执行。"
-        if alert is not None and "私有 WS" in alert.description:
+        # Round 76 — branch on the typed ``AlertRecord.reason_code``
+        # (populated by ``_record_strategy_auto_dispatch_issue`` via the gate
+        # path's ``sub_reason_code`` or the detail-based classifier fallback)
+        # instead of substring-probing ``alert.description`` for ``"私有 WS"``
+        # / ``"公共 WS"`` / ``"公共实时链路"``.
+        if alert is not None and alert.reason_code == AUTO_DISPATCH_GATE_REASON_PRIVATE_CHANNEL_OUTAGE:
             detail = alert.description
             next_action = alert.suggested_action or _build_private_execution_channel_recommended_action(alert.description)
-        elif alert is not None and ("公共 WS" in alert.description or "公共实时链路" in alert.description):
+        elif alert is not None and alert.reason_code == AUTO_DISPATCH_GATE_REASON_PUBLIC_CHANNEL_OUTAGE:
             detail = alert.description
             next_action = alert.suggested_action or _build_public_execution_channel_recommended_action(alert.description)
         return item.model_copy(
