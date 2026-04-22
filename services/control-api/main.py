@@ -1983,14 +1983,21 @@ def _collect_dynamic_auto_dispatch_blocked_contexts(state: Any) -> List[Dict[str
             preview = _build_strategy_execution_preview_from_state(strategy.id, strategy.mode)
         except (RuntimeError, ValueError, KeyError):
             continue
-        if preview.allowed or not preview.blocked_reason:
+        # Round 65 — route the ``is blocked?`` decision through the typed
+        # ``RiskDecision`` wrapper instead of re-reading ``preview.allowed`` /
+        # ``preview.blocked_reason`` directly.  The ``not preview.blocked_reason``
+        # short-circuit is preserved so defensive ``allowed=False`` + empty-reason
+        # previews still get filtered out rather than surfaced with the
+        # decision's default fallback detail.
+        decision = evaluate_risk_decision(preview)
+        if decision.verdict != "block" or not preview.blocked_reason:
             continue
         contexts.append(
             _build_execution_issue_strategy_context(
                 state,
                 strategy.id,
                 symbol=strategy.symbols[0] if strategy.symbols else None,
-                detail=preview.blocked_reason,
+                detail=decision.reason_detail,
                 recommended_action=preview.recommended_action,
             )
         )
@@ -8644,11 +8651,19 @@ def _apply_runtime_blocked_preview_context(
     item: StrategyRuntimeSnapshot,
     preview: Optional[ExecutionPreview],
 ) -> StrategyRuntimeSnapshot:
-    if preview is None or preview.allowed or not preview.blocked_reason:
+    if preview is None:
+        return item
+    # Round 65 — route the blocked-preview decoration through the typed
+    # ``RiskDecision`` wrapper so ``guard_detail`` / ``note`` come from
+    # ``decision.reason_detail`` rather than the raw ``preview.blocked_reason``.
+    # The ``not preview.blocked_reason`` short-circuit is preserved so the
+    # defensive ``allowed=False`` + empty-reason edge case still short-circuits.
+    decision = evaluate_risk_decision(preview)
+    if decision.verdict != "block" or not preview.blocked_reason:
         return item
     update: Dict[str, Any] = {
-        "guard_detail": preview.blocked_reason,
-        "note": preview.blocked_reason,
+        "guard_detail": decision.reason_detail,
+        "note": decision.reason_detail,
         "next_action": preview.recommended_action or item.next_action,
     }
     if item.guard_state == "none":
