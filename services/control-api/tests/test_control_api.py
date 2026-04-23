@@ -25568,5 +25568,206 @@ class OutcomeRecordTypedExcAttrsRound92Tests(unittest.TestCase):
         self.assertIsNone(kwargs.get("reason_code"))
 
 
+class PaperOrderTypedReasonCodeRound93Tests(unittest.TestCase):
+    """Round 93 — ``repository.AppRepository.create_paper_order`` and
+    :meth:`replace_paper_order` used to emit the ``risk.blocked_order`` audit
+    event with ``reason_code=block_code or derive_block_reason_code(detail)``.
+    Since R70 the risk-guard source (``evaluate_paper_order_risk`` +
+    :meth:`_evaluate_paper_order_risk_locked`) always returns a typed
+    ``block_code`` alongside a non-None ``blocked_reason`` (three branches:
+    ``RISK_REASON_INVALID_REQUEST`` / ``RISK_REASON_INSUFFICIENT_BALANCE`` /
+    ``RISK_REASON_INSUFFICIENT_INVENTORY``), so the ``or
+    derive_block_reason_code(...)`` fallback never fired in production.
+    R93 deletes that dead fallback — the audit ``reason_code`` is now read
+    directly from the typed ``block_code``.
+    Invariants pinned:
+    1. ``create_paper_order`` — when the risk guard returns ``(reason,
+       typed_code)``, the ``risk.blocked_order`` event's ``reason_code`` is
+       exactly ``typed_code`` (even if ``derive_block_reason_code(reason)``
+       would have classified the free-form string differently).
+    2. Same for ``replace_paper_order``.
+    3. Real end-to-end flow: an oversized BUY against the paper starting
+       cash produces an event whose ``reason_code`` matches
+       :data:`RISK_REASON_INSUFFICIENT_BALANCE` without running the
+       substring probe at all (asserted by choosing a reason string that
+       would have probed to ``PREVIEW_BLOCKED``).
+    """
+
+    def setUp(self) -> None:
+        import tempfile  # noqa: PLC0415
+        from pathlib import Path  # noqa: PLC0415
+        from repository import AppRepository  # noqa: PLC0415
+
+        self._tmp_dir = tempfile.mkdtemp(prefix="r93-paper-order-")
+        state_path = Path(self._tmp_dir) / "state.json"
+        self._repo = AppRepository(state_path)
+
+    def tearDown(self) -> None:
+        import shutil  # noqa: PLC0415
+
+        shutil.rmtree(self._tmp_dir, ignore_errors=True)
+
+    def _latest_blocked_event(self):
+        for event in self._repo.state.audit_events:
+            if event.event_type == "risk.blocked_order":
+                return event
+        self.fail("expected a risk.blocked_order event to be recorded")
+
+    def _make_payload(self):
+        from models import ManualOrderRequest  # noqa: PLC0415
+
+        return ManualOrderRequest(
+            symbol="BTCUSDT",
+            market="perp",
+            mode=AccountMode.PAPER,
+            side=Direction.BUY,
+            quantity=1.0,
+            price=65_000.0,
+            note="r93-harness",
+        )
+
+    def test_create_paper_order_typed_block_code_flows_directly_to_event_reason_code(
+        self,
+    ) -> None:
+        from models import (  # noqa: PLC0415
+            RISK_REASON_EXCHANGE_CONSTRAINT,
+            RISK_REASON_INSUFFICIENT_BALANCE,
+            RISK_REASON_INSUFFICIENT_INVENTORY,
+            RISK_REASON_INVALID_REQUEST,
+        )
+
+        cases = [
+            # Reason strings that the substring probe would map to a
+            # DIFFERENT code (or to the generic fallback) — this guarantees
+            # the event's ``reason_code`` is the typed ``block_code`` rather
+            # than the substring-probe derivation.
+            ("probe-would-return-fallback", RISK_REASON_INVALID_REQUEST),
+            ("probe-would-return-fallback", RISK_REASON_INSUFFICIENT_BALANCE),
+            ("probe-would-return-fallback", RISK_REASON_INSUFFICIENT_INVENTORY),
+            # Sanity: exchange-constraint code still flows through cleanly.
+            ("probe-would-return-fallback", RISK_REASON_EXCHANGE_CONSTRAINT),
+        ]
+        for detail, typed_code in cases:
+            with self.subTest(typed_code=typed_code):
+                self._repo.state.audit_events.clear()
+                with patch.object(
+                    self._repo,
+                    "_evaluate_paper_order_risk_locked",
+                    return_value=(detail, typed_code),
+                ):
+                    with self.assertRaises(ValueError):
+                        self._repo.create_paper_order(self._make_payload())
+                event = self._latest_blocked_event()
+                self.assertEqual(event.payload["reason_code"], typed_code)
+                self.assertEqual(event.payload["reason"], detail)
+                self.assertEqual(event.payload["stage"], "paper_order_create")
+
+    def test_replace_paper_order_typed_block_code_flows_directly_to_event_reason_code(
+        self,
+    ) -> None:
+        from models import (  # noqa: PLC0415
+            RISK_REASON_EXCHANGE_CONSTRAINT,
+            RISK_REASON_INSUFFICIENT_BALANCE,
+            RISK_REASON_INSUFFICIENT_INVENTORY,
+            RISK_REASON_INVALID_REQUEST,
+        )
+
+        # Seed a resting order so ``replace_paper_order`` has a target.
+        with patch.object(
+            self._repo,
+            "_evaluate_paper_order_risk_locked",
+            return_value=(None, None),
+        ):
+            seeded = self._repo.create_paper_order(self._make_payload())
+        cases = [
+            ("probe-would-return-fallback", RISK_REASON_INVALID_REQUEST),
+            ("probe-would-return-fallback", RISK_REASON_INSUFFICIENT_BALANCE),
+            ("probe-would-return-fallback", RISK_REASON_INSUFFICIENT_INVENTORY),
+            ("probe-would-return-fallback", RISK_REASON_EXCHANGE_CONSTRAINT),
+        ]
+        for detail, typed_code in cases:
+            with self.subTest(typed_code=typed_code):
+                self._repo.state.audit_events.clear()
+                with patch.object(
+                    self._repo,
+                    "_evaluate_paper_order_risk_locked",
+                    return_value=(detail, typed_code),
+                ):
+                    with self.assertRaises(ValueError):
+                        self._repo.replace_paper_order(
+                            seeded.order_id,
+                            0.8,
+                            66_000.0,
+                            "r93-harness",
+                        )
+                event = self._latest_blocked_event()
+                self.assertEqual(event.payload["reason_code"], typed_code)
+                self.assertEqual(event.payload["reason"], detail)
+                self.assertEqual(event.payload["stage"], "paper_order_replace")
+
+    def test_create_paper_order_real_insufficient_balance_emits_typed_reason_code(
+        self,
+    ) -> None:
+        from models import (  # noqa: PLC0415
+            ManualOrderRequest,
+            RISK_REASON_INSUFFICIENT_BALANCE,
+        )
+
+        # Paper starting cash is 250_000 USDT; 10 BTC @ 65_000 = 650_000
+        # USDT, guaranteed to trip the insufficient-balance branch of
+        # ``evaluate_paper_order_risk``.
+        payload = ManualOrderRequest(
+            symbol="BTCUSDT",
+            market="perp",
+            mode=AccountMode.PAPER,
+            side=Direction.BUY,
+            quantity=10.0,
+            price=65_000.0,
+            note="r93-real-insufficient-balance",
+        )
+        with self.assertRaises(ValueError):
+            self._repo.create_paper_order(payload)
+        event = self._latest_blocked_event()
+        self.assertEqual(
+            event.payload["reason_code"], RISK_REASON_INSUFFICIENT_BALANCE
+        )
+        self.assertEqual(event.payload["stage"], "paper_order_create")
+
+    def test_replace_paper_order_real_insufficient_balance_emits_typed_reason_code(
+        self,
+    ) -> None:
+        from models import (  # noqa: PLC0415
+            ManualOrderRequest,
+            RISK_REASON_INSUFFICIENT_BALANCE,
+        )
+
+        # Seed a small order that fits inside the paper starting cash, then
+        # try to replace it with an oversized quantity that trips the
+        # insufficient-balance branch on the recheck.
+        seeded = self._repo.create_paper_order(
+            ManualOrderRequest(
+                symbol="BTCUSDT",
+                market="perp",
+                mode=AccountMode.PAPER,
+                side=Direction.BUY,
+                quantity=0.1,
+                price=65_000.0,
+                note="r93-real-seed",
+            )
+        )
+        with self.assertRaises(ValueError):
+            self._repo.replace_paper_order(
+                seeded.order_id,
+                10.0,
+                65_000.0,
+                "r93-harness",
+            )
+        event = self._latest_blocked_event()
+        self.assertEqual(
+            event.payload["reason_code"], RISK_REASON_INSUFFICIENT_BALANCE
+        )
+        self.assertEqual(event.payload["stage"], "paper_order_replace")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

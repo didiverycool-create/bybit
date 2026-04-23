@@ -62,7 +62,7 @@ from models import (
 )
 import parameter_resolver
 from datetime_utils import parse_optional_iso_datetime
-from risk_decision import derive_block_reason_code, evaluate_risk_decision
+from risk_decision import evaluate_risk_decision
 from risk_guards import evaluate_paper_order_risk
 from seed import build_market_detail_for_watchlist, build_state
 
@@ -4997,10 +4997,13 @@ class AppRepository:
             )
             if blocked_reason is not None:
                 # Round 70 — the typed ``reason_code`` is produced at the
-                # risk-guard source and no longer needs ``derive_block_reason_code``'s
-                # substring probe.  ``block_code`` may still be ``None`` for
-                # unclassified futures hints — fall back to the substring probe
-                # so audit consumers always see *some* typed code.
+                # risk-guard source.  Round 93 — ``evaluate_paper_order_risk``
+                # always returns a typed ``block_code`` when it returns a
+                # non-None ``blocked_reason`` (three branches: INVALID_REQUEST
+                # / INSUFFICIENT_BALANCE / INSUFFICIENT_INVENTORY), so the
+                # historical ``or derive_block_reason_code(...)`` fallback
+                # never fired — delete it so the audit reason_code comes
+                # from the typed source only.
                 self.add_event(
                     event_type="risk.blocked_order",
                     source="quant-core",
@@ -5013,7 +5016,7 @@ class AppRepository:
                         "quantity": payload.quantity,
                         "price": payload.price,
                         "reason": blocked_reason,
-                        "reason_code": block_code or derive_block_reason_code(blocked_reason),
+                        "reason_code": block_code,
                         "stage": "paper_order_create",
                     },
                     symbol=payload.symbol,
@@ -5092,9 +5095,14 @@ class AppRepository:
                 exclude_order_id=order_id,
             )
             if blocked_reason is not None:
-                # Round 70 — ``block_code`` originates at the risk-guard source;
-                # fall back to ``derive_block_reason_code`` only when the source
-                # could not classify the reason (never should happen today).
+                # Round 70 — the typed ``reason_code`` is produced at the
+                # risk-guard source.  Round 93 — ``evaluate_paper_order_risk``
+                # always returns a typed ``block_code`` when it returns a
+                # non-None ``blocked_reason`` (three branches: INVALID_REQUEST
+                # / INSUFFICIENT_BALANCE / INSUFFICIENT_INVENTORY), so the
+                # historical ``or derive_block_reason_code(...)`` fallback
+                # never fired — delete it so the audit reason_code comes
+                # from the typed source only.
                 self.add_event(
                     event_type="risk.blocked_order",
                     source="quant-core",
@@ -5108,7 +5116,7 @@ class AppRepository:
                         "quantity": quantity,
                         "price": price,
                         "reason": blocked_reason,
-                        "reason_code": block_code or derive_block_reason_code(blocked_reason),
+                        "reason_code": block_code,
                         "stage": "paper_order_replace",
                     },
                     symbol=order.symbol,
