@@ -26133,5 +26133,150 @@ class ChannelIssueKindTypedDispatchRound95Tests(unittest.TestCase):
         )
 
 
+class BlockedPreviewIssueKindRound96Tests(unittest.TestCase):
+    """Pins the R96 end-to-end ``issue_kind`` threading.
+
+    Prior to Round 96 the R95 typed ``channel_issue_kind`` was auto-classified
+    from ``detail`` inside ``_build_execution_preview_recommended_action``'s
+    sub_block_code branch.  R96 adds an ``issue_kind`` kwarg on
+    ``_build_blocked_strategy_execution_preview`` and
+    ``_build_execution_preview_recommended_action`` so the raise-site's
+    already-known ``StrategyExecutionChannelOutageError.issue_kind`` survives
+    end-to-end without re-parsing ``detail`` at the umbrella boundary.
+
+    The observable test strategy is to construct a ``detail`` whose auto-
+    classified kind differs from the explicitly-passed ``issue_kind`` — the
+    explicit kind must drive the recommender's output.
+    """
+
+    def _make_snapshot(self) -> "control_main.StrategyRuntimeSnapshot":  # type: ignore[name-defined]
+        return control_main.StrategyRuntimeSnapshot(
+            strategy_id="strat-r96",
+            strategy_name="R96 Test",
+            symbol="BTCUSDT",
+            market="perp",
+            mode=control_main.AccountMode.LIVE,
+            runtime_status="running",
+            signal="long",
+            last_price=10000.0,
+            reference_price=10000.0,
+            change_24h=0.0,
+            note="",
+            next_action="--",
+            last_evaluated_at=datetime.now(timezone.utc).isoformat(),
+            guard_state="none",
+            guard_detail=None,
+        )
+
+    def test_explicit_issue_kind_wins_over_detail_auto_classification(self) -> None:
+        snapshot = self._make_snapshot()
+        # ``detail`` contains the canonical ``"尚未收到"`` token which would
+        # auto-classify to NO_FEED.  We pass ``issue_kind=STALE`` explicitly
+        # and assert the STALE recovery copy wins — observable proof that the
+        # R96 explicit kwarg is the primary discriminator.
+        detail = "当前 Bybit 公共 WS 尚未收到 BTCUSDT 的实时行情"
+        preview = control_main._build_blocked_strategy_execution_preview(
+            snapshot,
+            control_main.AccountMode.LIVE,
+            detail,
+            block_code=control_main.RISK_REASON_RUNTIME_UNAVAILABLE,
+            sub_block_code=control_main.RISK_REASON_RUNTIME_UNAVAILABLE_PUBLIC_CHANNEL,
+            issue_kind=control_main.CHANNEL_ISSUE_KIND_STALE,
+        )
+        self.assertEqual(
+            preview.recommended_action,
+            "请先确认目标品种公共实时行情已经重新持续刷新，再恢复真实策略执行。",
+        )
+
+    def test_issue_kind_none_falls_back_to_detail_auto_classification(self) -> None:
+        snapshot = self._make_snapshot()
+        # ``issue_kind=None`` must preserve the R95 behavior: auto-classify
+        # from ``detail``.  ``"尚未收到"`` → NO_FEED copy.
+        detail = "当前 Bybit 公共 WS 尚未收到 BTCUSDT 的实时行情"
+        preview = control_main._build_blocked_strategy_execution_preview(
+            snapshot,
+            control_main.AccountMode.LIVE,
+            detail,
+            block_code=control_main.RISK_REASON_RUNTIME_UNAVAILABLE,
+            sub_block_code=control_main.RISK_REASON_RUNTIME_UNAVAILABLE_PUBLIC_CHANNEL,
+            issue_kind=None,
+        )
+        self.assertEqual(
+            preview.recommended_action,
+            "请确认目标品种已加入 watchlist，并等待公共实时行情首帧到达后再恢复真实策略执行。",
+        )
+
+    def test_umbrella_recommender_prefers_explicit_issue_kind(self) -> None:
+        # Direct test of ``_build_execution_preview_recommended_action`` with
+        # ``issue_kind=AUTH`` on the private channel: even though ``detail``
+        # contains ``"未连通"`` (which would auto-classify to DISCONNECTED
+        # and NOT trigger the AUTH copy), the explicit kwarg wins.
+        detail = "当前 Bybit 私有 WS 未连通"
+        output = control_main._build_execution_preview_recommended_action(
+            detail,
+            block_code=control_main.RISK_REASON_RUNTIME_UNAVAILABLE,
+            sub_block_code=control_main.RISK_REASON_RUNTIME_UNAVAILABLE_PRIVATE_CHANNEL,
+            issue_kind=control_main.CHANNEL_ISSUE_KIND_AUTH,
+        )
+        self.assertEqual(
+            output,
+            "请检查私有 API Key 权限、程序侧 Demo / Live 模式与账户配置是否一致，再恢复私有实时链路。",
+        )
+
+    def test_channel_outage_except_branch_threads_issue_kind(self) -> None:
+        # Spies on ``_build_blocked_strategy_execution_preview`` during a real
+        # ``build_strategy_execution_preview`` call that raises
+        # ``StrategyExecutionChannelOutageError`` from the inner
+        # ``_build_strategy_execution_preview_from_state``.  The catch site at
+        # main.py:9319 must forward ``issue_kind=exc.issue_kind``.
+        captured_kwargs: Dict[str, Any] = {}
+        snapshot = self._make_snapshot()
+        real_blocked_builder = control_main._build_blocked_strategy_execution_preview
+
+        def fake_blocked_builder(snap, mode, detail, **kwargs):
+            captured_kwargs.update(kwargs)
+            return real_blocked_builder(snap, mode, detail, **kwargs)
+
+        def fake_state_builder(strategy_id, mode, **kwargs):
+            raise control_main.StrategyExecutionChannelOutageError(
+                "当前 Bybit 公共 WS 尚未收到 BTCUSDT 的实时行情",
+                channel="public",
+            )
+
+        state = control_main.repo.snapshot()
+        updated_snapshots = [snapshot]
+        with unittest.mock.patch.object(
+            control_main.repo,
+            "snapshot",
+            return_value=state.model_copy(update={"strategy_runtime_snapshots": updated_snapshots}),
+        ), unittest.mock.patch.object(
+            control_main, "_build_strategy_execution_preview_from_state", side_effect=fake_state_builder
+        ), unittest.mock.patch.object(
+            control_main, "refresh_strategy_runtime_once", return_value=updated_snapshots
+        ), unittest.mock.patch.object(
+            control_main,
+            "_build_blocked_strategy_execution_preview",
+            side_effect=fake_blocked_builder,
+        ):
+            preview = control_main.build_strategy_execution_preview(
+                "strat-r96",
+                mode=control_main.AccountMode.LIVE,
+            )
+
+        self.assertFalse(preview.allowed)
+        self.assertEqual(
+            captured_kwargs.get("issue_kind"),
+            control_main.CHANNEL_ISSUE_KIND_NO_FEED,
+        )
+        self.assertEqual(
+            captured_kwargs.get("sub_block_code"),
+            control_main.RISK_REASON_RUNTIME_UNAVAILABLE_PUBLIC_CHANNEL,
+        )
+        self.assertEqual(
+            captured_kwargs.get("block_code"),
+            control_main.RISK_REASON_RUNTIME_UNAVAILABLE,
+        )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

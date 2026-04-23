@@ -1063,6 +1063,7 @@ def _build_execution_preview_recommended_action(
     block_code: Optional[str] = None,
     sub_block_code: Optional[str] = None,
     market: Optional[str] = None,
+    issue_kind: Optional[str] = None,
 ) -> Optional[str]:
     """Derive a user-facing recommendation for a blocked ``ExecutionPreview``.
 
@@ -1103,18 +1104,24 @@ def _build_execution_preview_recommended_action(
         # forward to the recommender so "auth" vs "disconnected" / "stale"
         # private-WS outages pick the typed AUTH copy via the typed-first
         # branch rather than the legacy ``"鉴权"`` substring fallback.
+        # Round 96 — prefer the explicitly-passed ``issue_kind`` (threaded from
+        # ``StrategyExecutionChannelOutageError.issue_kind`` end-to-end); fall
+        # back to auto-classification for callers that only have ``detail``.
+        resolved_kind = issue_kind if issue_kind is not None else _classify_channel_issue_kind(detail)
         return _build_private_execution_channel_recommended_action(
             detail,
-            issue_kind=_classify_channel_issue_kind(detail),
+            issue_kind=resolved_kind,
         )
     if sub_block_code == RISK_REASON_RUNTIME_UNAVAILABLE_PUBLIC_CHANNEL:
         # Round 95 — see the private branch above; the public recommender uses
         # the typed ``NO_FEED`` / ``STALE`` kinds to pick the watchlist /
         # refresh-feed copy before the legacy ``"尚未收到"`` / ``"超过约"`` /
         # ``"持续刷新"`` substring fallback.
+        # Round 96 — same end-to-end-threading note as the private branch above.
+        resolved_kind = issue_kind if issue_kind is not None else _classify_channel_issue_kind(detail)
         return _build_public_execution_channel_recommended_action(
             detail,
-            issue_kind=_classify_channel_issue_kind(detail),
+            issue_kind=resolved_kind,
         )
     if sub_block_code == RISK_REASON_RUNTIME_UNAVAILABLE_WORKER_THREAD:
         return "打开设置页点击“恢复运行线程”，并确认最近审计日志与最新信号。"
@@ -3462,12 +3469,17 @@ def _build_strategy_activity_runtime_snapshot(
                 # needing a fresh classifier probe downstream.  Plain
                 # ``RuntimeError`` instances carry neither attr so
                 # ``getattr(..., None)`` falls back cleanly.
+                # Round 96 — also forward ``issue_kind`` (populated on
+                # :class:`StrategyExecutionChannelOutageError` by R95) so the
+                # channel recommender picks NO_FEED / STALE / AUTH copy off
+                # the typed kind end-to-end.
                 strategy_mode_preview = _build_blocked_strategy_execution_preview(
                     runtime,
                     strategy.mode,
                     str(exc),
                     block_code=getattr(exc, "block_code", None),
                     sub_block_code=getattr(exc, "sub_block_code", None),
+                    issue_kind=getattr(exc, "issue_kind", None),
                 )
             except ValueError as exc:
                 strategy_mode_preview = _build_blocked_strategy_execution_preview(runtime, strategy.mode, str(exc))
@@ -8354,6 +8366,7 @@ def _build_blocked_strategy_execution_preview(
     block_code: Optional[str] = None,
     *,
     sub_block_code: Optional[str] = None,
+    issue_kind: Optional[str] = None,
 ) -> ExecutionPreview:
     """Round 71 — ``block_code`` lets callers tag the typed risk code at the
     source (worker-health / WS outage / runtime error) so ``evaluate_risk_decision``
@@ -8366,6 +8379,13 @@ def _build_blocked_strategy_execution_preview(
     callers pass the typed private / public channel sub-code via
     ``StrategyExecutionChannelOutageError.sub_block_code``, and runtime
     worker-thread callers pass ``RISK_REASON_RUNTIME_UNAVAILABLE_WORKER_THREAD``.
+
+    Round 96 — ``issue_kind`` carries the ``CHANNEL_ISSUE_KIND_*`` typed
+    discriminator populated on :class:`StrategyExecutionChannelOutageError`
+    (R95).  The umbrella recommender threads it into
+    ``_build_{public,private}_execution_channel_recommended_action`` so the
+    typed-first NO_FEED / STALE / AUTH branch fires without re-parsing
+    ``detail``.  ``None`` lets the umbrella auto-classify (R95 behaviour).
     """
 
     fallback_side = Direction.BUY if snapshot.signal != "short" else Direction.SELL
@@ -8391,11 +8411,15 @@ def _build_blocked_strategy_execution_preview(
         # Round 80 — thread the typed ``sub_block_code`` so the RUNTIME_UNAVAILABLE
         # branch picks the channel / worker-thread recovery copy off the typed
         # discriminator rather than a ``"私有 WS"`` / ``"公共 WS"`` / ``"运行线程"`` probe.
+        # Round 96 — thread the typed ``issue_kind`` so the channel recommender
+        # picks NO_FEED / STALE / AUTH copy off the typed kind rather than
+        # auto-classifying ``detail`` again at the umbrella boundary.
         recommended_action=_build_execution_preview_recommended_action(
             detail,
             block_code=block_code,
             sub_block_code=sub_block_code,
             market=snapshot.market,
+            issue_kind=issue_kind,
         ),
         warnings=[detail],
         current_position_side="flat",
@@ -9293,6 +9317,10 @@ def build_strategy_execution_preview(strategy_id: str, mode: Optional[AccountMod
         # channel) so the blocked preview carries it and
         # ``_build_execution_preview_recommended_action`` dispatches without
         # substring-probing the detail for ``"私有 WS"`` / ``"公共 WS"``.
+        # Round 96 — also forward the typed ``issue_kind`` populated by
+        # ``StrategyExecutionChannelOutageError.__init__`` (R95) so the channel
+        # recommender picks NO_FEED / STALE / AUTH copy off the typed kind
+        # without re-classifying ``detail`` at the umbrella boundary.
         detail = str(exc)
         snapshot = next((item for item in repo.snapshot().strategy_runtime_snapshots if item.strategy_id == strategy_id), None)
         if snapshot is None:
@@ -9303,6 +9331,7 @@ def build_strategy_execution_preview(strategy_id: str, mode: Optional[AccountMod
             detail,
             block_code=exc.block_code,
             sub_block_code=exc.sub_block_code,
+            issue_kind=exc.issue_kind,
         )
 
 def _apply_runtime_blocked_preview_context(
@@ -9452,12 +9481,17 @@ def build_strategy_runtime_response() -> List[StrategyRuntimeSnapshot]:
             # the recommender's typed sub-dispatch fires on the snapshot's
             # execution_preview.  Plain ``RuntimeError`` carries neither
             # attr so ``getattr(..., None)`` falls back cleanly.
+            # Round 96 — also forward ``issue_kind`` (populated on
+            # :class:`StrategyExecutionChannelOutageError` by R95) so the
+            # channel recommender picks NO_FEED / STALE / AUTH copy off the
+            # typed kind end-to-end.
             preview = _build_blocked_strategy_execution_preview(
                 item,
                 resolved_mode,
                 str(exc),
                 block_code=getattr(exc, "block_code", None),
                 sub_block_code=getattr(exc, "sub_block_code", None),
+                issue_kind=getattr(exc, "issue_kind", None),
             )
         except ValueError as exc:
             preview = _build_blocked_strategy_execution_preview(item, resolved_mode, str(exc))
