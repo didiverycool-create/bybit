@@ -25568,6 +25568,211 @@ class OutcomeRecordTypedExcAttrsRound92Tests(unittest.TestCase):
         self.assertIsNone(kwargs.get("reason_code"))
 
 
+class DispatchStrategySignalRecordKwargsRound94Tests(unittest.TestCase):
+    """Round 94 — ``_dispatch_strategy_signal_from_state`` (main.py:7742)
+    forwards a pre-computed ``recommended_action=preview.recommended_action``
+    to ``_record_strategy_manual_execution_issue`` on the blocked-decision
+    branch.  Before R94 the callsite did not thread the typed ``market`` or
+    ``sub_block_code`` discriminators, so if the preview-side recommender
+    had returned ``None`` (unclassified branch / new builder not yet
+    migrated), the record helper's internal
+    ``_build_manual_execution_recommended_action`` fallback would have had
+    to re-derive ``sub_block_code`` from the Chinese detail via the R88
+    auto-classifier — missing the typed source-of-truth that the
+    preview builder already emitted.
+
+    R94 threads ``market=snapshot.market`` + ``sub_block_code=
+    preview.sub_block_code`` at the callsite so the typed discriminators
+    reach the record helper directly.  When the preview-side recommender
+    had emitted a canned copy (the common case), the pre-computed
+    ``recommended_action`` still wins via the helper's ``or`` short-circuit
+    — the typed kwargs are forwarding hygiene that kicks in on the
+    fallback path.
+
+    Invariants pinned (spy-style on ``_record_strategy_manual_execution_issue``):
+
+    1. Channel-outage preview (``sub_block_code=RISK_REASON_RUNTIME_UNAVAILABLE_PRIVATE_CHANNEL``) →
+       record helper receives the typed ``sub_block_code`` + the
+       snapshot's ``market``.
+    2. Insufficient-balance perp preview (``market="perp"``) →
+       record helper receives ``market="perp"``.
+    3. Block preview with ``sub_block_code=None`` (e.g. insufficient-balance
+       without a sub-classifier) threads ``sub_block_code=None`` — the
+       helper's auto-derivation still runs internally but the callsite
+       surfaces the typed field explicitly.
+    """
+
+    def _make_blocked_preview(
+        self,
+        *,
+        block_code: Optional[str],
+        sub_block_code: Optional[str],
+        market: str = "spot",
+        recommended_action: Optional[str] = None,
+    ):
+        from datetime import datetime, timezone  # noqa: PLC0415
+        from models import ExecutionPreview  # noqa: PLC0415
+
+        return ExecutionPreview(
+            symbol="BTCUSDT",
+            market=market,
+            mode=AccountMode.LIVE,
+            side=Direction.BUY,
+            origin="manual",
+            quantity=1.0,
+            price=65_000.0,
+            notional="65000.00 USDT",
+            action="买入",
+            allowed=False,
+            blocked_reason="unit-test blocked copy without canonical tokens",
+            block_code=block_code,
+            sub_block_code=sub_block_code,
+            recommended_action=recommended_action,
+            current_position_size="--",
+            current_avg_price="--",
+            projected_position_size="--",
+            projected_avg_price="--",
+            available_balance_before="--",
+            available_balance_after="--",
+            estimated_realized_pnl="--",
+            generated_at=datetime.now(timezone.utc).astimezone().isoformat(),
+        )
+
+    def _run_with_blocked_preview(
+        self,
+        preview,
+        *,
+        snapshot_market: str = "spot",
+    ) -> Dict[str, Any]:
+        from models import (  # noqa: PLC0415
+            StrategyExecutionRequest,
+            StrategyParameter,
+            StrategySummary,
+        )
+
+        strategy = StrategySummary(
+            id="r94-dispatch-01",
+            name="R94DispatchHarness",
+            category="template",
+            status="running",
+            symbols=["BTCUSDT"],
+            mode=AccountMode.LIVE,
+            version="v1",
+            pnl_7d="+0.0%",
+            max_drawdown="-0.0%",
+            risk_budget="10%",
+            description="R94 dispatch harness",
+            parameters=[StrategyParameter(key="noop", label="noop", value=0.0)],
+        )
+        snapshot = StrategyRuntimeSnapshot(
+            strategy_id="r94-dispatch-01",
+            strategy_name="R94DispatchHarness",
+            symbol="BTCUSDT",
+            market=snapshot_market,
+            mode=AccountMode.LIVE,
+            runtime_status="running",
+            signal="long",
+            confidence=42.0,
+            last_price=65_000.0,
+            reference_price=65_000.0,
+            change_24h=0.0,
+            note="",
+            next_action="",
+            last_evaluated_at="2026-04-24T00:00:00+08:00",
+        )
+
+        base_state = control_main.repo.snapshot()
+        stub_state = base_state.model_copy(
+            update={
+                "strategies": [strategy],
+                "strategy_runtime_snapshots": [snapshot],
+            }
+        )
+
+        captured: Dict[str, Any] = {}
+
+        def _spy(*args: Any, **kwargs: Any) -> None:
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+
+        with patch.object(
+            control_main,
+            "_build_strategy_execution_preview_from_state",
+            return_value=preview,
+        ), patch.object(
+            control_main.repo, "snapshot", return_value=stub_state
+        ), patch.object(
+            control_main,
+            "_record_strategy_manual_execution_issue",
+            side_effect=_spy,
+        ):
+            with self.assertRaises(control_main.StrategyExecutionBlockedError):
+                control_main._dispatch_strategy_signal_from_state(
+                    "r94-dispatch-01",
+                    StrategyExecutionRequest(mode=AccountMode.LIVE),
+                )
+        return captured
+
+    def test_channel_outage_preview_threads_typed_sub_block_code(self) -> None:
+        from models import (  # noqa: PLC0415
+            RISK_REASON_RUNTIME_UNAVAILABLE,
+            RISK_REASON_RUNTIME_UNAVAILABLE_PRIVATE_CHANNEL,
+        )
+
+        preview = self._make_blocked_preview(
+            block_code=RISK_REASON_RUNTIME_UNAVAILABLE,
+            sub_block_code=RISK_REASON_RUNTIME_UNAVAILABLE_PRIVATE_CHANNEL,
+            market="perp",
+        )
+        captured = self._run_with_blocked_preview(preview, snapshot_market="perp")
+        self.assertIn("kwargs", captured)
+        kwargs = captured["kwargs"]
+        self.assertEqual(
+            kwargs.get("sub_block_code"),
+            RISK_REASON_RUNTIME_UNAVAILABLE_PRIVATE_CHANNEL,
+        )
+        self.assertEqual(kwargs.get("market"), "perp")
+        self.assertEqual(kwargs.get("reason_code"), RISK_REASON_RUNTIME_UNAVAILABLE)
+
+    def test_insufficient_balance_perp_preview_threads_market(self) -> None:
+        from models import RISK_REASON_INSUFFICIENT_BALANCE  # noqa: PLC0415
+
+        preview = self._make_blocked_preview(
+            block_code=RISK_REASON_INSUFFICIENT_BALANCE,
+            sub_block_code=None,
+            market="perp",
+        )
+        captured = self._run_with_blocked_preview(preview, snapshot_market="perp")
+        kwargs = captured["kwargs"]
+        self.assertEqual(kwargs.get("market"), "perp")
+        self.assertIsNone(kwargs.get("sub_block_code"))
+        self.assertEqual(
+            kwargs.get("reason_code"), RISK_REASON_INSUFFICIENT_BALANCE
+        )
+
+    def test_no_sub_block_code_still_threads_explicit_none(self) -> None:
+        from models import RISK_REASON_PREVIEW_BLOCKED  # noqa: PLC0415
+
+        preview = self._make_blocked_preview(
+            block_code=None,
+            sub_block_code=None,
+            market="spot",
+        )
+        captured = self._run_with_blocked_preview(preview, snapshot_market="spot")
+        kwargs = captured["kwargs"]
+        # The callsite always threads the kwargs now (R94); we assert they
+        # appear explicitly rather than being omitted, so future callers
+        # know the shape of the call site.
+        self.assertIn("sub_block_code", kwargs)
+        self.assertIsNone(kwargs["sub_block_code"])
+        self.assertIn("market", kwargs)
+        self.assertEqual(kwargs["market"], "spot")
+        # R68 ``derive_block_reason_code`` would classify the free-form
+        # "unit-test blocked copy" detail as ``RISK_REASON_PREVIEW_BLOCKED``
+        # which then gets threaded via ``decision.reason_code``.
+        self.assertEqual(kwargs.get("reason_code"), RISK_REASON_PREVIEW_BLOCKED)
+
+
 class PaperOrderTypedReasonCodeRound93Tests(unittest.TestCase):
     """Round 93 — ``repository.AppRepository.create_paper_order`` and
     :meth:`replace_paper_order` used to emit the ``risk.blocked_order`` audit

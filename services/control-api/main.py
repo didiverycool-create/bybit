@@ -7769,6 +7769,16 @@ def _dispatch_strategy_signal_from_state(strategy_id: str, payload: StrategyExec
             else "当前策略真实模式执行预检未通过。"
         )
         detail = decision.reason_detail or default_detail
+        # Round 94 — thread the typed ``market`` / ``sub_block_code``
+        # discriminators into the record helper so that if
+        # ``preview.recommended_action`` is ``None`` (e.g. an unclassified
+        # block branch), the helper's internal
+        # ``_build_manual_execution_recommended_action`` fallback picks off
+        # the typed fields rather than re-deriving ``sub_block_code`` from
+        # the detail via the R88 auto-classifier.  Pre-computed
+        # ``recommended_action=preview.recommended_action`` still wins when
+        # the preview-side recommender already emitted a canned copy — the
+        # typed kwargs only matter on the fallback path.
         _record_strategy_manual_execution_issue(
             strategy_id,
             strategy.name,
@@ -7778,6 +7788,8 @@ def _dispatch_strategy_signal_from_state(strategy_id: str, payload: StrategyExec
             recommended_action=preview.recommended_action,
             strategy=strategy,
             reason_code=decision.reason_code,
+            market=snapshot.market,
+            sub_block_code=preview.sub_block_code,
         )
         raise StrategyExecutionBlockedError(detail, preview.recommended_action)
 
