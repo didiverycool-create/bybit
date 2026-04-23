@@ -242,6 +242,16 @@ import parameter_resolver
 from repository import AppRepository
 from seed import build_market_detail_for_watchlist
 from execution_health import (
+    # Round 98 — typed ``channel_issue_kind`` discriminators now live next to
+    # ``build_public_execution_channel_health`` (the primary emission site) so
+    # the helper can set ``issue_kind`` from the typed branch variables at
+    # source.  ``main.py`` re-exports the same names so existing callers and
+    # tests that reference ``control_main.CHANNEL_ISSUE_KIND_*`` keep working.
+    CHANNEL_ISSUE_KIND_AUTH,
+    CHANNEL_ISSUE_KIND_DISABLED,
+    CHANNEL_ISSUE_KIND_DISCONNECTED,
+    CHANNEL_ISSUE_KIND_NO_FEED,
+    CHANNEL_ISSUE_KIND_STALE,
     build_execution_health_top_issue_context as _build_execution_health_top_issue_context_impl,
     build_public_execution_channel_health as _build_public_execution_channel_health_impl,
     get_public_execution_channel_issue as _get_public_execution_channel_issue_impl,
@@ -313,11 +323,13 @@ _CHANNEL_SUB_BLOCK_CODE: Dict[str, str] = {
 # of the free-form ``detail`` Chinese string.  The typed kinds let the raise
 # sites pass the already-known issue classification explicitly, with the
 # substring probes kept as a last-resort fallback for legacy callers.
-CHANNEL_ISSUE_KIND_DISABLED = "disabled"
-CHANNEL_ISSUE_KIND_DISCONNECTED = "disconnected"
-CHANNEL_ISSUE_KIND_NO_FEED = "no_feed"
-CHANNEL_ISSUE_KIND_STALE = "stale"
-CHANNEL_ISSUE_KIND_AUTH = "auth"
+#
+# Round 98 — the constants now live in :mod:`execution_health` next to
+# ``build_public_execution_channel_health`` (the primary typed-at-source
+# emission site) and are re-imported above.  The classifier below remains
+# here as the fallback path for legacy detail-only callers (alert records
+# whose only typed source is the Chinese description, exception strings that
+# predate typed ``issue_kind`` kwargs, …).
 
 
 def _classify_channel_issue_kind(detail: Optional[str]) -> Optional[str]:
@@ -8447,22 +8459,28 @@ def _decorate_strategy_runtime_item(item: StrategyRuntimeSnapshot) -> StrategyRu
     state = repo.snapshot()
     strategy = next((entry for entry in state.strategies if entry.id == item.strategy_id), None)
     if strategy is not None:
-        public_channel_issue = (
-            get_public_execution_channel_issue(item.market, item.symbol)
+        # Round 98 — call the health helper once and read the typed
+        # ``issue_kind`` from the dict rather than going through
+        # ``get_public_execution_channel_issue`` (string-only) plus a second
+        # ``_classify_channel_issue_kind`` re-derivation.  The typed kind is
+        # now emitted at source inside
+        # ``build_public_execution_channel_health`` from the
+        # ``enabled`` / ``connected`` / ``has_symbol_feed`` / ``stale`` branch
+        # variables, so the R95 typed-first branch inside the recommender
+        # fires off the same typed source that picked the ``issue`` copy.
+        public_health = (
+            _build_public_execution_channel_health(item.market, item.symbol)
             if strategy.mode in {AccountMode.DEMO, AccountMode.LIVE} and strategy.status == "running"
             else None
         )
+        public_channel_issue = public_health.get("issue") if public_health else None
         if public_channel_issue is not None:
-            # Round 97 — thread the typed ``issue_kind`` (auto-classified from
-            # the ``get_public_execution_channel_issue`` detail string) so the
-            # R95 typed-first branch inside the recommender fires without
-            # depending on the legacy substring fallback.
             return item.model_copy(
                 update={
                     "note": public_channel_issue,
                     "next_action": _build_public_execution_channel_recommended_action(
                         public_channel_issue,
-                        issue_kind=_classify_channel_issue_kind(public_channel_issue),
+                        issue_kind=public_health.get("issue_kind"),
                     ),
                     "guard_state": "auto_dispatch_blocked",
                     "guard_detail": public_channel_issue,

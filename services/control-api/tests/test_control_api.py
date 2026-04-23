@@ -23318,9 +23318,15 @@ class AlertRecordTypedReasonCodeRound76Tests(unittest.TestCase):
                 "_has_active_strategy_auto_dispatch_alert",
                 return_value=True,
             ), patch.object(
+                # Round 98 — ``_decorate_strategy_runtime_item`` now reads the
+                # typed ``issue_kind`` from the health-dict emission site
+                # rather than piping the string through
+                # ``get_public_execution_channel_issue`` + a classifier.
+                # Simulate "no public issue" by returning a health dict whose
+                # ``issue`` / ``issue_kind`` fields are ``None``.
                 control_main,
-                "get_public_execution_channel_issue",
-                return_value=None,
+                "_build_public_execution_channel_health",
+                return_value={"issue": None, "issue_kind": None},
             ), patch.object(
                 control_main,
                 "get_private_execution_channel_issue",
@@ -26343,6 +26349,269 @@ class ChannelRecommenderProductionCallsiteThreadingRound97Tests(unittest.TestCas
             ),
             "请检查私有 API Key 权限、程序侧 Demo / Live 模式与账户配置是否一致，再恢复私有实时链路。",
         )
+
+
+class PublicChannelHealthIssueKindAtSourceRound98Tests(unittest.TestCase):
+    """Round 98 — ``build_public_execution_channel_health`` now emits the typed
+    ``issue_kind`` (CHANNEL_ISSUE_KIND_*) from the branch variables
+    (``enabled`` / ``connected`` / ``has_symbol_feed`` / ``stale``) at source.
+
+    Prior to R98 the helper produced only the free-form Chinese ``issue``
+    string and downstream consumers that needed the typed kind had to
+    re-classify the string via ``_classify_channel_issue_kind`` (R95 substring
+    probe).  After R98:
+
+    1. ``build_public_execution_channel_health`` populates ``health["issue_kind"]``
+       from the same branch that picks ``health["issue"]`` — the kind comes
+       from the typed precondition variables, not from classifying the string.
+    2. ``recommended_action_builder`` is invoked with the typed ``issue_kind``
+       kwarg so the recommender branch fires off the typed source rather than
+       re-classifying.
+    3. The production ``_decorate_strategy_runtime_item`` callsite reads the
+       typed kind from the health dict without calling
+       ``_classify_channel_issue_kind`` on the formatted string.
+    4. The constants ``CHANNEL_ISSUE_KIND_*`` now live in :mod:`execution_health`
+       (moved out of ``main.py``) and are re-exported by ``control_main``.
+    """
+
+    def _realtime_status(self, **overrides: Any) -> Dict[str, Any]:
+        base: Dict[str, Any] = {
+            "enabled": True,
+            "connected_spot": True,
+            "connected_linear": True,
+            "spot_stale": False,
+            "spot_stale_seconds": 0,
+            "linear_stale": False,
+            "linear_stale_seconds": 0,
+            "last_error": None,
+        }
+        base.update(overrides)
+        return base
+
+    def test_kind_is_disabled_when_enabled_flag_is_false(self) -> None:
+        from execution_health import build_public_execution_channel_health  # type: ignore
+
+        feed = StubPublicExecutionRealtimeFeed(ticker_symbols=[])
+        status = self._realtime_status(enabled=False)
+        recommender_calls: list[Any] = []
+
+        def fake_recommender(issue: Any, **kwargs: Any) -> str:
+            recommender_calls.append(kwargs)
+            return "recovery-copy"
+
+        health = build_public_execution_channel_health(
+            "perp",
+            "btcusdt",
+            realtime=feed,
+            realtime_status_builder=lambda: dict(status),
+            rest_probe_fn=lambda: {"reachable": True, "last_error": None, "tested_at": None},
+            recommended_action_builder=fake_recommender,
+            stale_threshold_seconds=90,
+        )
+        self.assertEqual(health["issue_kind"], control_main.CHANNEL_ISSUE_KIND_DISABLED)
+        self.assertIn("未启用", str(health["issue"]))
+        self.assertEqual(len(recommender_calls), 1)
+        self.assertEqual(
+            recommender_calls[0]["issue_kind"], control_main.CHANNEL_ISSUE_KIND_DISABLED
+        )
+
+    def test_kind_is_disconnected_when_channel_not_connected(self) -> None:
+        from execution_health import build_public_execution_channel_health  # type: ignore
+
+        feed = StubPublicExecutionRealtimeFeed(ticker_symbols=[])
+        status = self._realtime_status(connected_linear=False)
+
+        health = build_public_execution_channel_health(
+            "perp",
+            "btcusdt",
+            realtime=feed,
+            realtime_status_builder=lambda: dict(status),
+            rest_probe_fn=lambda: {"reachable": True, "last_error": None, "tested_at": None},
+            recommended_action_builder=lambda *_args, **_kwargs: "recovery-copy",
+            stale_threshold_seconds=90,
+        )
+        self.assertEqual(
+            health["issue_kind"], control_main.CHANNEL_ISSUE_KIND_DISCONNECTED
+        )
+        self.assertIn("未连通", str(health["issue"]))
+
+    def test_kind_is_no_feed_when_symbol_feed_missing(self) -> None:
+        from execution_health import build_public_execution_channel_health  # type: ignore
+
+        feed = StubPublicExecutionRealtimeFeed(ticker_symbols=["PERP:ETHUSDT"])
+        status = self._realtime_status()
+
+        health = build_public_execution_channel_health(
+            "perp",
+            "btcusdt",
+            realtime=feed,
+            realtime_status_builder=lambda: dict(status),
+            rest_probe_fn=lambda: {"reachable": True, "last_error": None, "tested_at": None},
+            recommended_action_builder=lambda *_args, **_kwargs: "recovery-copy",
+            stale_threshold_seconds=90,
+        )
+        self.assertEqual(health["issue_kind"], control_main.CHANNEL_ISSUE_KIND_NO_FEED)
+        self.assertIn("尚未收到 BTCUSDT", str(health["issue"]))
+
+    def test_kind_is_stale_when_symbol_feed_stale(self) -> None:
+        from execution_health import build_public_execution_channel_health  # type: ignore
+
+        stale_timestamp = (
+            datetime.now(timezone.utc).astimezone() - timedelta(seconds=600)
+        ).isoformat()
+        feed = StubPublicExecutionRealtimeFeed(
+            ticker_symbols=["PERP:BTCUSDT", "BTCUSDT"],
+            symbol_last_message_at={"PERP:BTCUSDT": stale_timestamp},
+        )
+        status = self._realtime_status()
+
+        health = build_public_execution_channel_health(
+            "perp",
+            "btcusdt",
+            realtime=feed,
+            realtime_status_builder=lambda: dict(status),
+            rest_probe_fn=lambda: {"reachable": True, "last_error": None, "tested_at": None},
+            recommended_action_builder=lambda *_args, **_kwargs: "recovery-copy",
+            stale_threshold_seconds=90,
+        )
+        self.assertEqual(health["issue_kind"], control_main.CHANNEL_ISSUE_KIND_STALE)
+        self.assertIn("超过约", str(health["issue"]))
+
+    def test_kind_is_none_when_no_issue(self) -> None:
+        from execution_health import build_public_execution_channel_health  # type: ignore
+
+        fresh_timestamp = datetime.now(timezone.utc).astimezone().isoformat()
+        feed = StubPublicExecutionRealtimeFeed(
+            ticker_symbols=["PERP:BTCUSDT", "BTCUSDT"],
+            symbol_last_message_at={"PERP:BTCUSDT": fresh_timestamp},
+        )
+        status = self._realtime_status()
+
+        health = build_public_execution_channel_health(
+            "perp",
+            "btcusdt",
+            realtime=feed,
+            realtime_status_builder=lambda: dict(status),
+            rest_probe_fn=lambda: {"reachable": True, "last_error": None, "tested_at": None},
+            recommended_action_builder=lambda *_args, **_kwargs: "unused",
+            stale_threshold_seconds=90,
+        )
+        self.assertIsNone(health["issue"])
+        self.assertIsNone(health["issue_kind"])
+        self.assertIsNone(health["recommended_action"])
+
+    def test_kind_is_emitted_from_typed_branch_not_string_classification(self) -> None:
+        """The kind is set from the typed precondition variable, not from
+        classifying the formatted Chinese string.  Swap in a
+        ``recommended_action_builder`` that always returns a canary; the
+        typed kind in the health dict matches the branch that fired
+        regardless of what the builder does with the string.
+        """
+
+        from execution_health import build_public_execution_channel_health  # type: ignore
+
+        # NO_FEED branch: ``has_symbol_feed=False`` picks NO_FEED even though
+        # the formatted string contains multiple classifier-matching tokens.
+        feed = StubPublicExecutionRealtimeFeed(ticker_symbols=[])
+        status = self._realtime_status()
+        health = build_public_execution_channel_health(
+            "perp",
+            "btcusdt",
+            realtime=feed,
+            realtime_status_builder=lambda: dict(status),
+            rest_probe_fn=lambda: {"reachable": True, "last_error": None, "tested_at": None},
+            recommended_action_builder=lambda *_args, **_kwargs: "unused",
+            stale_threshold_seconds=90,
+        )
+        self.assertEqual(health["issue_kind"], control_main.CHANNEL_ISSUE_KIND_NO_FEED)
+        # Cross-check: the classifier on the emitted string would also yield
+        # NO_FEED — but the typed kind is set by the branch *before* the
+        # string is built, proving it is not re-derived from the copy.
+        self.assertEqual(
+            control_main._classify_channel_issue_kind(str(health["issue"])),
+            control_main.CHANNEL_ISSUE_KIND_NO_FEED,
+        )
+
+    def test_constants_re_exported_from_execution_health(self) -> None:
+        import execution_health  # type: ignore
+
+        self.assertEqual(
+            control_main.CHANNEL_ISSUE_KIND_DISABLED, execution_health.CHANNEL_ISSUE_KIND_DISABLED
+        )
+        self.assertEqual(
+            control_main.CHANNEL_ISSUE_KIND_DISCONNECTED,
+            execution_health.CHANNEL_ISSUE_KIND_DISCONNECTED,
+        )
+        self.assertEqual(
+            control_main.CHANNEL_ISSUE_KIND_NO_FEED, execution_health.CHANNEL_ISSUE_KIND_NO_FEED
+        )
+        self.assertEqual(
+            control_main.CHANNEL_ISSUE_KIND_STALE, execution_health.CHANNEL_ISSUE_KIND_STALE
+        )
+        self.assertEqual(
+            control_main.CHANNEL_ISSUE_KIND_AUTH, execution_health.CHANNEL_ISSUE_KIND_AUTH
+        )
+
+    def test_decorator_reads_typed_kind_from_health_dict_without_reclassifying(self) -> None:
+        """``_decorate_strategy_runtime_item`` reads ``issue_kind`` directly
+        from the health dict.  Assert ``_classify_channel_issue_kind`` is not
+        invoked on the public issue string during the decoration flow.
+        """
+        from types import SimpleNamespace  # noqa: PLC0415
+
+        strategy = SimpleNamespace(
+            id="strat-r98",
+            name="R98 Strategy",
+            mode=control_main.AccountMode.LIVE,
+            status="running",
+            symbol="BTCUSDT",
+            symbols=["BTCUSDT"],
+            market="perp",
+        )
+        snapshot_stub = SimpleNamespace(strategies=[strategy])
+        runtime_item = control_main.StrategyRuntimeSnapshot(
+            strategy_id="strat-r98",
+            strategy_name="R98 Strategy",
+            symbol="BTCUSDT",
+            market="perp",
+            mode=control_main.AccountMode.LIVE,
+            runtime_status="running",
+            signal="long",
+            last_price=10000.0,
+            reference_price=10000.0,
+            change_24h=0.0,
+            note="",
+            next_action="--",
+            last_evaluated_at=datetime.now(timezone.utc).isoformat(),
+            guard_state="none",
+            guard_detail=None,
+        )
+        health_dict: Dict[str, Any] = {
+            "issue": "当前 Bybit 公共 WS (linear) 未连通，无法安全执行真实策略委托，请先恢复公共实时链路。",
+            "issue_kind": control_main.CHANNEL_ISSUE_KIND_DISCONNECTED,
+        }
+        classifier_calls: list[Any] = []
+
+        def spy_classify(detail: Any) -> Any:
+            classifier_calls.append(detail)
+            return None
+
+        with patch.object(
+            control_main, "_has_active_strategy_live_stop_loss_alert", return_value=False
+        ), patch.object(
+            control_main.repo, "snapshot", return_value=snapshot_stub
+        ), patch.object(
+            control_main, "_build_public_execution_channel_health", return_value=health_dict
+        ), patch.object(
+            control_main, "_classify_channel_issue_kind", side_effect=spy_classify
+        ):
+            decorated = control_main._decorate_strategy_runtime_item(runtime_item)
+
+        self.assertEqual(decorated.guard_state, "auto_dispatch_blocked")
+        self.assertEqual(decorated.guard_detail, health_dict["issue"])
+        # The decorator must NOT have re-classified the public issue string;
+        # it reads ``issue_kind`` straight from the health dict.
+        self.assertNotIn(health_dict["issue"], classifier_calls)
 
 
 if __name__ == "__main__":

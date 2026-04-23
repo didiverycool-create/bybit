@@ -15,6 +15,25 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
 
 
+# Round 98 — typed ``channel_issue_kind`` discriminators are now the canonical
+# classification source.  Prior to R98 the constants lived in ``main.py`` and
+# the helper below emitted only the free-form ``issue`` Chinese string; every
+# downstream call-site that needed the typed kind had to re-classify the
+# formatted string via ``_classify_channel_issue_kind`` (R95 substring probe).
+# R98 moves the constants here so ``build_public_execution_channel_health``
+# can set ``issue_kind`` directly from the typed branch variables
+# (``enabled`` / ``connected`` / ``has_symbol_feed`` / ``stale``) at source,
+# and downstream consumers read the typed kind from the health dict.
+# ``main.py`` re-imports these names so existing references (including the
+# ``_classify_channel_issue_kind`` fallback path for legacy detail-only
+# callers) keep working.
+CHANNEL_ISSUE_KIND_DISABLED = "disabled"
+CHANNEL_ISSUE_KIND_DISCONNECTED = "disconnected"
+CHANNEL_ISSUE_KIND_NO_FEED = "no_feed"
+CHANNEL_ISSUE_KIND_STALE = "stale"
+CHANNEL_ISSUE_KIND_AUTH = "auth"
+
+
 def public_channel_for_market(market: str) -> str:
     """Return the Bybit public realtime channel name for a market."""
 
@@ -42,6 +61,7 @@ def build_public_execution_channel_health(
             "stale_seconds": 0,
             "has_symbol_feed": False,
             "issue": None,
+            "issue_kind": None,
             "recommended_action": None,
             "channel": public_channel_for_market(market),
             "symbol": symbol.upper(),
@@ -83,19 +103,30 @@ def build_public_execution_channel_health(
         stale = bool(realtime_status.get(f"{channel}_stale"))
         stale_seconds = int(realtime_status.get(f"{channel}_stale_seconds") or 0)
 
+    # Round 98 — emit the typed ``issue_kind`` from the branch variables here
+    # at source.  Prior to R98 downstream consumers re-classified the formatted
+    # Chinese ``issue`` string via ``_classify_channel_issue_kind``; the typed
+    # kind is now set from the same condition that picks the string copy, so
+    # both the detail and the discriminator are produced from the same typed
+    # source.  Consumers read ``health["issue_kind"]`` directly.
     issue: Optional[str] = None
+    issue_kind: Optional[str] = None
     if not enabled:
+        issue_kind = CHANNEL_ISSUE_KIND_DISABLED
         issue = "当前 Bybit 公共 WS 未启用，无法安全执行真实策略委托，请先恢复公共实时链路。"
     elif not connected:
+        issue_kind = CHANNEL_ISSUE_KIND_DISCONNECTED
         issue = (
             f"当前 Bybit 公共 WS ({channel}) 未连通，无法安全执行真实策略委托，请先恢复公共实时链路。"
         )
     elif not has_symbol_feed:
+        issue_kind = CHANNEL_ISSUE_KIND_NO_FEED
         issue = (
             f"当前 Bybit 公共 WS 尚未收到 {symbol_upper} 的实时行情，"
             "无法安全执行真实策略委托，请先恢复公共实时链路。"
         )
     elif stale:
+        issue_kind = CHANNEL_ISSUE_KIND_STALE
         issue = (
             f"当前 Bybit 公共 WS 已超过约 {stale_seconds} 秒未收到 {symbol_upper} 的实时行情，"
             "无法安全执行真实策略委托，请先恢复公共实时链路。"
@@ -108,6 +139,7 @@ def build_public_execution_channel_health(
             issue,
             last_error=last_error,
             rest_reachable=resolved_rest_probe.get("reachable") if resolved_rest_probe else None,
+            issue_kind=issue_kind,
         )
         if issue is not None
         else None
@@ -122,6 +154,7 @@ def build_public_execution_channel_health(
         "last_message_at": raw_symbol_last_message_at,
         "last_error": last_error,
         "issue": issue,
+        "issue_kind": issue_kind,
         "recommended_action": recommended_action,
         "channel": channel,
         "symbol": symbol_upper,
