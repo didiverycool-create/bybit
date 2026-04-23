@@ -26278,5 +26278,72 @@ class BlockedPreviewIssueKindRound96Tests(unittest.TestCase):
         )
 
 
+class ChannelRecommenderProductionCallsiteThreadingRound97Tests(unittest.TestCase):
+    """Pins the R97 production-callsite ``issue_kind`` threading.
+
+    Round 97 collapses the R95 dual-path (typed-first + substring fallback)
+    inside ``_build_{public,private}_execution_channel_recommended_action``
+    into single-path typed dispatch that auto-classifies from ``detail`` via
+    :func:`_classify_channel_issue_kind` when no explicit ``issue_kind`` is
+    passed.  The three production callsites in ``_decorate_strategy_runtime_item``
+    (main.py:8464/8482 public/private channel branches, main.py:8532/8540
+    alert-based channel branches) and ``build_bybit_private_status``
+    (main.py:10790) now pass ``issue_kind=_classify_channel_issue_kind(detail)``
+    explicitly so the typed-first branch fires at the callsite rather than
+    depending on the helper's internal auto-classification fallback.
+
+    This is a "belt and suspenders" layering — the helper would auto-classify
+    regardless — but it pins the invariant that every in-tree recommender
+    callsite threads the typed kind through, which is necessary prep work for
+    a future round that makes ``issue_kind`` a required kwarg and removes the
+    internal auto-classification.
+    """
+
+    def test_public_helper_collapses_dual_path_into_classifier_dispatch(self) -> None:
+        # Observable: an arbitrary detail that does not match any classifier
+        # hint now falls through to the generic copy (not the legacy STALE
+        # probe).  R95 kept ``"超过约"`` as a substring fallback inside the
+        # helper; R97 removed it — the classifier only matches ``"超过约"`` or
+        # ``"持续刷新"`` / ``"尚未收到"`` / ``"鉴权"`` / ``"未连通"`` / ``"未启用"``.
+        # A detail carrying none of those goes to the generic copy.
+        self.assertEqual(
+            control_main._build_public_execution_channel_recommended_action(
+                "公共行情通道出现异常，等待处理。",
+            ),
+            "先恢复 Bybit 公共实时链路并确认目标品种已经持续收到最新行情，再恢复真实策略执行。",
+        )
+
+    def test_private_helper_collapses_dual_path_into_classifier_dispatch(self) -> None:
+        self.assertEqual(
+            control_main._build_private_execution_channel_recommended_action(
+                "私有行情通道出现异常，等待处理。",
+            ),
+            "请先恢复 Bybit 私有实时链路，并确认程序侧 Demo / Live 模式与 API 配置一致。",
+        )
+
+    def test_helper_classifier_dispatch_preserves_canonical_substring_behaviour(self) -> None:
+        # Round 97 regression check: the classifier recognises the canonical
+        # tokens so the same output flows even though the inline substring
+        # probe was removed.
+        self.assertEqual(
+            control_main._build_public_execution_channel_recommended_action(
+                "当前 Bybit 公共 WS 尚未收到 BTCUSDT 的实时行情",
+            ),
+            "请确认目标品种已加入 watchlist，并等待公共实时行情首帧到达后再恢复真实策略执行。",
+        )
+        self.assertEqual(
+            control_main._build_public_execution_channel_recommended_action(
+                "当前 Bybit 公共 WS 已超过约 90 秒未收到行情",
+            ),
+            "请先确认目标品种公共实时行情已经重新持续刷新，再恢复真实策略执行。",
+        )
+        self.assertEqual(
+            control_main._build_private_execution_channel_recommended_action(
+                "当前 Bybit 私有 WS 尚未完成鉴权",
+            ),
+            "请检查私有 API Key 权限、程序侧 Demo / Live 模式与账户配置是否一致，再恢复私有实时链路。",
+        )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -1010,18 +1010,18 @@ def _build_public_execution_channel_recommended_action(
         return "请优先检查本机代理、VPN、防火墙或企业网关是否拦截 Bybit 公共 WS，并确认系统根证书或 TLS 设置。"
     if _is_network_transport_error(normalized_error):
         return "请先检查本机到 Bybit 的网络连通、DNS 与代理配置，再确认公共实时链路已恢复。"
-    # Round 95 — typed ``issue_kind`` dispatch.  The typed path fires first so
-    # a caller passing ``CHANNEL_ISSUE_KIND_NO_FEED`` gets the watchlist
-    # recovery copy even when ``detail`` has been translated or reworded and
-    # no longer carries the ``"尚未收到"`` substring.  Substring probes remain
-    # as a legacy fallback for callers that have not been wired yet.
-    if issue_kind == CHANNEL_ISSUE_KIND_NO_FEED:
+    # Round 97 — collapse the R95 dual-path (typed-first + substring fallback)
+    # into single-path typed dispatch: auto-classify from ``detail`` when no
+    # explicit ``issue_kind`` is passed.  The classifier now owns all
+    # detail-substring knowledge; the helper's branches consume only typed
+    # kinds.  All in-tree callers either pass the typed kind explicitly (R96
+    # end-to-end threading, R97 production callsites) or rely on the detail
+    # strings emitted by ``execution_health`` / ``get_public_execution_channel_issue``
+    # which always contain the canonical tokens the classifier recognises.
+    resolved_kind = issue_kind if issue_kind is not None else _classify_channel_issue_kind(detail)
+    if resolved_kind == CHANNEL_ISSUE_KIND_NO_FEED:
         return "请确认目标品种已加入 watchlist，并等待公共实时行情首帧到达后再恢复真实策略执行。"
-    if issue_kind == CHANNEL_ISSUE_KIND_STALE:
-        return "请先确认目标品种公共实时行情已经重新持续刷新，再恢复真实策略执行。"
-    if detail and "尚未收到" in detail:
-        return "请确认目标品种已加入 watchlist，并等待公共实时行情首帧到达后再恢复真实策略执行。"
-    if detail and ("超过约" in detail or "持续刷新" in detail):
+    if resolved_kind == CHANNEL_ISSUE_KIND_STALE:
         return "请先确认目标品种公共实时行情已经重新持续刷新，再恢复真实策略执行。"
     return "先恢复 Bybit 公共实时链路并确认目标品种已经持续收到最新行情，再恢复真实策略执行。"
 
@@ -1045,14 +1045,13 @@ def _build_private_execution_channel_recommended_action(
         return "请优先检查本机代理、VPN、防火墙或企业网关是否拦截 Bybit 私有 WS，并确认系统根证书、TLS 设置和当前 Demo / Live 配置。"
     if _is_network_transport_error(normalized_error):
         return "请先检查本机到 Bybit 的网络连通、DNS 与代理配置，并确认私有实时链路已恢复。"
-    # Round 95 — see the public helper for the typed-first dispatch rationale.
-    # ``CHANNEL_ISSUE_KIND_AUTH`` maps to the private-WS rekey copy;
-    # ``CHANNEL_ISSUE_KIND_STALE`` / ``CHANNEL_ISSUE_KIND_DISCONNECTED`` fall
+    # Round 97 — see the public helper above for the single-path typed-dispatch
+    # rationale.  ``CHANNEL_ISSUE_KIND_AUTH`` maps to the private-WS rekey
+    # copy; every other kind (STALE / DISCONNECTED / DISABLED / None) falls
     # through to the generic recovery copy (same as the historical behaviour
     # for non-auth private outages).
-    if issue_kind == CHANNEL_ISSUE_KIND_AUTH:
-        return "请检查私有 API Key 权限、程序侧 Demo / Live 模式与账户配置是否一致，再恢复私有实时链路。"
-    if detail and "鉴权" in detail:
+    resolved_kind = issue_kind if issue_kind is not None else _classify_channel_issue_kind(detail)
+    if resolved_kind == CHANNEL_ISSUE_KIND_AUTH:
         return "请检查私有 API Key 权限、程序侧 Demo / Live 模式与账户配置是否一致，再恢复私有实时链路。"
     return "请先恢复 Bybit 私有实时链路，并确认程序侧 Demo / Live 模式与 API 配置一致。"
 
@@ -8454,10 +8453,17 @@ def _decorate_strategy_runtime_item(item: StrategyRuntimeSnapshot) -> StrategyRu
             else None
         )
         if public_channel_issue is not None:
+            # Round 97 — thread the typed ``issue_kind`` (auto-classified from
+            # the ``get_public_execution_channel_issue`` detail string) so the
+            # R95 typed-first branch inside the recommender fires without
+            # depending on the legacy substring fallback.
             return item.model_copy(
                 update={
                     "note": public_channel_issue,
-                    "next_action": _build_public_execution_channel_recommended_action(public_channel_issue),
+                    "next_action": _build_public_execution_channel_recommended_action(
+                        public_channel_issue,
+                        issue_kind=_classify_channel_issue_kind(public_channel_issue),
+                    ),
                     "guard_state": "auto_dispatch_blocked",
                     "guard_detail": public_channel_issue,
                 }
@@ -8468,12 +8474,14 @@ def _decorate_strategy_runtime_item(item: StrategyRuntimeSnapshot) -> StrategyRu
             else None
         )
         if private_channel_issue is not None:
+            # Round 97 — see the public branch above for the typed-first note.
             return item.model_copy(
                 update={
                     "note": private_channel_issue,
                     "next_action": _build_private_execution_channel_recommended_action(
                         private_channel_issue,
                         last_error=str(private_realtime.get_status().get("last_error") or "").strip() or None,
+                        issue_kind=_classify_channel_issue_kind(private_channel_issue),
                     ),
                     "guard_state": "auto_dispatch_blocked",
                     "guard_detail": private_channel_issue,
@@ -8523,10 +8531,20 @@ def _decorate_strategy_runtime_item(item: StrategyRuntimeSnapshot) -> StrategyRu
         # / ``"公共 WS"`` / ``"公共实时链路"``.
         if alert is not None and alert.reason_code == AUTO_DISPATCH_GATE_REASON_PRIVATE_CHANNEL_OUTAGE:
             detail = alert.description
-            next_action = alert.suggested_action or _build_private_execution_channel_recommended_action(alert.description)
+            # Round 97 — thread the typed ``issue_kind`` (auto-classified from
+            # the alert description) so the R95 typed-first branch inside the
+            # recommender fires without the substring fallback.
+            next_action = alert.suggested_action or _build_private_execution_channel_recommended_action(
+                alert.description,
+                issue_kind=_classify_channel_issue_kind(alert.description),
+            )
         elif alert is not None and alert.reason_code == AUTO_DISPATCH_GATE_REASON_PUBLIC_CHANNEL_OUTAGE:
             detail = alert.description
-            next_action = alert.suggested_action or _build_public_execution_channel_recommended_action(alert.description)
+            # Round 97 — see the private branch above for the typed-first note.
+            next_action = alert.suggested_action or _build_public_execution_channel_recommended_action(
+                alert.description,
+                issue_kind=_classify_channel_issue_kind(alert.description),
+            )
         return item.model_copy(
             update={
                 "note": detail,
@@ -10784,10 +10802,14 @@ def get_bybit_private_status():
             "realtime_stale_seconds": int(realtime_status.get("stale_seconds") or 0),
             "realtime_last_error": realtime_status.get("last_error"),
             "realtime_recommended_action": (
+                # Round 97 — thread the typed ``issue_kind`` so the R95
+                # typed-first branch picks the AUTH recovery copy off the
+                # typed kind rather than the legacy ``"鉴权"`` substring fallback.
                 _build_private_execution_channel_recommended_action(
                     realtime_issue,
                     last_error=realtime_status.get("last_error"),
                     rest_reachable=private_rest_reachable,
+                    issue_kind=_classify_channel_issue_kind(realtime_issue),
                 )
                 if realtime_issue
                 else None
