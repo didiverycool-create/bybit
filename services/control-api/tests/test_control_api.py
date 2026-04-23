@@ -23034,17 +23034,24 @@ class AutoDispatchGateReasonContextTypedReturnRound75Tests(unittest.TestCase):
             AutoDispatchGateReasonContext,
         )
 
+        # Round 100 — ``_strategy_auto_dispatch_gate_reason`` now reads the
+        # typed ``issue_kind`` off the R98/R99 health helpers instead of
+        # calling ``get_{public,private}_execution_channel_issue``; patch the
+        # health helpers accordingly.
         with patch.object(control_main.repo, "snapshot", return_value=self._scheduler_snapshot()), \
              patch.object(control_main, "_resolve_strategy_primary_market", return_value="perp"), \
              patch.object(
                  control_main,
-                 "get_public_execution_channel_issue",
-                 return_value="当前 Bybit 公共 WS 未启用，无法安全执行真实策略委托。",
+                 "_build_public_execution_channel_health",
+                 return_value={
+                     "issue": "当前 Bybit 公共 WS 未启用，无法安全执行真实策略委托。",
+                     "issue_kind": control_main.CHANNEL_ISSUE_KIND_DISABLED,
+                 },
              ), \
              patch.object(
                  control_main,
-                 "get_private_execution_channel_issue",
-                 return_value=None,
+                 "_build_private_execution_channel_health",
+                 return_value={"issue": None, "issue_kind": None},
              ):
             context = control_main._strategy_auto_dispatch_gate_reason(self._live_strategy())
 
@@ -23060,17 +23067,23 @@ class AutoDispatchGateReasonContextTypedReturnRound75Tests(unittest.TestCase):
             AutoDispatchGateReasonContext,
         )
 
+        # Round 100 — see the public branch above; patch the health helpers
+        # so the gate context reads the typed ``issue_kind`` alongside the
+        # issue string.
         with patch.object(control_main.repo, "snapshot", return_value=self._scheduler_snapshot()), \
              patch.object(control_main, "_resolve_strategy_primary_market", return_value="perp"), \
              patch.object(
                  control_main,
-                 "get_public_execution_channel_issue",
-                 return_value=None,
+                 "_build_public_execution_channel_health",
+                 return_value={"issue": None, "issue_kind": None},
              ), \
              patch.object(
                  control_main,
-                 "get_private_execution_channel_issue",
-                 return_value="当前 Bybit 私有 WS 未连通，无法安全执行真实策略委托。",
+                 "_build_private_execution_channel_health",
+                 return_value={
+                     "issue": "当前 Bybit 私有 WS 未连通，无法安全执行真实策略委托。",
+                     "issue_kind": control_main.CHANNEL_ISSUE_KIND_DISCONNECTED,
+                 },
              ):
             context = control_main._strategy_auto_dispatch_gate_reason(self._live_strategy())
 
@@ -24330,6 +24343,7 @@ class RecordStrategyExecutionIssueTypedKwargsRound84Tests(unittest.TestCase):
             suggested_action: Optional[str],
             strategy_id: Optional[str],
             reason_code: Optional[str],
+            issue_kind: Optional[str] = None,
         ) -> bool:
             captured["suggested_action"] = suggested_action
             captured["reason_code"] = reason_code
@@ -24366,6 +24380,7 @@ class RecordStrategyExecutionIssueTypedKwargsRound84Tests(unittest.TestCase):
             suggested_action: Optional[str],
             strategy_id: Optional[str],
             reason_code: Optional[str],
+            issue_kind: Optional[str] = None,
         ) -> bool:
             captured["suggested_action"] = suggested_action
             return False
@@ -24405,6 +24420,7 @@ class RecordStrategyExecutionIssueTypedKwargsRound84Tests(unittest.TestCase):
             suggested_action: Optional[str],
             strategy_id: Optional[str],
             reason_code: Optional[str],
+            issue_kind: Optional[str] = None,
         ) -> bool:
             captured["suggested_action"] = suggested_action
             return False
@@ -24434,6 +24450,7 @@ class RecordStrategyExecutionIssueTypedKwargsRound84Tests(unittest.TestCase):
             suggested_action: Optional[str],
             strategy_id: Optional[str],
             reason_code: Optional[str],
+            issue_kind: Optional[str] = None,
         ) -> bool:
             captured["suggested_action"] = suggested_action
             return False
@@ -24935,6 +24952,7 @@ class RuntimeUnavailableUmbrellaSubstringRemovalRound88Tests(unittest.TestCase):
             suggested_action: Optional[str],
             strategy_id: Optional[str],
             reason_code: Optional[str],
+            issue_kind: Optional[str] = None,
         ) -> bool:
             captured["suggested_action"] = suggested_action
             return False
@@ -24976,6 +24994,7 @@ class RuntimeUnavailableUmbrellaSubstringRemovalRound88Tests(unittest.TestCase):
             suggested_action: Optional[str],
             strategy_id: Optional[str],
             reason_code: Optional[str],
+            issue_kind: Optional[str] = None,
         ) -> bool:
             captured["suggested_action"] = suggested_action
             return False
@@ -26835,6 +26854,378 @@ class PrivateChannelHealthIssueKindAtSourceRound99Tests(unittest.TestCase):
         self.assertEqual(
             decorated.next_action,
             "请检查私有 API Key 权限、程序侧 Demo / Live 模式与账户配置是否一致，再恢复私有实时链路。",
+        )
+
+
+class AlertIssueKindAtSourceRound100Tests(unittest.TestCase):
+    """Round 100 — typed ``issue_kind`` flows end-to-end from the R98/R99
+    channel-health emitters through ``AutoDispatchGateReasonContext`` →
+    ``AutoDispatchGate`` → ``AlertRecord`` so the runtime-snapshot decoration
+    reads ``alert.issue_kind`` directly instead of re-classifying the composed
+    alert description via ``_classify_channel_issue_kind``.
+    """
+    def test_alert_record_defaults_issue_kind_to_none(self) -> None:
+        alert = AlertRecord(
+            id="alert-r100-default",
+            severity="P1",
+            symbol="BTCUSDT",
+            title="t",
+            description="d",
+            triggered_at=datetime.now(timezone.utc).isoformat(),
+            suggested_action="s",
+        )
+        self.assertIsNone(alert.issue_kind)
+
+    def test_gate_reason_context_carries_public_kind(self) -> None:
+        from models import (  # noqa: PLC0415
+            AUTO_DISPATCH_GATE_REASON_PUBLIC_CHANNEL_OUTAGE,
+        )
+
+        strategy = SimpleNamespace(
+            id="strat-r100-pub",
+            symbols=["BTCUSDT"],
+            mode=control_main.AccountMode.LIVE,
+        )
+        state_stub = SimpleNamespace(
+            control_snapshot=SimpleNamespace(
+                scheduler=SimpleNamespace(status="auto", freeze_publish=False)
+            )
+        )
+        with patch.object(control_main.repo, "snapshot", return_value=state_stub), patch.object(
+            control_main, "_resolve_strategy_primary_market", return_value="perp"
+        ), patch.object(
+            control_main,
+            "_build_public_execution_channel_health",
+            return_value={
+                "issue": "当前 Bybit 公共 WS 尚未收到 BTCUSDT 最新行情，请先恢复公共实时链路。",
+                "issue_kind": control_main.CHANNEL_ISSUE_KIND_NO_FEED,
+            },
+        ), patch.object(
+            control_main,
+            "_build_private_execution_channel_health",
+            return_value={"issue": None, "issue_kind": None},
+        ):
+            context = control_main._strategy_auto_dispatch_gate_reason(strategy)
+        self.assertIsNotNone(context)
+        assert context is not None
+        self.assertEqual(context.reason_code, AUTO_DISPATCH_GATE_REASON_PUBLIC_CHANNEL_OUTAGE)
+        self.assertEqual(context.issue_kind, control_main.CHANNEL_ISSUE_KIND_NO_FEED)
+
+    def test_gate_reason_context_carries_private_auth_kind(self) -> None:
+        from models import (  # noqa: PLC0415
+            AUTO_DISPATCH_GATE_REASON_PRIVATE_CHANNEL_OUTAGE,
+        )
+
+        strategy = SimpleNamespace(
+            id="strat-r100-priv",
+            symbols=["BTCUSDT"],
+            mode=control_main.AccountMode.LIVE,
+        )
+        state_stub = SimpleNamespace(
+            control_snapshot=SimpleNamespace(
+                scheduler=SimpleNamespace(status="auto", freeze_publish=False)
+            )
+        )
+        with patch.object(control_main.repo, "snapshot", return_value=state_stub), patch.object(
+            control_main, "_resolve_strategy_primary_market", return_value="perp"
+        ), patch.object(
+            control_main,
+            "_build_public_execution_channel_health",
+            return_value={"issue": None, "issue_kind": None},
+        ), patch.object(
+            control_main,
+            "_build_private_execution_channel_health",
+            return_value={
+                "issue": "当前 Bybit 私有 WS 尚未完成鉴权，无法安全执行真实策略委托，请先恢复私有实时链路。",
+                "issue_kind": control_main.CHANNEL_ISSUE_KIND_AUTH,
+            },
+        ):
+            context = control_main._strategy_auto_dispatch_gate_reason(strategy)
+        self.assertIsNotNone(context)
+        assert context is not None
+        self.assertEqual(context.reason_code, AUTO_DISPATCH_GATE_REASON_PRIVATE_CHANNEL_OUTAGE)
+        self.assertEqual(context.issue_kind, control_main.CHANNEL_ISSUE_KIND_AUTH)
+
+    def test_gate_reason_context_leaves_scheduler_issue_kind_none(self) -> None:
+        from models import AUTO_DISPATCH_GATE_REASON_SCHEDULER_PAUSED  # noqa: PLC0415
+
+        strategy = SimpleNamespace(
+            id="strat-r100-sched",
+            symbols=["BTCUSDT"],
+            mode=control_main.AccountMode.LIVE,
+        )
+        state_stub = SimpleNamespace(
+            control_snapshot=SimpleNamespace(
+                scheduler=SimpleNamespace(status="paused", freeze_publish=False)
+            )
+        )
+        with patch.object(control_main.repo, "snapshot", return_value=state_stub):
+            context = control_main._strategy_auto_dispatch_gate_reason(strategy)
+        self.assertIsNotNone(context)
+        assert context is not None
+        self.assertEqual(context.reason_code, AUTO_DISPATCH_GATE_REASON_SCHEDULER_PAUSED)
+        self.assertIsNone(context.issue_kind)
+
+    def test_evaluate_gate_forwards_issue_kind_onto_gate(self) -> None:
+        from models import (  # noqa: PLC0415
+            AutoDispatchGateReasonContext,
+            AUTO_DISPATCH_GATE_REASON_PUBLIC_CHANNEL_OUTAGE,
+        )
+
+        strategy = SimpleNamespace(
+            id="strat-r100-eval",
+            symbols=["BTCUSDT"],
+            mode=control_main.AccountMode.LIVE,
+            status="running",
+        )
+        snapshot = SimpleNamespace(
+            strategy_id="strat-r100-eval",
+            strategy_name="R100 Eval",
+            symbol="BTCUSDT",
+            market="perp",
+            signal="long",
+            runtime_status="running",
+        )
+        reason_context = AutoDispatchGateReasonContext(
+            reason_code=AUTO_DISPATCH_GATE_REASON_PUBLIC_CHANNEL_OUTAGE,
+            detail="当前 Bybit 公共 WS 尚未收到 BTCUSDT 最新行情。",
+            cancel_existing=True,
+            issue_kind=control_main.CHANNEL_ISSUE_KIND_NO_FEED,
+        )
+        with patch.object(
+            control_main,
+            "_strategy_live_stop_loss_cooldown_remaining_minutes",
+            return_value=None,
+        ), patch.object(
+            control_main,
+            "_has_active_strategy_live_stop_loss_alert",
+            return_value=False,
+        ), patch.object(
+            control_main,
+            "_strategy_exchange_rejection_guard_remaining_minutes",
+            return_value=None,
+        ), patch.object(
+            control_main,
+            "_strategy_auto_dispatch_gate_reason",
+            return_value=reason_context,
+        ):
+            gate = control_main._evaluate_strategy_auto_dispatch_gate(strategy, snapshot)
+        self.assertEqual(gate.verdict, "block")
+        self.assertTrue(gate.record_issue)
+        self.assertEqual(gate.issue_kind, control_main.CHANNEL_ISSUE_KIND_NO_FEED)
+
+    def test_record_auto_dispatch_issue_threads_issue_kind_onto_alert(self) -> None:
+        control_main.repo.state.alerts = []
+        try:
+            control_main._record_strategy_auto_dispatch_issue(
+                "strat-r100-record",
+                "R100 Record",
+                "BTCUSDT",
+                "long",
+                control_main.AccountMode.LIVE,
+                "当前 Bybit 私有 WS 未连通，无法安全执行真实策略委托。",
+                strategy=None,
+                issue_kind=control_main.CHANNEL_ISSUE_KIND_DISCONNECTED,
+            )
+            alerts = [
+                alert
+                for alert in control_main.repo.state.alerts
+                if (alert.rule_key or "").startswith("strategy-auto-dispatch:strat-r100-record:")
+            ]
+            self.assertEqual(len(alerts), 1)
+            self.assertEqual(alerts[0].issue_kind, control_main.CHANNEL_ISSUE_KIND_DISCONNECTED)
+        finally:
+            control_main.repo.state.alerts = []
+
+    def test_record_manual_execution_issue_threads_issue_kind_onto_alert(self) -> None:
+        control_main.repo.state.alerts = []
+        try:
+            control_main._record_strategy_manual_execution_issue(
+                "strat-r100-manual",
+                "R100 Manual",
+                "BTCUSDT",
+                control_main.AccountMode.LIVE,
+                "当前 Bybit 公共 WS 尚未收到 BTCUSDT 最新行情。",
+                strategy=None,
+                issue_kind=control_main.CHANNEL_ISSUE_KIND_NO_FEED,
+            )
+            alerts = [
+                alert
+                for alert in control_main.repo.state.alerts
+                if (alert.rule_key or "").startswith("strategy-blocked-execution:strat-r100-manual:")
+            ]
+            self.assertEqual(len(alerts), 1)
+            self.assertEqual(alerts[0].issue_kind, control_main.CHANNEL_ISSUE_KIND_NO_FEED)
+        finally:
+            control_main.repo.state.alerts = []
+
+    def test_decorator_reads_alert_issue_kind_without_reclassifying(self) -> None:
+        from models import AUTO_DISPATCH_GATE_REASON_PRIVATE_CHANNEL_OUTAGE  # noqa: PLC0415
+
+        strategy = SimpleNamespace(
+            id="strat-r100-dec",
+            name="R100 Dec",
+            mode=control_main.AccountMode.LIVE,
+            status="running",
+            symbol="BTCUSDT",
+            symbols=["BTCUSDT"],
+            market="perp",
+        )
+        runtime_item = control_main.StrategyRuntimeSnapshot(
+            strategy_id="strat-r100-dec",
+            strategy_name="R100 Dec",
+            symbol="BTCUSDT",
+            market="perp",
+            mode=control_main.AccountMode.LIVE,
+            runtime_status="running",
+            signal="long",
+            last_price=10000.0,
+            reference_price=10000.0,
+            change_24h=0.0,
+            note="",
+            next_action="--",
+            last_evaluated_at=datetime.now(timezone.utc).isoformat(),
+            guard_state="none",
+            guard_detail=None,
+        )
+        composed_description = "R100 Dec 在 LIVE 自动执行时被阻断。" \
+            "(描述里不包含任何 WS 识别字串，只有 issue_kind 能让装饰器识别。)"
+        alert = AlertRecord(
+            id="alert-r100-dec",
+            severity="P1",
+            symbol="BTCUSDT",
+            title="BTCUSDT 自动执行被拦截",
+            description=composed_description,
+            triggered_at=datetime.now(timezone.utc).isoformat(),
+            suggested_action="",
+            source_type="system",
+            rule_key="strategy-auto-dispatch:strat-r100-dec:long:live",
+            reason_code=AUTO_DISPATCH_GATE_REASON_PRIVATE_CHANNEL_OUTAGE,
+            issue_kind=control_main.CHANNEL_ISSUE_KIND_AUTH,
+        )
+        state_stub = SimpleNamespace(strategies=[strategy], alerts=[alert])
+        classifier_calls: list[Any] = []
+
+        def spy_classify(detail: Any) -> Any:
+            classifier_calls.append(detail)
+            return None
+
+        with patch.object(
+            control_main, "_has_active_strategy_live_stop_loss_alert", return_value=False
+        ), patch.object(
+            control_main.repo, "snapshot", return_value=state_stub
+        ), patch.object(
+            control_main,
+            "_build_public_execution_channel_health",
+            return_value={"issue": None, "issue_kind": None},
+        ), patch.object(
+            control_main,
+            "_build_private_execution_channel_health",
+            return_value={"issue": None, "issue_kind": None},
+        ), patch.object(
+            control_main,
+            "_strategy_live_stop_loss_cooldown_remaining_minutes",
+            return_value=None,
+        ), patch.object(
+            control_main, "_has_active_strategy_stale_order_alert", return_value=False
+        ), patch.object(
+            control_main,
+            "_strategy_exchange_rejection_guard_remaining_minutes",
+            return_value=None,
+        ), patch.object(
+            control_main, "_has_active_strategy_auto_dispatch_alert", return_value=True
+        ), patch.object(
+            control_main, "_find_latest_active_system_alert_by_prefix", return_value=alert
+        ), patch.object(
+            control_main, "_classify_channel_issue_kind", side_effect=spy_classify
+        ):
+            decorated = control_main._decorate_strategy_runtime_item(runtime_item)
+        self.assertEqual(decorated.guard_state, "auto_dispatch_blocked")
+        self.assertNotIn(composed_description, classifier_calls)
+        self.assertEqual(
+            decorated.next_action,
+            "请检查私有 API Key 权限、程序侧 Demo / Live 模式与账户配置是否一致，再恢复私有实时链路。",
+        )
+
+    def test_decorator_falls_back_to_classifier_when_alert_issue_kind_absent(self) -> None:
+        from models import AUTO_DISPATCH_GATE_REASON_PUBLIC_CHANNEL_OUTAGE  # noqa: PLC0415
+
+        strategy = SimpleNamespace(
+            id="strat-r100-legacy",
+            name="R100 Legacy",
+            mode=control_main.AccountMode.LIVE,
+            status="running",
+            symbol="BTCUSDT",
+            symbols=["BTCUSDT"],
+            market="perp",
+        )
+        runtime_item = control_main.StrategyRuntimeSnapshot(
+            strategy_id="strat-r100-legacy",
+            strategy_name="R100 Legacy",
+            symbol="BTCUSDT",
+            market="perp",
+            mode=control_main.AccountMode.LIVE,
+            runtime_status="running",
+            signal="long",
+            last_price=10000.0,
+            reference_price=10000.0,
+            change_24h=0.0,
+            note="",
+            next_action="--",
+            last_evaluated_at=datetime.now(timezone.utc).isoformat(),
+            guard_state="none",
+            guard_detail=None,
+        )
+        legacy_description = (
+            "R100 Legacy 在 LIVE 自动执行时被阻断。"
+            "当前 Bybit 公共 WS 尚未收到 BTCUSDT 最新行情。"
+        )
+        alert = AlertRecord(
+            id="alert-r100-legacy",
+            severity="P1",
+            symbol="BTCUSDT",
+            title="BTCUSDT 自动执行被拦截",
+            description=legacy_description,
+            triggered_at=datetime.now(timezone.utc).isoformat(),
+            suggested_action="",
+            source_type="system",
+            rule_key="strategy-auto-dispatch:strat-r100-legacy:long:live",
+            reason_code=AUTO_DISPATCH_GATE_REASON_PUBLIC_CHANNEL_OUTAGE,
+            issue_kind=None,
+        )
+        state_stub = SimpleNamespace(strategies=[strategy], alerts=[alert])
+        with patch.object(
+            control_main, "_has_active_strategy_live_stop_loss_alert", return_value=False
+        ), patch.object(
+            control_main.repo, "snapshot", return_value=state_stub
+        ), patch.object(
+            control_main,
+            "_build_public_execution_channel_health",
+            return_value={"issue": None, "issue_kind": None},
+        ), patch.object(
+            control_main,
+            "_build_private_execution_channel_health",
+            return_value={"issue": None, "issue_kind": None},
+        ), patch.object(
+            control_main,
+            "_strategy_live_stop_loss_cooldown_remaining_minutes",
+            return_value=None,
+        ), patch.object(
+            control_main, "_has_active_strategy_stale_order_alert", return_value=False
+        ), patch.object(
+            control_main,
+            "_strategy_exchange_rejection_guard_remaining_minutes",
+            return_value=None,
+        ), patch.object(
+            control_main, "_has_active_strategy_auto_dispatch_alert", return_value=True
+        ), patch.object(
+            control_main, "_find_latest_active_system_alert_by_prefix", return_value=alert
+        ):
+            decorated = control_main._decorate_strategy_runtime_item(runtime_item)
+        self.assertEqual(decorated.guard_state, "auto_dispatch_blocked")
+        self.assertEqual(
+            decorated.next_action,
+            "请确认目标品种已加入 watchlist，并等待公共实时行情首帧到达后再恢复真实策略执行。",
         )
 
 

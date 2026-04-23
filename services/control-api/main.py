@@ -6892,6 +6892,7 @@ def _record_strategy_auto_dispatch_issue(
     reason_code: Optional[str] = None,
     market: Optional[str] = None,
     sub_block_code: Optional[str] = None,
+    issue_kind: Optional[str] = None,
 ) -> None:
     # Round 84 — ``market`` / ``sub_block_code`` thread the typed
     # discriminators through to the recommendation helper so the runtime-worker
@@ -6903,6 +6904,14 @@ def _record_strategy_auto_dispatch_issue(
     # derive it from the detail so the umbrella RUNTIME_UNAVAILABLE substring
     # probe inside ``_build_execution_preview_recommended_action`` can be
     # deleted without regressing that call site.
+    # Round 100 — ``issue_kind`` forwards the typed ``CHANNEL_ISSUE_KIND_*``
+    # discriminator onto ``AlertRecord.issue_kind`` so the runtime-snapshot
+    # decoration (``_decorate_strategy_runtime_item``) can pick the typed
+    # "no_feed" / "stale" / "auth" recovery copy without re-classifying the
+    # composed alert description.  Callers that already carry the typed kind
+    # (gate path + ``StrategyExecutionChannelOutageError`` outcome path) pass
+    # it in explicitly; legacy / non-channel callers leave it ``None`` and
+    # the alert omits the field (decorator falls back to the R97 classifier).
     rule_key = f"strategy-auto-dispatch:{strategy_id}:{signal}:{mode.value}"
     resolved_sub_block_code = sub_block_code or _derive_sub_block_code_from_detail(detail)
     suggested_action = recommended_action or _build_auto_dispatch_recommended_action(
@@ -6925,6 +6934,7 @@ def _record_strategy_auto_dispatch_issue(
             suggested_action=suggested_action,
             strategy_id=strategy_id,
             reason_code=resolved_reason_code,
+            issue_kind=issue_kind,
         )
         if changed:
             _queue_strategy_issue_review_locked(
@@ -6969,6 +6979,7 @@ def _record_strategy_manual_execution_issue(
     reason_code: Optional[str] = None,
     market: Optional[str] = None,
     sub_block_code: Optional[str] = None,
+    issue_kind: Optional[str] = None,
 ) -> None:
     # Round 84 — ``market`` / ``sub_block_code`` thread the typed
     # discriminators through to the recommendation helper so the runtime-worker
@@ -6983,6 +6994,10 @@ def _record_strategy_manual_execution_issue(
     # branch at ``dispatch_strategy_signal`` for plain ``RuntimeError``
     # instances that happen to carry the ``"私有 WS"`` / ``"公共 WS"`` token
     # without being ``StrategyExecutionChannelOutageError`` instances).
+    # Round 100 — ``issue_kind`` mirrors the auto-dispatch helper: forward the
+    # typed ``CHANNEL_ISSUE_KIND_*`` onto ``AlertRecord.issue_kind`` so
+    # audit-record consumers that branch on the typed kind can skip
+    # ``_classify_channel_issue_kind`` on the composed description.
     rule_key = f"strategy-blocked-execution:{strategy_id}:{mode.value}"
     resolved_sub_block_code = sub_block_code or _derive_sub_block_code_from_detail(detail)
     suggested_action = recommended_action or _build_manual_execution_recommended_action(
@@ -7012,6 +7027,7 @@ def _record_strategy_manual_execution_issue(
             suggested_action=suggested_action,
             strategy_id=strategy_id,
             reason_code=resolved_reason_code,
+            issue_kind=issue_kind,
         )
         repo.add_event(
             event_type="strategy.execution.blocked",
@@ -7192,19 +7208,31 @@ def _strategy_auto_dispatch_gate_reason(
         market = _resolve_strategy_primary_market(state, strategy)
         symbol = strategy.symbols[0] if strategy.symbols else ""
         if symbol:
-            public_channel_issue = get_public_execution_channel_issue(market, symbol)
+            # Round 100 — call the health helper once so the typed
+            # ``issue_kind`` from the ``enabled`` / ``connected`` /
+            # ``has_symbol_feed`` / ``stale`` branch variables in
+            # ``build_public_execution_channel_health`` (R98) flows onto the
+            # reason context alongside the user-facing ``issue`` string.
+            public_health = _build_public_execution_channel_health(market, symbol)
+            public_channel_issue = public_health.get("issue") if public_health else None
             if public_channel_issue is not None:
                 return AutoDispatchGateReasonContext(
                     reason_code=AUTO_DISPATCH_GATE_REASON_PUBLIC_CHANNEL_OUTAGE,
                     detail=public_channel_issue,
                     cancel_existing=True,
+                    issue_kind=public_health.get("issue_kind"),
                 )
-        private_channel_issue = get_private_execution_channel_issue(strategy.mode)
+        # Round 100 — mirror the public branch: read typed ``issue_kind`` off
+        # the R99 private-health helper instead of calling the string-only
+        # ``get_private_execution_channel_issue`` accessor.
+        private_health = _build_private_execution_channel_health(strategy.mode)
+        private_channel_issue = private_health.get("issue") if private_health else None
         if private_channel_issue is not None:
             return AutoDispatchGateReasonContext(
                 reason_code=AUTO_DISPATCH_GATE_REASON_PRIVATE_CHANNEL_OUTAGE,
                 detail=private_channel_issue,
                 cancel_existing=True,
+                issue_kind=private_health.get("issue_kind"),
             )
     return None
 
@@ -8027,6 +8055,9 @@ def _evaluate_strategy_auto_dispatch_gate(
         # Round 76 — surface the typed sub-reason on the gate so the alert
         # emitter can tag ``AlertRecord.reason_code`` without re-classifying
         # the free-form detail.
+        # Round 100 — surface the typed ``issue_kind`` on the gate (forwarded
+        # from ``gate_reason_context.issue_kind``) so ``AlertRecord.issue_kind``
+        # can be tagged without re-parsing the composed description.
         return AutoDispatchGate(
             verdict="block",
             reason_code="auto.scheduler_or_channel_gate",
@@ -8035,6 +8066,7 @@ def _evaluate_strategy_auto_dispatch_gate(
             clear_alerts=False,
             record_issue=True,
             sub_reason_code=gate_reason_context.reason_code,
+            issue_kind=gate_reason_context.issue_kind,
         )
     if snapshot.runtime_status != "running":
         return AutoDispatchGate(
@@ -8093,6 +8125,12 @@ def _auto_dispatch_strategy_signal_changes(
                 # gate codes have no preview-side counterpart and map to
                 # ``None`` (the helper's ``or …`` short-circuits covers
                 # the rest).
+                # Round 100 — thread the typed ``issue_kind`` (public /
+                # private channel-outage kind auto-classified at the
+                # ``_build_{public,private}_execution_channel_health`` source
+                # and surfaced on the gate) so the resulting
+                # ``AlertRecord.issue_kind`` is typed at emit time and the
+                # decorator consumer reads it directly.
                 _record_strategy_auto_dispatch_issue(
                     snapshot.strategy_id,
                     snapshot.strategy_name,
@@ -8107,6 +8145,7 @@ def _auto_dispatch_strategy_signal_changes(
                         if gate.sub_reason_code is not None
                         else None
                     ),
+                    issue_kind=gate.issue_kind,
                 )
             continue
         active_order_count, active_order = _build_strategy_active_order_summary(
@@ -8266,7 +8305,16 @@ def _auto_dispatch_strategy_signal_changes(
             # instances do not carry ``sub_block_code``, so ``getattr(..., None)``
             # falls back cleanly and the helper's fallback classifier still fires
             # for them (preserves behaviour for the non-channel-outage branches).
+            # Round 100 — ``StrategyExecutionChannelOutageError`` also carries
+            # a typed ``issue_kind`` (populated at raise time from the
+            # ``CHANNEL_ISSUE_KIND_*`` classification of the detail / kwarg);
+            # forward it via ``getattr(...)`` so ``AlertRecord.issue_kind`` is
+            # typed at emit time and the downstream decorator can skip the
+            # ``_classify_channel_issue_kind`` re-classification of the
+            # composed description.  Plain ``RuntimeError`` instances lack
+            # the attr so ``getattr(..., None)`` preserves the legacy path.
             exc_sub_block_code = getattr(caught, "sub_block_code", None)
+            exc_issue_kind = getattr(caught, "issue_kind", None)
             _record_strategy_auto_dispatch_issue(
                 snapshot.strategy_id,
                 snapshot.strategy_name,
@@ -8280,6 +8328,7 @@ def _auto_dispatch_strategy_signal_changes(
                 if exc_sub_block_code is not None
                 else None,
                 sub_block_code=exc_sub_block_code,
+                issue_kind=exc_issue_kind,
             )
 
 
@@ -8603,16 +8652,23 @@ def _decorate_strategy_runtime_item(item: StrategyRuntimeSnapshot) -> StrategyRu
             # Round 97 — thread the typed ``issue_kind`` (auto-classified from
             # the alert description) so the R95 typed-first branch inside the
             # recommender fires without the substring fallback.
+            # Round 100 — read ``alert.issue_kind`` directly (populated at
+            # emit time from the R98/R99 health helpers via the gate
+            # context).  Fall back to ``_classify_channel_issue_kind`` on the
+            # composed description for legacy alerts that predate the new
+            # field, so pre-R100 persisted state keeps its typed branch.
             next_action = alert.suggested_action or _build_private_execution_channel_recommended_action(
                 alert.description,
-                issue_kind=_classify_channel_issue_kind(alert.description),
+                issue_kind=alert.issue_kind or _classify_channel_issue_kind(alert.description),
             )
         elif alert is not None and alert.reason_code == AUTO_DISPATCH_GATE_REASON_PUBLIC_CHANNEL_OUTAGE:
             detail = alert.description
             # Round 97 — see the private branch above for the typed-first note.
+            # Round 100 — same ``alert.issue_kind`` direct-read note as the
+            # private branch.
             next_action = alert.suggested_action or _build_public_execution_channel_recommended_action(
                 alert.description,
-                issue_kind=_classify_channel_issue_kind(alert.description),
+                issue_kind=alert.issue_kind or _classify_channel_issue_kind(alert.description),
             )
         return item.model_copy(
             update={
@@ -9644,8 +9700,12 @@ def dispatch_strategy_signal(strategy_id: str, payload: StrategyExecutionRequest
                 # instead of leaning on the ``"私有 WS"`` / ``"公共 WS"``
                 # substring probe.  Plain ``RuntimeError`` instances carry
                 # neither attr so ``getattr(..., None)`` falls back cleanly.
+                # Round 100 — forward the typed ``issue_kind`` attached to
+                # ``StrategyExecutionChannelOutageError`` so the emitted
+                # ``AlertRecord.issue_kind`` is typed at source.
                 exc_block_code = getattr(exc, "block_code", None)
                 exc_sub_block_code = getattr(exc, "sub_block_code", None)
+                exc_issue_kind = getattr(exc, "issue_kind", None)
                 _record_strategy_manual_execution_issue(
                     strategy_id,
                     strategy.name,
@@ -9656,6 +9716,7 @@ def dispatch_strategy_signal(strategy_id: str, payload: StrategyExecutionRequest
                     strategy=strategy,
                     reason_code=exc_block_code,
                     sub_block_code=exc_sub_block_code,
+                    issue_kind=exc_issue_kind,
                 )
         raise
 

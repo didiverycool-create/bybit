@@ -1199,6 +1199,14 @@ class AlertRecord(BaseModel):
     # Consumers that need to branch on "what kind of alert is this" should
     # inspect this field instead of substring-probing ``description``.
     reason_code: Optional[str] = None
+    # Round 100 — finer-grained discriminator populated by channel-outage
+    # emitters (one of the ``CHANNEL_ISSUE_KIND_*`` tags from
+    # :mod:`execution_health`).  Decorators that pick the "no_feed" / "stale"
+    # / "auth" recovery copy now read this field directly instead of re-
+    # classifying ``description`` via ``_classify_channel_issue_kind``.  Kept
+    # optional so alerts without a channel-outage taxonomy (manual ack,
+    # news-driven, backtest-triggered, …) leave it unset.
+    issue_kind: Optional[str] = None
 
 
 class AlertRule(BaseModel):
@@ -1604,6 +1612,12 @@ class AutoDispatchGate(BaseModel):
     # the resulting ``AlertRecord.reason_code`` without re-classifying the
     # free-form ``reason_detail`` string.
     sub_reason_code: Optional[str] = None
+    # Round 100 — typed ``CHANNEL_ISSUE_KIND_*`` discriminator mirroring
+    # ``AutoDispatchGateReasonContext.issue_kind``; carried on the gate so
+    # the alert emitter can thread ``AlertRecord.issue_kind`` without
+    # reaching back into the context object.  ``None`` for non-channel
+    # gate reasons (paused / stop-loss / cooldown / scheduler-only).
+    issue_kind: Optional[str] = None
     timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
@@ -1661,6 +1675,13 @@ class AutoDispatchGateReasonContext(BaseModel):
     reason_code: AutoDispatchGateReasonCode
     detail: str
     cancel_existing: bool
+    # Round 100 — typed ``CHANNEL_ISSUE_KIND_*`` discriminator emitted at the
+    # channel-outage source (``_build_{public,private}_execution_channel_health``)
+    # so the downstream ``_record_strategy_auto_dispatch_issue`` callsite can
+    # forward it onto ``AlertRecord.issue_kind`` without re-classifying the
+    # free-form ``detail`` string.  Scheduler / freeze-publish branches carry
+    # ``None`` since their detail strings have no channel-kind taxonomy.
+    issue_kind: Optional[str] = None
 
 
 class ClosePaperPositionPayload(BaseModel):

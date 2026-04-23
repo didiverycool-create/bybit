@@ -2740,6 +2740,7 @@ class AppRepository:
         suggested_action: str,
         strategy_id: Optional[str] = None,
         reason_code: Optional[str] = None,
+        issue_kind: Optional[str] = None,
     ) -> bool:
         existing = next(
             (
@@ -2758,6 +2759,7 @@ class AppRepository:
                 or existing.suggested_action != suggested_action
                 or existing.source_type != "system"
                 or existing.reason_code != reason_code
+                or existing.issue_kind != issue_kind
             )
             existing.severity = severity
             existing.symbol = symbol
@@ -2766,6 +2768,7 @@ class AppRepository:
             existing.suggested_action = suggested_action
             existing.source_type = "system"
             existing.reason_code = reason_code
+            existing.issue_kind = issue_kind
             existing.triggered_at = now_iso()
             return changed
 
@@ -2781,6 +2784,7 @@ class AppRepository:
             source_type="system",
             rule_key=rule_key,
             reason_code=reason_code,
+            issue_kind=issue_kind,
         )
         self.state.alerts.insert(0, alert)
         self.add_event(
