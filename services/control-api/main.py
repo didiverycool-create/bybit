@@ -306,14 +306,65 @@ _CHANNEL_SUB_BLOCK_CODE: Dict[str, str] = {
 }
 
 
+# Round 95 — typed ``channel_issue_kind`` discriminators.  Prior to R95 the
+# ``_build_{public,private}_execution_channel_recommended_action`` helpers
+# keyed their "has no feed" / "stale feed" / "private auth" recovery copy off
+# substring probes (``"尚未收到"`` / ``"超过约"`` / ``"持续刷新"`` / ``"鉴权"``)
+# of the free-form ``detail`` Chinese string.  The typed kinds let the raise
+# sites pass the already-known issue classification explicitly, with the
+# substring probes kept as a last-resort fallback for legacy callers.
+CHANNEL_ISSUE_KIND_DISABLED = "disabled"
+CHANNEL_ISSUE_KIND_DISCONNECTED = "disconnected"
+CHANNEL_ISSUE_KIND_NO_FEED = "no_feed"
+CHANNEL_ISSUE_KIND_STALE = "stale"
+CHANNEL_ISSUE_KIND_AUTH = "auth"
+
+
+def _classify_channel_issue_kind(detail: Optional[str]) -> Optional[str]:
+    """Best-effort map a free-form channel-issue ``detail`` onto a typed kind.
+
+    Round 95 — centralises the substring-to-typed-kind mapping so the raise
+    sites at :func:`_build_strategy_execution_preview_from_state` can auto-
+    classify the existing ``get_public_execution_channel_issue`` /
+    ``get_private_execution_channel_issue`` strings without each call-site
+    re-probing.  Returns ``None`` when no hint matches, so downstream helpers
+    can fall through to their legacy substring dispatch.
+    """
+
+    if not detail:
+        return None
+    if "尚未启用" in detail or "未启用" in detail:
+        return CHANNEL_ISSUE_KIND_DISABLED
+    if "尚未完成鉴权" in detail or "鉴权" in detail:
+        return CHANNEL_ISSUE_KIND_AUTH
+    if "尚未收到" in detail:
+        return CHANNEL_ISSUE_KIND_NO_FEED
+    if "超过约" in detail or "持续刷新" in detail:
+        return CHANNEL_ISSUE_KIND_STALE
+    if "未连通" in detail:
+        return CHANNEL_ISSUE_KIND_DISCONNECTED
+    return None
+
+
 class StrategyExecutionChannelOutageError(RuntimeError):
     block_code: str = RISK_REASON_RUNTIME_UNAVAILABLE
 
-    def __init__(self, detail: str, *, channel: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        detail: str,
+        *,
+        channel: Optional[str] = None,
+        issue_kind: Optional[str] = None,
+    ) -> None:
         super().__init__(detail)
         self.detail = detail
         self.channel = channel
         self.sub_block_code = _CHANNEL_SUB_BLOCK_CODE.get(channel) if channel else None
+        # Round 95 — typed issue-kind discriminator so downstream dispatch can
+        # pick the "no_feed" / "stale" / "auth" recovery copy without probing
+        # ``detail`` for Chinese substrings.  Auto-classify from ``detail`` when
+        # the caller does not pass an explicit kind.
+        self.issue_kind = issue_kind if issue_kind is not None else _classify_channel_issue_kind(detail)
 
 
 # Round 81 — typed ``RuntimeError`` subclass raised by
@@ -945,6 +996,7 @@ def _build_public_execution_channel_recommended_action(
     *,
     last_error: Optional[str] = None,
     rest_reachable: Optional[bool] = None,
+    issue_kind: Optional[str] = None,
 ) -> str:
     normalized_error = str(last_error or _extract_recent_transport_error(detail) or "").strip() or None
     if rest_reachable is True and _is_tls_or_proxy_transport_error(normalized_error):
@@ -958,6 +1010,15 @@ def _build_public_execution_channel_recommended_action(
         return "请优先检查本机代理、VPN、防火墙或企业网关是否拦截 Bybit 公共 WS，并确认系统根证书或 TLS 设置。"
     if _is_network_transport_error(normalized_error):
         return "请先检查本机到 Bybit 的网络连通、DNS 与代理配置，再确认公共实时链路已恢复。"
+    # Round 95 — typed ``issue_kind`` dispatch.  The typed path fires first so
+    # a caller passing ``CHANNEL_ISSUE_KIND_NO_FEED`` gets the watchlist
+    # recovery copy even when ``detail`` has been translated or reworded and
+    # no longer carries the ``"尚未收到"`` substring.  Substring probes remain
+    # as a legacy fallback for callers that have not been wired yet.
+    if issue_kind == CHANNEL_ISSUE_KIND_NO_FEED:
+        return "请确认目标品种已加入 watchlist，并等待公共实时行情首帧到达后再恢复真实策略执行。"
+    if issue_kind == CHANNEL_ISSUE_KIND_STALE:
+        return "请先确认目标品种公共实时行情已经重新持续刷新，再恢复真实策略执行。"
     if detail and "尚未收到" in detail:
         return "请确认目标品种已加入 watchlist，并等待公共实时行情首帧到达后再恢复真实策略执行。"
     if detail and ("超过约" in detail or "持续刷新" in detail):
@@ -970,6 +1031,7 @@ def _build_private_execution_channel_recommended_action(
     *,
     last_error: Optional[str] = None,
     rest_reachable: Optional[bool] = None,
+    issue_kind: Optional[str] = None,
 ) -> str:
     normalized_error = str(last_error or _extract_recent_transport_error(detail) or "").strip() or None
     if rest_reachable is True and _is_tls_or_proxy_transport_error(normalized_error):
@@ -983,6 +1045,13 @@ def _build_private_execution_channel_recommended_action(
         return "请优先检查本机代理、VPN、防火墙或企业网关是否拦截 Bybit 私有 WS，并确认系统根证书、TLS 设置和当前 Demo / Live 配置。"
     if _is_network_transport_error(normalized_error):
         return "请先检查本机到 Bybit 的网络连通、DNS 与代理配置，并确认私有实时链路已恢复。"
+    # Round 95 — see the public helper for the typed-first dispatch rationale.
+    # ``CHANNEL_ISSUE_KIND_AUTH`` maps to the private-WS rekey copy;
+    # ``CHANNEL_ISSUE_KIND_STALE`` / ``CHANNEL_ISSUE_KIND_DISCONNECTED`` fall
+    # through to the generic recovery copy (same as the historical behaviour
+    # for non-auth private outages).
+    if issue_kind == CHANNEL_ISSUE_KIND_AUTH:
+        return "请检查私有 API Key 权限、程序侧 Demo / Live 模式与账户配置是否一致，再恢复私有实时链路。"
     if detail and "鉴权" in detail:
         return "请检查私有 API Key 权限、程序侧 Demo / Live 模式与账户配置是否一致，再恢复私有实时链路。"
     return "请先恢复 Bybit 私有实时链路，并确认程序侧 Demo / Live 模式与 API 配置一致。"
@@ -1030,9 +1099,23 @@ def _build_execution_preview_recommended_action(
     # through).  The three RUNTIME_UNAVAILABLE sub-codes map deterministically
     # to their recovery copy; return early before the umbrella cascade.
     if sub_block_code == RISK_REASON_RUNTIME_UNAVAILABLE_PRIVATE_CHANNEL:
-        return _build_private_execution_channel_recommended_action(detail)
+        # Round 95 — auto-classify the typed ``issue_kind`` from ``detail`` and
+        # forward to the recommender so "auth" vs "disconnected" / "stale"
+        # private-WS outages pick the typed AUTH copy via the typed-first
+        # branch rather than the legacy ``"鉴权"`` substring fallback.
+        return _build_private_execution_channel_recommended_action(
+            detail,
+            issue_kind=_classify_channel_issue_kind(detail),
+        )
     if sub_block_code == RISK_REASON_RUNTIME_UNAVAILABLE_PUBLIC_CHANNEL:
-        return _build_public_execution_channel_recommended_action(detail)
+        # Round 95 — see the private branch above; the public recommender uses
+        # the typed ``NO_FEED`` / ``STALE`` kinds to pick the watchlist /
+        # refresh-feed copy before the legacy ``"尚未收到"`` / ``"超过约"`` /
+        # ``"持续刷新"`` substring fallback.
+        return _build_public_execution_channel_recommended_action(
+            detail,
+            issue_kind=_classify_channel_issue_kind(detail),
+        )
     if sub_block_code == RISK_REASON_RUNTIME_UNAVAILABLE_WORKER_THREAD:
         return "打开设置页点击“恢复运行线程”，并确认最近审计日志与最新信号。"
     resolved_code = block_code or derive_block_reason_code(detail)

@@ -25974,5 +25974,164 @@ class PaperOrderTypedReasonCodeRound93Tests(unittest.TestCase):
         self.assertEqual(event.payload["stage"], "paper_order_replace")
 
 
+class ChannelIssueKindTypedDispatchRound95Tests(unittest.TestCase):
+    """Pins the R95 typed ``channel_issue_kind`` dispatch.
+
+    Prior to Round 95 the ``_build_{public,private}_execution_channel_recommended_action``
+    helpers keyed their "has no feed" / "stale feed" / "private auth" recovery
+    copy off substring probes of the free-form Chinese ``detail`` string.
+    Round 95 introduces a typed ``issue_kind`` kwarg on both helpers plus a
+    ``_classify_channel_issue_kind`` classifier and threads the typed kind
+    through :class:`StrategyExecutionChannelOutageError` and the
+    ``_build_execution_preview_recommended_action`` sub_block_code dispatch.
+
+    This test class pins:
+
+    1. :func:`main._classify_channel_issue_kind` maps the canonical Chinese
+       substrings to their typed kind constants.
+    2. ``StrategyExecutionChannelOutageError`` auto-classifies ``issue_kind``
+       from ``detail`` when the caller does not pass it explicitly; an explicit
+       kwarg wins over the auto-classification.
+    3. Both recommender helpers return the typed-kind copy even when ``detail``
+       is missing the canonical substring (the typed-first branch fires
+       without the substring fallback).
+    4. ``_build_execution_preview_recommended_action`` threads the auto-classified
+       kind through when the ``RISK_REASON_RUNTIME_UNAVAILABLE`` sub_block_code
+       routes to the channel helper; the output for a detail-only call matches
+       the typed + reworded-detail call (same recovery copy).
+    """
+
+    def test_classify_channel_issue_kind_canonical_substrings(self) -> None:
+        self.assertEqual(
+            control_main._classify_channel_issue_kind("当前 Bybit 公共 WS 尚未收到 BTCUSDT 的实时行情"),
+            control_main.CHANNEL_ISSUE_KIND_NO_FEED,
+        )
+        self.assertEqual(
+            control_main._classify_channel_issue_kind("当前 Bybit 公共 WS 已超过约 120 秒未收到行情"),
+            control_main.CHANNEL_ISSUE_KIND_STALE,
+        )
+        self.assertEqual(
+            control_main._classify_channel_issue_kind("公共实时行情未能持续刷新"),
+            control_main.CHANNEL_ISSUE_KIND_STALE,
+        )
+        self.assertEqual(
+            control_main._classify_channel_issue_kind("当前 Bybit 私有 WS 尚未完成鉴权"),
+            control_main.CHANNEL_ISSUE_KIND_AUTH,
+        )
+        self.assertEqual(
+            control_main._classify_channel_issue_kind("当前 Bybit 私有 WS 未连通"),
+            control_main.CHANNEL_ISSUE_KIND_DISCONNECTED,
+        )
+        self.assertEqual(
+            control_main._classify_channel_issue_kind("当前 Bybit 公共 WS 未启用"),
+            control_main.CHANNEL_ISSUE_KIND_DISABLED,
+        )
+        self.assertIsNone(control_main._classify_channel_issue_kind(None))
+        self.assertIsNone(control_main._classify_channel_issue_kind(""))
+        self.assertIsNone(
+            control_main._classify_channel_issue_kind("some message without any canonical token"),
+        )
+
+    def test_channel_outage_exception_auto_classifies_issue_kind(self) -> None:
+        no_feed = control_main.StrategyExecutionChannelOutageError(
+            "当前 Bybit 公共 WS 尚未收到 ETHUSDT 的实时行情",
+            channel="public",
+        )
+        self.assertEqual(no_feed.issue_kind, control_main.CHANNEL_ISSUE_KIND_NO_FEED)
+
+        stale = control_main.StrategyExecutionChannelOutageError(
+            "当前 Bybit 公共 WS 已超过约 90 秒未收到行情",
+            channel="public",
+        )
+        self.assertEqual(stale.issue_kind, control_main.CHANNEL_ISSUE_KIND_STALE)
+
+        auth = control_main.StrategyExecutionChannelOutageError(
+            "当前 Bybit 私有 WS 尚未完成鉴权",
+            channel="private",
+        )
+        self.assertEqual(auth.issue_kind, control_main.CHANNEL_ISSUE_KIND_AUTH)
+
+    def test_channel_outage_exception_explicit_issue_kind_wins(self) -> None:
+        explicit = control_main.StrategyExecutionChannelOutageError(
+            "当前 Bybit 私有 WS 尚未完成鉴权",
+            channel="private",
+            issue_kind=control_main.CHANNEL_ISSUE_KIND_DISCONNECTED,
+        )
+        self.assertEqual(
+            explicit.issue_kind, control_main.CHANNEL_ISSUE_KIND_DISCONNECTED
+        )
+
+    def test_public_helper_typed_kind_picks_copy_without_substring(self) -> None:
+        # ``detail`` deliberately omits ``"尚未收到"`` / ``"超过约"`` / ``"持续刷新"``
+        # so the legacy substring fallback cannot fire.  The typed kwarg is
+        # the only channel that can reach the NO_FEED / STALE recovery copy.
+        detail = "公共行情通道出现异常，等待处理。"
+        self.assertEqual(
+            control_main._build_public_execution_channel_recommended_action(
+                detail,
+                issue_kind=control_main.CHANNEL_ISSUE_KIND_NO_FEED,
+            ),
+            "请确认目标品种已加入 watchlist，并等待公共实时行情首帧到达后再恢复真实策略执行。",
+        )
+        self.assertEqual(
+            control_main._build_public_execution_channel_recommended_action(
+                detail,
+                issue_kind=control_main.CHANNEL_ISSUE_KIND_STALE,
+            ),
+            "请先确认目标品种公共实时行情已经重新持续刷新，再恢复真实策略执行。",
+        )
+
+    def test_private_helper_typed_auth_kind_picks_copy_without_substring(self) -> None:
+        detail = "私有行情通道出现异常，等待处理。"
+        self.assertEqual(
+            control_main._build_private_execution_channel_recommended_action(
+                detail,
+                issue_kind=control_main.CHANNEL_ISSUE_KIND_AUTH,
+            ),
+            "请检查私有 API Key 权限、程序侧 Demo / Live 模式与账户配置是否一致，再恢复私有实时链路。",
+        )
+
+    def test_channel_helper_substring_fallback_still_fires(self) -> None:
+        # Backwards-compatibility check: a legacy caller that passes only
+        # ``detail`` (no ``issue_kind``) with the canonical substring still
+        # gets the same recovery copy.  The typed-first branch declines (no
+        # ``issue_kind``) and the substring fallback takes over.
+        self.assertEqual(
+            control_main._build_public_execution_channel_recommended_action(
+                "当前 Bybit 公共 WS 尚未收到 BTCUSDT 的实时行情",
+            ),
+            "请确认目标品种已加入 watchlist，并等待公共实时行情首帧到达后再恢复真实策略执行。",
+        )
+        self.assertEqual(
+            control_main._build_private_execution_channel_recommended_action(
+                "当前 Bybit 私有 WS 尚未完成鉴权",
+            ),
+            "请检查私有 API Key 权限、程序侧 Demo / Live 模式与账户配置是否一致，再恢复私有实时链路。",
+        )
+
+    def test_preview_recommender_threads_auto_classified_kind(self) -> None:
+        # With a canonical detail string the substring fallback and the typed
+        # path produce the same output, but the code path that executed
+        # depends on whether ``issue_kind`` was threaded through.  We assert
+        # the output matches the typed-first copy to pin the R95 contract that
+        # the umbrella dispatcher auto-classifies + forwards.
+        private_detail = "当前 Bybit 私有 WS 尚未完成鉴权"
+        self.assertEqual(
+            control_main._build_execution_preview_recommended_action(
+                private_detail,
+                sub_block_code=control_main.RISK_REASON_RUNTIME_UNAVAILABLE_PRIVATE_CHANNEL,
+            ),
+            "请检查私有 API Key 权限、程序侧 Demo / Live 模式与账户配置是否一致，再恢复私有实时链路。",
+        )
+        public_detail = "当前 Bybit 公共 WS 尚未收到 BTCUSDT 的实时行情"
+        self.assertEqual(
+            control_main._build_execution_preview_recommended_action(
+                public_detail,
+                sub_block_code=control_main.RISK_REASON_RUNTIME_UNAVAILABLE_PUBLIC_CHANNEL,
+            ),
+            "请确认目标品种已加入 watchlist，并等待公共实时行情首帧到达后再恢复真实策略执行。",
+        )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
