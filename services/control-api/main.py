@@ -1507,28 +1507,75 @@ def _build_private_realtime_health() -> Dict[str, Any]:
     }
 
 
-def get_private_execution_channel_issue(mode: AccountMode) -> Optional[str]:
+def _build_private_execution_channel_health(mode: AccountMode) -> Dict[str, Any]:
+    """Return ``{"issue", "issue_kind", "last_error"}`` for the private WS.
+
+    Round 99 — mirrors the R98 public-channel refactor: the typed
+    ``issue_kind`` (:data:`CHANNEL_ISSUE_KIND_*`) is now emitted from the
+    typed branch variables (``connected`` / ``authenticated`` / ``stale``)
+    at source, so downstream consumers read the typed kind from the dict
+    rather than re-classifying the formatted Chinese string via
+    :func:`_classify_channel_issue_kind`.
+
+    ``access_error`` branches (Paper mode / private API not configured /
+    Demo vs Live mismatch) fall outside the channel-issue-kind taxonomy
+    (they are account-mode issues, not channel WS state), so the helper
+    leaves ``issue_kind=None`` for them — callers that need a typed code
+    for access-error paths use :data:`RISK_REASON_ACCOUNT_MODE_UNAVAILABLE`
+    elsewhere.
+    """
+
     status, access_error = resolve_private_mode_access(mode)
     if access_error is not None:
-        return access_error
+        return {"issue": access_error, "issue_kind": None, "last_error": None}
     if mode == AccountMode.PAPER:
-        return None
+        return {"issue": None, "issue_kind": None, "last_error": None}
     realtime_status = _build_private_realtime_health()
     last_error = str(realtime_status.get("last_error") or "").strip() or None
     if not bool(realtime_status.get("connected")):
         issue = "当前 Bybit 私有 WS 未连通，无法安全执行真实策略委托，请先恢复私有实时链路。"
-        return f"{issue} 最近错误：{last_error}" if last_error else issue
+        if last_error:
+            issue = f"{issue} 最近错误：{last_error}"
+        return {
+            "issue": issue,
+            "issue_kind": CHANNEL_ISSUE_KIND_DISCONNECTED,
+            "last_error": last_error,
+        }
     if not bool(realtime_status.get("authenticated")):
         issue = "当前 Bybit 私有 WS 尚未完成鉴权，无法安全执行真实策略委托，请先恢复私有实时链路。"
-        return f"{issue} 最近错误：{last_error}" if last_error else issue
+        if last_error:
+            issue = f"{issue} 最近错误：{last_error}"
+        return {
+            "issue": issue,
+            "issue_kind": CHANNEL_ISSUE_KIND_AUTH,
+            "last_error": last_error,
+        }
     if bool(realtime_status.get("stale")):
         stale_seconds = int(realtime_status.get("stale_seconds") or 0)
         issue = (
             f"当前 Bybit 私有 WS 已超过约 {stale_seconds} 秒未收到更新，"
             "无法安全执行真实策略委托，请先恢复私有实时链路。"
         )
-        return f"{issue} 最近错误：{last_error}" if last_error else issue
-    return None
+        if last_error:
+            issue = f"{issue} 最近错误：{last_error}"
+        return {
+            "issue": issue,
+            "issue_kind": CHANNEL_ISSUE_KIND_STALE,
+            "last_error": last_error,
+        }
+    return {"issue": None, "issue_kind": None, "last_error": last_error}
+
+
+def get_private_execution_channel_issue(mode: AccountMode) -> Optional[str]:
+    """Return only the ``issue`` string from the private-channel health.
+
+    Round 99 — thin accessor that preserves the legacy string-only signature
+    for callers that do not need the typed ``issue_kind``.  Callers that do
+    need the typed kind should invoke :func:`_build_private_execution_channel_health`
+    directly and read ``health["issue_kind"]``.
+    """
+
+    return _build_private_execution_channel_health(mode).get("issue")
 
 
 def load_private_wallet_snapshot() -> tuple[BybitPrivateStatus, Dict[str, Any], str]:
@@ -8486,20 +8533,24 @@ def _decorate_strategy_runtime_item(item: StrategyRuntimeSnapshot) -> StrategyRu
                     "guard_detail": public_channel_issue,
                 }
             )
-        private_channel_issue = (
-            get_private_execution_channel_issue(strategy.mode)
+        # Round 99 — mirror the R98 public-channel pattern: call the health
+        # helper once and read the typed ``issue_kind`` from the dict rather
+        # than going through ``get_private_execution_channel_issue`` plus a
+        # second ``_classify_channel_issue_kind`` re-derivation.
+        private_health = (
+            _build_private_execution_channel_health(strategy.mode)
             if strategy.mode in {AccountMode.DEMO, AccountMode.LIVE} and strategy.status == "running"
             else None
         )
+        private_channel_issue = private_health.get("issue") if private_health else None
         if private_channel_issue is not None:
-            # Round 97 — see the public branch above for the typed-first note.
             return item.model_copy(
                 update={
                     "note": private_channel_issue,
                     "next_action": _build_private_execution_channel_recommended_action(
                         private_channel_issue,
                         last_error=str(private_realtime.get_status().get("last_error") or "").strip() or None,
-                        issue_kind=_classify_channel_issue_kind(private_channel_issue),
+                        issue_kind=private_health.get("issue_kind"),
                     ),
                     "guard_state": "auto_dispatch_blocked",
                     "guard_detail": private_channel_issue,
@@ -10809,7 +10860,11 @@ def get_bybit_private_status():
         private_rest_reachable = any(item.error is None for item in balance_diagnostics)
     else:
         private_rest_reachable = None
-    realtime_issue = get_private_execution_channel_issue(status.mode)
+    # Round 99 — read both the ``issue`` string and the typed ``issue_kind``
+    # from the new health helper so the recommender receives the typed kind
+    # from source rather than having the callsite re-classify.
+    private_health = _build_private_execution_channel_health(status.mode)
+    realtime_issue = private_health.get("issue")
     return status.model_copy(
         update={
             "realtime_enabled": bool(realtime_status.get("enabled")),
@@ -10820,14 +10875,11 @@ def get_bybit_private_status():
             "realtime_stale_seconds": int(realtime_status.get("stale_seconds") or 0),
             "realtime_last_error": realtime_status.get("last_error"),
             "realtime_recommended_action": (
-                # Round 97 — thread the typed ``issue_kind`` so the R95
-                # typed-first branch picks the AUTH recovery copy off the
-                # typed kind rather than the legacy ``"鉴权"`` substring fallback.
                 _build_private_execution_channel_recommended_action(
                     realtime_issue,
                     last_error=realtime_status.get("last_error"),
                     rest_reachable=private_rest_reachable,
-                    issue_kind=_classify_channel_issue_kind(realtime_issue),
+                    issue_kind=private_health.get("issue_kind"),
                 )
                 if realtime_issue
                 else None

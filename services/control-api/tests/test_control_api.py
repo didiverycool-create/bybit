@@ -10,6 +10,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
@@ -26612,6 +26613,229 @@ class PublicChannelHealthIssueKindAtSourceRound98Tests(unittest.TestCase):
         # The decorator must NOT have re-classified the public issue string;
         # it reads ``issue_kind`` straight from the health dict.
         self.assertNotIn(health_dict["issue"], classifier_calls)
+
+
+class PrivateChannelHealthIssueKindAtSourceRound99Tests(unittest.TestCase):
+    """Round 99 — ``_build_private_execution_channel_health(mode)`` mirrors
+    the R98 public-channel refactor: the typed ``issue_kind``
+    (``CHANNEL_ISSUE_KIND_DISCONNECTED`` / ``_AUTH`` / ``_STALE``) is emitted
+    from the typed branch variables (``connected`` / ``authenticated`` /
+    ``stale``) at source.  Downstream consumers read the typed kind from
+    the dict instead of re-classifying the formatted Chinese string.
+
+    Invariants pinned:
+    1. Each branch (DISCONNECTED / AUTH / STALE / None) emits its typed kind.
+    2. The string accessor ``get_private_execution_channel_issue`` still
+       returns only the issue string (backward compat).
+    3. Access-error branches (Paper / account-mode unavailable) leave
+       ``issue_kind=None`` — those are account-mode issues, orthogonal to
+       the channel-issue taxonomy.
+    4. The runtime-item decorator reads ``issue_kind`` from the health dict
+       without calling ``_classify_channel_issue_kind`` on the formatted string.
+    """
+
+
+    def _realtime_status(self, **overrides: Any) -> Dict[str, Any]:
+        base: Dict[str, Any] = {
+            "enabled": True,
+            "connected": True,
+            "authenticated": True,
+            "stale": False,
+            "stale_seconds": 0,
+            "last_error": None,
+        }
+        base.update(overrides)
+        return base
+
+    def test_kind_is_disconnected_when_not_connected(self) -> None:
+        status = SimpleNamespace(mode=control_main.AccountMode.LIVE)
+        with patch.object(
+            control_main,
+            "resolve_private_mode_access",
+            return_value=(status, None),
+        ), patch.object(
+            control_main,
+            "_build_private_realtime_health",
+            return_value=self._realtime_status(connected=False),
+        ):
+            health = control_main._build_private_execution_channel_health(
+                control_main.AccountMode.LIVE
+            )
+        self.assertEqual(
+            health["issue_kind"], control_main.CHANNEL_ISSUE_KIND_DISCONNECTED
+        )
+        self.assertIn("未连通", str(health["issue"]))
+
+    def test_kind_is_auth_when_not_authenticated(self) -> None:
+        status = SimpleNamespace(mode=control_main.AccountMode.LIVE)
+        with patch.object(
+            control_main,
+            "resolve_private_mode_access",
+            return_value=(status, None),
+        ), patch.object(
+            control_main,
+            "_build_private_realtime_health",
+            return_value=self._realtime_status(authenticated=False),
+        ):
+            health = control_main._build_private_execution_channel_health(
+                control_main.AccountMode.LIVE
+            )
+        self.assertEqual(health["issue_kind"], control_main.CHANNEL_ISSUE_KIND_AUTH)
+        self.assertIn("尚未完成鉴权", str(health["issue"]))
+
+    def test_kind_is_stale_when_stale_flag_set(self) -> None:
+        status = SimpleNamespace(mode=control_main.AccountMode.LIVE)
+        with patch.object(
+            control_main,
+            "resolve_private_mode_access",
+            return_value=(status, None),
+        ), patch.object(
+            control_main,
+            "_build_private_realtime_health",
+            return_value=self._realtime_status(stale=True, stale_seconds=600),
+        ):
+            health = control_main._build_private_execution_channel_health(
+                control_main.AccountMode.LIVE
+            )
+        self.assertEqual(health["issue_kind"], control_main.CHANNEL_ISSUE_KIND_STALE)
+        self.assertIn("超过约 600", str(health["issue"]))
+
+    def test_kind_is_none_when_no_issue(self) -> None:
+        status = SimpleNamespace(mode=control_main.AccountMode.LIVE)
+        with patch.object(
+            control_main,
+            "resolve_private_mode_access",
+            return_value=(status, None),
+        ), patch.object(
+            control_main,
+            "_build_private_realtime_health",
+            return_value=self._realtime_status(),
+        ):
+            health = control_main._build_private_execution_channel_health(
+                control_main.AccountMode.LIVE
+            )
+        self.assertIsNone(health["issue"])
+        self.assertIsNone(health["issue_kind"])
+
+    def test_access_error_issue_is_not_assigned_a_channel_kind(self) -> None:
+        status = SimpleNamespace(mode=control_main.AccountMode.LIVE)
+        access_error_message = (
+            "当前 Demo / Live 私有 API 配置不可用，请先在设置中填入有效凭据。"
+        )
+        with patch.object(
+            control_main,
+            "resolve_private_mode_access",
+            return_value=(status, access_error_message),
+        ):
+            health = control_main._build_private_execution_channel_health(
+                control_main.AccountMode.LIVE
+            )
+        self.assertEqual(health["issue"], access_error_message)
+        # Access-error branches are orthogonal to the channel-issue-kind
+        # taxonomy (they carry RISK_REASON_ACCOUNT_MODE_UNAVAILABLE elsewhere),
+        # so ``issue_kind`` is intentionally None here.
+        self.assertIsNone(health["issue_kind"])
+
+    def test_paper_mode_returns_no_issue_and_no_kind(self) -> None:
+        status = SimpleNamespace(mode=control_main.AccountMode.PAPER)
+        with patch.object(
+            control_main,
+            "resolve_private_mode_access",
+            return_value=(status, None),
+        ):
+            health = control_main._build_private_execution_channel_health(
+                control_main.AccountMode.PAPER
+            )
+        self.assertIsNone(health["issue"])
+        self.assertIsNone(health["issue_kind"])
+
+    def test_get_private_execution_channel_issue_still_returns_only_string(self) -> None:
+        status = SimpleNamespace(mode=control_main.AccountMode.LIVE)
+        with patch.object(
+            control_main,
+            "resolve_private_mode_access",
+            return_value=(status, None),
+        ), patch.object(
+            control_main,
+            "_build_private_realtime_health",
+            return_value=self._realtime_status(connected=False),
+        ):
+            issue = control_main.get_private_execution_channel_issue(
+                control_main.AccountMode.LIVE
+            )
+        self.assertIsInstance(issue, str)
+        self.assertIn("未连通", issue)
+
+    def test_decorator_reads_typed_kind_from_private_health_dict(self) -> None:
+        """``_decorate_strategy_runtime_item`` reads ``issue_kind`` directly
+        from the private-channel health dict without re-classifying the
+        formatted Chinese string.
+        """
+
+        strategy = SimpleNamespace(
+            id="strat-r99",
+            name="R99 Strategy",
+            mode=control_main.AccountMode.LIVE,
+            status="running",
+            symbol="BTCUSDT",
+            symbols=["BTCUSDT"],
+            market="perp",
+        )
+        snapshot_stub = SimpleNamespace(strategies=[strategy])
+        runtime_item = control_main.StrategyRuntimeSnapshot(
+            strategy_id="strat-r99",
+            strategy_name="R99 Strategy",
+            symbol="BTCUSDT",
+            market="perp",
+            mode=control_main.AccountMode.LIVE,
+            runtime_status="running",
+            signal="long",
+            last_price=10000.0,
+            reference_price=10000.0,
+            change_24h=0.0,
+            note="",
+            next_action="--",
+            last_evaluated_at=datetime.now(timezone.utc).isoformat(),
+            guard_state="none",
+            guard_detail=None,
+        )
+        private_health_dict: Dict[str, Any] = {
+            "issue": "当前 Bybit 私有 WS 尚未完成鉴权，无法安全执行真实策略委托，请先恢复私有实时链路。",
+            "issue_kind": control_main.CHANNEL_ISSUE_KIND_AUTH,
+        }
+        classifier_calls: list[Any] = []
+
+        def spy_classify(detail: Any) -> Any:
+            classifier_calls.append(detail)
+            return None
+
+        with patch.object(
+            control_main, "_has_active_strategy_live_stop_loss_alert", return_value=False
+        ), patch.object(
+            control_main.repo, "snapshot", return_value=snapshot_stub
+        ), patch.object(
+            control_main,
+            "_build_public_execution_channel_health",
+            return_value={"issue": None, "issue_kind": None},
+        ), patch.object(
+            control_main,
+            "_build_private_execution_channel_health",
+            return_value=private_health_dict,
+        ), patch.object(
+            control_main, "_classify_channel_issue_kind", side_effect=spy_classify
+        ):
+            decorated = control_main._decorate_strategy_runtime_item(runtime_item)
+
+        self.assertEqual(decorated.guard_state, "auto_dispatch_blocked")
+        self.assertEqual(decorated.guard_detail, private_health_dict["issue"])
+        # The decorator must NOT have re-classified the private issue string;
+        # it reads ``issue_kind`` straight from the health dict.
+        self.assertNotIn(private_health_dict["issue"], classifier_calls)
+        # The AUTH kind flows into the recommender → private-channel AUTH copy.
+        self.assertEqual(
+            decorated.next_action,
+            "请检查私有 API Key 权限、程序侧 Demo / Live 模式与账户配置是否一致，再恢复私有实时链路。",
+        )
 
 
 if __name__ == "__main__":
