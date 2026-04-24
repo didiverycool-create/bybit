@@ -27384,5 +27384,59 @@ class NonRunningStrategyStatusesConstantRound102Tests(unittest.TestCase):
         self.assertNotIn(strategy.status, control_main._NON_RUNNING_STRATEGY_STATUSES)
 
 
+class NonPaperAccountModesConstantRound103Tests(unittest.TestCase):
+    """Round 103 — the inline set literal ``{AccountMode.DEMO, AccountMode.LIVE}``
+    (and its reversed variant ``{AccountMode.LIVE, AccountMode.DEMO}``) was
+    duplicated at 11 callsites across ``main.py`` and
+    ``alert_and_guard_sync.py``, each gating real-market-connection branches
+    against paper-mode fallback.  R103 extracts the set onto the public
+    constant :data:`models.NON_PAPER_ACCOUNT_MODES` so any future account mode
+    addition surfaces as a single audit point.  These tests pin:
+
+    1. The constant is a ``frozenset`` (immutable).
+    2. The constant's members are exactly ``{AccountMode.DEMO, AccountMode.LIVE}``.
+    3. The constant equals the complement of :attr:`AccountMode.PAPER` within
+       the enum, so ``NON_PAPER_ACCOUNT_MODES | {PAPER}`` covers every
+       ``AccountMode`` member.
+    4. The constant is re-exported through ``main.py``'s models import so
+       legacy call-sites that read it off the module keep working.
+    """
+
+    def test_constant_is_frozenset_not_mutable_set(self) -> None:
+        from models import NON_PAPER_ACCOUNT_MODES
+
+        self.assertIsInstance(NON_PAPER_ACCOUNT_MODES, frozenset)
+
+    def test_constant_members_match_non_paper_account_modes(self) -> None:
+        from models import AccountMode, NON_PAPER_ACCOUNT_MODES
+
+        self.assertEqual(
+            set(NON_PAPER_ACCOUNT_MODES),
+            {AccountMode.DEMO, AccountMode.LIVE},
+        )
+
+    def test_constant_equals_complement_of_paper_within_enum(self) -> None:
+        from models import AccountMode, NON_PAPER_ACCOUNT_MODES
+
+        # ``AccountMode`` is a ``str Enum`` with three members — ``PAPER`` /
+        # ``DEMO`` / ``LIVE``.  The constant should be exactly ``all - {PAPER}``.
+        all_modes: set = set(AccountMode)
+        self.assertEqual(set(NON_PAPER_ACCOUNT_MODES), all_modes - {AccountMode.PAPER})
+
+    def test_main_module_reexports_constant(self) -> None:
+        # ``main.py`` imports ``NON_PAPER_ACCOUNT_MODES`` off ``models`` so the
+        # 8 callsites inside ``main.py`` reference the same object.
+        from models import NON_PAPER_ACCOUNT_MODES
+
+        self.assertIs(control_main.NON_PAPER_ACCOUNT_MODES, NON_PAPER_ACCOUNT_MODES)
+
+    def test_paper_mode_excluded_from_constant(self) -> None:
+        from models import AccountMode, NON_PAPER_ACCOUNT_MODES
+
+        self.assertNotIn(AccountMode.PAPER, NON_PAPER_ACCOUNT_MODES)
+        self.assertIn(AccountMode.DEMO, NON_PAPER_ACCOUNT_MODES)
+        self.assertIn(AccountMode.LIVE, NON_PAPER_ACCOUNT_MODES)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -93,6 +93,17 @@ class AccountMode(str, Enum):
     LIVE = "live"
 
 
+# Round 103 — the complement of :attr:`AccountMode.PAPER` within the enum.
+# Captures the "real-market-connection" set used by every gate that wants to
+# distinguish simulated paper state from modes that actually submit orders to
+# Bybit (``DEMO`` hits Bybit demo account; ``LIVE`` hits production).  Before
+# R103 this was inlined as ``{AccountMode.DEMO, AccountMode.LIVE}`` /
+# ``{AccountMode.LIVE, AccountMode.DEMO}`` across 11 callsites in
+# ``main.py`` and ``alert_and_guard_sync.py``; a single constant makes any
+# future mode extension surface as a single audit point.
+NON_PAPER_ACCOUNT_MODES: frozenset = frozenset({AccountMode.DEMO, AccountMode.LIVE})
+
+
 class MetricCard(BaseModel):
     label: str
     value: str

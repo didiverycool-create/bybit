@@ -149,6 +149,7 @@ from models import (
     MarketDetail,
     MarketLiveDiagnostics,
     MarketLiveSnapshot,
+    NON_PAPER_ACCOUNT_MODES,
     NewsEvent,
     OpsLiveSnapshot,
     OpsLiveSummary,
@@ -2355,7 +2356,7 @@ def _build_execution_health_top_issue_context(
 def _collect_dynamic_auto_dispatch_blocked_contexts(state: Any) -> List[Dict[str, Optional[str]]]:
     contexts: List[Dict[str, Optional[str]]] = []
     for strategy in state.strategies:
-        if strategy.status != "running" or strategy.mode not in {AccountMode.DEMO, AccountMode.LIVE}:
+        if strategy.status != "running" or strategy.mode not in NON_PAPER_ACCOUNT_MODES:
             continue
         if (
             _has_active_strategy_live_stop_loss_alert(strategy.id)
@@ -2611,16 +2612,16 @@ def _build_control_snapshot_response() -> ControlSnapshot:
     selected_mode = state.workspace_preferences.selected_mode
     strategies_by_id = {item.id: item for item in state.strategies}
     real_execution_modes: set[AccountMode] = set()
-    if selected_mode in {AccountMode.DEMO, AccountMode.LIVE}:
+    if selected_mode in NON_PAPER_ACCOUNT_MODES:
         real_execution_modes.add(selected_mode)
     for strategy in state.strategies:
-        if strategy.mode in {AccountMode.DEMO, AccountMode.LIVE} and strategy.status == "running":
+        if strategy.mode in NON_PAPER_ACCOUNT_MODES and strategy.status == "running":
             real_execution_modes.add(strategy.mode)
     public_execution_issue_detail = None
     public_execution_stale = False
     public_execution_stale_seconds = 0
     for strategy in state.strategies:
-        if strategy.status != "running" or strategy.mode not in {AccountMode.DEMO, AccountMode.LIVE}:
+        if strategy.status != "running" or strategy.mode not in NON_PAPER_ACCOUNT_MODES:
             continue
         symbol = strategy.symbols[0] if strategy.symbols else None
         if not symbol:
@@ -7218,7 +7219,7 @@ def _strategy_auto_dispatch_gate_reason(
             detail="当前已冻结自动发布，后台自动执行暂不继续提交新委托。",
             cancel_existing=False,
         )
-    if strategy is not None and strategy.mode in {AccountMode.DEMO, AccountMode.LIVE}:
+    if strategy is not None and strategy.mode in NON_PAPER_ACCOUNT_MODES:
         state = repo.snapshot()
         market = _resolve_strategy_primary_market(state, strategy)
         symbol = strategy.symbols[0] if strategy.symbols else ""
@@ -7478,7 +7479,7 @@ def _apply_live_strategy_stop_loss_guards(current_items: List[StrategyRuntimeSna
         strategy = strategies_by_id.get(snapshot.strategy_id)
         if strategy is None:
             continue
-        if strategy.mode not in {AccountMode.LIVE, AccountMode.DEMO}:
+        if strategy.mode not in NON_PAPER_ACCOUNT_MODES:
             _clear_strategy_live_stop_loss_alerts(snapshot.strategy_id)
             continue
         if strategy.status in _NON_RUNNING_STRATEGY_STATUSES or snapshot.runtime_status != "running":
@@ -8581,7 +8582,7 @@ def _decorate_strategy_runtime_item(item: StrategyRuntimeSnapshot) -> StrategyRu
         # fires off the same typed source that picked the ``issue`` copy.
         public_health = (
             _build_public_execution_channel_health(item.market, item.symbol)
-            if strategy.mode in {AccountMode.DEMO, AccountMode.LIVE} and strategy.status == "running"
+            if strategy.mode in NON_PAPER_ACCOUNT_MODES and strategy.status == "running"
             else None
         )
         public_channel_issue = public_health.get("issue") if public_health else None
@@ -8603,7 +8604,7 @@ def _decorate_strategy_runtime_item(item: StrategyRuntimeSnapshot) -> StrategyRu
         # second ``_classify_channel_issue_kind`` re-derivation.
         private_health = (
             _build_private_execution_channel_health(strategy.mode)
-            if strategy.mode in {AccountMode.DEMO, AccountMode.LIVE} and strategy.status == "running"
+            if strategy.mode in NON_PAPER_ACCOUNT_MODES and strategy.status == "running"
             else None
         )
         private_channel_issue = private_health.get("issue") if private_health else None

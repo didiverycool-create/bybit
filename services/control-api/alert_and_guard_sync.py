@@ -16,7 +16,7 @@ from __future__ import annotations
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import parameter_resolver
-from models import AccountMode, EventSeverity
+from models import AccountMode, EventSeverity, NON_PAPER_ACCOUNT_MODES
 
 
 def sync_strategy_runtime_worker_issue_alerts(
@@ -192,7 +192,7 @@ def sync_public_execution_channel_alerts(
     state = repo.snapshot()
     active_rule_keys = set()
     for strategy in state.strategies:
-        if strategy.mode not in {AccountMode.DEMO, AccountMode.LIVE} or strategy.status != "running":
+        if strategy.mode not in NON_PAPER_ACCOUNT_MODES or strategy.status != "running":
             continue
         symbol = strategy.symbols[0] if strategy.symbols else None
         if not symbol:
@@ -289,10 +289,10 @@ def sync_private_execution_channel_alerts(
     state = repo.snapshot()
     selected_mode = state.workspace_preferences.selected_mode
     real_execution_modes = set()
-    if selected_mode in {AccountMode.DEMO, AccountMode.LIVE}:
+    if selected_mode in NON_PAPER_ACCOUNT_MODES:
         real_execution_modes.add(selected_mode)
     for strategy in state.strategies:
-        if strategy.mode in {AccountMode.DEMO, AccountMode.LIVE} and strategy.status == "running":
+        if strategy.mode in NON_PAPER_ACCOUNT_MODES and strategy.status == "running":
             real_execution_modes.add(strategy.mode)
 
     for mode in (AccountMode.DEMO, AccountMode.LIVE):
