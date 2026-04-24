@@ -276,6 +276,21 @@ from execution_preview_builders import (
 from risk_decision import derive_block_reason_code, evaluate_risk_decision
 
 
+# Round 102 — the complement of ``"running"`` within the
+# :class:`StrategySummary` ``status`` ``Literal["running", "paused", "paper_only", "shadow"]``
+# enum.  Captures the set of statuses where the autonomous live-dispatch
+# pipeline (auto dispatch gate / rejection guard / live stop-loss alert
+# sync) intentionally does not engage — each member represents a strategy
+# that opted out of runtime dispatch (paper-only or shadow) or is paused.
+# Previously repeated as an inline set literal at three callsites
+# (``_strategy_exchange_rejection_guard_remaining_minutes`` /
+# ``_sync_strategy_live_stop_loss_alerts`` /
+# ``_evaluate_strategy_auto_dispatch_gate``); extracted so the three sites
+# share one definition and any future status extension surfaces as a
+# single audit point.
+_NON_RUNNING_STRATEGY_STATUSES: frozenset = frozenset({"paper_only", "paused", "shadow"})
+
+
 app = FastAPI(title="Bybit 控制端本地服务", version="0.1.0")
 app.add_middleware(
     CORSMiddleware,
@@ -7303,7 +7318,7 @@ def _strategy_exchange_rejection_recent_count(strategy: StrategySummary) -> int:
     )
 
 def _strategy_exchange_rejection_guard_remaining_minutes(strategy: StrategySummary) -> Optional[int]:
-    if strategy.mode == AccountMode.PAPER or strategy.status in {"paper_only", "paused", "shadow"}:
+    if strategy.mode == AccountMode.PAPER or strategy.status in _NON_RUNNING_STRATEGY_STATUSES:
         return None
     threshold = _strategy_exchange_rejection_guard_threshold(strategy)
     cooldown_minutes = _strategy_exchange_rejection_guard_cooldown_minutes(strategy)
@@ -7466,7 +7481,7 @@ def _apply_live_strategy_stop_loss_guards(current_items: List[StrategyRuntimeSna
         if strategy.mode not in {AccountMode.LIVE, AccountMode.DEMO}:
             _clear_strategy_live_stop_loss_alerts(snapshot.strategy_id)
             continue
-        if strategy.status in {"paper_only", "paused", "shadow"} or snapshot.runtime_status != "running":
+        if strategy.status in _NON_RUNNING_STRATEGY_STATUSES or snapshot.runtime_status != "running":
             _clear_strategy_live_stop_loss_alerts(snapshot.strategy_id)
             continue
 
@@ -7999,7 +8014,7 @@ def _evaluate_strategy_auto_dispatch_gate(
     strategy: StrategySummary,
     snapshot: StrategyRuntimeSnapshot,
 ) -> AutoDispatchGate:
-    if strategy.mode == AccountMode.PAPER or strategy.status in {"paper_only", "paused", "shadow"}:
+    if strategy.mode == AccountMode.PAPER or strategy.status in _NON_RUNNING_STRATEGY_STATUSES:
         return AutoDispatchGate(
             verdict="block",
             reason_code="auto.paper_or_paused_strategy",

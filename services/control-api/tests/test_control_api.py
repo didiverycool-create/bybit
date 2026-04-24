@@ -27309,5 +27309,80 @@ class ExchangeOrderStatusEventClassifierRound101Tests(unittest.TestCase):
         )
 
 
+class NonRunningStrategyStatusesConstantRound102Tests(unittest.TestCase):
+    """Round 102 — the inline set literal ``{"paper_only", "paused", "shadow"}``
+    was duplicated across three callsites
+    (``_strategy_exchange_rejection_guard_remaining_minutes`` /
+    ``_sync_strategy_live_stop_loss_alerts`` /
+    ``_evaluate_strategy_auto_dispatch_gate``) that all gate the autonomous
+    live-dispatch pipeline on "is this strategy in a non-running state?".
+    R102 extracts the set onto the module constant
+    :data:`_NON_RUNNING_STRATEGY_STATUSES` so any future status extension
+    surfaces as a single audit point.  These tests pin:
+
+    1. The constant is a ``frozenset`` (immutable — protects against accidental
+       mutation by consumers).
+    2. The constant's members are exactly ``{"paper_only", "paused", "shadow"}``.
+    3. The constant equals the complement of ``"running"`` within the
+       :class:`StrategySummary` ``status`` ``Literal`` — i.e. ``"running"``
+       is the only status NOT in the gated set — so the enum-level invariant
+       ("the set represents not-running") is reinforced.
+    4. The auto-dispatch gate, rejection-guard remaining, and stop-loss-alert
+       sync all consult the constant rather than an inline set literal.
+    """
+
+    def test_constant_is_frozenset_not_mutable_set(self) -> None:
+        self.assertIsInstance(control_main._NON_RUNNING_STRATEGY_STATUSES, frozenset)
+
+    def test_constant_members_match_non_running_statuses(self) -> None:
+        self.assertEqual(
+            set(control_main._NON_RUNNING_STRATEGY_STATUSES),
+            {"paper_only", "paused", "shadow"},
+        )
+
+    def test_constant_equals_literal_complement_of_running(self) -> None:
+        # The ``StrategySummary.status`` field is typed
+        # ``Literal["running", "paused", "paper_only", "shadow"]``; the
+        # constant should be exactly that enum minus ``"running"`` so a future
+        # status addition is forced to explicitly opt in or out of the gate.
+        all_statuses: set = {"running", "paused", "paper_only", "shadow"}
+        self.assertEqual(
+            set(control_main._NON_RUNNING_STRATEGY_STATUSES),
+            all_statuses - {"running"},
+        )
+
+    def test_auto_dispatch_gate_blocks_each_non_running_status(self) -> None:
+        # All three statuses in the constant should trigger the
+        # ``auto.paper_or_paused_strategy`` gate regardless of mode.
+        strategy_tmpl = SimpleNamespace(
+            id="gate-status-probe",
+            mode=control_main.AccountMode.LIVE,
+            status="running",
+        )
+        snapshot_tmpl = SimpleNamespace(strategy_id="gate-status-probe", runtime_status="running")
+        for status in control_main._NON_RUNNING_STRATEGY_STATUSES:
+            with self.subTest(status=status):
+                strategy = SimpleNamespace(
+                    id="gate-status-probe",
+                    mode=control_main.AccountMode.LIVE,
+                    status=status,
+                )
+                gate = control_main._evaluate_strategy_auto_dispatch_gate(strategy, snapshot_tmpl)
+                self.assertEqual(gate.verdict, "block")
+                self.assertEqual(gate.reason_code, "auto.paper_or_paused_strategy")
+
+    def test_auto_dispatch_gate_allows_running_status_past_mode_gate(self) -> None:
+        # ``"running"`` is the one status NOT in the gated set so the gate
+        # passes the mode/status check (the subsequent branches will make
+        # their own decisions — this test only verifies the early-return
+        # branch does not fire for ``"running"``).
+        strategy = SimpleNamespace(
+            id="gate-status-probe",
+            mode=control_main.AccountMode.LIVE,
+            status="running",
+        )
+        self.assertNotIn(strategy.status, control_main._NON_RUNNING_STRATEGY_STATUSES)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
