@@ -8,7 +8,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_UP
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 from uuid import uuid4
 
 import uvicorn
@@ -8798,6 +8798,27 @@ def _build_strategy_current_position_summary(
     avg_price = position.avg_price if position.avg_price not in {"", "--"} else None
     return position.side, position.size, avg_price
 
+# Round 101 — classify a Bybit exchange-order status string onto the typed
+# ``(event_type, severity)`` tuple shared by every consumer that projects
+# external order history onto the ``exchange_order.*`` audit family.  Bybit
+# returns mixed-case variants (``"Filled"`` / ``"PartiallyFilled"`` /
+# ``"Cancelled"`` / ``"PartiallyFilledCanceled"`` / ``"Rejected"`` / …) so the
+# classifier lowercases first and matches substrings.  Callers that treat an
+# unknown status as a no-op short-circuit on ``None``; callers that want an
+# ``exchange_order.updated`` fallback apply it at the callsite.
+def _classify_exchange_order_status_event(
+    status: str,
+) -> Optional[Tuple[str, EventSeverity]]:
+    normalized = status.lower()
+    if "fill" in normalized:
+        return "exchange_order.filled", EventSeverity.INFO
+    if "cancel" in normalized:
+        return "exchange_order.cancelled", EventSeverity.WARNING
+    if "reject" in normalized:
+        return "exchange_order.rejected", EventSeverity.ERROR
+    return None
+
+
 def _sync_strategy_exchange_order_history_events(history_items: List[OrderRecord]) -> None:
     def _event_payload_matches(item: ExecutionEvent, event_type: str, order_id: str) -> bool:
         return item.event_type == event_type and str(item.payload.get("order_id") or "") == order_id
@@ -8807,21 +8828,16 @@ def _sync_strategy_exchange_order_history_events(history_items: List[OrderRecord
         for order in history_items:
             if order.origin != "strategy" or not order.strategy_id:
                 continue
-            status_normalized = order.status.lower()
-            if "fill" in status_normalized:
-                event_type = "exchange_order.filled"
-                severity = EventSeverity.INFO
-                detail = f"真实策略委托已成交 {order.qty}@{order.price} ({order.status})"
-            elif "cancel" in status_normalized:
-                event_type = "exchange_order.cancelled"
-                severity = EventSeverity.WARNING
-                detail = f"真实策略委托已撤销 {order.qty}@{order.price} ({order.status})"
-            elif "reject" in status_normalized:
-                event_type = "exchange_order.rejected"
-                severity = EventSeverity.ERROR
-                detail = f"真实策略委托被拒绝 {order.qty}@{order.price} ({order.status})"
-            else:
+            classified = _classify_exchange_order_status_event(order.status)
+            if classified is None:
                 continue
+            event_type, severity = classified
+            if event_type == "exchange_order.filled":
+                detail = f"真实策略委托已成交 {order.qty}@{order.price} ({order.status})"
+            elif event_type == "exchange_order.cancelled":
+                detail = f"真实策略委托已撤销 {order.qty}@{order.price} ({order.status})"
+            else:
+                detail = f"真实策略委托被拒绝 {order.qty}@{order.price} ({order.status})"
             if any(_event_payload_matches(event, event_type, order.order_id) for event in repo.state.audit_events):  # type: ignore[attr-defined]
                 continue
             repo.add_event(
@@ -9116,19 +9132,15 @@ def _build_strategy_last_execution_summary(
             order_at = _parse_iso(order.created_at)
             if order_at < best_at:
                 continue
-            status_normalized = order.status.lower()
-            if "fill" in status_normalized:
-                event_type = "exchange_order.filled"
-                severity = EventSeverity.INFO
-                detail = f"最近真实策略委托已成交 {order.qty}@{order.price} ({order.status})"
-            elif "cancel" in status_normalized:
-                event_type = "exchange_order.cancelled"
-                severity = EventSeverity.WARNING
-                detail = f"最近真实策略委托已撤销 {order.qty}@{order.price} ({order.status})"
-            elif "reject" in status_normalized:
-                event_type = "exchange_order.rejected"
-                severity = EventSeverity.ERROR
-                detail = f"最近真实策略委托被拒绝 {order.qty}@{order.price} ({order.status})"
+            classified = _classify_exchange_order_status_event(order.status)
+            if classified is not None:
+                event_type, severity = classified
+                if event_type == "exchange_order.filled":
+                    detail = f"最近真实策略委托已成交 {order.qty}@{order.price} ({order.status})"
+                elif event_type == "exchange_order.cancelled":
+                    detail = f"最近真实策略委托已撤销 {order.qty}@{order.price} ({order.status})"
+                else:
+                    detail = f"最近真实策略委托被拒绝 {order.qty}@{order.price} ({order.status})"
             else:
                 event_type = "exchange_order.updated"
                 severity = EventSeverity.INFO

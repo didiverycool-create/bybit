@@ -27229,5 +27229,85 @@ class AlertIssueKindAtSourceRound100Tests(unittest.TestCase):
         )
 
 
+class ExchangeOrderStatusEventClassifierRound101Tests(unittest.TestCase):
+    """Round 101 — the ``(status → event_type, severity)`` mapping used to
+    project Bybit exchange-order history onto the ``exchange_order.*`` audit
+    family was duplicated across ``_sync_strategy_exchange_order_history_events``
+    and ``_resolve_strategy_recent_execution_event`` with byte-identical
+    ``if "fill" … elif "cancel" … elif "reject" …`` ladders.  R101 extracts the
+    classifier onto the module helper ``_classify_exchange_order_status_event``
+    so both callsites share one definition.  These tests pin the classifier's
+    observable contract:
+
+    1. Canonical Bybit statuses (``"Filled"`` / ``"Cancelled"`` / ``"Rejected"``)
+       each return the typed ``(event_type, EventSeverity)`` tuple.
+    2. Mixed-case and compound statuses (``"PartiallyFilled"`` /
+       ``"PartiallyFilledCanceled"``) lowercase-then-substring match — the
+       ``"fill"`` probe fires first on ``"PartiallyFilledCanceled"`` because
+       the legacy ladder ordered ``fill`` ahead of ``cancel``.
+    3. Unknown statuses return ``None`` so callers branch on the ``Optional``
+       result rather than substring-probing again at the callsite.
+    """
+
+    def test_filled_status_returns_typed_tuple(self) -> None:
+        self.assertEqual(
+            control_main._classify_exchange_order_status_event("Filled"),
+            ("exchange_order.filled", control_main.EventSeverity.INFO),
+        )
+
+    def test_cancelled_status_returns_typed_tuple(self) -> None:
+        self.assertEqual(
+            control_main._classify_exchange_order_status_event("Cancelled"),
+            ("exchange_order.cancelled", control_main.EventSeverity.WARNING),
+        )
+
+    def test_rejected_status_returns_typed_tuple(self) -> None:
+        self.assertEqual(
+            control_main._classify_exchange_order_status_event("Rejected"),
+            ("exchange_order.rejected", control_main.EventSeverity.ERROR),
+        )
+
+    def test_partially_filled_status_matches_fill(self) -> None:
+        self.assertEqual(
+            control_main._classify_exchange_order_status_event("PartiallyFilled"),
+            ("exchange_order.filled", control_main.EventSeverity.INFO),
+        )
+
+    def test_partially_filled_canceled_prefers_fill_per_legacy_ordering(self) -> None:
+        # ``"PartiallyFilledCanceled"`` contains both ``"fill"`` and ``"cancel"``
+        # substrings; the legacy ladder placed ``"fill"`` first so the helper
+        # returns filled to preserve audit-feed continuity.
+        self.assertEqual(
+            control_main._classify_exchange_order_status_event("PartiallyFilledCanceled"),
+            ("exchange_order.filled", control_main.EventSeverity.INFO),
+        )
+
+    def test_unknown_status_returns_none(self) -> None:
+        # Legacy callsite #1 (``_sync_strategy_exchange_order_history_events``)
+        # short-circuits on ``None``; callsite #2
+        # (``_resolve_strategy_recent_execution_event``) falls back to
+        # ``exchange_order.updated`` at the callsite.
+        self.assertIsNone(control_main._classify_exchange_order_status_event("New"))
+        self.assertIsNone(control_main._classify_exchange_order_status_event("Untriggered"))
+        self.assertIsNone(control_main._classify_exchange_order_status_event(""))
+
+    def test_status_is_lowercased_before_substring_probe(self) -> None:
+        # Probe the helper with an uppercase variant that could not possibly
+        # match a case-sensitive substring on ``"fill"`` / ``"cancel"`` /
+        # ``"reject"``, proving the ``.lower()`` call fires at source.
+        self.assertEqual(
+            control_main._classify_exchange_order_status_event("FILLED"),
+            ("exchange_order.filled", control_main.EventSeverity.INFO),
+        )
+        self.assertEqual(
+            control_main._classify_exchange_order_status_event("CANCELLED"),
+            ("exchange_order.cancelled", control_main.EventSeverity.WARNING),
+        )
+        self.assertEqual(
+            control_main._classify_exchange_order_status_event("REJECTED"),
+            ("exchange_order.rejected", control_main.EventSeverity.ERROR),
+        )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
