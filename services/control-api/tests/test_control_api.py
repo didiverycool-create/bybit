@@ -22912,6 +22912,16 @@ class StrategyExecutionChannelOutageTypedExceptionRound74Tests(unittest.TestCase
     def test_wrapper_maps_channel_outage_to_blocked_preview_but_propagates_plain_runtime(self) -> None:
         from models import RISK_REASON_RUNTIME_UNAVAILABLE  # noqa: PLC0415
 
+        # Round 116 — fixture isolation: when this test runs alone (e.g. via
+        # the verify scripts that invoke ``unittest -v`` and order tests
+        # alphabetically), ``state.strategy_runtime_snapshots`` is empty
+        # because no earlier test has triggered a runtime refresh yet.
+        # The wrapper at ``build_strategy_execution_preview`` re-raises the
+        # typed exception when it cannot find a matching snapshot, so we
+        # populate snapshots once before patching.
+        if not control_main.repo.snapshot().strategy_runtime_snapshots:
+            control_main.refresh_strategy_runtime_once()
+
         state = control_main.repo.snapshot()
         snapshot = next(iter(state.strategy_runtime_snapshots), None)
         self.assertIsNotNone(snapshot, "seed state must carry at least one runtime snapshot")
@@ -23355,6 +23365,16 @@ class AlertRecordTypedReasonCodeRound76Tests(unittest.TestCase):
                 # ``issue`` / ``issue_kind`` fields are ``None``.
                 control_main,
                 "_build_public_execution_channel_health",
+                return_value={"issue": None, "issue_kind": None},
+            ), patch.object(
+                # Round 116 — _decorate_strategy_runtime_item switched to
+                # `_build_private_execution_channel_health` at R99; the
+                # legacy `get_private_execution_channel_issue` patch alone
+                # leaves the real private health helper running and
+                # surfaces "私有 WS 未连通" from the seeded private_status,
+                # which masks the alert path under test.
+                control_main,
+                "_build_private_execution_channel_health",
                 return_value={"issue": None, "issue_kind": None},
             ), patch.object(
                 control_main,
