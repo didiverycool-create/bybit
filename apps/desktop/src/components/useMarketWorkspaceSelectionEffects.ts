@@ -2,7 +2,7 @@ import { useEffect } from 'react'
 import type { Dispatch, SetStateAction } from 'react'
 import type { QueryClient } from '@tanstack/react-query'
 
-import { api } from '../api'
+import { marketApi } from '../apiMarket'
 import type { WatchlistInstrument } from '../types'
 import type { MarketTimeframe } from '../utils/workspace-helpers'
 import {
@@ -70,7 +70,7 @@ export function useMarketWorkspaceSelectionEffects({
       try {
         const refreshedWatchlist = await queryClient.fetchQuery({
           queryKey: ['watchlist'],
-          queryFn: api.getWatchlist,
+          queryFn: marketApi.getWatchlist,
           staleTime: 0,
         })
         if (cancelled) {

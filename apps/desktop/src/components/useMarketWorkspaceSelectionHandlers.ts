@@ -1,7 +1,7 @@
 import { useCallback } from 'react'
 import type { QueryClient } from '@tanstack/react-query'
 
-import { api } from '../api'
+import { marketApi } from '../apiMarket'
 import type { MarketTimeframe } from '../utils/workspace-helpers'
 
 type UseMarketWorkspaceSelectionHandlersArgs = {
@@ -35,7 +35,7 @@ export function useMarketWorkspaceSelectionHandlers({
       void queryClient
         .fetchQuery({
           queryKey: ['market-live', normalizedSymbol, timeframe],
-          queryFn: () => api.getMarketLiveSnapshot(normalizedSymbol, timeframe),
+          queryFn: () => marketApi.getMarketLiveSnapshot(normalizedSymbol, timeframe),
           staleTime: 0,
         })
         .catch(() => {

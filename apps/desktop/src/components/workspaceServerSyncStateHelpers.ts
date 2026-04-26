@@ -1,6 +1,6 @@
 import type { QueryClient } from '@tanstack/react-query'
 
-import { api } from '../api'
+import { marketApi } from '../apiMarket'
 import type { WorkspacePreferences } from '../types'
 import type { WorkspaceBootstrap } from '../utils/workspace-helpers'
 import {
@@ -140,7 +140,7 @@ export async function applyWorkspaceServerStateWithMarketPrefetch(
     try {
       await queryClient.fetchQuery({
         queryKey: ['market-live', nextSymbol, nextTimeframe],
-        queryFn: () => api.getMarketLiveSnapshot(nextSymbol, nextTimeframe),
+        queryFn: () => marketApi.getMarketLiveSnapshot(nextSymbol, nextTimeframe),
         staleTime: 0,
       })
     } catch {

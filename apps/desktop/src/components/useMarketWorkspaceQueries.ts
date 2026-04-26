@@ -1,7 +1,7 @@
 import { useMemo } from 'react'
 import { useQuery } from '@tanstack/react-query'
 
-import { api } from '../api'
+import { marketApi } from '../apiMarket'
 import type {
   MarketLiveSnapshot,
   SectionKey,
@@ -25,20 +25,20 @@ export function useMarketWorkspaceQueries({
 
   const watchlistQuery = useQuery({
     queryKey: ['watchlist'],
-    queryFn: api.getWatchlist,
+    queryFn: marketApi.getWatchlist,
     enabled: true,
     refetchInterval: 12000,
     staleTime: 0,
   })
   const marketDetailQuery = useQuery({
     queryKey: ['market', selectedSymbol, selectedMarketTimeframe],
-    queryFn: () => api.getMarketDetail(selectedSymbol, selectedMarketTimeframe),
+    queryFn: () => marketApi.getMarketDetail(selectedSymbol, selectedMarketTimeframe),
     enabled: !liveMarketEnabled,
     refetchInterval: 12000,
   })
   const marketLiveQuery = useQuery({
     queryKey: ['market-live', selectedSymbol, selectedMarketTimeframe],
-    queryFn: () => api.getMarketLiveSnapshot(selectedSymbol, selectedMarketTimeframe),
+    queryFn: () => marketApi.getMarketLiveSnapshot(selectedSymbol, selectedMarketTimeframe),
     enabled: liveMarketEnabled,
     refetchInterval: 30000,
     staleTime: 0,

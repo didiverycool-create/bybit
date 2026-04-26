@@ -1,7 +1,7 @@
 import { useEffect } from 'react'
 import type { QueryClient } from '@tanstack/react-query'
 
-import { api } from '../api'
+import { marketApi } from '../apiMarket'
 import type { MarketDetail, MarketLiveSnapshot, WatchlistInstrument } from '../types'
 import type { MarketTimeframe } from '../utils/workspace-helpers'
 import { buildMarketLivePrefetchTargets } from './marketWorkspaceSelectionHelpers'
@@ -38,7 +38,7 @@ export function useMarketWorkspaceLiveCachePrefetch({
       void queryClient
         .prefetchQuery({
           queryKey: ['market-live', symbol, timeframe],
-          queryFn: () => api.getMarketLiveSnapshot(symbol, timeframe),
+          queryFn: () => marketApi.getMarketLiveSnapshot(symbol, timeframe),
           staleTime: 0,
         })
         .then((payload) => {
