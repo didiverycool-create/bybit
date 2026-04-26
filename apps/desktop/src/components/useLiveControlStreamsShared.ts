@@ -1,6 +1,6 @@
 import { useEffect, useRef } from 'react'
 
-import { CONTROL_API_BASE } from '../api'
+import { CONTROL_API_BASE } from '../apiHttp'
 
 export type LiveControlStreamPhase =
   | 'idle'

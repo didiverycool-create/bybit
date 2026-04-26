@@ -1,4 +1,4 @@
-import { CONTROL_API_BASE } from '../api'
+import { CONTROL_API_BASE } from '../apiHttp'
 import type { BuildAppPresentationModelsArgs } from './buildAppPresentationModels'
 import type { BuildAppWorkspaceModelsArgsInput } from './buildAppWorkspaceModelsArgs'
 

@@ -1,6 +1,6 @@
 import type { ComponentProps, Dispatch, SetStateAction } from 'react'
 
-import { CONTROL_API_BASE } from '../api'
+import { CONTROL_API_BASE } from '../apiHttp'
 import type { SchedulerState, SectionKey } from '../types'
 import { schedulerLabel } from '../utils/app-helpers'
 import AppOverlayPanelsContainer from './AppOverlayPanelsContainer'
