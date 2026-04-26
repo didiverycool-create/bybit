@@ -1,6 +1,6 @@
 import { useQuery } from '@tanstack/react-query'
 
-import { api } from '../api'
+import { strategyApi } from '../apiStrategy'
 
 import type { UseControlStrategyQueriesArgs } from './useControlStrategyQueries.types'
 
@@ -26,7 +26,7 @@ export function useControlStrategyLiveQueries({
 }: UseControlStrategyLiveQueriesArgs) {
   const strategyExecutionPreviewQuery = useQuery({
     queryKey: ['strategy-execution-preview', activeStrategyId, selectedMode],
-    queryFn: () => api.getStrategyExecutionPreview(activeStrategyId, selectedMode),
+    queryFn: () => strategyApi.getStrategyExecutionPreview(activeStrategyId, selectedMode),
     enabled:
       Boolean(activeStrategyId) &&
       liveStrategyEnabled &&
@@ -38,7 +38,7 @@ export function useControlStrategyLiveQueries({
   })
   const strategyActivityQuery = useQuery({
     queryKey: ['strategy-activity', activeStrategyId],
-    queryFn: () => api.getStrategyActivity(activeStrategyId),
+    queryFn: () => strategyApi.getStrategyActivity(activeStrategyId),
     enabled: Boolean(activeStrategyId) && strategyActivityPanelOpen,
     refetchInterval: strategyActivityPanelOpen ? 5000 : false,
     staleTime: 0,

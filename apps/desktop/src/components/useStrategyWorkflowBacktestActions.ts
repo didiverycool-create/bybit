@@ -1,6 +1,6 @@
 import { useMutation } from '@tanstack/react-query'
 
-import { api } from '../api'
+import { aiWorkflowApi } from '../apiAiWorkflow'
 
 import { buildStrategyWorkflowBacktestChangeRequestAction } from './useStrategyWorkflowBacktestChangeRequestAction'
 import { buildStrategyWorkflowBacktestRecommendationAction } from './useStrategyWorkflowBacktestRecommendationAction'
@@ -23,7 +23,7 @@ export function useStrategyWorkflowBacktestActions({
   showFeedback,
 }: UseStrategyWorkflowBacktestActionsArgs) {
   const backtestMutation = useMutation({
-    mutationFn: api.createBacktest,
+    mutationFn: aiWorkflowApi.createBacktest,
     onSuccess: refreshControlData,
   })
 

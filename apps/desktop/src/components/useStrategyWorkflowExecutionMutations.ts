@@ -1,6 +1,7 @@
 import { useMutation } from '@tanstack/react-query'
 
-import { api } from '../api'
+import { aiWorkflowApi } from '../apiAiWorkflow'
+import { strategyApi } from '../apiStrategy'
 
 import type { UseStrategyWorkflowExecutionActionsArgs } from './useStrategyWorkflowExecutionActions.types'
 
@@ -14,23 +15,23 @@ export function useStrategyWorkflowExecutionMutations({
 }: UseStrategyWorkflowExecutionMutationsArgs) {
   const executeStrategySignalMutation = useMutation({
     mutationFn: ({ strategyId, note, mode }: { strategyId: string; note?: string; mode?: 'paper' | 'demo' | 'live' }) =>
-      api.executeStrategySignal(strategyId, { requested_by: 'desktop_operator', note, mode }),
+      strategyApi.executeStrategySignal(strategyId, { requested_by: 'desktop_operator', note, mode }),
     onSuccess: refreshControlData,
   })
 
   const agentJobMutation = useMutation({
-    mutationFn: api.createAgentJob,
+    mutationFn: aiWorkflowApi.createAgentJob,
     onSuccess: refreshControlData,
   })
 
   const retryAgentJobMutation = useMutation({
-    mutationFn: (jobId: string) => api.retryAgentJob(jobId, 'desktop_operator'),
+    mutationFn: (jobId: string) => aiWorkflowApi.retryAgentJob(jobId, 'desktop_operator'),
     onSuccess: refreshControlData,
   })
 
   const proposalMutation = useMutation({
     mutationFn: ({ proposalId, action }: { proposalId: string; action: 'accept' | 'reject' }) =>
-      api.applyStrategyProposalAction(proposalId, action),
+      aiWorkflowApi.applyStrategyProposalAction(proposalId, action),
     onSuccess: refreshControlData,
   })
 

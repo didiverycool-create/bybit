@@ -1,6 +1,7 @@
 import { useQuery } from '@tanstack/react-query'
 
-import { api } from '../api'
+import { aiWorkflowApi } from '../apiAiWorkflow'
+import { strategyApi } from '../apiStrategy'
 
 import type { UseControlStrategyQueriesArgs } from './useControlStrategyQueries.types'
 
@@ -14,24 +15,24 @@ export function useControlStrategyPrimaryQueries({
 }: UseControlStrategyPrimaryQueriesArgs) {
   const strategiesQuery = useQuery({
     queryKey: ['strategies'],
-    queryFn: api.getStrategies,
+    queryFn: strategyApi.getStrategies,
     refetchInterval: 20000,
   })
   const strategyRuntimeQuery = useQuery({
     queryKey: ['strategy-runtime'],
-    queryFn: api.getStrategyRuntime,
+    queryFn: strategyApi.getStrategyRuntime,
     enabled: activeSection === 'strategy' || activeSection === 'overview',
     refetchInterval: 6000,
     staleTime: 0,
   })
   const backtestsQuery = useQuery({
     queryKey: ['backtests'],
-    queryFn: api.getBacktests,
+    queryFn: aiWorkflowApi.getBacktests,
     refetchInterval: 20000,
   })
   const reviewsQuery = useQuery({
     queryKey: ['reviews'],
-    queryFn: api.getReviews,
+    queryFn: aiWorkflowApi.getReviews,
     refetchInterval: 30000,
   })
 

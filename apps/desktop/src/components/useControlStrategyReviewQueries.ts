@@ -1,6 +1,6 @@
 import { useQuery } from '@tanstack/react-query'
 
-import { api } from '../api'
+import { aiWorkflowApi } from '../apiAiWorkflow'
 
 import type { UseControlStrategyQueriesArgs } from './useControlStrategyQueries.types'
 
@@ -22,7 +22,7 @@ export function useControlStrategyReviewQueries({
 }: UseControlStrategyReviewQueriesArgs) {
   const selectedStrategyReviewsQuery = useQuery({
     queryKey: ['strategy-reviews', activeStrategyId],
-    queryFn: () => api.getReviews({ strategyId: activeStrategyId }),
+    queryFn: () => aiWorkflowApi.getReviews({ strategyId: activeStrategyId }),
     enabled:
       Boolean(activeStrategyId) &&
       (activeSection === 'strategy' || activeSection === 'backtest' || activeSection === 'replay'),
@@ -36,7 +36,7 @@ export function useControlStrategyReviewQueries({
   const selectedBacktestReviewsQuery = useQuery({
     queryKey: ['backtest-reviews', selectedBacktestQueryId],
     queryFn: () =>
-      api.getReviews({ backtestId: selectedBacktestQueryId, periods: ['backtest'] }),
+      aiWorkflowApi.getReviews({ backtestId: selectedBacktestQueryId, periods: ['backtest'] }),
     enabled:
       Boolean(selectedBacktestQueryId) &&
       (activeSection === 'backtest' || activeSection === 'replay'),
@@ -46,7 +46,7 @@ export function useControlStrategyReviewQueries({
   const replayTrackingReviewsQuery = useQuery({
     queryKey: ['replay-tracking-reviews', replayTrackingScope, selectedStrategyIdForReplay ?? 'none'],
     queryFn: () =>
-      api.getReviews({
+      aiWorkflowApi.getReviews({
         strategyId: replayTrackingScope === 'selected' ? selectedStrategyIdForReplay : null,
         periods: ['strategy_issue', 'strategy_change'],
       }),

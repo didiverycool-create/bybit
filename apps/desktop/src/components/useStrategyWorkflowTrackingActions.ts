@@ -1,6 +1,7 @@
 import { useMutation } from '@tanstack/react-query'
 
-import { api } from '../api'
+import { aiWorkflowApi } from '../apiAiWorkflow'
+import { strategyApi } from '../apiStrategy'
 import { resolveErrorMessage } from '../utils/app-helpers'
 
 import type { UseStrategyWorkflowActionsArgs } from './strategyWorkflowActionShared'
@@ -34,7 +35,7 @@ export function useStrategyWorkflowTrackingActions({
   showFeedback,
 }: UseStrategyWorkflowTrackingActionsArgs) {
   const changeRequestMutation = useMutation({
-    mutationFn: api.createChangeRequest,
+    mutationFn: aiWorkflowApi.createChangeRequest,
     onSuccess: refreshControlData,
   })
 
@@ -51,7 +52,7 @@ export function useStrategyWorkflowTrackingActions({
         requested_by?: string
         request_key?: string
       }
-    }) => api.createStrategyTrackingReview(strategyId, payload),
+    }) => strategyApi.createStrategyTrackingReview(strategyId, payload),
     onSuccess: refreshControlData,
   })
 

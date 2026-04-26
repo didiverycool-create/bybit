@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
-import { api } from '../api'
+import { aiWorkflowApi } from '../apiAiWorkflow'
 import type { ExecutionImpactRecord } from '../types'
 import { formatDateTime, resolveErrorMessage } from '../utils/app-helpers'
 
@@ -89,12 +89,12 @@ export default function ExecutionImpactSection() {
   const queryClient = useQueryClient()
   const recordsQuery = useQuery({
     queryKey: EXECUTION_IMPACT_QUERY_KEY,
-    queryFn: api.fetchExecutionImpactRecords,
+    queryFn: aiWorkflowApi.fetchExecutionImpactRecords,
     staleTime: 15000,
     refetchInterval: 30000,
   })
   const summarizeMutation = useMutation({
-    mutationFn: api.queueExecutionImpactSummary,
+    mutationFn: aiWorkflowApi.queueExecutionImpactSummary,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: EXECUTION_IMPACT_QUERY_KEY })
     },
