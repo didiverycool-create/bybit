@@ -1,6 +1,6 @@
 import { useQuery } from '@tanstack/react-query'
 
-import { api } from '../api'
+import { accountTradingApi } from '../apiAccountTrading'
 import type { BybitPrivateStatus, ExecutionPreview, MarketDetail, Mode, StrategyRuntimeSnapshot } from '../types'
 
 import type { ManualOrderDraft } from './manualTradePanelTypes'
@@ -50,7 +50,7 @@ export function useManualTradePreviewModel({
       editingOrderId ?? 'new',
     ],
     queryFn: () =>
-      api.previewExecution({
+      accountTradingApi.previewExecution({
         symbol: marketDetail!.symbol,
         market: marketDetail!.market,
         mode: selectedMode,
