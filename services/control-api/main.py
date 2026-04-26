@@ -3,8 +3,20 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import json
+import sys as _sys
 import threading
 import time
+
+# Round 117 — when this file is launched as a script (`python3 main.py`),
+# Python registers it under module name `__main__`.  ``routes.py`` (extracted
+# in Round 109) does ``import main`` at module body, which would otherwise
+# trigger a second top-to-bottom load of this file under the name ``main``,
+# producing a circular-import failure when the second pass tries to wire the
+# router back into a module that is itself still loading.  Aliasing ``main``
+# to the currently-loading module keeps every later ``import main`` against
+# the same partial module object, so the router wiring at the bottom always
+# sees the same ``app`` and the same already-defined helpers.
+_sys.modules.setdefault("main", _sys.modules[__name__])
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_UP
 from pathlib import Path
