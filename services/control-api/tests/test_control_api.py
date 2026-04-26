@@ -28205,5 +28205,961 @@ class BacktestEngineRound119Tests(unittest.TestCase):
             empty_engine.merge_review_risks([], {})
 
 
+class RiskEngineEdgeCaseRound122Tests(unittest.TestCase):
+    """Round 122 — :class:`risk_engine.RiskEngine` boundary / edge-case parity
+    suite that complements :class:`RiskEngineRound118Tests` (happy paths).
+
+    Wave-3 implementation will lean heavily on the engine, so these tests pin
+    the parity contract for every reason taxonomy:
+
+    * Each ``RISK_REASON_*`` constant maps onto the engine output identically
+      to the underlying ``risk_decision.evaluate_risk_decision`` helper.
+    * Each ``CHANNEL_ISSUE_KIND_*`` value flows through unchanged when the
+      outage exception is classified.
+    * Each ``AUTO_DISPATCH_GATE_REASON_*`` sub-reason flows through to the
+      gate verdict identically whether the caller goes through the engine or
+      the underlying ``main._evaluate_strategy_auto_dispatch_gate`` helper.
+    * Defensive paths (``block_code=None`` legacy preview, plain
+      :class:`RuntimeError`, :class:`KeyboardInterrupt`, missing snapshot
+      runtime status) all preserve byte-for-byte parity.
+
+    The fixtures below are synthetic — they construct typed model instances
+    rather than mutating seed-state strategies/snapshots — so the suite avoids
+    the test-isolation pitfalls flagged in R74/R76.
+    """
+
+    @staticmethod
+    def _build_blocked_preview(
+        *,
+        blocked_reason: str,
+        block_code: Optional[str] = None,
+        recommended_action: Optional[str] = None,
+    ):
+        """Return a synthetic blocked :class:`ExecutionPreview`."""
+
+        from models import ExecutionPreview as _Preview  # noqa: PLC0415
+
+        return _Preview(
+            symbol="BTCUSDT",
+            market="perp",
+            mode=AccountMode.PAPER,
+            side=Direction.BUY,
+            origin="manual",
+            quantity=0.5,
+            price=42_000.0,
+            notional="21000.00",
+            action="开多",
+            allowed=False,
+            blocked_reason=blocked_reason,
+            block_code=block_code,
+            recommended_action=recommended_action,
+            warnings=[blocked_reason],
+            current_position_size="0",
+            current_avg_price="--",
+            projected_position_size="--",
+            projected_avg_price="--",
+            available_balance_before="50000.00",
+            available_balance_after="--",
+            estimated_realized_pnl="--",
+            generated_at="2026-04-26T08:00:00+08:00",
+        )
+
+    @staticmethod
+    def _build_strategy(*, mode: AccountMode = AccountMode.LIVE, status: str = "running"):
+        from models import StrategySummary as _Strategy  # noqa: PLC0415
+
+        return _Strategy(
+            id="risk-engine-r122-edge",
+            name="RiskEngineEdgeHarness",
+            category="template",
+            status=status,
+            symbols=["BTCUSDT"],
+            mode=mode,
+            version="v1",
+            pnl_7d="+0.0%",
+            max_drawdown="-0.0%",
+            risk_budget="10%",
+            description="R122 risk-engine edge harness",
+            parameters=[StrategyParameter(key="noop", label="noop", value=0.0)],
+        )
+
+    @staticmethod
+    def _build_snapshot(*, runtime_status: str = "running"):
+        return StrategyRuntimeSnapshot(
+            strategy_id="risk-engine-r122-edge",
+            strategy_name="RiskEngineEdgeHarness",
+            symbol="BTCUSDT",
+            market="perp",
+            mode=AccountMode.LIVE,
+            runtime_status=runtime_status,
+            signal="long",
+            confidence=42.0,
+            last_price=42_000.0,
+            reference_price=42_000.0,
+            change_24h=0.0,
+            note="",
+            next_action="",
+            last_evaluated_at="2026-04-26T08:00:00+08:00",
+        )
+
+    @staticmethod
+    def _patch_clean_gates():
+        """Neutralise every side-gate so ``evaluate_auto_dispatch_gate`` runs
+        only the requested branch.  Mirrors
+        ``RiskEngineRound118Tests._patch_clean_gates`` so fixtures stay in
+        sync."""
+
+        return [
+            patch.object(
+                control_main,
+                "_strategy_live_stop_loss_cooldown_remaining_minutes",
+                return_value=None,
+            ),
+            patch.object(
+                control_main,
+                "_has_active_strategy_live_stop_loss_alert",
+                return_value=False,
+            ),
+            patch.object(
+                control_main,
+                "_strategy_exchange_rejection_guard_remaining_minutes",
+                return_value=None,
+            ),
+            patch.object(
+                control_main,
+                "_strategy_auto_dispatch_gate_reason",
+                return_value=None,
+            ),
+        ]
+
+    # ------------------------------------------------------------------
+    # evaluate_preview() — every RISK_REASON_* code
+    # ------------------------------------------------------------------
+
+    def test_evaluate_preview_parity_for_each_risk_reason_block_code(self) -> None:
+        """Build a synthetic blocked preview tagged with each
+        ``RISK_REASON_*`` constant and assert the engine's verdict matches
+        the underlying helper byte-for-byte.
+
+        R70 + R72 made ``ExecutionPreview.block_code`` the typed source of
+        truth; ``evaluate_risk_decision`` reads it directly when set.  The
+        engine must forward the typed code unchanged."""
+
+        import risk_decision  # noqa: PLC0415
+        from models import (  # noqa: PLC0415
+            RISK_REASON_ACCOUNT_MODE_UNAVAILABLE,
+            RISK_REASON_EXCHANGE_CONSTRAINT,
+            RISK_REASON_INSUFFICIENT_BALANCE,
+            RISK_REASON_INSUFFICIENT_INVENTORY,
+            RISK_REASON_INVALID_REQUEST,
+            RISK_REASON_PREVIEW_BLOCKED,
+            RISK_REASON_RUNTIME_UNAVAILABLE,
+            RISK_REASON_RUNTIME_UNAVAILABLE_PRIVATE_CHANNEL,
+            RISK_REASON_RUNTIME_UNAVAILABLE_PUBLIC_CHANNEL,
+            RISK_REASON_RUNTIME_UNAVAILABLE_WORKER_THREAD,
+            RISK_REASON_STOP_LOSS_GUARD,
+        )
+
+        codes = [
+            RISK_REASON_ACCOUNT_MODE_UNAVAILABLE,
+            RISK_REASON_EXCHANGE_CONSTRAINT,
+            RISK_REASON_INSUFFICIENT_BALANCE,
+            RISK_REASON_INSUFFICIENT_INVENTORY,
+            RISK_REASON_INVALID_REQUEST,
+            RISK_REASON_PREVIEW_BLOCKED,
+            RISK_REASON_RUNTIME_UNAVAILABLE,
+            RISK_REASON_RUNTIME_UNAVAILABLE_PRIVATE_CHANNEL,
+            RISK_REASON_RUNTIME_UNAVAILABLE_PUBLIC_CHANNEL,
+            RISK_REASON_RUNTIME_UNAVAILABLE_WORKER_THREAD,
+            RISK_REASON_STOP_LOSS_GUARD,
+        ]
+
+        for code in codes:
+            preview = self._build_blocked_preview(
+                blocked_reason=f"synthetic {code} block",
+                block_code=code,
+            )
+            engine_decision = control_main.risk_engine.evaluate_preview(preview)
+            helper_decision = risk_decision.evaluate_risk_decision(preview)
+            self.assertEqual(engine_decision.verdict, "block", f"code={code}")
+            self.assertEqual(
+                engine_decision.reason_code,
+                code,
+                f"engine should preserve typed block_code={code}",
+            )
+            self.assertEqual(
+                engine_decision.reason_code,
+                helper_decision.reason_code,
+                f"engine vs helper parity diverged for code={code}",
+            )
+            self.assertEqual(engine_decision.reason_detail, helper_decision.reason_detail)
+            self.assertIs(engine_decision.preview, preview)
+
+    def test_evaluate_preview_legacy_block_code_none_falls_back_to_substring_probe(
+        self,
+    ) -> None:
+        """A blocked preview with ``block_code=None`` (legacy / defensive
+        path) must still produce a typed reason code via
+        ``derive_block_reason_code``.  The engine and helper must agree on
+        the fallback classification."""
+
+        import risk_decision  # noqa: PLC0415
+        from models import (  # noqa: PLC0415
+            RISK_REASON_INSUFFICIENT_BALANCE,
+            RISK_REASON_PREVIEW_BLOCKED,
+        )
+
+        # Substring "可用余额不足" — known hint for INSUFFICIENT_BALANCE.
+        legacy_balance = self._build_blocked_preview(
+            blocked_reason="当前 Paper 可用余额不足，缺口 100 USDT。",
+            block_code=None,
+        )
+        engine_decision = control_main.risk_engine.evaluate_preview(legacy_balance)
+        helper_decision = risk_decision.evaluate_risk_decision(legacy_balance)
+        self.assertEqual(engine_decision.reason_code, RISK_REASON_INSUFFICIENT_BALANCE)
+        self.assertEqual(engine_decision.reason_code, helper_decision.reason_code)
+
+        # Truly novel reason — no hint matches → PREVIEW_BLOCKED fallback.
+        legacy_unknown = self._build_blocked_preview(
+            blocked_reason="some novel english reason with no Chinese hint",
+            block_code=None,
+        )
+        engine_decision_novel = control_main.risk_engine.evaluate_preview(legacy_unknown)
+        helper_decision_novel = risk_decision.evaluate_risk_decision(legacy_unknown)
+        self.assertEqual(engine_decision_novel.reason_code, RISK_REASON_PREVIEW_BLOCKED)
+        self.assertEqual(
+            engine_decision_novel.reason_code, helper_decision_novel.reason_code
+        )
+
+    def test_evaluate_preview_explicit_recommendation_overrides_freeform(self) -> None:
+        """When the caller passes an explicit
+        :class:`RiskDecisionRecommendation` it must propagate end-to-end via
+        the engine, replacing the preview's free-form ``recommended_action``
+        echo path."""
+
+        import risk_decision  # noqa: PLC0415
+        from models import (  # noqa: PLC0415
+            RISK_REASON_INSUFFICIENT_BALANCE,
+            RiskDecisionRecommendation,
+        )
+
+        preview = self._build_blocked_preview(
+            blocked_reason="当前 Paper 可用余额不足，请补充。",
+            block_code=RISK_REASON_INSUFFICIENT_BALANCE,
+            recommended_action="请补充 Paper 余额。",  # would be echoed when no override
+        )
+        explicit = RiskDecisionRecommendation(retry_after_seconds=60)
+
+        engine_decision = control_main.risk_engine.evaluate_preview(
+            preview, recommended_action=explicit
+        )
+        helper_decision = risk_decision.evaluate_risk_decision(
+            preview, recommended_action=explicit
+        )
+
+        # Engine forwards verbatim; helper does the same.
+        assert engine_decision.recommended_action is not None
+        self.assertEqual(engine_decision.recommended_action.retry_after_seconds, 60)
+        self.assertIsNone(engine_decision.recommended_action.recommendation)
+        self.assertEqual(
+            engine_decision.recommended_action,
+            helper_decision.recommended_action,
+        )
+
+    # ------------------------------------------------------------------
+    # evaluate_auto_dispatch_gate() — every AUTO_DISPATCH_GATE_REASON_*
+    # ------------------------------------------------------------------
+
+    def test_evaluate_auto_dispatch_gate_parity_for_every_scheduler_channel_reason(
+        self,
+    ) -> None:
+        """For each ``AUTO_DISPATCH_GATE_REASON_*`` sub-reason the gate
+        must surface ``auto.scheduler_or_channel_gate`` with the typed
+        sub-code on ``sub_reason_code`` and the ``cancel_existing`` flag
+        from the typed context preserved verbatim.  The engine and the
+        underlying helper must agree on every gate field."""
+
+        from contextlib import ExitStack  # noqa: PLC0415
+        from models import (  # noqa: PLC0415
+            AUTO_DISPATCH_GATE_REASON_PRIVATE_CHANNEL_OUTAGE,
+            AUTO_DISPATCH_GATE_REASON_PUBLIC_CHANNEL_OUTAGE,
+            AUTO_DISPATCH_GATE_REASON_SCHEDULER_FREEZE_PUBLISH,
+            AUTO_DISPATCH_GATE_REASON_SCHEDULER_MANUAL_OVERRIDE,
+            AUTO_DISPATCH_GATE_REASON_SCHEDULER_PAUSED,
+            AutoDispatchGateReasonContext,
+        )
+
+        cases = [
+            # (reason_code, cancel_existing flag the typed context carries)
+            (AUTO_DISPATCH_GATE_REASON_SCHEDULER_MANUAL_OVERRIDE, True),
+            (AUTO_DISPATCH_GATE_REASON_SCHEDULER_PAUSED, True),
+            (AUTO_DISPATCH_GATE_REASON_SCHEDULER_FREEZE_PUBLISH, False),
+            (AUTO_DISPATCH_GATE_REASON_PUBLIC_CHANNEL_OUTAGE, True),
+            (AUTO_DISPATCH_GATE_REASON_PRIVATE_CHANNEL_OUTAGE, True),
+        ]
+
+        strategy = self._build_strategy()
+        snapshot = self._build_snapshot()
+
+        for sub_code, cancel_flag in cases:
+            with ExitStack() as stack:
+                # Neutralise the leading guards so the test exercises only
+                # the scheduler/channel branch.
+                stack.enter_context(patch.object(
+                    control_main,
+                    "_strategy_live_stop_loss_cooldown_remaining_minutes",
+                    return_value=None,
+                ))
+                stack.enter_context(patch.object(
+                    control_main,
+                    "_has_active_strategy_live_stop_loss_alert",
+                    return_value=False,
+                ))
+                stack.enter_context(patch.object(
+                    control_main,
+                    "_strategy_exchange_rejection_guard_remaining_minutes",
+                    return_value=None,
+                ))
+                stack.enter_context(patch.object(
+                    control_main,
+                    "_strategy_auto_dispatch_gate_reason",
+                    return_value=AutoDispatchGateReasonContext(
+                        reason_code=sub_code,
+                        detail=f"synthetic {sub_code} detail",
+                        cancel_existing=cancel_flag,
+                    ),
+                ))
+                engine_gate = control_main.risk_engine.evaluate_auto_dispatch_gate(
+                    strategy, snapshot
+                )
+                helper_gate = control_main._evaluate_strategy_auto_dispatch_gate(
+                    strategy, snapshot
+                )
+
+            self.assertEqual(engine_gate.verdict, "block", f"sub_code={sub_code}")
+            self.assertEqual(engine_gate.reason_code, "auto.scheduler_or_channel_gate")
+            self.assertEqual(engine_gate.sub_reason_code, sub_code)
+            self.assertEqual(engine_gate.cancel_existing_orders, cancel_flag)
+            # Engine + helper byte-for-byte parity.
+            self.assertEqual(engine_gate.verdict, helper_gate.verdict)
+            self.assertEqual(engine_gate.reason_code, helper_gate.reason_code)
+            self.assertEqual(engine_gate.sub_reason_code, helper_gate.sub_reason_code)
+            self.assertEqual(
+                engine_gate.cancel_existing_orders, helper_gate.cancel_existing_orders
+            )
+            self.assertEqual(engine_gate.clear_alerts, helper_gate.clear_alerts)
+            self.assertEqual(engine_gate.record_issue, helper_gate.record_issue)
+
+    def test_evaluate_auto_dispatch_gate_paper_preserves_cancel_clear_flags(self) -> None:
+        """The PAPER-mode gate sets ``cancel_existing_orders=True`` /
+        ``clear_alerts=True`` / ``record_issue=False``.  Pin every flag
+        through the engine layer so a regression on any individual side
+        effect surfaces a parity failure."""
+
+        from contextlib import ExitStack  # noqa: PLC0415
+
+        strategy = self._build_strategy(mode=AccountMode.PAPER)
+        snapshot = self._build_snapshot()
+
+        with ExitStack() as stack:
+            for p in self._patch_clean_gates():
+                stack.enter_context(p)
+            engine_gate = control_main.risk_engine.evaluate_auto_dispatch_gate(
+                strategy, snapshot
+            )
+            helper_gate = control_main._evaluate_strategy_auto_dispatch_gate(
+                strategy, snapshot
+            )
+
+        self.assertEqual(engine_gate.reason_code, "auto.paper_or_paused_strategy")
+        self.assertTrue(engine_gate.cancel_existing_orders)
+        self.assertTrue(engine_gate.clear_alerts)
+        self.assertFalse(engine_gate.record_issue)
+        # Parity.
+        self.assertEqual(
+            engine_gate.cancel_existing_orders, helper_gate.cancel_existing_orders
+        )
+        self.assertEqual(engine_gate.clear_alerts, helper_gate.clear_alerts)
+        self.assertEqual(engine_gate.record_issue, helper_gate.record_issue)
+
+    def test_evaluate_auto_dispatch_gate_non_running_status_blocks_via_strategy_status(
+        self,
+    ) -> None:
+        """Strategy status in ``_NON_RUNNING_STRATEGY_STATUSES`` (paused /
+        shadow / paper_only) must block on the leading
+        ``auto.paper_or_paused_strategy`` branch — even when ``mode=LIVE``
+        and the snapshot's ``runtime_status`` is ``"running"``.  Engine
+        and helper must agree."""
+
+        from contextlib import ExitStack  # noqa: PLC0415
+
+        snapshot = self._build_snapshot(runtime_status="running")
+
+        for status in ("paused", "shadow", "paper_only"):
+            strategy = self._build_strategy(status=status)
+            with ExitStack() as stack:
+                for p in self._patch_clean_gates():
+                    stack.enter_context(p)
+                engine_gate = control_main.risk_engine.evaluate_auto_dispatch_gate(
+                    strategy, snapshot
+                )
+                helper_gate = control_main._evaluate_strategy_auto_dispatch_gate(
+                    strategy, snapshot
+                )
+            self.assertEqual(engine_gate.reason_code, "auto.paper_or_paused_strategy", f"status={status}")
+            self.assertEqual(engine_gate.reason_code, helper_gate.reason_code)
+
+    # ------------------------------------------------------------------
+    # classify_outcome() — typed exception subclasses + defensive paths
+    # ------------------------------------------------------------------
+
+    def test_classify_outcome_plain_runtime_error_lands_in_failed_branch(self) -> None:
+        """Plain :class:`RuntimeError` (i.e. not a typed subclass) must
+        classify as ``failed`` with the raw ``str(exc)`` carried verbatim
+        on ``reason_detail``.  This is the R89 contract — a plain
+        ``RuntimeError`` must NOT auto-classify as noop even if its detail
+        carries the historical Chinese token."""
+
+        # Even a message that historically would have triggered the noop
+        # substring probe (R89 removed it) must now stay in "failed".
+        cases = [
+            "私有通道暂时不可用，请稍后重试。",
+            "无需再次提交委托",  # historical noop token, R89 no longer auto-routes
+            "generic runtime failure",
+        ]
+        for detail in cases:
+            exc = RuntimeError(detail)
+            engine_outcome = control_main.risk_engine.classify_outcome(exc)
+            helper_outcome = control_main._classify_auto_dispatch_outcome(exc)
+            self.assertEqual(engine_outcome.verdict, "failed", f"detail={detail!r}")
+            self.assertEqual(engine_outcome.reason_code, "auto.dispatch.failed")
+            self.assertEqual(engine_outcome.reason_detail, detail)
+            self.assertTrue(engine_outcome.record_issue)
+            self.assertFalse(engine_outcome.emit_noop_event)
+            # Engine + helper byte-for-byte parity.
+            self.assertEqual(engine_outcome.verdict, helper_outcome.verdict)
+            self.assertEqual(engine_outcome.reason_detail, helper_outcome.reason_detail)
+            self.assertEqual(engine_outcome.record_issue, helper_outcome.record_issue)
+
+    def test_classify_outcome_blocked_for_each_recommendation_string(self) -> None:
+        """``StrategyExecutionBlockedError`` carries a free-form
+        ``recommended_action`` string that the engine must propagate
+        verbatim onto ``AutoDispatchOutcome.recommended_action`` regardless
+        of which underlying ``RISK_REASON_*`` originally tripped the
+        block.  R86 typed the kwargs flowing into the raise site so the
+        engine layer must not transform the recommendation."""
+
+        from models import (  # noqa: PLC0415
+            RISK_REASON_EXCHANGE_CONSTRAINT,
+            RISK_REASON_INSUFFICIENT_BALANCE,
+            RISK_REASON_RUNTIME_UNAVAILABLE,
+            RISK_REASON_STOP_LOSS_GUARD,
+        )
+
+        # Each block-code carries a different recovery copy.  The
+        # ``_classify_auto_dispatch_outcome`` helper does not inspect the
+        # underlying risk reason — it only relies on the typed
+        # subclass — so the engine must surface the same
+        # ``auto.dispatch.blocked`` verdict for every variant.
+        cases = [
+            (RISK_REASON_INSUFFICIENT_BALANCE, "请先补充 Live 可用余额。"),
+            (RISK_REASON_EXCHANGE_CONSTRAINT, "请按交易所最小下单量调整后再提交。"),
+            (RISK_REASON_RUNTIME_UNAVAILABLE, "请先恢复策略运行线程后再执行真实策略。"),
+            (RISK_REASON_STOP_LOSS_GUARD, "请等待止损保护冷却结束后再继续。"),
+        ]
+        for risk_code, recommendation in cases:
+            exc = control_main.StrategyExecutionBlockedError(
+                f"synthetic {risk_code} block",
+                recommended_action=recommendation,
+            )
+            engine_outcome = control_main.risk_engine.classify_outcome(exc)
+            helper_outcome = control_main._classify_auto_dispatch_outcome(exc)
+            self.assertEqual(engine_outcome.verdict, "blocked", f"risk_code={risk_code}")
+            self.assertEqual(engine_outcome.reason_code, "auto.dispatch.blocked")
+            self.assertEqual(engine_outcome.recommended_action, recommendation)
+            self.assertTrue(engine_outcome.record_issue)
+            # Parity.
+            self.assertEqual(
+                engine_outcome.recommended_action, helper_outcome.recommended_action
+            )
+            self.assertEqual(engine_outcome.record_issue, helper_outcome.record_issue)
+
+    def test_classify_outcome_channel_outage_for_each_issue_kind(self) -> None:
+        """:class:`StrategyExecutionChannelOutageError` is a
+        :class:`RuntimeError` subclass that is NOT
+        :class:`StrategyExecutionNoopError` /
+        :class:`StrategyExecutionBlockedError`, so it lands in the
+        ``failed`` branch — the engine must preserve that contract for
+        every ``CHANNEL_ISSUE_KIND_*`` discriminator (R95/R98/R99) without
+        masking the typed ``issue_kind`` attribute."""
+
+        from execution_health import (  # noqa: PLC0415
+            CHANNEL_ISSUE_KIND_AUTH,
+            CHANNEL_ISSUE_KIND_DISABLED,
+            CHANNEL_ISSUE_KIND_DISCONNECTED,
+            CHANNEL_ISSUE_KIND_NO_FEED,
+            CHANNEL_ISSUE_KIND_STALE,
+        )
+
+        kinds = [
+            CHANNEL_ISSUE_KIND_AUTH,
+            CHANNEL_ISSUE_KIND_DISABLED,
+            CHANNEL_ISSUE_KIND_DISCONNECTED,
+            CHANNEL_ISSUE_KIND_NO_FEED,
+            CHANNEL_ISSUE_KIND_STALE,
+        ]
+        for kind in kinds:
+            exc = control_main.StrategyExecutionChannelOutageError(
+                f"synthetic {kind} outage",
+                channel="public",
+                issue_kind=kind,
+            )
+            # Sanity: the typed attribute survives onto the exception itself.
+            self.assertEqual(exc.issue_kind, kind)
+
+            engine_outcome = control_main.risk_engine.classify_outcome(exc)
+            helper_outcome = control_main._classify_auto_dispatch_outcome(exc)
+            self.assertEqual(engine_outcome.verdict, "failed", f"kind={kind}")
+            self.assertEqual(engine_outcome.reason_code, "auto.dispatch.failed")
+            # Parity with the underlying helper across every flag.
+            self.assertEqual(engine_outcome.verdict, helper_outcome.verdict)
+            self.assertEqual(engine_outcome.reason_code, helper_outcome.reason_code)
+            self.assertEqual(engine_outcome.reason_detail, helper_outcome.reason_detail)
+            self.assertEqual(engine_outcome.record_issue, helper_outcome.record_issue)
+
+    def test_classify_outcome_noop_propagates_reason_detail(self) -> None:
+        """:class:`StrategyExecutionNoopError` must surface as
+        ``noop`` / ``auto.dispatch.noop`` with the raw exception detail
+        forwarded onto ``reason_detail``.  R81/R89 — the typed subclass is
+        the only path into this verdict; plain ``RuntimeError`` no longer
+        auto-routes here."""
+
+        detail = "当前真实持仓已经与策略目标一致，无需再次提交委托。"
+        exc = control_main.StrategyExecutionNoopError(detail)
+        engine_outcome = control_main.risk_engine.classify_outcome(exc)
+        helper_outcome = control_main._classify_auto_dispatch_outcome(exc)
+
+        self.assertEqual(engine_outcome.verdict, "noop")
+        self.assertEqual(engine_outcome.reason_code, "auto.dispatch.noop")
+        self.assertEqual(engine_outcome.reason_detail, detail)
+        self.assertTrue(engine_outcome.emit_noop_event)
+        self.assertTrue(engine_outcome.clear_alerts)
+        self.assertFalse(engine_outcome.record_issue)
+        # Parity.
+        self.assertEqual(engine_outcome.reason_detail, helper_outcome.reason_detail)
+        self.assertEqual(engine_outcome.emit_noop_event, helper_outcome.emit_noop_event)
+
+    def test_classify_outcome_keyboard_interrupt_lands_in_generic_exception_branch(
+        self,
+    ) -> None:
+        """``_classify_auto_dispatch_outcome`` accepts
+        :class:`Optional[BaseException]` and the final unconditional
+        ``return`` covers anything that is not a :class:`RuntimeError`.
+        :class:`KeyboardInterrupt` is a :class:`BaseException` (not a
+        ``RuntimeError``) so it lands in that branch with the
+        ``"后台自动执行异常："`` audit prefix.  The engine must preserve that
+        exact contract — Wave-3 callers may rely on the ``failed`` verdict
+        for any non-RuntimeError exception they propagate."""
+
+        exc = KeyboardInterrupt("operator cancelled")
+        engine_outcome = control_main.risk_engine.classify_outcome(exc)
+        helper_outcome = control_main._classify_auto_dispatch_outcome(exc)
+
+        self.assertEqual(engine_outcome.verdict, "failed")
+        self.assertEqual(engine_outcome.reason_code, "auto.dispatch.failed")
+        self.assertTrue(engine_outcome.reason_detail.startswith("后台自动执行异常："))
+        self.assertIn("operator cancelled", engine_outcome.reason_detail)
+        self.assertTrue(engine_outcome.record_issue)
+        # Engine + helper byte-for-byte parity.
+        self.assertEqual(engine_outcome.verdict, helper_outcome.verdict)
+        self.assertEqual(engine_outcome.reason_detail, helper_outcome.reason_detail)
+        self.assertEqual(engine_outcome.record_issue, helper_outcome.record_issue)
+
+
+class BacktestEngineEdgeCaseRound122Tests(unittest.TestCase):
+    """Round 122 — :class:`backtest_engine.BacktestEngine` boundary / edge-case
+    parity suite that complements :class:`BacktestEngineRound119Tests` (happy
+    paths).
+
+    Wave-3 will lean on the engine for synchronous payload assembly, sample-
+    quality classification and review-risk merging, so these tests pin the
+    contract for empty / extreme / mixed inputs:
+
+    * ``build_payload`` produces a payload with a ``parameter_snapshot`` dict
+      (not ``None``) for every supported timeframe and for strategies whose
+      legacy ``parameters`` list is empty.
+    * ``resolve_decision_readiness`` covers the empty-context default, the
+      reference-only / low-sample / truncated branches, and the precedence
+      order between them.
+    * ``filter_sample_quality_guarded_proposals`` handles empty / all-guarded
+      / mixed proposal lists.
+    * ``merge_review_risks`` is a deduplicating merge that never duplicates
+      content already present in the input list.
+
+    Each test calls the engine method *and* the underlying helper / wrapper
+    pair and asserts byte-for-byte parity, so the engine layer cannot drift
+    from the helpers without the suite going red.  Synthetic fixtures only —
+    no seed-state mutation — to dodge the test-isolation traps R74/R76 hit.
+    """
+
+    def _build_engine(self) -> Any:
+        return backtest_engine.BacktestEngine(
+            repo=control_main.repo,
+            market_data=control_main.market_data,
+            resolve_strategy_primary_market=control_main._resolve_strategy_primary_market,
+            merge_execution_health_review_risks=control_main._merge_execution_health_review_risks,
+        )
+
+    @staticmethod
+    def _build_empty_param_strategy() -> Any:
+        """A live strategy with an empty ``parameters`` list — verifies the
+        engine still produces a fully-formed payload (the
+        ``snapshot_parameters`` helper merges in default top-level toggles
+        even when the legacy parameter rows are empty)."""
+
+        from models import StrategyParameter as _Param  # noqa: PLC0415
+        from models import StrategySummary as _Strategy  # noqa: PLC0415
+
+        return _Strategy(
+            id="trend-empty-r122-edge",
+            name="EmptyParamStrategy",
+            category="template",
+            status="running",
+            symbols=["BTCUSDT"],
+            mode=AccountMode.LIVE,
+            version="v1",
+            pnl_7d="+0.0%",
+            max_drawdown="-0.0%",
+            risk_budget="10%",
+            description="strategy with no parameter rows",
+            parameters=[],
+        )
+
+    # ------------------------------------------------------------------
+    # build_payload() boundary cases
+    # ------------------------------------------------------------------
+
+    def test_build_payload_for_each_supported_timeframe(self) -> None:
+        """Every supported timeframe (15m / 1h / 4h / 1d) must produce a
+        non-``None`` payload with a populated ``parameter_snapshot`` dict
+        and a numeric ``retrieved_candle_count``.  The engine and the
+        ``main.build_backtest_payload`` thin wrapper must agree on every
+        per-timeframe payload."""
+
+        original_market_data = control_main.market_data
+        control_main.market_data = RecordingBacktestMarketClient()
+        self.addCleanup(setattr, control_main, "market_data", original_market_data)
+
+        strategy = next(
+            item for item in control_main.repo.state.strategies if item.id == "trend-btc-01"
+        )
+        engine = self._build_engine()
+
+        for tf in ("15m", "1h", "4h", "1d"):
+            engine_payload = engine.build_payload(strategy, "最近 90 天", tf)
+            main_payload = control_main.build_backtest_payload(
+                strategy, data_range="最近 90 天", timeframe=tf
+            )
+            self.assertIsNotNone(engine_payload, f"engine returned None for tf={tf}")
+            self.assertIsNotNone(main_payload, f"main wrapper returned None for tf={tf}")
+            self.assertIsInstance(engine_payload["parameter_snapshot"], dict)
+            self.assertIsNotNone(engine_payload["parameter_snapshot"])
+            # Engine + main wrapper parity on the structural fields.
+            self.assertEqual(
+                engine_payload["sample_quality"], main_payload["sample_quality"]
+            )
+            self.assertEqual(
+                engine_payload["history_source"], main_payload["history_source"]
+            )
+            self.assertEqual(
+                engine_payload["decision_readiness"],
+                main_payload["decision_readiness"],
+            )
+            self.assertEqual(
+                engine_payload["symbol_scope"], main_payload["symbol_scope"]
+            )
+
+    def test_build_payload_empty_parameters_strategy_yields_dict_snapshot(self) -> None:
+        """A strategy with an empty ``parameters`` list must still produce
+        a payload whose ``parameter_snapshot`` is a ``dict`` (possibly
+        empty or carrying the default top-level toggles), never ``None``.
+        Pinning this contract protects downstream consumers that
+        ``payload["parameter_snapshot"].get(...)`` on the result."""
+
+        original_market_data = control_main.market_data
+        control_main.market_data = RecordingBacktestMarketClient()
+        self.addCleanup(setattr, control_main, "market_data", original_market_data)
+
+        strategy = self._build_empty_param_strategy()
+        engine = self._build_engine()
+
+        engine_payload = engine.build_payload(strategy, "最近 90 天", "1h")
+        # The engine returns ``None`` only when the runner has insufficient
+        # candles — the recording stub provides a sufficient fixture, so
+        # the payload should always be present for this strategy.
+        self.assertIsNotNone(engine_payload)
+        ps = engine_payload["parameter_snapshot"]
+        self.assertIsInstance(ps, dict)
+        self.assertIsNotNone(ps)
+
+        # Parity with the main-module thin wrapper.
+        main_payload = control_main.build_backtest_payload(
+            strategy, data_range="最近 90 天", timeframe="1h"
+        )
+        self.assertIsNotNone(main_payload)
+        self.assertEqual(engine_payload["parameter_snapshot"], main_payload["parameter_snapshot"])
+
+    # ------------------------------------------------------------------
+    # resolve_decision_readiness() boundary cases
+    # ------------------------------------------------------------------
+
+    def test_resolve_decision_readiness_empty_context_yields_ready_default(self) -> None:
+        """An empty context dict has no sample-quality / truncated /
+        fallback flags and so must resolve to the ``ready`` default
+        verdict.  Engine + helper parity."""
+
+        engine = self._build_engine()
+        engine_result = engine.resolve_decision_readiness({})
+        helper_result = backtest_engine.resolve_backtest_decision_readiness({})
+        # main thin wrapper alias for parity coverage.
+        wrapper_result = control_main._resolve_backtest_decision_readiness({})
+
+        self.assertEqual(engine_result, helper_result)
+        self.assertEqual(engine_result, wrapper_result)
+        self.assertEqual(engine_result["decision_readiness"], "ready")
+        self.assertIsNone(engine_result["decision_recommended_data_range"])
+        self.assertIsNone(engine_result["decision_recommended_timeframe"])
+        self.assertIsNone(engine_result["decision_readiness_action"])
+
+    def test_resolve_decision_readiness_reference_only_routes_to_research_only(
+        self,
+    ) -> None:
+        """A context flagged ``reference_only`` (or with the explicit
+        ``sample_quality=reference_only``) must resolve to
+        ``research_only`` with a recommended sample-validation payload."""
+
+        engine = self._build_engine()
+        ctx = {
+            "data_range": "最近 90 天",
+            "timeframe": "1h",
+            "sample_quality": "reference_only",
+        }
+        engine_result = engine.resolve_decision_readiness(ctx)
+        helper_result = backtest_engine.resolve_backtest_decision_readiness(ctx)
+        self.assertEqual(engine_result, helper_result)
+        self.assertEqual(engine_result["decision_readiness"], "research_only")
+        self.assertEqual(engine_result["decision_recommended_data_range"], "最近 180 天")
+
+    def test_resolve_decision_readiness_truncated_takes_precedence_over_low_sample(
+        self,
+    ) -> None:
+        """When both ``low_sample`` and ``history_truncated`` would fire,
+        the ordering inside ``resolve_backtest_decision_readiness`` puts
+        the truncated branch first.  Pin that precedence."""
+
+        engine = self._build_engine()
+        ctx = {
+            "data_range": "最近 180 天",
+            "timeframe": "1h",
+            "sample_quality": "low_sample",
+            "history_truncated": True,
+            "requested_candle_estimate": 30_000,
+            "requested_candle_limit": 20_000,
+            "metrics": {"trades": 2},
+        }
+        engine_result = engine.resolve_decision_readiness(ctx)
+        helper_result = backtest_engine.resolve_backtest_decision_readiness(ctx)
+        self.assertEqual(engine_result, helper_result)
+        self.assertEqual(engine_result["decision_readiness"], "sample_incomplete")
+        self.assertIsNotNone(engine_result["decision_readiness_action"])
+
+    # ------------------------------------------------------------------
+    # filter_sample_quality_guarded_proposals() boundary cases
+    # ------------------------------------------------------------------
+
+    def test_filter_sample_quality_guarded_proposals_empty_list_returns_empty(self) -> None:
+        """An empty proposals list short-circuits to ``[]`` regardless of
+        the context shape."""
+
+        engine = self._build_engine()
+        for ctx in (
+            {},
+            {"data_range": "最近 180 天", "timeframe": "1h"},
+            {
+                "data_range": "最近 180 天",
+                "timeframe": "1h",
+                "history_truncated": True,
+                "requested_candle_estimate": 30_000,
+                "requested_candle_limit": 20_000,
+            },
+        ):
+            engine_result = engine.filter_sample_quality_guarded_proposals([], ctx)
+            helper_result = backtest_engine.filter_sample_quality_guarded_proposals(
+                [], ctx
+            )
+            wrapper_result = (
+                control_main._filter_sample_quality_guarded_parsed_proposals(
+                    [], ctx
+                )
+            )
+            self.assertEqual(engine_result, [], f"ctx={ctx}")
+            self.assertEqual(engine_result, helper_result)
+            self.assertEqual(engine_result, wrapper_result)
+
+    def test_filter_sample_quality_guarded_proposals_skips_non_backtest_proposals(
+        self,
+    ) -> None:
+        """Proposals whose ``proposal_type`` is not ``backtest_request``
+        cannot be normalised, so the helper falls through to ``[]`` even
+        when the context would otherwise downgrade.  The engine must
+        match this defensive contract."""
+
+        from models import StrategyProposal  # noqa: PLC0415
+
+        engine = self._build_engine()
+        # Mix of non-backtest-request proposal types.  ``param_update`` is
+        # one of the valid ``ProposalType`` literals but does NOT carry the
+        # ``backtest_request`` semantics, so the filter must skip it.
+        non_backtest_proposals = [
+            StrategyProposal(
+                id="prop-non-bt-1",
+                proposal_type="param_update",  # not backtest_request
+                strategy_id="strategy-test",
+                title="t",
+                description="d",
+                created_at=datetime.now(timezone.utc).astimezone().isoformat(),
+                status="pending",
+                expected_impact="impact",
+                payload={"data_range": "最近 180 天", "timeframe": "4h"},
+            ),
+        ]
+        ctx = {
+            "data_range": "最近 180 天",
+            "timeframe": "1h",
+            "history_truncated": True,
+            "requested_candle_estimate": 30_000,
+            "requested_candle_limit": 20_000,
+        }
+        engine_result = engine.filter_sample_quality_guarded_proposals(
+            non_backtest_proposals, ctx
+        )
+        helper_result = backtest_engine.filter_sample_quality_guarded_proposals(
+            non_backtest_proposals, ctx
+        )
+        self.assertEqual(engine_result, [])
+        self.assertEqual(engine_result, helper_result)
+
+    def test_filter_sample_quality_guarded_proposals_returns_only_first_normalised(
+        self,
+    ) -> None:
+        """A mixed list of guarded backtest-request proposals must yield
+        exactly the first-normalised entry — the helper short-circuits on
+        the first match.  Pin the engine matches that contract."""
+
+        from models import StrategyProposal  # noqa: PLC0415
+
+        engine = self._build_engine()
+        proposals = [
+            StrategyProposal(
+                id=f"prop-{idx}",
+                proposal_type="backtest_request",
+                strategy_id="strategy-test",
+                title="t",
+                description="d",
+                created_at=datetime.now(timezone.utc).astimezone().isoformat(),
+                status="pending",
+                expected_impact="impact",
+                payload={"data_range": "最近 180 天", "timeframe": "4h"},
+            )
+            for idx in range(3)
+        ]
+        ctx = {
+            "data_range": "最近 180 天",
+            "timeframe": "1h",
+            "history_truncated": True,
+            "requested_candle_estimate": 30_000,
+            "requested_candle_limit": 20_000,
+        }
+        engine_result = engine.filter_sample_quality_guarded_proposals(proposals, ctx)
+        helper_result = backtest_engine.filter_sample_quality_guarded_proposals(
+            proposals, ctx
+        )
+        # The helper's contract is to normalise & return exactly one entry.
+        self.assertEqual(len(engine_result), 1)
+        self.assertEqual(len(engine_result), len(helper_result))
+        # First-match parity.
+        self.assertEqual(engine_result[0].payload, helper_result[0].payload)
+
+    # ------------------------------------------------------------------
+    # merge_review_risks() boundary cases
+    # ------------------------------------------------------------------
+
+    def test_merge_review_risks_empty_input_returns_empty_list(self) -> None:
+        """Empty ``risks`` + empty context → empty list.  Engine + helper
+        + main wrapper parity, ensuring the deduplicating merge does not
+        invent content out of nothing."""
+
+        engine = self._build_engine()
+        engine_result = engine.merge_review_risks([], {})
+        helper_result = backtest_engine.merge_backtest_review_risks(
+            [],
+            {},
+            merge_execution_health_review_risks=control_main._merge_execution_health_review_risks,
+        )
+        wrapper_result = control_main._merge_backtest_review_risks([], {})
+        self.assertEqual(engine_result, [])
+        self.assertEqual(engine_result, helper_result)
+        self.assertEqual(engine_result, wrapper_result)
+
+    def test_merge_review_risks_does_not_duplicate_existing_warning(self) -> None:
+        """When ``risks`` already contains a phrase matching the merger's
+        deduplication probe (e.g. ``"样本量偏小"`` for low-sample
+        contexts), the merger must NOT append a duplicate.  Pin the
+        engine matches this no-op contract."""
+
+        engine = self._build_engine()
+        # Pre-existing risk that already mentions the low-sample phrase.
+        existing = ["样本量偏小提示：手动复核中。"]
+        ctx = {
+            "sample_quality": "low_sample",
+            "data_range": "最近 180 天",
+            "timeframe": "1h",
+            "metrics": {"trades": 2},
+        }
+        engine_result = engine.merge_review_risks(existing, ctx)
+        helper_result = backtest_engine.merge_backtest_review_risks(
+            existing,
+            ctx,
+            merge_execution_health_review_risks=control_main._merge_execution_health_review_risks,
+        )
+        wrapper_result = control_main._merge_backtest_review_risks(existing, ctx)
+        # The merger must dedupe — exactly one risk on the output.
+        self.assertEqual(engine_result, ["样本量偏小提示：手动复核中。"])
+        self.assertEqual(engine_result, helper_result)
+        self.assertEqual(engine_result, wrapper_result)
+
+    def test_merge_review_risks_passes_through_when_context_carries_no_flags(self) -> None:
+        """When the context carries no sample-quality / truncated /
+        fallback flags, the merge is a pass-through (modulo
+        ``execution_health`` augmentation).  The engine must surface the
+        same list as the helper for parity."""
+
+        engine = self._build_engine()
+        risks = ["原始风险一", "原始风险二"]
+        ctx = {"data_range": "最近 180 天", "timeframe": "1h"}
+        engine_result = engine.merge_review_risks(risks, ctx)
+        helper_result = backtest_engine.merge_backtest_review_risks(
+            risks,
+            ctx,
+            merge_execution_health_review_risks=control_main._merge_execution_health_review_risks,
+        )
+        wrapper_result = control_main._merge_backtest_review_risks(risks, ctx)
+        # The original two risks must be preserved verbatim.
+        for original in risks:
+            self.assertIn(original, engine_result)
+        self.assertEqual(engine_result, helper_result)
+        self.assertEqual(engine_result, wrapper_result)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
