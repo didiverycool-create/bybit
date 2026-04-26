@@ -27936,5 +27936,274 @@ class RiskEngineRound118Tests(unittest.TestCase):
         self.assertEqual(ve_engine.reason_detail, ve_helper.reason_detail)
 
 
+class BacktestEngineRound119Tests(unittest.TestCase):
+    """Round 119 — :class:`backtest_engine.BacktestEngine` is the new
+    coordinating façade for "everything we can / cannot conclude from a
+    given backtest context": the synchronous payload builder plus the
+    sample-quality / window-coverage classifiers, the recommendation
+    planners, and the review-risk merger.  The helpers used to live on
+    ``main.py`` directly; R119 moves the implementations into
+    :mod:`backtest_engine` and leaves thin re-export wrappers behind so
+    every existing call-site keeps working.
+
+    These tests pin:
+
+    1. The class is constructible with the runtime dependencies wired in
+       and exposes the expected public methods.
+    2. Each :class:`BacktestEngine` method delegates to the corresponding
+       ``main.py`` thin wrapper bit-for-bit (for pure helpers).
+    3. The ``main.py`` wrappers themselves delegate to the
+       :mod:`backtest_engine` module-level helpers (so the wrappers do
+       not contain the actual logic any more).
+    4. ``build_payload`` runs end-to-end through the engine and produces
+       the same payload as the legacy ``main.build_backtest_payload``
+       call-site that ``repo.backtest_runner`` already references.
+    """
+
+    def _build_engine(self) -> Any:
+        return backtest_engine.BacktestEngine(
+            repo=control_main.repo,
+            market_data=control_main.market_data,
+            resolve_strategy_primary_market=control_main._resolve_strategy_primary_market,
+            merge_execution_health_review_risks=control_main._merge_execution_health_review_risks,
+        )
+
+    def test_engine_exposes_expected_public_methods(self) -> None:
+        engine = self._build_engine()
+        for method_name in (
+            "build_payload",
+            "resolve_decision_readiness",
+            "resolve_full_window_recommendation",
+            "merge_review_risks",
+            "filter_sample_quality_guarded_proposals",
+            "extract_safe_sample_validation_payload",
+            "build_sample_validation_backtest_payload",
+            "build_full_window_backtest_plan",
+            "render_sample_validation_action",
+            "resolve_history_source_recommendation",
+        ):
+            self.assertTrue(
+                callable(getattr(engine, method_name, None)),
+                f"BacktestEngine should expose callable {method_name!r}",
+            )
+
+    def test_resolve_decision_readiness_matches_main_wrapper(self) -> None:
+        engine = self._build_engine()
+        context = {
+            "data_range": "最近 180 天",
+            "timeframe": "1h",
+            "metrics": {"trades": 12},
+            "sample_quality": "sufficient",
+            "history_source": "exchange_history",
+        }
+        engine_payload = engine.resolve_decision_readiness(context)
+        main_payload = control_main._resolve_backtest_decision_readiness(context)
+        self.assertEqual(engine_payload, main_payload)
+        self.assertEqual(engine_payload["decision_readiness"], "ready")
+
+    def test_resolve_full_window_recommendation_matches_main_wrapper(self) -> None:
+        engine = self._build_engine()
+        context = {
+            "data_range": "最近 180 天",
+            "timeframe": "15m",
+            "history_truncated": True,
+            "history_gap_reason": "sample_cap",
+            "requested_candle_estimate": 30_000,
+            "requested_candle_limit": 20_000,
+        }
+        engine_payload = engine.resolve_full_window_recommendation(context)
+        main_payload = control_main._resolve_full_window_recommendation(context)
+        self.assertEqual(engine_payload, main_payload)
+        self.assertIn("payload", engine_payload)
+        self.assertIn("can_cover_full_window", engine_payload)
+
+    def test_build_sample_validation_backtest_payload_matches_main_wrapper(self) -> None:
+        engine = self._build_engine()
+        engine_payload = engine.build_sample_validation_backtest_payload(
+            "最近 90 天",
+            "1h",
+            prefer_finer_timeframe=True,
+        )
+        main_payload = control_main._build_sample_validation_backtest_payload(
+            "最近 90 天",
+            "1h",
+            prefer_finer_timeframe=True,
+        )
+        self.assertEqual(engine_payload, main_payload)
+        # Spec: when caller is already on the canonical 180-day window the
+        # helper steps the timeframe down; otherwise it expands to 180d.
+        self.assertEqual(engine_payload["data_range"], "最近 180 天")
+
+    def test_build_full_window_backtest_plan_matches_main_wrapper(self) -> None:
+        engine = self._build_engine()
+        engine_plan = engine.build_full_window_backtest_plan("最近 180 天", "1h")
+        main_plan = control_main._build_full_window_backtest_plan("最近 180 天", "1h")
+        self.assertEqual(engine_plan, main_plan)
+
+    def test_render_sample_validation_action_matches_main_wrapper(self) -> None:
+        engine = self._build_engine()
+        payload = {"data_range": "最近 180 天", "timeframe": "15m"}
+        rendered = engine.render_sample_validation_action(
+            "最近 90 天",
+            "1h",
+            payload,
+        )
+        main_rendered = control_main._render_sample_validation_action(
+            "最近 90 天",
+            "1h",
+            payload,
+        )
+        self.assertEqual(rendered, main_rendered)
+        self.assertIn("最近 180 天", rendered)
+        self.assertIn("15m", rendered)
+
+    def test_resolve_history_source_recommendation_matches_main_wrapper(self) -> None:
+        engine = self._build_engine()
+        context = {
+            "data_range": "最近 180 天",
+            "timeframe": "1h",
+            "history_source": "market_detail_fallback",
+            "history_source_reason": "insufficient_exchange_samples",
+        }
+        engine_plan = engine.resolve_history_source_recommendation(context)
+        main_plan = control_main._resolve_history_source_recommendation(context)
+        self.assertEqual(engine_plan, main_plan)
+        self.assertIn("recommended_action", engine_plan)
+        self.assertIn("data_range", engine_plan)
+        self.assertIn("timeframe", engine_plan)
+
+    def test_extract_safe_sample_validation_payload_matches_main_wrapper(self) -> None:
+        engine = self._build_engine()
+        context = {
+            "data_range": "最近 180 天",
+            "timeframe": "1h",
+            "history_truncated": True,
+            "requested_candle_estimate": 30_000,
+            "requested_candle_limit": 20_000,
+        }
+        proposal_payload = {"data_range": "最近 180 天", "timeframe": "4h"}
+        engine_payload = engine.extract_safe_sample_validation_payload(
+            proposal_payload,
+            context,
+        )
+        main_payload = control_main._extract_safe_sample_validation_payload(
+            proposal_payload,
+            context,
+        )
+        self.assertEqual(engine_payload, main_payload)
+
+    def test_merge_review_risks_appends_low_sample_warning(self) -> None:
+        engine = self._build_engine()
+        context = {
+            "data_range": "最近 180 天",
+            "timeframe": "1h",
+            "metrics": {"trades": 2},
+            "sample_quality": "low_sample",
+            "history_source": "exchange_history",
+        }
+        engine_risks = engine.merge_review_risks([], context)
+        main_risks = control_main._merge_backtest_review_risks([], context)
+        self.assertEqual(engine_risks, main_risks)
+        self.assertTrue(
+            any("仅产生" in risk and "样本量偏小" in risk for risk in engine_risks),
+            f"low-sample warning missing from {engine_risks!r}",
+        )
+
+    def test_filter_sample_quality_guarded_proposals_matches_main_wrapper(self) -> None:
+        from models import StrategyProposal
+
+        engine = self._build_engine()
+        # Construct a backtest_request proposal that should be normalised
+        # into a downgraded payload (180d × 4h is safer than the current
+        # truncated 180d × 1h request).
+        proposal = StrategyProposal(
+            id="prop-test-r119",
+            proposal_type="backtest_request",
+            strategy_id="strategy-test",
+            title="t",
+            description="d",
+            created_at=datetime.now(timezone.utc).astimezone().isoformat(),
+            status="pending",
+            expected_impact="impact",
+            payload={"data_range": "最近 180 天", "timeframe": "4h"},
+        )
+        context = {
+            "data_range": "最近 180 天",
+            "timeframe": "1h",
+            "history_truncated": True,
+            "requested_candle_estimate": 30_000,
+            "requested_candle_limit": 20_000,
+        }
+        engine_filtered = engine.filter_sample_quality_guarded_proposals(
+            [proposal],
+            context,
+        )
+        main_filtered = control_main._filter_sample_quality_guarded_parsed_proposals(
+            [proposal],
+            context,
+        )
+        self.assertEqual(len(engine_filtered), len(main_filtered))
+        for left, right in zip(engine_filtered, main_filtered):
+            self.assertEqual(left.payload, right.payload)
+
+    def test_build_payload_matches_legacy_main_callsite(self) -> None:
+        original_market_data = control_main.market_data
+        recording_market_data = RecordingBacktestMarketClient()
+        control_main.market_data = recording_market_data
+        self.addCleanup(setattr, control_main, "market_data", original_market_data)
+
+        strategy = next(
+            item for item in control_main.repo.state.strategies if item.id == "trend-btc-01"
+        )
+        # Call through the engine — wired with the same dependencies the
+        # main module currently uses, so the resulting payload should be
+        # identical to ``control_main.build_backtest_payload``.
+        engine = backtest_engine.BacktestEngine(
+            repo=control_main.repo,
+            market_data=control_main.market_data,
+            resolve_strategy_primary_market=control_main._resolve_strategy_primary_market,
+            merge_execution_health_review_risks=control_main._merge_execution_health_review_risks,
+        )
+        engine_payload = engine.build_payload(
+            strategy,
+            data_range="2025-12-01 ~ 2026-03-29",
+            timeframe="1h",
+        )
+        self.assertIsNotNone(engine_payload)
+        # The thin wrapper on main.py should now produce identical output
+        # because both call into the same backtest_engine.build_backtest_payload.
+        main_payload = control_main.build_backtest_payload(
+            strategy,
+            data_range="2025-12-01 ~ 2026-03-29",
+            timeframe="1h",
+        )
+        self.assertIsNotNone(main_payload)
+        self.assertEqual(engine_payload["symbol_scope"], main_payload["symbol_scope"])
+        self.assertEqual(engine_payload["sample_quality"], main_payload["sample_quality"])
+        self.assertEqual(engine_payload["history_source"], main_payload["history_source"])
+        self.assertEqual(
+            engine_payload["decision_readiness"],
+            main_payload["decision_readiness"],
+        )
+
+    def test_engine_build_payload_requires_dependencies(self) -> None:
+        # Without the dependencies wired in, build_payload should raise rather
+        # than silently call into ``None.snapshot()``.
+        empty_engine = backtest_engine.BacktestEngine()
+        with self.assertRaises(RuntimeError):
+            empty_engine.build_payload(object(), "最近 180 天", "1h")
+
+    def test_engine_merge_review_risks_requires_callback(self) -> None:
+        # Without the merge_execution_health_review_risks callback wired in,
+        # merge_review_risks should raise to signal misconfiguration.
+        empty_engine = backtest_engine.BacktestEngine(
+            repo=control_main.repo,
+            market_data=control_main.market_data,
+            resolve_strategy_primary_market=control_main._resolve_strategy_primary_market,
+        )
+        with self.assertRaises(RuntimeError):
+            empty_engine.merge_review_risks([], {})
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
