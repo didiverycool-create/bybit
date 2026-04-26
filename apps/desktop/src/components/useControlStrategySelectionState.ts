@@ -14,9 +14,9 @@ type UseControlStrategySelectionStateArgs = Pick<
   UseControlStrategyQueriesArgs,
   'selectedBacktestId' | 'selectedMode' | 'selectedStrategyId' | 'backtestFilter'
 > & {
-  strategiesQueryData: Awaited<ReturnType<typeof import('../api').api.getStrategies>> | undefined
-  strategyRuntimeQueryData: Awaited<ReturnType<typeof import('../api').api.getStrategyRuntime>> | undefined
-  backtestsQueryData: Awaited<ReturnType<typeof import('../api').api.getBacktests>> | undefined
+  strategiesQueryData: Awaited<ReturnType<typeof import('../apiStrategy').strategyApi.getStrategies>> | undefined
+  strategyRuntimeQueryData: Awaited<ReturnType<typeof import('../apiStrategy').strategyApi.getStrategyRuntime>> | undefined
+  backtestsQueryData: Awaited<ReturnType<typeof import('../apiAiWorkflow').aiWorkflowApi.getBacktests>> | undefined
 }
 
 export function useControlStrategySelectionState({

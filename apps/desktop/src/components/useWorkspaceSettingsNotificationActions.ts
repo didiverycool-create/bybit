@@ -2,7 +2,7 @@ import type { Dispatch, MutableRefObject, SetStateAction } from 'react'
 import { useMutation } from '@tanstack/react-query'
 import type { QueryClient } from '@tanstack/react-query'
 
-import { api } from '../api'
+import { systemIntegrationApi } from '../apiSystemIntegration'
 import type { SettingsPayload } from '../types'
 import type { DesktopNotificationDelivery, DesktopNotificationPayload, SettingsDraft, SettingsNotificationChannel } from '../utils/app-helpers'
 import { normalizeSettingsNotificationChannels, resolveErrorMessage } from '../utils/app-helpers'
@@ -46,7 +46,7 @@ export function useWorkspaceSettingsNotificationActions({
   showFeedback,
 }: UseWorkspaceSettingsNotificationActionsArgs) {
   const settingsMutation = useMutation({
-    mutationFn: api.updateSettings,
+    mutationFn: systemIntegrationApi.updateSettings,
     onSuccess: async (nextSettings) => {
       queryClient.setQueryData(['settings'], nextSettings)
       await Promise.all([

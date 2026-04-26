@@ -1,6 +1,8 @@
 import { useQuery } from '@tanstack/react-query'
 
-import { api } from '../api'
+import { controlRuntimeApi } from '../apiControlRuntime'
+import { getServiceHealth } from '../apiHttp'
+import { systemIntegrationApi } from '../apiSystemIntegration'
 
 type UseControlStatusQueriesArgs = {
   grafanaPreviewOpen: boolean
@@ -11,57 +13,57 @@ export function useControlStatusQueries({
 }: UseControlStatusQueriesArgs) {
   const healthQuery = useQuery({
     queryKey: ['service-health'],
-    queryFn: api.getServiceHealth,
+    queryFn: getServiceHealth,
     retry: false,
     refetchInterval: 15000,
   })
   const runtimeWorkerStatusQuery = useQuery({
     queryKey: ['runtime-worker-status'],
-    queryFn: api.getRuntimeWorkerStatus,
+    queryFn: controlRuntimeApi.getRuntimeWorkerStatus,
     enabled: Boolean(healthQuery.data?.ok),
     refetchInterval: 5000,
     staleTime: 0,
   })
   const snapshotQuery = useQuery({
     queryKey: ['snapshot'],
-    queryFn: api.getControlSnapshot,
+    queryFn: controlRuntimeApi.getControlSnapshot,
     refetchInterval: 12000,
   })
   const settingsQuery = useQuery({
     queryKey: ['settings'],
-    queryFn: api.getSettings,
+    queryFn: systemIntegrationApi.getSettings,
     staleTime: 60000,
   })
   const grafanaQuery = useQuery({
     queryKey: ['grafana'],
-    queryFn: api.getGrafanaStatus,
+    queryFn: systemIntegrationApi.getGrafanaStatus,
     staleTime: 60000,
   })
   const metricsPreviewQuery = useQuery({
     queryKey: ['metrics-preview'],
-    queryFn: api.getPrometheusMetrics,
+    queryFn: systemIntegrationApi.getPrometheusMetrics,
     enabled: grafanaPreviewOpen,
     staleTime: 15000,
   })
   const workspaceQuery = useQuery({
     queryKey: ['workspace'],
-    queryFn: api.getWorkspacePreferences,
+    queryFn: systemIntegrationApi.getWorkspacePreferences,
     staleTime: 30000,
     retry: false,
   })
   const openClawQuery = useQuery({
     queryKey: ['openclaw'],
-    queryFn: api.getOpenClawStatus,
+    queryFn: systemIntegrationApi.getOpenClawStatus,
     refetchInterval: 20000,
   })
   const bybitPrivateQuery = useQuery({
     queryKey: ['bybit-private'],
-    queryFn: api.getBybitPrivateStatus,
+    queryFn: systemIntegrationApi.getBybitPrivateStatus,
     refetchInterval: 20000,
   })
   const bybitPublicQuery = useQuery({
     queryKey: ['bybit-public'],
-    queryFn: api.getBybitPublicStatus,
+    queryFn: systemIntegrationApi.getBybitPublicStatus,
     refetchInterval: 20000,
   })
 

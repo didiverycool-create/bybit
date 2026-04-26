@@ -1,6 +1,8 @@
 import { useQuery } from '@tanstack/react-query'
 
-import { api } from '../api'
+import { accountTradingApi } from '../apiAccountTrading'
+import { aiWorkflowApi } from '../apiAiWorkflow'
+import { opsMonitoringApi } from '../apiOpsMonitoring'
 
 type UseControlOpsLiveQueriesArgs = {
   liveAiEnabled: boolean
@@ -15,21 +17,21 @@ export function useControlOpsLiveQueries({
 }: UseControlOpsLiveQueriesArgs) {
   const aiLiveQuery = useQuery({
     queryKey: ['ai-live'],
-    queryFn: api.getAiLiveSnapshot,
+    queryFn: aiWorkflowApi.getAiLiveSnapshot,
     enabled: liveAiEnabled,
     refetchInterval: 4000,
     staleTime: 0,
   })
   const opsLiveQuery = useQuery({
     queryKey: ['ops-live'],
-    queryFn: api.getOpsLiveSnapshot,
+    queryFn: opsMonitoringApi.getOpsLiveSnapshot,
     enabled: liveOpsEnabled,
     refetchInterval: 4000,
     staleTime: 0,
   })
   const accountLiveQuery = useQuery({
     queryKey: ['account-live'],
-    queryFn: api.getAccountLiveSnapshot,
+    queryFn: accountTradingApi.getAccountLiveSnapshot,
     enabled: liveAccountEnabled,
     refetchInterval: 4000,
     staleTime: 0,

@@ -1,6 +1,7 @@
 import { useMutation } from '@tanstack/react-query'
 
-import { api } from '../api'
+import { aiWorkflowApi } from '../apiAiWorkflow'
+import { controlRuntimeApi } from '../apiControlRuntime'
 import { resolveErrorMessage, schedulerCommandFeedbackDetail } from '../utils/app-helpers'
 
 type ActionTone = 'success' | 'warning' | 'error'
@@ -15,12 +16,12 @@ export function useWorkspaceSchedulerRuntimeActions({
   showFeedback,
 }: UseWorkspaceSchedulerRuntimeActionsArgs) {
   const schedulerMutation = useMutation({
-    mutationFn: api.sendSchedulerCommand,
+    mutationFn: aiWorkflowApi.sendSchedulerCommand,
     onSuccess: refreshControlData,
   })
 
   const restartRuntimeWorkerMutation = useMutation({
-    mutationFn: api.restartStrategyRuntimeWorker,
+    mutationFn: controlRuntimeApi.restartStrategyRuntimeWorker,
     onSuccess: refreshControlData,
   })
 

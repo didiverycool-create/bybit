@@ -1,7 +1,7 @@
 import { useCallback } from 'react'
 import { useMutation, type QueryClient } from '@tanstack/react-query'
 
-import { api } from '../api'
+import { systemIntegrationApi } from '../apiSystemIntegration'
 import { buildWorkspaceSignature } from '../utils/workspace-helpers'
 
 type UseControlRefreshActionsArgs = {
@@ -43,7 +43,7 @@ export function useControlRefreshActions({
   }, [queryClient])
 
   const workspaceMutation = useMutation({
-    mutationFn: api.updateWorkspacePreferences,
+    mutationFn: systemIntegrationApi.updateWorkspacePreferences,
     onSuccess: async (workspace) => {
       setWorkspaceSavedAt(workspace.updated_at)
       setLastSyncedWorkspaceSignature(buildWorkspaceSignature(workspace))

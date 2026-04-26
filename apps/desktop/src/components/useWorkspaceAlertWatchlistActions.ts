@@ -1,7 +1,8 @@
 import type { Dispatch, SetStateAction } from 'react'
 import { useMutation } from '@tanstack/react-query'
 
-import { api } from '../api'
+import { marketApi } from '../apiMarket'
+import { opsMonitoringApi } from '../apiOpsMonitoring'
 import {
   type ActionTone,
   type SubmitStrategyRequest,
@@ -33,17 +34,17 @@ export function useWorkspaceAlertWatchlistActions({
 }: UseWorkspaceAlertWatchlistActionsArgs) {
   const alertMutation = useMutation({
     mutationFn: ({ alertId, acknowledged }: { alertId: string; acknowledged: boolean }) =>
-      api.acknowledgeAlert(alertId, acknowledged),
+      opsMonitoringApi.acknowledgeAlert(alertId, acknowledged),
     onSuccess: refreshControlData,
   })
 
   const watchlistAddMutation = useMutation({
-    mutationFn: api.addWatchlistItem,
+    mutationFn: marketApi.addWatchlistItem,
     onSuccess: refreshControlData,
   })
 
   const watchlistRemoveMutation = useMutation({
-    mutationFn: api.removeWatchlistItem,
+    mutationFn: marketApi.removeWatchlistItem,
     onSuccess: refreshControlData,
   })
 
