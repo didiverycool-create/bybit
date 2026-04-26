@@ -4042,6 +4042,12 @@ class PrometheusLabelEscapeTests(unittest.TestCase):
             'a\\\\\\"b',
         )
 
+    def test_label_value_escapes_plain_backslash(self) -> None:
+        self.assertEqual(
+            control_main.prometheus_label_value("path\\to\\file"),
+            "path\\\\to\\\\file",
+        )
+
     def test_label_value_escapes_newline(self) -> None:
         self.assertEqual(
             control_main.prometheus_label_value("line1\nline2"),
@@ -4051,6 +4057,15 @@ class PrometheusLabelEscapeTests(unittest.TestCase):
     def test_label_value_coerces_non_string(self) -> None:
         self.assertEqual(control_main.prometheus_label_value(42), "42")
         self.assertEqual(control_main.prometheus_label_value(True), "True")
+
+    def test_label_value_coerces_dict_via_str(self) -> None:
+        # Python's str(dict) uses single quotes, so there is nothing for the
+        # label escaper to rewrite — but it must still pass the value through
+        # rather than blow up on a non-string input.
+        self.assertEqual(
+            control_main.prometheus_label_value({"k": "v"}),
+            "{'k': 'v'}",
+        )
 
     def test_labels_wraps_each_value_in_quotes(self) -> None:
         rendered = control_main.prometheus_labels(status="running", queue=3)
