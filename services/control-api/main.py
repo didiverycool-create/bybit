@@ -5266,132 +5266,6 @@ def format_sse(data: Dict[str, Any], event: str = "snapshot") -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
-@app.get("/health")
-def health() -> dict:
-    return build_health_payload()
-
-
-@app.head("/health")
-def health_head() -> dict:
-    return build_health_payload()
-
-
-@app.get("/api/control/snapshot")
-def get_control_snapshot():
-    _sync_strategy_runtime_worker_issue_alerts()
-    _sync_public_execution_channel_alerts()
-    _sync_private_execution_channel_alerts()
-    return _build_control_snapshot_response()
-
-
-@app.get("/metrics", response_class=PlainTextResponse)
-def get_prometheus_metrics():
-    return PlainTextResponse(build_prometheus_metrics())
-
-
-@app.get("/api/market/watchlist")
-def get_watchlist(refresh: bool = False):
-    watchlist = (
-        market_data.enrich_watchlist(repo.snapshot().watchlist)
-        if refresh
-        else market_data.enrich_watchlist_fast(repo.snapshot().watchlist)
-    )
-    repo.sync_market_watchlist(watchlist)
-    return watchlist
-
-
-@app.post("/api/market/watchlist", response_model=WatchlistInstrument)
-def add_watchlist_item(payload: WatchlistCreatePayload):
-    try:
-        item, detail = build_watchlist_item(payload.symbol, payload.market)
-        saved = repo.add_watchlist_item(item, payload.requested_by, detail_override=detail)
-        if hasattr(market_data, "update_realtime_watchlist"):
-            market_data.update_realtime_watchlist(repo.snapshot().watchlist)
-        return saved
-    except RuntimeError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-
-@app.delete("/api/market/watchlist/{symbol}", response_model=WatchlistRemoveResult)
-def remove_watchlist_item(symbol: str, requested_by: str = "desktop_operator"):
-    try:
-        removed = repo.remove_watchlist_item(symbol, requested_by=requested_by)
-        if hasattr(market_data, "update_realtime_watchlist"):
-            market_data.update_realtime_watchlist(repo.snapshot().watchlist)
-        return removed
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail=f"自选品种不存在: {exc}") from exc
-    except ValueError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-
-
-@app.get("/api/market/live", response_model=MarketLiveSnapshot)
-def get_market_live_snapshot(symbol: str, timeframe: str = "1h"):
-    return build_market_live_snapshot_payload(symbol, timeframe=timeframe)
-
-
-@app.get("/api/market/stream")
-async def stream_market_live(symbol: str, timeframe: str = "1h", once: bool = False, interval_ms: int = 4000):
-    interval_seconds = max(interval_ms, 1000) / 1000
-    try:
-        normalized_timeframe = market_data.normalize_timeframe(timeframe)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    async def event_generator():
-        while True:
-            snapshot = await asyncio.to_thread(
-                build_market_live_snapshot_payload,
-                symbol,
-                normalized_timeframe,
-            )
-            yield format_sse(snapshot.model_dump(mode="json"))
-            if once:
-                break
-            await asyncio.sleep(interval_seconds)
-
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
-
-
-@app.get("/api/market/{symbol}")
-def get_market_detail(symbol: str, timeframe: str = "1h"):
-    state = repo.snapshot()
-    uppercase_symbol = symbol.upper()
-    try:
-        normalized_timeframe = market_data.normalize_timeframe(timeframe)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    watch_item = next((item for item in state.watchlist if item.symbol == uppercase_symbol), None)
-    detail = state.market_details.get(uppercase_symbol)
-    market = watch_item.market if watch_item is not None else detail.market if detail is not None else None
-    if market is None:
-        raise HTTPException(status_code=404, detail="找不到该品种")
-    fallback_detail = build_runtime_market_fallback_detail(
-        symbol=uppercase_symbol,
-        market=market,
-        timeframe=normalized_timeframe,
-        watch_item=watch_item,
-        base_detail=detail,
-    )
-    try:
-        return market_data.enrich_market_detail(
-            symbol=uppercase_symbol,
-            market=market,
-            fallback_detail=fallback_detail,
-            watch_item=watch_item,
-            timeframe=normalized_timeframe,
-        )
-    except RuntimeError as exc:
-        return build_runtime_market_fallback_detail(
-            symbol=uppercase_symbol,
-            market=market,
-            timeframe=normalized_timeframe,
-            watch_item=watch_item,
-            base_detail=detail,
-            failure_reason=str(exc),
-        )
-
-
 def build_manual_strategy_review_job(strategy_id: str, payload: StrategyTrackingReviewRequest) -> AgentJobCreate:
     state = repo.snapshot()
     strategy = next((item for item in state.strategies if item.id == strategy_id), None)
@@ -10160,256 +10034,6 @@ def _build_strategy_activity_review_context(strategy_id: str) -> Optional[Dict[s
 
 
 
-@app.get("/api/strategies")
-def get_strategies():
-    return repo.snapshot().strategies
-
-
-@app.get("/api/strategies/live", response_model=List[StrategyRuntimeSnapshot])
-def get_strategy_runtime():
-    return build_strategy_runtime_response()
-
-
-@app.get(
-    "/api/strategies/{strategy_id}/activity",
-    response_model=StrategyActivitySnapshot,
-    response_model_exclude_none=True,
-)
-def get_strategy_activity(strategy_id: str):
-    try:
-        return build_strategy_activity_payload(strategy_id)
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail=f"策略不存在: {exc}") from exc
-
-
-@app.post("/api/strategies/{strategy_id}/review")
-def create_strategy_tracking_review(strategy_id: str, payload: StrategyTrackingReviewRequest):
-    try:
-        job_payload = build_manual_strategy_review_job(strategy_id, payload)
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail=f"策略不存在: {exc}") from exc
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    job = repo.create_agent_job(job_payload)
-    repo.add_event(
-        event_type="strategy.review.requested",
-        source="desktop",
-        severity=EventSeverity.INFO,
-        payload={
-            "job_id": job.id,
-            "job_type": job.job_type,
-            "review_kind": payload.review_kind,
-            "summary": payload.summary.strip(),
-            "detail": (payload.detail or "").strip() or None,
-            "requested_by": payload.requested_by,
-        },
-        symbol=str(job.context.get("symbol") or None),
-        strategy_id=str(job.context.get("strategy_id") or None),
-    )
-    return job
-
-
-@app.get("/api/strategies/stream", response_model=StrategyLiveSnapshot)
-async def stream_strategy_runtime(once: bool = False, interval_ms: int = 4000):
-    interval_seconds = max(interval_ms, 1000) / 1000
-
-    async def event_generator():
-        while True:
-            snapshot = await asyncio.to_thread(build_strategy_live_snapshot_payload)
-            yield format_sse(snapshot.model_dump(mode="json"))
-            if once:
-                break
-            await asyncio.sleep(interval_seconds)
-
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
-
-
-@app.get("/api/strategies/{strategy_id}/execution-preview", response_model=ExecutionPreview)
-def get_strategy_execution_preview(strategy_id: str, mode: Optional[AccountMode] = None):
-    try:
-        return build_strategy_execution_preview(strategy_id, mode)
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail=f"策略不存在: {exc}") from exc
-    except RuntimeError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    except ValueError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-
-
-@app.post("/api/strategies/{strategy_id}/execute", response_model=StrategyExecutionResult)
-def execute_strategy_signal(strategy_id: str, payload: StrategyExecutionRequest):
-    try:
-        return dispatch_strategy_signal(strategy_id, payload)
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail=f"策略不存在: {exc}") from exc
-    except RuntimeError as exc:
-        raise HTTPException(status_code=409, detail=_format_runtime_error_detail(exc)) from exc
-    except ValueError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-
-
-@app.get("/api/account/overview", response_model=AccountOverview)
-def get_account_overview(mode: Optional[AccountMode] = None):
-    return parse_account_overview(mode=mode)
-
-
-@app.get("/api/account/live", response_model=AccountLiveSnapshot)
-def get_account_live_snapshot(mode: Optional[AccountMode] = None):
-    return build_account_live_snapshot_payload(mode=mode)
-
-
-@app.get("/api/account/positions", response_model=List[PositionRecord])
-def get_account_positions(mode: Optional[AccountMode] = None):
-    return parse_positions(mode=mode)
-
-
-@app.get("/api/account/orders", response_model=List[OrderRecord])
-def get_account_orders(mode: Optional[AccountMode] = None):
-    return parse_open_orders(mode=mode)
-
-
-@app.get("/api/account/order-history", response_model=List[OrderRecord])
-def get_account_order_history(mode: Optional[AccountMode] = None):
-    return parse_order_history(mode=mode)
-
-
-@app.get("/api/account/stream")
-async def stream_account_live(once: bool = False, interval_ms: int = 4000, mode: Optional[AccountMode] = None):
-    interval_seconds = max(interval_ms, 1000) / 1000
-
-    async def event_generator():
-        while True:
-            snapshot = await asyncio.to_thread(build_account_live_snapshot_payload, mode)
-            yield format_sse(snapshot.model_dump(mode="json"))
-            if once:
-                break
-            await asyncio.sleep(interval_seconds)
-
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
-
-
-@app.get("/api/backtests")
-def get_backtests():
-    return repo.snapshot().backtests
-
-
-@app.post("/api/backtests")
-def create_backtest(payload: BacktestCreate):
-    try:
-        normalized_timeframe = normalize_backtest_timeframe(payload.timeframe)
-        return repo.create_backtest(
-            payload.strategy_id,
-            payload.data_range,
-            normalized_timeframe,
-            source_change_request_id=payload.source_change_request_id,
-            source_backtest_id=payload.source_backtest_id,
-            source_review_id=payload.source_review_id,
-            source_proposal_id=payload.source_proposal_id,
-            trigger_reason=payload.trigger_reason,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail=f"策略不存在: {exc}") from exc
-
-
-@app.get("/api/change-requests")
-def get_change_requests():
-    return repo.snapshot().change_requests
-
-
-@app.post("/api/change-requests")
-def create_change_request(payload: ChangeRequestCreate):
-    return repo.create_change_request(payload)
-
-
-@app.get("/api/ai/scheduler", response_model=SchedulerSnapshot)
-def get_scheduler():
-    return build_scheduler_snapshot_payload()
-
-
-@app.get("/api/ai/live", response_model=AiLiveSnapshot)
-def get_ai_live_snapshot():
-    return build_ai_live_snapshot_payload()
-
-
-@app.get("/api/ai/stream")
-async def stream_ai_live(once: bool = False, interval_ms: int = 4000):
-    interval_seconds = max(interval_ms, 1000) / 1000
-
-    async def event_generator():
-        while True:
-            snapshot = await asyncio.to_thread(build_ai_live_snapshot_payload)
-            yield format_sse(snapshot.model_dump(mode="json"))
-            if once:
-                break
-            await asyncio.sleep(interval_seconds)
-
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
-
-
-@app.get("/api/ops/live", response_model=OpsLiveSnapshot)
-def get_ops_live_snapshot():
-    return build_ops_live_snapshot_payload()
-
-
-@app.get("/api/ops/stream")
-async def stream_ops_live(once: bool = False, interval_ms: int = 4000):
-    interval_seconds = max(interval_ms, 1000) / 1000
-
-    async def event_generator():
-        while True:
-            snapshot = await asyncio.to_thread(build_ops_live_snapshot_payload)
-            yield format_sse(snapshot.model_dump(mode="json"))
-            if once:
-                break
-            await asyncio.sleep(interval_seconds)
-
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
-
-
-@app.post("/api/ai/scheduler/commands")
-def apply_scheduler_command(payload: SchedulerCommand):
-    return repo.apply_scheduler_command(payload)
-
-
-@app.post("/api/runtime/strategy-worker/restart", response_model=RuntimeWorkerActionResult)
-def post_restart_strategy_runtime_worker(payload: RuntimeWorkerActionPayload):
-    try:
-        return restart_strategy_runtime_worker(payload)
-    except RuntimeError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-
-
-@app.get("/api/runtime/strategy-worker/status", response_model=RuntimeWorkerStatus)
-def get_runtime_worker_status():
-    _sync_strategy_runtime_worker_issue_alerts()
-    _sync_private_execution_channel_alerts()
-    return build_runtime_worker_status()
-
-
-@app.get("/api/ai/jobs")
-def get_agent_jobs():
-    return repo.snapshot().agent_jobs
-
-
-@app.post("/api/ai/jobs")
-def create_agent_job(payload: AgentJobCreate):
-    if payload.job_type in {"generate_daily_review", "generate_backtest_review"}:
-        payload = payload.model_copy(update={"context": enrich_review_job_context(dict(payload.context))})
-    return repo.create_agent_job(payload)
-
-
-@app.post("/api/ai/jobs/{job_id}/retry")
-def retry_agent_job(job_id: str, payload: AgentJobRetryPayload):
-    try:
-        return repo.retry_agent_job(job_id, requested_by=payload.requested_by)
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail=f"任务不存在: {exc}") from exc
-    except ValueError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-
-
 class ExecutionImpactSummarizeRequest(BaseModel):
     strategy_id: str
     strategy_name: str
@@ -10425,161 +10049,6 @@ class ExecutionImpactSummarizeRequest(BaseModel):
     requested_by: Optional[str] = None
 
 
-@app.post("/api/execution-impact/summarize")
-def summarize_execution_impact(payload: ExecutionImpactSummarizeRequest):
-    job_id = repo.queue_summarize_execution_impact(
-        strategy_id=payload.strategy_id,
-        strategy_name=payload.strategy_name,
-        window_start=payload.window_start,
-        window_end=payload.window_end,
-        order_count=payload.order_count,
-        fill_count=payload.fill_count,
-        total_notional=payload.total_notional,
-        slippage_bps=payload.slippage_bps,
-        expected_pnl=payload.expected_pnl,
-        realized_pnl=payload.realized_pnl,
-        anomalies=payload.anomalies,
-        requested_by=payload.requested_by,
-    )
-    return {"job_id": job_id}
-
-
-@app.get("/api/execution-impact/records", response_model=List[ExecutionImpactRecord])
-def get_execution_impact_records():
-    return repo.snapshot().execution_impact_records
-
-
-@app.get("/api/ai/reviews")
-def get_reviews(
-    strategy_id: Optional[str] = None,
-    period: Optional[str] = None,
-    backtest_id: Optional[str] = None,
-):
-    reviews = repo.snapshot().reviews
-
-    if strategy_id:
-        needle = strategy_id.strip()
-        reviews = [
-            review
-            for review in reviews
-            if review.strategy_id == needle
-            or any(proposal.strategy_id == needle for proposal in review.proposals)
-        ]
-    if backtest_id:
-        needle = backtest_id.strip()
-        reviews = [review for review in reviews if review.backtest_id == needle]
-
-    if period:
-        allowed_periods = {item.strip() for item in period.split(",") if item.strip()}
-        if allowed_periods:
-            reviews = [review for review in reviews if review.period in allowed_periods]
-
-    return reviews
-
-
-@app.post("/api/ai/proposals/{proposal_id}/action", response_model=StrategyProposalActionResult)
-def apply_strategy_proposal_action(proposal_id: str, payload: StrategyProposalActionPayload):
-    try:
-        return repo.apply_strategy_proposal(proposal_id, payload)
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail=f"提案不存在: {exc}") from exc
-    except ValueError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-
-
-@app.get("/api/news")
-def get_news():
-    feed = build_news_feed()
-    repo.sync_news_events(feed)
-    return repo.snapshot().news_events
-
-
-@app.get("/api/alerts")
-def get_alerts():
-    return repo.snapshot().alerts
-
-
-@app.get("/api/alert-rules")
-def get_alert_rules():
-    return repo.snapshot().alert_rules
-
-
-@app.post("/api/alerts/{alert_id}/acknowledge")
-def acknowledge_alert(alert_id: str, payload: AlertAcknowledgePayload):
-    try:
-        return repo.acknowledge_alert(alert_id, payload)
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail=f"提醒不存在: {exc}") from exc
-
-
-@app.get("/api/trades")
-def get_trades():
-    return parse_trades()
-
-
-@app.post("/api/trades/manual")
-def create_manual_trade(payload: ManualOrderRequest):
-    if payload.mode != AccountMode.PAPER:
-        raise HTTPException(
-            status_code=409,
-            detail="当前版本只开放 Paper 模式的手动交易录入；Demo / Live 待真实执行引擎接通后再开放。",
-        )
-    try:
-        return repo.create_manual_trade(payload)
-    except ValueError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-
-
-@app.post("/api/orders/exchange", response_model=OrderRecord)
-def create_exchange_order(payload: ManualOrderRequest):
-    if payload.mode == AccountMode.PAPER:
-        raise HTTPException(status_code=409, detail="Paper 模式请继续使用本地手动交易或 Paper 委托接口。")
-    try:
-        return submit_exchange_order(payload)
-    except RuntimeError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-
-
-@app.post("/api/orders/exchange/{order_id}/cancel", response_model=OrderRecord)
-def post_cancel_exchange_order(order_id: str, payload: PaperOrderCancelPayload):
-    try:
-        return cancel_exchange_order(order_id, payload.requested_by)
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail=f"找不到待取消的真实委托: {exc}") from exc
-    except RuntimeError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-
-
-@app.post("/api/orders/exchange/{order_id}/replace", response_model=OrderRecord)
-def post_replace_exchange_order(order_id: str, payload: PaperOrderReplacePayload):
-    try:
-        return replace_exchange_order(order_id, payload.quantity, payload.price, payload.requested_by)
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail=f"找不到待修改的真实委托: {exc}") from exc
-    except RuntimeError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-
-
-@app.post("/api/orders/exchange/cancel-all", response_model=PaperOrderBulkCancelResult)
-def post_cancel_all_exchange_orders(payload: PaperOrderCancelPayload):
-    try:
-        return cancel_all_exchange_orders(payload.requested_by)
-    except RuntimeError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-
-
-@app.post("/api/account/paper/orders", response_model=OrderRecord)
-def create_paper_order(payload: ManualOrderRequest):
-    if payload.mode != AccountMode.PAPER:
-        raise HTTPException(status_code=409, detail="当前仅允许在 Paper 模式下创建本地限价委托。")
-    if repo.snapshot().workspace_preferences.selected_mode != AccountMode.PAPER:
-        raise HTTPException(status_code=409, detail="当前工作台不在 Paper 模式，无法创建本地限价委托。")
-    try:
-        return repo.create_paper_order(payload)
-    except ValueError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-
-
 def _build_preview_for_request(payload: ExecutionPreviewRequest) -> ExecutionPreview:
     """Route ``payload`` to the Paper or private preview builder.
 
@@ -10590,195 +10059,6 @@ def _build_preview_for_request(payload: ExecutionPreviewRequest) -> ExecutionPre
     if payload.mode == AccountMode.PAPER:
         return repo.preview_execution(payload)
     return build_private_execution_preview(payload)
-
-
-@app.post("/api/trades/preview", response_model=ExecutionPreview)
-def preview_trade(payload: ExecutionPreviewRequest):
-    return _build_preview_for_request(payload)
-
-
-@app.post("/api/trades/preview/decision", response_model=RiskDecision)
-def preview_trade_decision(payload: ExecutionPreviewRequest) -> RiskDecision:
-    """Return the Round 58 :class:`RiskDecision` for ``payload``.
-
-    Wraps the same preview the ``/api/trades/preview`` endpoint returns so
-    callers can branch on the typed ``verdict`` / ``reason_code`` while still
-    reading the embedded preview's numeric fields (notional, projected
-    position, sizing budgets, …).
-    """
-
-    preview = _build_preview_for_request(payload)
-    return evaluate_risk_decision(preview)
-
-
-@app.post("/api/account/paper/orders/{order_id}/cancel", response_model=OrderRecord)
-def cancel_paper_order(order_id: str, payload: PaperOrderCancelPayload):
-    if repo.snapshot().workspace_preferences.selected_mode != AccountMode.PAPER:
-        raise HTTPException(status_code=409, detail="当前仅允许在 Paper 模式下取消本地限价委托。")
-    try:
-        return repo.cancel_paper_order(order_id, payload.requested_by)
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail=f"找不到待取消的 Paper 委托: {exc}") from exc
-
-
-@app.post("/api/account/paper/orders/cancel-all", response_model=PaperOrderBulkCancelResult)
-def cancel_all_paper_orders(payload: PaperOrderCancelPayload):
-    if repo.snapshot().workspace_preferences.selected_mode != AccountMode.PAPER:
-        raise HTTPException(status_code=409, detail="当前仅允许在 Paper 模式下批量取消本地限价委托。")
-    return repo.cancel_all_paper_orders(payload.requested_by)
-
-
-@app.post("/api/account/paper/orders/{order_id}/replace", response_model=OrderRecord)
-def replace_paper_order(order_id: str, payload: PaperOrderReplacePayload):
-    if repo.snapshot().workspace_preferences.selected_mode != AccountMode.PAPER:
-        raise HTTPException(status_code=409, detail="当前仅允许在 Paper 模式下修改本地限价委托。")
-    try:
-        return repo.replace_paper_order(order_id, payload.quantity, payload.price, payload.requested_by)
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail=f"找不到待修改的 Paper 委托: {exc}") from exc
-    except ValueError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-
-
-@app.post("/api/account/paper/positions/{symbol}/close")
-def close_paper_position(symbol: str, payload: ClosePaperPositionPayload):
-    if repo.snapshot().workspace_preferences.selected_mode != AccountMode.PAPER:
-        raise HTTPException(status_code=409, detail="当前仅允许在 Paper 模式下一键平仓。")
-    try:
-        return repo.close_paper_position(symbol, payload.requested_by)
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail=f"{symbol.upper()} 当前没有可平的 Paper 持仓。") from exc
-    except ValueError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-
-
-@app.post("/api/account/paper/positions/close-all", response_model=PaperPositionBulkCloseResult)
-def close_all_paper_positions(payload: ClosePaperPositionPayload):
-    if repo.snapshot().workspace_preferences.selected_mode != AccountMode.PAPER:
-        raise HTTPException(status_code=409, detail="当前仅允许在 Paper 模式下批量平仓。")
-    return repo.close_all_paper_positions(payload.requested_by)
-
-
-@app.post("/api/account/exchange/positions/{symbol}/close", response_model=OrderRecord)
-def post_close_exchange_position(symbol: str, payload: ClosePaperPositionPayload):
-    try:
-        return close_exchange_position(symbol, payload.requested_by)
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail=f"{symbol.upper()} 当前没有可平的真实持仓。") from exc
-    except RuntimeError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-
-
-@app.post("/api/account/exchange/positions/close-all", response_model=ExchangePositionBulkCloseResult)
-def post_close_all_exchange_positions(payload: ClosePaperPositionPayload):
-    try:
-        return close_all_exchange_positions(payload.requested_by)
-    except RuntimeError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-
-
-@app.get("/api/audit/events")
-def get_audit_events():
-    return repo.snapshot().audit_events
-
-
-@app.get("/api/settings", response_model=SettingsPayload)
-def get_settings():
-    return repo.snapshot().settings
-
-
-@app.post("/api/settings", response_model=SettingsPayload)
-def update_settings(payload: SettingsUpdatePayload):
-    try:
-        settings = repo.update_settings(payload)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    market_data.base_url = settings.api_base_url.rstrip("/")
-    if hasattr(market_data, "_candle_cache"):
-        market_data._candle_cache.clear()  # type: ignore[attr-defined]
-    if hasattr(market_data, "_recent_trade_cache"):
-        market_data._recent_trade_cache.clear()  # type: ignore[attr-defined]
-    if hasattr(market_data, "_announcement_cache"):
-        market_data._announcement_cache.clear()  # type: ignore[attr-defined]
-    if hasattr(market_data, "_instrument_cache"):
-        market_data._instrument_cache.clear()  # type: ignore[attr-defined]
-    if hasattr(market_data, "_connectivity_probe_cache"):
-        market_data._connectivity_probe_cache = None  # type: ignore[attr-defined]
-    if hasattr(market_data, "_candle_history_cache"):
-        market_data._candle_history_cache.clear()  # type: ignore[attr-defined]
-    return settings
-
-
-@app.get("/api/workspace/preferences", response_model=WorkspacePreferences)
-def get_workspace_preferences():
-    return repo.snapshot().workspace_preferences
-
-
-@app.post("/api/workspace/preferences", response_model=WorkspacePreferences)
-def update_workspace_preferences(payload: WorkspacePreferencesUpdate):
-    return repo.update_workspace_preferences(payload)
-
-
-@app.get("/api/integrations/openclaw", response_model=OpenClawStatus)
-def get_openclaw_status():
-    status = openclaw.get_status(worker_state=agent_worker_state)
-    repo.set_openclaw_connection(status.reachable)
-    return status
-
-
-@app.get("/api/integrations/bybit-private", response_model=BybitPrivateStatus)
-def get_bybit_private_status():
-    status = private_data.get_status()
-    realtime_status = _build_private_realtime_health()
-    balance_diagnostics = _build_private_usdt_balance_diagnostics(status)
-    private_rest_reachable: Optional[bool]
-    if balance_diagnostics:
-        private_rest_reachable = any(item.error is None for item in balance_diagnostics)
-    else:
-        private_rest_reachable = None
-    # Round 99 — read both the ``issue`` string and the typed ``issue_kind``
-    # from the new health helper so the recommender receives the typed kind
-    # from source rather than having the callsite re-classify.
-    private_health = _build_private_execution_channel_health(status.mode)
-    realtime_issue = private_health.get("issue")
-    return status.model_copy(
-        update={
-            "realtime_enabled": bool(realtime_status.get("enabled")),
-            "realtime_connected": bool(realtime_status.get("connected")),
-            "realtime_authenticated": bool(realtime_status.get("authenticated")),
-            "realtime_last_message_at": realtime_status.get("last_message_at"),
-            "realtime_stale": bool(realtime_status.get("stale")),
-            "realtime_stale_seconds": int(realtime_status.get("stale_seconds") or 0),
-            "realtime_last_error": realtime_status.get("last_error"),
-            "realtime_recommended_action": (
-                _build_private_execution_channel_recommended_action(
-                    realtime_issue,
-                    last_error=realtime_status.get("last_error"),
-                    rest_reachable=private_rest_reachable,
-                    issue_kind=private_health.get("issue_kind"),
-                )
-                if realtime_issue
-                else None
-            ),
-            "usdt_balance_diagnostics": balance_diagnostics,
-        }
-    )
-
-
-@app.get("/api/integrations/bybit-public", response_model=BybitPublicStatus)
-def get_bybit_public_status():
-    return build_bybit_public_status()
-
-
-@app.get("/api/integrations/grafana", response_model=GrafanaIntegrationStatus)
-def get_grafana_status():
-    return build_grafana_status()
-
-
-@app.post("/api/integrations/bybit-private/probe-trade", response_model=BybitTradeProbeResult)
-def post_bybit_trade_probe():
-    return probe_private_trade_route()
 
 
 def ensure_background_services_started() -> None:
@@ -10798,46 +10078,86 @@ def ensure_background_services_started() -> None:
     _start_strategy_runtime_worker()
 
 
-@app.get("/api/strategies/{strategy_id}/risk-hints")
-def get_strategy_runtime_risk_hints(strategy_id: str):
-    """Expose structured stop/target/band reference prices for a strategy.
+import routes  # noqa: E402  (after app + globals + helpers are defined so the router can wire into the existing app)
+app.include_router(routes.router)
 
-    Additive read-only helper: derives hints from the same market detail the
-    runtime evaluator already sees, so the UI (or risk-gate middleware) can
-    surface concrete "距离止损/止盈" numbers without re-implementing the math.
-    """
-
-    from strategy_runtime import compute_strategy_runtime_risk_hints
-
-    state = repo.snapshot()
-    strategy = next((item for item in state.strategies if item.id == strategy_id), None)
-    if strategy is None:
-        raise HTTPException(status_code=404, detail=f"策略不存在: {strategy_id}")
-    if not strategy.symbols:
-        raise HTTPException(status_code=400, detail="策略未绑定任何交易对，无法生成风控提示。")
-
-    symbol = strategy.symbols[0]
-    watch_item = next((item for item in state.watchlist if item.symbol == symbol), None)
-    if watch_item is None:
-        raise HTTPException(status_code=404, detail=f"观察列表未包含 {symbol}，无法生成风控提示。")
-
-    fallback_detail = state.market_details.get(symbol) or build_market_detail_for_watchlist(watch_item)
-    try:
-        detail = market_data.enrich_market_detail(
-            symbol=symbol,
-            market=watch_item.market,
-            fallback_detail=fallback_detail.model_copy(update={"timeframe": "1h"}),
-            watch_item=watch_item,
-            timeframe="1h",
-        )
-    except RuntimeError:
-        detail = fallback_detail.model_copy(update={"timeframe": "1h"})
-
-    return compute_strategy_runtime_risk_hints(
-        strategy=strategy,
-        detail=detail,
-        watch_item=watch_item,
-    )
+# Re-export the route handlers extracted into ``routes`` so existing tests
+# (and any external callers) that invoke them as plain Python functions via
+# ``control_main.<route_handler>(...)`` keep working.  The HTTP-level
+# behaviour stays driven by ``app.include_router(routes.router)`` above.
+acknowledge_alert = routes.acknowledge_alert
+add_watchlist_item = routes.add_watchlist_item
+apply_scheduler_command = routes.apply_scheduler_command
+apply_strategy_proposal_action = routes.apply_strategy_proposal_action
+cancel_all_paper_orders = routes.cancel_all_paper_orders
+cancel_paper_order = routes.cancel_paper_order
+close_all_paper_positions = routes.close_all_paper_positions
+close_paper_position = routes.close_paper_position
+create_agent_job = routes.create_agent_job
+create_backtest = routes.create_backtest
+create_change_request = routes.create_change_request
+create_exchange_order = routes.create_exchange_order
+create_manual_trade = routes.create_manual_trade
+create_paper_order = routes.create_paper_order
+create_strategy_tracking_review = routes.create_strategy_tracking_review
+execute_strategy_signal = routes.execute_strategy_signal
+get_account_live_snapshot = routes.get_account_live_snapshot
+get_account_order_history = routes.get_account_order_history
+get_account_orders = routes.get_account_orders
+get_account_overview = routes.get_account_overview
+get_account_positions = routes.get_account_positions
+get_agent_jobs = routes.get_agent_jobs
+get_ai_live_snapshot = routes.get_ai_live_snapshot
+get_alert_rules = routes.get_alert_rules
+get_alerts = routes.get_alerts
+get_audit_events = routes.get_audit_events
+get_backtests = routes.get_backtests
+get_bybit_private_status = routes.get_bybit_private_status
+get_bybit_public_status = routes.get_bybit_public_status
+get_change_requests = routes.get_change_requests
+get_control_snapshot = routes.get_control_snapshot
+get_execution_impact_records = routes.get_execution_impact_records
+get_grafana_status = routes.get_grafana_status
+get_market_detail = routes.get_market_detail
+get_market_live_snapshot = routes.get_market_live_snapshot
+get_news = routes.get_news
+get_openclaw_status = routes.get_openclaw_status
+get_ops_live_snapshot = routes.get_ops_live_snapshot
+get_prometheus_metrics = routes.get_prometheus_metrics
+get_reviews = routes.get_reviews
+get_runtime_worker_status = routes.get_runtime_worker_status
+get_scheduler = routes.get_scheduler
+get_settings = routes.get_settings
+get_strategies = routes.get_strategies
+get_strategy_activity = routes.get_strategy_activity
+get_strategy_execution_preview = routes.get_strategy_execution_preview
+get_strategy_runtime = routes.get_strategy_runtime
+get_strategy_runtime_risk_hints = routes.get_strategy_runtime_risk_hints
+get_trades = routes.get_trades
+get_watchlist = routes.get_watchlist
+get_workspace_preferences = routes.get_workspace_preferences
+health = routes.health
+health_head = routes.health_head
+post_bybit_trade_probe = routes.post_bybit_trade_probe
+post_cancel_all_exchange_orders = routes.post_cancel_all_exchange_orders
+post_cancel_exchange_order = routes.post_cancel_exchange_order
+post_close_all_exchange_positions = routes.post_close_all_exchange_positions
+post_close_exchange_position = routes.post_close_exchange_position
+post_replace_exchange_order = routes.post_replace_exchange_order
+post_restart_strategy_runtime_worker = routes.post_restart_strategy_runtime_worker
+preview_trade = routes.preview_trade
+preview_trade_decision = routes.preview_trade_decision
+remove_watchlist_item = routes.remove_watchlist_item
+replace_paper_order = routes.replace_paper_order
+retry_agent_job = routes.retry_agent_job
+stream_account_live = routes.stream_account_live
+stream_ai_live = routes.stream_ai_live
+stream_market_live = routes.stream_market_live
+stream_ops_live = routes.stream_ops_live
+stream_strategy_runtime = routes.stream_strategy_runtime
+summarize_execution_impact = routes.summarize_execution_impact
+update_settings = routes.update_settings
+update_workspace_preferences = routes.update_workspace_preferences
 
 
 if __name__ == "__main__":
