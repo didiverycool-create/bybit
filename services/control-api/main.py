@@ -291,7 +291,20 @@ from execution_preview_builders import (
     private_released_order_reservation as _private_released_order_reservation_impl,
     private_reserved_spot_sell_quantity as _private_reserved_spot_sell_quantity_impl,
 )
-from risk_decision import derive_block_reason_code, evaluate_risk_decision
+from risk_decision import derive_block_reason_code
+from risk_engine import RiskEngine
+
+
+# Round 118 — module-level :class:`RiskEngine` singleton.  The engine is a
+# stateless coordinator that exposes the typed risk-decision graph (preview
+# verdict / autonomous-dispatch gate / outcome classification) behind a single
+# typed API; its methods delegate verbatim to the existing helpers
+# (``evaluate_risk_decision`` / ``_evaluate_strategy_auto_dispatch_gate`` /
+# ``_classify_auto_dispatch_outcome``).  Keeping it module-level lets
+# call-sites read ``risk_engine.evaluate_preview(preview)`` instead of fishing
+# for the underlying helper while preserving the full extraction history
+# (R58 / R60 / R61) of the underlying helpers.
+risk_engine = RiskEngine()
 
 
 # Round 102 — the complement of ``"running"`` within the
@@ -2393,7 +2406,11 @@ def _collect_dynamic_auto_dispatch_blocked_contexts(state: Any) -> List[Dict[str
         # short-circuit is preserved so defensive ``allowed=False`` + empty-reason
         # previews still get filtered out rather than surfaced with the
         # decision's default fallback detail.
-        decision = evaluate_risk_decision(preview)
+        # Round 118 — wrap the verdict through the unified :class:`RiskEngine`
+        # so the preview-side risk dispatch shares one entry point with the
+        # autonomous-dispatch gate / outcome classifier; behaviour parity is
+        # preserved (the engine delegates verbatim to ``evaluate_risk_decision``).
+        decision = risk_engine.evaluate_preview(preview)
         if decision.verdict != "block" or not preview.blocked_reason:
             continue
         contexts.append(
@@ -5387,7 +5404,8 @@ def submit_exchange_order(
     # Round 67 — route the submit-side preview check through ``RiskDecision``
     # so the raised message reuses the same Chinese fallback as every other
     # block surface.
-    submit_decision = evaluate_risk_decision(preview)
+    # Round 118 — dispatch through the unified :class:`RiskEngine` singleton.
+    submit_decision = risk_engine.evaluate_preview(preview)
     if submit_decision.verdict == "block":
         raise RuntimeError(submit_decision.reason_detail)
 
@@ -5948,7 +5966,8 @@ def replace_exchange_order(
     )
     # Round 67 — route replace-side preview check through ``RiskDecision`` so
     # it matches the submit-side pattern.
-    replace_decision = evaluate_risk_decision(preview)
+    # Round 118 — dispatch through the unified :class:`RiskEngine` singleton.
+    replace_decision = risk_engine.evaluate_preview(preview)
     if replace_decision.verdict == "block":
         raise RuntimeError(replace_decision.reason_detail)
     desired_reduce_only = _execution_preview_requires_reduce_only(preview)
@@ -7617,7 +7636,11 @@ def _dispatch_strategy_signal_from_state(strategy_id: str, payload: StrategyExec
     # ``reason_code`` instead of ad-hoc ``preview.allowed`` / substring checks
     # on ``preview.blocked_reason``.  The embedded ``decision.preview`` keeps
     # numeric fields readable for the ``StrategyExecutionResult`` payload.
-    decision = evaluate_risk_decision(preview)
+    # Round 118 — route through the unified :class:`RiskEngine` singleton so
+    # the strategy-signal dispatcher shares one entry point with the rest of
+    # the preview-verdict callsites (manual submit / replace / runtime
+    # decoration).
+    decision = risk_engine.evaluate_preview(preview)
     state = repo.snapshot()
     resolved_mode = payload.mode or state.workspace_preferences.selected_mode
     strategy = next((item for item in state.strategies if item.id == strategy_id), None)
@@ -7789,7 +7812,10 @@ def _auto_dispatch_strategy_signal_changes(
         if strategy is None:
             continue
         pending_reconcile = _has_active_strategy_auto_dispatch_alert(snapshot.strategy_id)
-        gate = _evaluate_strategy_auto_dispatch_gate(strategy, snapshot)
+        # Round 118 — route the autonomous-dispatch gate through the unified
+        # :class:`RiskEngine` singleton; the engine delegates verbatim to
+        # ``_evaluate_strategy_auto_dispatch_gate`` so behaviour is unchanged.
+        gate = risk_engine.evaluate_auto_dispatch_gate(strategy, snapshot)
         if gate.verdict == "block":
             if gate.cancel_existing_orders:
                 _cancel_strategy_exchange_orders(
@@ -7962,7 +7988,10 @@ def _auto_dispatch_strategy_signal_changes(
             )
         except Exception as exc:  # pragma: no cover - defensive guard for background worker
             caught = exc
-        outcome = _classify_auto_dispatch_outcome(caught)
+        # Round 118 — route the terminal-outcome classification through the
+        # unified :class:`RiskEngine` singleton; the engine delegates verbatim
+        # to ``_classify_auto_dispatch_outcome`` so behaviour is unchanged.
+        outcome = risk_engine.classify_outcome(caught)
         if outcome.clear_alerts:
             _clear_strategy_auto_dispatch_alerts(snapshot.strategy_id)
         if outcome.emit_noop_event:
@@ -9190,7 +9219,8 @@ def _apply_runtime_blocked_preview_context(
     # ``decision.reason_detail`` rather than the raw ``preview.blocked_reason``.
     # The ``not preview.blocked_reason`` short-circuit is preserved so the
     # defensive ``allowed=False`` + empty-reason edge case still short-circuits.
-    decision = evaluate_risk_decision(preview)
+    # Round 118 — dispatch through the unified :class:`RiskEngine` singleton.
+    decision = risk_engine.evaluate_preview(preview)
     if decision.verdict != "block" or not preview.blocked_reason:
         return item
     update: Dict[str, Any] = {

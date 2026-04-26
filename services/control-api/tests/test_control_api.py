@@ -27473,5 +27473,468 @@ class NonPaperAccountModesConstantRound103Tests(unittest.TestCase):
         self.assertIn(AccountMode.LIVE, NON_PAPER_ACCOUNT_MODES)
 
 
+class RiskEngineRound118Tests(unittest.TestCase):
+    """Round 118 — :class:`risk_engine.RiskEngine` parity regression suite.
+
+    Wave-2-A introduced the unified :class:`RiskEngine` coordinator that wraps
+    the typed risk-decision graph (``evaluate_risk_decision`` /
+    ``_evaluate_strategy_auto_dispatch_gate`` / ``_classify_auto_dispatch_outcome``)
+    behind a single typed API.  The engine is **stateless** — every method
+    delegates verbatim to the underlying helper kept inside ``main.py`` /
+    ``risk_decision.py``.
+
+    These tests pin the parity contract:
+
+    1. ``RiskEngine.evaluate_preview`` returns a decision byte-identical to
+       calling ``risk_decision.evaluate_risk_decision`` directly (allow + block
+       paths, with and without an explicit ``recommended_action``).
+    2. ``RiskEngine.evaluate_auto_dispatch_gate`` returns the same
+       :class:`AutoDispatchGate` as the underlying R60 helper across the
+       documented verdict spectrum (paper-or-paused / live-stop-loss /
+       runtime-not-running / ready).
+    3. ``RiskEngine.classify_outcome`` returns the same
+       :class:`AutoDispatchOutcome` as the underlying R61 helper across the
+       four typed verdicts (dispatched / noop / blocked / failed).
+    4. ``main.py`` exposes a module-level ``risk_engine`` singleton instance
+       so the call-sites refactored in R118 pick up the same coordinator.
+    """
+
+    @staticmethod
+    def _build_allowed_preview():
+        """Return a minimal allowed :class:`ExecutionPreview`."""
+
+        from models import ExecutionPreview as _Preview  # noqa: PLC0415
+
+        return _Preview(
+            symbol="BTCUSDT",
+            market="perp",
+            mode=AccountMode.PAPER,
+            side=Direction.BUY,
+            origin="manual",
+            quantity=0.5,
+            price=42_000.0,
+            notional="21000.00",
+            action="开多",
+            allowed=True,
+            blocked_reason=None,
+            recommended_action=None,
+            warnings=[],
+            current_position_size="0",
+            current_avg_price="--",
+            projected_position_size="0.5",
+            projected_avg_price="42000.00",
+            available_balance_before="50000.00",
+            available_balance_after="29000.00",
+            estimated_realized_pnl="--",
+            generated_at="2026-04-26T08:00:00+08:00",
+        )
+
+    @staticmethod
+    def _build_blocked_preview(blocked_reason: str, *, recommended_action: Optional[str] = None):
+        """Return a minimal blocked :class:`ExecutionPreview`."""
+
+        from models import ExecutionPreview as _Preview  # noqa: PLC0415
+
+        return _Preview(
+            symbol="BTCUSDT",
+            market="perp",
+            mode=AccountMode.PAPER,
+            side=Direction.BUY,
+            origin="manual",
+            quantity=0.5,
+            price=42_000.0,
+            notional="21000.00",
+            action="开多",
+            allowed=False,
+            blocked_reason=blocked_reason,
+            recommended_action=recommended_action,
+            warnings=[blocked_reason],
+            current_position_size="0",
+            current_avg_price="--",
+            projected_position_size="--",
+            projected_avg_price="--",
+            available_balance_before="50000.00",
+            available_balance_after="--",
+            estimated_realized_pnl="--",
+            generated_at="2026-04-26T08:00:00+08:00",
+        )
+
+    @staticmethod
+    def _build_strategy(*, mode: AccountMode = AccountMode.LIVE, status: str = "running"):
+        """Return a minimal :class:`StrategySummary` for gate tests."""
+
+        from models import StrategySummary as _Strategy  # noqa: PLC0415
+
+        return _Strategy(
+            id="risk-engine-r118-01",
+            name="RiskEngineHarness",
+            category="template",
+            status=status,
+            symbols=["BTCUSDT"],
+            mode=mode,
+            version="v1",
+            pnl_7d="+0.0%",
+            max_drawdown="-0.0%",
+            risk_budget="10%",
+            description="R118 risk-engine harness",
+            parameters=[StrategyParameter(key="noop", label="noop", value=0.0)],
+        )
+
+    @staticmethod
+    def _build_snapshot(*, runtime_status: str = "running"):
+        """Return a minimal :class:`StrategyRuntimeSnapshot` for gate tests."""
+
+        return StrategyRuntimeSnapshot(
+            strategy_id="risk-engine-r118-01",
+            strategy_name="RiskEngineHarness",
+            symbol="BTCUSDT",
+            market="perp",
+            mode=AccountMode.LIVE,
+            runtime_status=runtime_status,
+            signal="long",
+            confidence=42.0,
+            last_price=42_000.0,
+            reference_price=42_000.0,
+            change_24h=0.0,
+            note="",
+            next_action="",
+            last_evaluated_at="2026-04-26T08:00:00+08:00",
+        )
+
+    @staticmethod
+    def _patch_clean_gates():
+        """Neutralise every side-gate so ``evaluate_auto_dispatch_gate`` runs
+        the requested branch without falling through to scheduler / channel
+        side-effects.  Mirrors ``AutoDispatchGateRound60UnitTests._patch_clean_gates``
+        so the parity contract uses the same neutral fixture."""
+
+        return [
+            patch.object(
+                control_main,
+                "_strategy_live_stop_loss_cooldown_remaining_minutes",
+                return_value=None,
+            ),
+            patch.object(
+                control_main,
+                "_has_active_strategy_live_stop_loss_alert",
+                return_value=False,
+            ),
+            patch.object(
+                control_main,
+                "_strategy_exchange_rejection_guard_remaining_minutes",
+                return_value=None,
+            ),
+            patch.object(
+                control_main,
+                "_strategy_auto_dispatch_gate_reason",
+                return_value=None,
+            ),
+        ]
+
+    # ------------------------------------------------------------------
+    # Singleton + module surface tests
+    # ------------------------------------------------------------------
+
+    def test_main_module_exposes_risk_engine_singleton_instance(self) -> None:
+        """``main.py`` must expose a module-level :data:`risk_engine` singleton
+        so every refactored call-site reads the same coordinator instance."""
+
+        from risk_engine import RiskEngine  # noqa: PLC0415
+
+        self.assertTrue(hasattr(control_main, "risk_engine"))
+        self.assertIsInstance(control_main.risk_engine, RiskEngine)
+
+    def test_risk_engine_is_stateless_no_dict_or_instance_attributes(self) -> None:
+        """Wave-2-A's :class:`RiskEngine` is a stateless coordinator — every
+        method delegates to the underlying helper, so the instance must not
+        accumulate per-call state.  ``__slots__ = ()`` guarantees attribute
+        assignment raises :class:`AttributeError`, pinning the no-state
+        contract at the type level."""
+
+        with self.assertRaises(AttributeError):
+            control_main.risk_engine.some_arbitrary_attr = 42  # type: ignore[attr-defined]
+
+    # ------------------------------------------------------------------
+    # evaluate_preview parity tests
+    # ------------------------------------------------------------------
+
+    def test_evaluate_preview_allow_path_matches_underlying_helper(self) -> None:
+        """``RiskEngine.evaluate_preview`` on an ``allowed=True`` preview must
+        return the same ``verdict`` / ``reason_code`` / ``preview`` reference
+        as ``risk_decision.evaluate_risk_decision`` — the engine is a thin
+        delegator and must not transform the verdict."""
+
+        import risk_decision  # noqa: PLC0415
+        from models import RISK_REASON_APPROVED  # noqa: PLC0415
+
+        preview = self._build_allowed_preview()
+        engine_decision = control_main.risk_engine.evaluate_preview(preview)
+        helper_decision = risk_decision.evaluate_risk_decision(preview)
+
+        self.assertEqual(engine_decision.verdict, "allow")
+        self.assertEqual(engine_decision.reason_code, RISK_REASON_APPROVED)
+        self.assertIs(engine_decision.preview, preview)
+        # Parity: the engine and the underlying helper must agree.
+        self.assertEqual(engine_decision.verdict, helper_decision.verdict)
+        self.assertEqual(engine_decision.reason_code, helper_decision.reason_code)
+        self.assertEqual(engine_decision.reason_detail, helper_decision.reason_detail)
+
+    def test_evaluate_preview_block_path_carries_typed_reason_code(self) -> None:
+        """A blocked preview with insufficient-balance copy must surface the
+        ``risk.insufficient_balance`` typed reason code through the engine —
+        the substring-probe / typed ``block_code`` dispatch lives inside
+        ``derive_block_reason_code`` / ``RiskDecision.reason_code`` and the
+        engine must not mask either branch."""
+
+        import risk_decision  # noqa: PLC0415
+        from models import RISK_REASON_INSUFFICIENT_BALANCE  # noqa: PLC0415
+
+        preview = self._build_blocked_preview(
+            "当前 Paper 可用余额不足，缺口 2000 USDT。",
+            recommended_action="请先补充 Paper 可用余额。",
+        )
+        engine_decision = control_main.risk_engine.evaluate_preview(preview)
+        helper_decision = risk_decision.evaluate_risk_decision(preview)
+
+        self.assertEqual(engine_decision.verdict, "block")
+        self.assertEqual(engine_decision.reason_code, RISK_REASON_INSUFFICIENT_BALANCE)
+        self.assertIn("可用余额不足", engine_decision.reason_detail)
+        # Parity with the underlying helper.
+        self.assertEqual(engine_decision.verdict, helper_decision.verdict)
+        self.assertEqual(engine_decision.reason_code, helper_decision.reason_code)
+        self.assertEqual(engine_decision.reason_detail, helper_decision.reason_detail)
+        assert engine_decision.recommended_action is not None
+        self.assertEqual(
+            engine_decision.recommended_action.recommendation,
+            "请先补充 Paper 可用余额。",
+        )
+
+    def test_evaluate_preview_forwards_explicit_recommended_action_kwarg(self) -> None:
+        """When the caller passes an explicit
+        :class:`RiskDecisionRecommendation`, the engine must forward it
+        verbatim instead of synthesising one from the preview's free-form
+        ``recommended_action`` string."""
+
+        from models import RiskDecisionRecommendation  # noqa: PLC0415
+
+        preview = self._build_blocked_preview(
+            "当前敞口已接近上限，请按 30% 规模继续。",
+            recommended_action="请先复核敞口预算。",
+        )
+        explicit = RiskDecisionRecommendation(size_multiplier=0.3)
+
+        decision = control_main.risk_engine.evaluate_preview(
+            preview, recommended_action=explicit
+        )
+
+        self.assertEqual(decision.verdict, "block")
+        # The explicit recommendation must override the preview's free-form one.
+        assert decision.recommended_action is not None
+        self.assertEqual(decision.recommended_action.size_multiplier, 0.3)
+        self.assertIsNone(decision.recommended_action.recommendation)
+
+    # ------------------------------------------------------------------
+    # evaluate_auto_dispatch_gate parity tests
+    # ------------------------------------------------------------------
+
+    def test_evaluate_auto_dispatch_gate_paper_status_matches_helper(self) -> None:
+        """A strategy on PAPER mode must produce the same
+        ``auto.paper_or_paused_strategy`` gate verdict whether the caller
+        invokes ``main._evaluate_strategy_auto_dispatch_gate`` or the engine
+        wrapper."""
+
+        from contextlib import ExitStack  # noqa: PLC0415
+
+        strategy = self._build_strategy(mode=AccountMode.PAPER)
+        snapshot = self._build_snapshot()
+
+        with ExitStack() as stack:
+            for p in self._patch_clean_gates():
+                stack.enter_context(p)
+            engine_gate = control_main.risk_engine.evaluate_auto_dispatch_gate(
+                strategy, snapshot
+            )
+            helper_gate = control_main._evaluate_strategy_auto_dispatch_gate(
+                strategy, snapshot
+            )
+
+        self.assertEqual(engine_gate.verdict, "block")
+        self.assertEqual(engine_gate.reason_code, "auto.paper_or_paused_strategy")
+        # Parity: every documented public field on the gate matches.
+        self.assertEqual(engine_gate.verdict, helper_gate.verdict)
+        self.assertEqual(engine_gate.reason_code, helper_gate.reason_code)
+        self.assertEqual(
+            engine_gate.cancel_existing_orders, helper_gate.cancel_existing_orders
+        )
+        self.assertEqual(engine_gate.clear_alerts, helper_gate.clear_alerts)
+        self.assertEqual(engine_gate.record_issue, helper_gate.record_issue)
+
+    def test_evaluate_auto_dispatch_gate_runtime_not_running_matches_helper(self) -> None:
+        """When the snapshot's ``runtime_status`` is anything other than
+        ``"running"`` and every other guard passes, the engine + helper must
+        agree on ``auto.runtime_not_running`` with both cleanup flags
+        (``cancel_existing_orders`` + ``clear_alerts``) on.
+
+        The strategy is kept in ``"running"`` (so the leading
+        ``_NON_RUNNING_STRATEGY_STATUSES`` gate does not fire) while the
+        snapshot's ``runtime_status`` is ``"paused"`` to drive the late-stage
+        ``auto.runtime_not_running`` branch."""
+
+        from contextlib import ExitStack  # noqa: PLC0415
+
+        strategy = self._build_strategy()
+        snapshot = self._build_snapshot(runtime_status="paused")
+
+        with ExitStack() as stack:
+            for p in self._patch_clean_gates():
+                stack.enter_context(p)
+            engine_gate = control_main.risk_engine.evaluate_auto_dispatch_gate(
+                strategy, snapshot
+            )
+            helper_gate = control_main._evaluate_strategy_auto_dispatch_gate(
+                strategy, snapshot
+            )
+
+        self.assertEqual(engine_gate.verdict, "block")
+        self.assertEqual(engine_gate.reason_code, "auto.runtime_not_running")
+        self.assertTrue(engine_gate.cancel_existing_orders)
+        self.assertTrue(engine_gate.clear_alerts)
+        # Parity check.
+        self.assertEqual(engine_gate.verdict, helper_gate.verdict)
+        self.assertEqual(engine_gate.reason_code, helper_gate.reason_code)
+
+    def test_evaluate_auto_dispatch_gate_ready_path_matches_helper(self) -> None:
+        """With every guard neutralised and the snapshot in ``"running"``, the
+        engine and helper must both surface ``auto.ready`` (verdict allow,
+        zero side effects)."""
+
+        from contextlib import ExitStack  # noqa: PLC0415
+
+        strategy = self._build_strategy()
+        snapshot = self._build_snapshot()
+
+        with ExitStack() as stack:
+            for p in self._patch_clean_gates():
+                stack.enter_context(p)
+            engine_gate = control_main.risk_engine.evaluate_auto_dispatch_gate(
+                strategy, snapshot
+            )
+            helper_gate = control_main._evaluate_strategy_auto_dispatch_gate(
+                strategy, snapshot
+            )
+
+        self.assertEqual(engine_gate.verdict, "allow")
+        self.assertEqual(engine_gate.reason_code, "auto.ready")
+        self.assertFalse(engine_gate.cancel_existing_orders)
+        self.assertFalse(engine_gate.clear_alerts)
+        self.assertFalse(engine_gate.record_issue)
+        # Parity.
+        self.assertEqual(engine_gate.verdict, helper_gate.verdict)
+        self.assertEqual(engine_gate.reason_code, helper_gate.reason_code)
+
+    # ------------------------------------------------------------------
+    # classify_outcome parity tests
+    # ------------------------------------------------------------------
+
+    def test_classify_outcome_dispatched_when_no_exception(self) -> None:
+        """``RiskEngine.classify_outcome(None)`` must surface the same
+        ``dispatched`` / ``auto.dispatch.success`` verdict + side-effect flags
+        as the underlying R61 helper."""
+
+        engine_outcome = control_main.risk_engine.classify_outcome(None)
+        helper_outcome = control_main._classify_auto_dispatch_outcome(None)
+
+        self.assertEqual(engine_outcome.verdict, "dispatched")
+        self.assertEqual(engine_outcome.reason_code, "auto.dispatch.success")
+        self.assertTrue(engine_outcome.clear_alerts)
+        self.assertFalse(engine_outcome.emit_noop_event)
+        self.assertFalse(engine_outcome.record_issue)
+        # Parity.
+        self.assertEqual(engine_outcome.verdict, helper_outcome.verdict)
+        self.assertEqual(engine_outcome.reason_code, helper_outcome.reason_code)
+        self.assertEqual(engine_outcome.clear_alerts, helper_outcome.clear_alerts)
+        self.assertEqual(
+            engine_outcome.emit_noop_event, helper_outcome.emit_noop_event
+        )
+        self.assertEqual(engine_outcome.record_issue, helper_outcome.record_issue)
+
+    def test_classify_outcome_noop_from_typed_subclass_matches_helper(self) -> None:
+        """A :class:`StrategyExecutionNoopError` must surface as ``noop`` /
+        ``auto.dispatch.noop`` with ``emit_noop_event=True`` through the
+        engine — pinning the R81 typed-raise contract through the engine
+        layer."""
+
+        exc = control_main.StrategyExecutionNoopError(
+            "当前挂单已与目标一致，无需再次提交委托。"
+        )
+
+        engine_outcome = control_main.risk_engine.classify_outcome(exc)
+        helper_outcome = control_main._classify_auto_dispatch_outcome(exc)
+
+        self.assertEqual(engine_outcome.verdict, "noop")
+        self.assertEqual(engine_outcome.reason_code, "auto.dispatch.noop")
+        self.assertTrue(engine_outcome.emit_noop_event)
+        # Parity with the underlying helper across every flag.
+        self.assertEqual(engine_outcome.verdict, helper_outcome.verdict)
+        self.assertEqual(engine_outcome.reason_code, helper_outcome.reason_code)
+        self.assertEqual(engine_outcome.reason_detail, helper_outcome.reason_detail)
+        self.assertEqual(engine_outcome.clear_alerts, helper_outcome.clear_alerts)
+        self.assertEqual(
+            engine_outcome.emit_noop_event, helper_outcome.emit_noop_event
+        )
+        self.assertEqual(engine_outcome.record_issue, helper_outcome.record_issue)
+
+    def test_classify_outcome_blocked_propagates_recommended_action(self) -> None:
+        """``StrategyExecutionBlockedError`` carries an
+        ``recommended_action``; the engine must propagate it onto
+        ``AutoDispatchOutcome.recommended_action`` so the operator console
+        can render the next-step button."""
+
+        exc = control_main.StrategyExecutionBlockedError(
+            "当前 Live 余额不足，暂缓自动执行。",
+            recommended_action="请先补充 Live 可用余额。",
+        )
+
+        engine_outcome = control_main.risk_engine.classify_outcome(exc)
+        helper_outcome = control_main._classify_auto_dispatch_outcome(exc)
+
+        self.assertEqual(engine_outcome.verdict, "blocked")
+        self.assertEqual(engine_outcome.reason_code, "auto.dispatch.blocked")
+        self.assertEqual(
+            engine_outcome.recommended_action, "请先补充 Live 可用余额。"
+        )
+        self.assertTrue(engine_outcome.record_issue)
+        # Parity.
+        self.assertEqual(engine_outcome.verdict, helper_outcome.verdict)
+        self.assertEqual(
+            engine_outcome.recommended_action, helper_outcome.recommended_action
+        )
+
+    def test_classify_outcome_failed_for_plain_runtime_and_generic_exceptions(self) -> None:
+        """Any other ``RuntimeError`` / generic ``Exception`` must surface as
+        ``failed`` / ``auto.dispatch.failed`` with the audit prefix on the
+        generic-exception branch — pinning the R61 defensive contract through
+        the engine."""
+
+        rt_exc = RuntimeError("私有通道暂时不可用，请稍后重试。")
+        ve_exc = ValueError("unexpected state machine transition")
+
+        rt_engine = control_main.risk_engine.classify_outcome(rt_exc)
+        rt_helper = control_main._classify_auto_dispatch_outcome(rt_exc)
+        ve_engine = control_main.risk_engine.classify_outcome(ve_exc)
+        ve_helper = control_main._classify_auto_dispatch_outcome(ve_exc)
+
+        self.assertEqual(rt_engine.verdict, "failed")
+        self.assertEqual(rt_engine.reason_code, "auto.dispatch.failed")
+        self.assertEqual(rt_engine.reason_detail, "私有通道暂时不可用，请稍后重试。")
+        self.assertEqual(rt_engine.verdict, rt_helper.verdict)
+        self.assertEqual(rt_engine.reason_detail, rt_helper.reason_detail)
+
+        self.assertEqual(ve_engine.verdict, "failed")
+        self.assertTrue(ve_engine.reason_detail.startswith("后台自动执行异常："))
+        self.assertEqual(ve_engine.verdict, ve_helper.verdict)
+        self.assertEqual(ve_engine.reason_detail, ve_helper.reason_detail)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
