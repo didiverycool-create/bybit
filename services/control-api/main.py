@@ -321,6 +321,28 @@ from strategy_alerts import (
     resolve_alert_sub_block_code as _resolve_alert_sub_block_code_impl,
     sync_strategy_position_drift_issue as _sync_strategy_position_drift_issue_impl,
 )
+from strategy_execution_sync import (
+    apply_live_strategy_stop_loss_guards as _apply_live_strategy_stop_loss_guards_impl,
+    classify_exchange_order_status_event as _classify_exchange_order_status_event_impl,
+    is_strategy_active_order_stale as _is_strategy_active_order_stale_impl,
+    parse_order_created_at as _parse_order_created_at_impl,
+    strategy_active_order_stale_age_minutes as _strategy_active_order_stale_age_minutes_impl,
+    strategy_exchange_order_stale_minutes as _strategy_exchange_order_stale_minutes_impl,
+    strategy_exchange_rejection_event_time as _strategy_exchange_rejection_event_time_impl,
+    strategy_exchange_rejection_guard_cooldown_minutes as _strategy_exchange_rejection_guard_cooldown_minutes_impl,
+    strategy_exchange_rejection_guard_remaining_minutes as _strategy_exchange_rejection_guard_remaining_minutes_impl,
+    strategy_exchange_rejection_guard_threshold as _strategy_exchange_rejection_guard_threshold_impl,
+    strategy_exchange_rejection_guard_window_minutes as _strategy_exchange_rejection_guard_window_minutes_impl,
+    strategy_exchange_rejection_recent_count as _strategy_exchange_rejection_recent_count_impl,
+    strategy_live_stop_loss_cooldown_remaining_minutes as _strategy_live_stop_loss_cooldown_remaining_minutes_impl,
+    strategy_parameter_float as _strategy_parameter_float_impl,
+    strategy_parameter_int as _strategy_parameter_int_impl,
+    sync_strategy_exchange_order_history_alerts as _sync_strategy_exchange_order_history_alerts_impl,
+    sync_strategy_exchange_order_history_events as _sync_strategy_exchange_order_history_events_impl,
+    sync_strategy_exchange_rejection_guards as _sync_strategy_exchange_rejection_guards_impl,
+    sync_strategy_position_drift_issues as _sync_strategy_position_drift_issues_impl,
+    sync_strategy_stale_order_issues as _sync_strategy_stale_order_issues_impl,
+)
 
 
 # Round 118 — module-level :class:`RiskEngine` singleton.  The engine is a
@@ -5952,116 +5974,47 @@ def _strategy_auto_dispatch_gate_reason(
     return None
 
 def _strategy_parameter_float(strategy: StrategySummary, key: str) -> Optional[float]:
-    for parameter in strategy.parameters:
-        if parameter.key != key:
-            continue
-        try:
-            return float(parameter.value)
-        except (TypeError, ValueError):
-            return None
-    return None
+    return _strategy_parameter_float_impl(strategy, key)
 
 def _strategy_parameter_int(strategy: StrategySummary, key: str) -> Optional[int]:
-    value = _strategy_parameter_float(strategy, key)
-    if value is None:
-        return None
-    return int(round(value))
+    return _strategy_parameter_int_impl(strategy, key)
 
 def _strategy_live_stop_loss_cooldown_remaining_minutes(strategy: StrategySummary) -> Optional[int]:
-    cooldown_minutes = _strategy_parameter_float(strategy, "cooldown_minutes") or 0.0
-    if cooldown_minutes <= 0:
-        return None
-    latest_guard_event = next(
-        (
-            event
-            for event in repo.snapshot().audit_events
-            if event.event_type == "strategy.exchange_stop_loss.alerted"
-            and event.strategy_id == strategy.id
-        ),
-        None,
-    )
-    if latest_guard_event is None:
-        return None
-    try:
-        occurred_at = datetime.fromisoformat(latest_guard_event.occurred_at)
-    except ValueError:
-        return None
-    elapsed_minutes = (datetime.now(timezone.utc).astimezone() - occurred_at).total_seconds() / 60
-    remaining = int(round(cooldown_minutes - elapsed_minutes))
-    return remaining if remaining > 0 else None
+    return _strategy_live_stop_loss_cooldown_remaining_minutes_impl(strategy, repo=repo)
 
 def _strategy_exchange_rejection_guard_threshold(strategy: StrategySummary) -> int:
-    return max(_strategy_parameter_int(strategy, "rejection_guard_count") or 2, 1)
+    return _strategy_exchange_rejection_guard_threshold_impl(strategy)
 
 def _strategy_exchange_rejection_guard_window_minutes(strategy: StrategySummary) -> int:
-    return max(_strategy_parameter_int(strategy, "rejection_guard_window_minutes") or 15, 1)
+    return _strategy_exchange_rejection_guard_window_minutes_impl(strategy)
 
 def _strategy_exchange_rejection_guard_cooldown_minutes(strategy: StrategySummary) -> int:
-    return max(_strategy_parameter_int(strategy, "rejection_cooldown_minutes") or 20, 1)
+    return _strategy_exchange_rejection_guard_cooldown_minutes_impl(strategy)
 
 def _strategy_exchange_rejection_event_time(event: ExecutionEvent) -> datetime:
-    raw_value = event.payload.get("order_created_at") or event.occurred_at
-    try:
-        return datetime.fromisoformat(str(raw_value))
-    except (TypeError, ValueError):
-        return datetime.fromtimestamp(0, tz=timezone.utc)
+    return _strategy_exchange_rejection_event_time_impl(event)
 
 def _strategy_exchange_rejection_recent_count(strategy: StrategySummary) -> int:
-    threshold_window = _strategy_exchange_rejection_guard_window_minutes(strategy)
-    cutoff = datetime.now(timezone.utc).astimezone() - timedelta(minutes=threshold_window)
-    return sum(
-        1
-        for event in repo.snapshot().audit_events
-        if event.strategy_id == strategy.id
-        and event.event_type == "exchange_order.rejected"
-        and _strategy_exchange_rejection_event_time(event) >= cutoff
-    )
+    return _strategy_exchange_rejection_recent_count_impl(strategy, repo=repo)
 
 def _strategy_exchange_rejection_guard_remaining_minutes(strategy: StrategySummary) -> Optional[int]:
-    if strategy.mode == AccountMode.PAPER or strategy.status in _NON_RUNNING_STRATEGY_STATUSES:
-        return None
-    threshold = _strategy_exchange_rejection_guard_threshold(strategy)
-    cooldown_minutes = _strategy_exchange_rejection_guard_cooldown_minutes(strategy)
-    threshold_window = _strategy_exchange_rejection_guard_window_minutes(strategy)
-    if threshold <= 0 or cooldown_minutes <= 0 or threshold_window <= 0:
-        return None
-
-    cutoff = datetime.now(timezone.utc).astimezone() - timedelta(minutes=threshold_window)
-    recent_events = [
-        event
-        for event in repo.snapshot().audit_events
-        if event.strategy_id == strategy.id
-        and event.event_type == "exchange_order.rejected"
-        and _strategy_exchange_rejection_event_time(event) >= cutoff
-    ]
-    if len(recent_events) < threshold:
-        return None
-    latest_event = max(recent_events, key=_strategy_exchange_rejection_event_time)
-    latest_at = _strategy_exchange_rejection_event_time(latest_event)
-    elapsed_minutes = (datetime.now(timezone.utc).astimezone() - latest_at).total_seconds() / 60
-    remaining = int(round(cooldown_minutes - elapsed_minutes))
-    return remaining if remaining > 0 else None
+    return _strategy_exchange_rejection_guard_remaining_minutes_impl(
+        strategy,
+        repo=repo,
+        non_running_strategy_statuses=_NON_RUNNING_STRATEGY_STATUSES,
+    )
 
 def _strategy_exchange_order_stale_minutes(strategy: StrategySummary) -> int:
-    return max(_strategy_parameter_int(strategy, "stale_order_minutes") or 20, 1)
+    return _strategy_exchange_order_stale_minutes_impl(strategy)
 
 def _parse_order_created_at(value: Optional[str]) -> datetime:
-    if not value:
-        return datetime.fromtimestamp(0, tz=timezone.utc)
-    try:
-        return datetime.fromisoformat(str(value))
-    except (TypeError, ValueError):
-        return datetime.fromtimestamp(0, tz=timezone.utc)
+    return _parse_order_created_at_impl(value)
 
 def _strategy_active_order_stale_age_minutes(order: OrderRecord) -> int:
-    created_at = _parse_order_created_at(order.created_at)
-    elapsed_minutes = (datetime.now(timezone.utc).astimezone() - created_at).total_seconds() / 60
-    return max(int(round(elapsed_minutes)), 0)
+    return _strategy_active_order_stale_age_minutes_impl(order)
 
 def _is_strategy_active_order_stale(strategy: StrategySummary, order: Optional[OrderRecord]) -> bool:
-    if order is None or strategy.mode == AccountMode.PAPER:
-        return False
-    return _strategy_active_order_stale_age_minutes(order) >= _strategy_exchange_order_stale_minutes(strategy)
+    return _is_strategy_active_order_stale_impl(strategy, order)
 
 def _record_strategy_live_stop_loss_issue(
     strategy: StrategySummary,
@@ -6140,72 +6093,17 @@ def _exchange_order_matches_requested_target(
     return _raw_private_order_reduce_only_enabled(_find_private_raw_open_order(order.order_id))
 
 def _apply_live_strategy_stop_loss_guards(current_items: List[StrategyRuntimeSnapshot]) -> None:
-    state = repo.snapshot()
-    strategies_by_id = {item.id: item for item in state.strategies}
-    positions = parse_positions(use_private_only=True)
-    positions_by_key = {(item.symbol, item.market): item for item in positions}
-
-    for snapshot in current_items:
-        strategy = strategies_by_id.get(snapshot.strategy_id)
-        if strategy is None:
-            continue
-        if strategy.mode not in NON_PAPER_ACCOUNT_MODES:
-            _clear_strategy_live_stop_loss_alerts(snapshot.strategy_id)
-            continue
-        if strategy.status in _NON_RUNNING_STRATEGY_STATUSES or snapshot.runtime_status != "running":
-            _clear_strategy_live_stop_loss_alerts(snapshot.strategy_id)
-            continue
-
-        stop_loss_pct = _strategy_parameter_float(strategy, "stop_loss_pct")
-        cooldown_remaining = _strategy_live_stop_loss_cooldown_remaining_minutes(strategy)
-        if stop_loss_pct is None or stop_loss_pct <= 0:
-            if cooldown_remaining is not None:
-                continue
-            _clear_strategy_live_stop_loss_alerts(snapshot.strategy_id)
-            continue
-
-        position = positions_by_key.get((snapshot.symbol, snapshot.market))
-        if position is None:
-            if cooldown_remaining is not None:
-                continue
-            _clear_strategy_live_stop_loss_alerts(snapshot.strategy_id)
-            continue
-
-        current_qty = parse_metric_number(position.size) * (1 if position.side == "long" else -1)
-        current_avg = parse_metric_number(position.avg_price)
-        if abs(current_qty) <= 1e-9 or current_avg <= 0:
-            if cooldown_remaining is not None:
-                continue
-            _clear_strategy_live_stop_loss_alerts(snapshot.strategy_id)
-            continue
-
-        stop_triggered = False
-        if current_qty > 0 and snapshot.last_price <= current_avg * (1 - stop_loss_pct / 100):
-            stop_triggered = True
-        elif current_qty < 0 and snapshot.last_price >= current_avg * (1 + stop_loss_pct / 100):
-            stop_triggered = True
-
-        if not stop_triggered:
-            if _has_active_strategy_live_stop_loss_alert(snapshot.strategy_id) or cooldown_remaining is not None:
-                continue
-            _clear_strategy_live_stop_loss_alerts(snapshot.strategy_id)
-            continue
-
-        cancelled_count = _cancel_strategy_exchange_orders(
-            snapshot.strategy_id,
-            snapshot.symbol,
-            snapshot.market,
-            strategy.mode,
-            "strategy_runtime_worker",
-            "当前参考价已触发真实模式止损保护，自动撤销旧策略委托并暂停后台自动执行。",
-        )
-        _record_strategy_live_stop_loss_issue(
-            strategy,
-            snapshot,
-            position,
-            stop_loss_pct=stop_loss_pct,
-            cancelled_count=cancelled_count,
-        )
+    _apply_live_strategy_stop_loss_guards_impl(
+        current_items,
+        repo=repo,
+        non_running_strategy_statuses=_NON_RUNNING_STRATEGY_STATUSES,
+        parse_positions=parse_positions,
+        parse_metric_number=parse_metric_number,
+        clear_strategy_live_stop_loss_alerts=_clear_strategy_live_stop_loss_alerts,
+        has_active_strategy_live_stop_loss_alert=_has_active_strategy_live_stop_loss_alert,
+        cancel_strategy_exchange_orders=_cancel_strategy_exchange_orders,
+        record_strategy_live_stop_loss_issue=_record_strategy_live_stop_loss_issue,
+    )
 
 # Round 57 — the five helpers below + ``_dispatch_strategy_signal_from_state``
 # realise a strategy signal via a canonical ``ExecutionIntent`` (models.py).
@@ -7505,252 +7403,43 @@ def _build_strategy_current_position_summary(
 def _classify_exchange_order_status_event(
     status: str,
 ) -> Optional[Tuple[str, EventSeverity]]:
-    normalized = status.lower()
-    if "fill" in normalized:
-        return "exchange_order.filled", EventSeverity.INFO
-    if "cancel" in normalized:
-        return "exchange_order.cancelled", EventSeverity.WARNING
-    if "reject" in normalized:
-        return "exchange_order.rejected", EventSeverity.ERROR
-    return None
+    return _classify_exchange_order_status_event_impl(status)
 
 
 def _sync_strategy_exchange_order_history_events(history_items: List[OrderRecord]) -> None:
-    def _event_payload_matches(item: ExecutionEvent, event_type: str, order_id: str) -> bool:
-        return item.event_type == event_type and str(item.payload.get("order_id") or "") == order_id
-
-    changed = False
-    with repo._lock:  # type: ignore[attr-defined]
-        for order in history_items:
-            if order.origin != "strategy" or not order.strategy_id:
-                continue
-            classified = _classify_exchange_order_status_event(order.status)
-            if classified is None:
-                continue
-            event_type, severity = classified
-            if event_type == "exchange_order.filled":
-                detail = f"真实策略委托已成交 {order.qty}@{order.price} ({order.status})"
-            elif event_type == "exchange_order.cancelled":
-                detail = f"真实策略委托已撤销 {order.qty}@{order.price} ({order.status})"
-            else:
-                detail = f"真实策略委托被拒绝 {order.qty}@{order.price} ({order.status})"
-            if any(_event_payload_matches(event, event_type, order.order_id) for event in repo.state.audit_events):  # type: ignore[attr-defined]
-                continue
-            repo.add_event(
-                event_type=event_type,
-                source="quant-core",
-                severity=severity,
-                payload={
-                    "order_id": order.order_id,
-                    "order_created_at": order.created_at,
-                    "strategy_id": order.strategy_id,
-                    "symbol": order.symbol,
-                    "market": order.market,
-                    "status": order.status,
-                    "qty": order.qty,
-                    "price": order.price,
-                    "detail": detail,
-                },
-                symbol=order.symbol,
-                strategy_id=order.strategy_id,
-                parameter_snapshot=_resolve_strategy_parameter_snapshot(order.strategy_id),
-            )
-            changed = True
-        if changed:
-            repo._persist()  # type: ignore[attr-defined]
+    _sync_strategy_exchange_order_history_events_impl(
+        history_items,
+        repo=repo,
+        resolve_strategy_parameter_snapshot=_resolve_strategy_parameter_snapshot,
+    )
 
 def _sync_strategy_exchange_order_history_alerts(history_items: List[OrderRecord]) -> None:
-    snapshot_state = repo.snapshot()
-    strategies_by_id = {item.id: item for item in snapshot_state.strategies}
-    fallback_mode = snapshot_state.workspace_preferences.selected_mode
-
-    def _parse_order_time(value: Optional[str]) -> datetime:
-        if not value:
-            return datetime.fromtimestamp(0, tz=timezone.utc)
-        try:
-            return datetime.fromisoformat(value)
-        except ValueError:
-            return datetime.fromtimestamp(0, tz=timezone.utc)
-
-    latest_by_strategy: Dict[str, OrderRecord] = {}
-    for order in history_items:
-        if order.origin != "strategy" or not order.strategy_id:
-            continue
-        current = latest_by_strategy.get(order.strategy_id)
-        if current is None or _parse_order_time(order.created_at) >= _parse_order_time(current.created_at):
-            latest_by_strategy[order.strategy_id] = order
-
-    for strategy_id, order in latest_by_strategy.items():
-        if "reject" not in order.status.lower():
-            _clear_strategy_exchange_rejected_alerts(
-                strategy_id,
-                resolution_detail="最新真实策略委托已不再处于拒单状态，异常提醒已收起。",
-            )
-            continue
-        strategy = strategies_by_id.get(strategy_id)
-        strategy_name = strategy.name if strategy is not None else strategy_id
-        issue_mode = strategy.mode if strategy is not None else fallback_mode
-        changed = False
-        with repo._lock:  # type: ignore[attr-defined]
-            changed = repo._upsert_system_alert_locked(  # type: ignore[attr-defined]
-                rule_key=f"strategy-exchange-rejected:{strategy_id}:{order.order_id}",
-                severity="P1",
-                symbol=order.symbol,
-                title=f"{order.symbol} 策略真实委托被拒绝",
-                description=(
-                    f"{strategy_name} 最近一笔真实策略委托被交易所拒绝。"
-                    f"委托参数 {order.qty}@{order.price}，状态 {order.status}。"
-                ),
-                suggested_action="打开策略页、交易记录和账户页复核真实仓位、委托参数与模式配置。",
-                strategy_id=strategy_id,
-            )
-            if changed:
-                _queue_strategy_issue_review_locked(
-                    strategy_id=strategy_id,
-                    strategy_name=strategy_name,
-                    symbol=order.symbol,
-                    mode=issue_mode,
-                    issue_type="exchange_order_rejected",
-                    summary=f"{order.symbol} 策略真实委托被拒绝",
-                    detail=f"委托参数 {order.qty}@{order.price}，状态 {order.status}。",
-                    rule_key=f"strategy-exchange-rejected:{strategy_id}:{order.order_id}",
-                )
-                repo._refresh_derived_state()  # type: ignore[attr-defined]
-                repo._persist()  # type: ignore[attr-defined]
+    _sync_strategy_exchange_order_history_alerts_impl(
+        history_items,
+        repo=repo,
+        clear_strategy_exchange_rejected_alerts=_clear_strategy_exchange_rejected_alerts,
+        queue_strategy_issue_review_locked=_queue_strategy_issue_review_locked,
+    )
 
 def _sync_strategy_exchange_rejection_guards(current_items: List[StrategyRuntimeSnapshot]) -> None:
-    state = repo.snapshot()
-    strategies_by_id = {item.id: item for item in state.strategies}
-    for snapshot in current_items:
-        strategy = strategies_by_id.get(snapshot.strategy_id)
-        if strategy is None:
-            continue
-        remaining = _strategy_exchange_rejection_guard_remaining_minutes(strategy)
-        if remaining is None:
-            _clear_strategy_exchange_rejection_guard_alerts(
-                snapshot.strategy_id,
-                resolution_detail="连续拒单熔断已结束，真实策略自动执行可在人工确认后恢复。",
-            )
-            continue
-        rejection_count = _strategy_exchange_rejection_recent_count(strategy)
-        detail = (
-            f"最近 {_strategy_exchange_rejection_guard_window_minutes(strategy)} 分钟真实策略委托已连续拒绝 "
-            f"{rejection_count} 次，自动执行冷却剩余约 {remaining} 分钟。"
-        )
-        with repo._lock:  # type: ignore[attr-defined]
-            changed = repo._upsert_system_alert_locked(  # type: ignore[attr-defined]
-                rule_key=f"strategy-exchange-rejection-guard:{snapshot.strategy_id}:{snapshot.mode.value}",
-                severity="P1",
-                symbol=snapshot.symbol,
-                title=f"{snapshot.symbol} 策略连续拒单已熔断",
-                description=f"{snapshot.strategy_name} 当前已进入连续拒单冷却期。{detail}",
-                suggested_action="先复核交易所模式、仓位、委托参数和最小下单约束，确认后再恢复自动执行。",
-                strategy_id=snapshot.strategy_id,
-            )
-            if changed:
-                _queue_strategy_issue_review_locked(
-                    strategy_id=snapshot.strategy_id,
-                    strategy_name=snapshot.strategy_name,
-                    symbol=snapshot.symbol,
-                    mode=snapshot.mode,
-                    issue_type="exchange_rejection_guard",
-                    summary=f"{snapshot.symbol} 策略连续拒单已熔断",
-                    detail=detail,
-                    rule_key=f"strategy-exchange-rejection-guard:{snapshot.strategy_id}:{snapshot.mode.value}",
-                )
-                repo.add_event(
-                    event_type="strategy.exchange_order.rejection_guard.alerted",
-                    source="quant-core",
-                    severity=EventSeverity.WARNING,
-                    payload={
-                        "strategy_id": snapshot.strategy_id,
-                        "strategy_name": snapshot.strategy_name,
-                        "symbol": snapshot.symbol,
-                        "mode": snapshot.mode.value,
-                        "rejection_count": rejection_count,
-                        "window_minutes": _strategy_exchange_rejection_guard_window_minutes(strategy),
-                        "cooldown_remaining_minutes": remaining,
-                        "detail": detail,
-                    },
-                    symbol=snapshot.symbol,
-                    strategy_id=snapshot.strategy_id,
-                    parameter_snapshot=parameter_resolver.snapshot_parameters(strategy),
-                )
-                repo._refresh_derived_state()  # type: ignore[attr-defined]
-                repo._persist()  # type: ignore[attr-defined]
+    _sync_strategy_exchange_rejection_guards_impl(
+        current_items,
+        repo=repo,
+        parameter_resolver_module=parameter_resolver,
+        non_running_strategy_statuses=_NON_RUNNING_STRATEGY_STATUSES,
+        clear_strategy_exchange_rejection_guard_alerts=_clear_strategy_exchange_rejection_guard_alerts,
+        queue_strategy_issue_review_locked=_queue_strategy_issue_review_locked,
+    )
 
 def _sync_strategy_stale_order_issues(current_items: List[StrategyRuntimeSnapshot]) -> None:
-    state = repo.snapshot()
-    strategies_by_id = {item.id: item for item in state.strategies}
-    for snapshot in current_items:
-        strategy = strategies_by_id.get(snapshot.strategy_id)
-        if strategy is None:
-            continue
-        active_order_count, active_order = _build_strategy_active_order_summary(
-            snapshot.strategy_id,
-            snapshot.mode,
-            snapshot.symbol,
-            snapshot.market,
-        )
-        if (
-            snapshot.mode == AccountMode.PAPER
-            or snapshot.runtime_status != "running"
-            or active_order_count == 0
-            or active_order is None
-            or not _is_strategy_active_order_stale(strategy, active_order)
-        ):
-            _clear_strategy_stale_order_alerts(
-                snapshot.strategy_id,
-                resolution_detail="当前已不再存在长时间未处理的策略挂单，停滞提醒已收起。",
-            )
-            continue
-
-        stale_age_minutes = _strategy_active_order_stale_age_minutes(active_order)
-        detail = (
-            f"当前真实策略委托已挂单约 {stale_age_minutes} 分钟仍未成交或撤单，"
-            f"超过 { _strategy_exchange_order_stale_minutes(strategy) } 分钟阈值。"
-        )
-        with repo._lock:  # type: ignore[attr-defined]
-            changed = repo._upsert_system_alert_locked(  # type: ignore[attr-defined]
-                rule_key=f"strategy-stale-order:{snapshot.strategy_id}:{active_order.order_id}",
-                severity="P1",
-                symbol=snapshot.symbol,
-                title=f"{snapshot.symbol} 策略挂单停滞",
-                description=f"{snapshot.strategy_name} 当前存在长时间未处理的真实策略委托。{detail}",
-                suggested_action="先复核委托价格是否偏离、交易所限制与市场状态；必要时改价、撤单或人工接管。",
-                strategy_id=snapshot.strategy_id,
-            )
-            if changed:
-                _queue_strategy_issue_review_locked(
-                    strategy_id=snapshot.strategy_id,
-                    strategy_name=snapshot.strategy_name,
-                    symbol=snapshot.symbol,
-                    mode=snapshot.mode,
-                    issue_type="stale_order",
-                    summary=f"{snapshot.symbol} 策略挂单停滞",
-                    detail=detail,
-                    rule_key=f"strategy-stale-order:{snapshot.strategy_id}:{active_order.order_id}",
-                )
-                repo.add_event(
-                    event_type="strategy.exchange_order.stale_alerted",
-                    source="quant-core",
-                    severity=EventSeverity.WARNING,
-                    payload={
-                        "strategy_id": snapshot.strategy_id,
-                        "strategy_name": snapshot.strategy_name,
-                        "symbol": snapshot.symbol,
-                        "mode": snapshot.mode.value,
-                        "order_id": active_order.order_id,
-                        "stale_age_minutes": stale_age_minutes,
-                        "threshold_minutes": _strategy_exchange_order_stale_minutes(strategy),
-                        "detail": detail,
-                    },
-                    symbol=snapshot.symbol,
-                    strategy_id=snapshot.strategy_id,
-                    parameter_snapshot=parameter_resolver.snapshot_parameters(strategy),
-                )
-                repo._refresh_derived_state()  # type: ignore[attr-defined]
-                repo._persist()  # type: ignore[attr-defined]
+    _sync_strategy_stale_order_issues_impl(
+        current_items,
+        repo=repo,
+        parameter_resolver_module=parameter_resolver,
+        build_strategy_active_order_summary=_build_strategy_active_order_summary,
+        clear_strategy_stale_order_alerts=_clear_strategy_stale_order_alerts,
+        queue_strategy_issue_review_locked=_queue_strategy_issue_review_locked,
+    )
 
 def _build_strategy_last_execution_summary(
     strategy_id: str,
@@ -7851,34 +7540,12 @@ def _build_strategy_last_execution_summary(
     return best_event_type, best_occurred_at, best_severity, best_detail, best_recommended_action
 
 def _sync_strategy_position_drift_issues(current_items: List[StrategyRuntimeSnapshot]) -> None:
-    for snapshot in current_items:
-        active_order_count, _active_order = _build_strategy_active_order_summary(
-            snapshot.strategy_id,
-            snapshot.mode,
-            snapshot.symbol,
-            snapshot.market,
-        )
-        (
-            target_position_side,
-            target_position_size,
-            position_alignment,
-            position_alignment_detail,
-        ) = _build_strategy_position_alignment_summary(
-            snapshot.strategy_id,
-            snapshot.mode,
-            snapshot.symbol,
-            snapshot.market,
-            active_order_count,
-        )
-        enriched = snapshot.model_copy(
-            update={
-                "target_position_side": target_position_side,
-                "target_position_size": target_position_size,
-                "position_alignment": position_alignment,
-                "position_alignment_detail": position_alignment_detail,
-            }
-        )
-        _sync_strategy_position_drift_issue(enriched, active_order_count=active_order_count)
+    _sync_strategy_position_drift_issues_impl(
+        current_items,
+        build_strategy_active_order_summary=_build_strategy_active_order_summary,
+        build_strategy_position_alignment_summary=_build_strategy_position_alignment_summary,
+        sync_strategy_position_drift_issue=_sync_strategy_position_drift_issue,
+    )
 
 def _get_strategy_signal_order_hint_for_runtime_snapshot(
     strategy_id: str,
