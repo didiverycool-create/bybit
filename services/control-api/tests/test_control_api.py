@@ -31210,5 +31210,318 @@ class PaperIntentIdempotencyTests(unittest.TestCase):
         self.assertEqual(len(control_main.repo.state.trades), before + 1)
 
 
+# ============================================================================
+# Round 136 — Paper shadow-parity (P0-4.2 §F.2 Wave-3-B commit 5)
+# ============================================================================
+# Wave-3-B's parity contract: when ``execution_engine.paper`` is flipped on
+# the engine path produces a ``TradeRecord`` that is byte-equivalent (in
+# the comparable fields) to the legacy ``repo.execute_strategy_signal``
+# output.  ``compare_paper_executed`` is the pure helper that does the
+# comparison; ``_emit_paper_engine_trade_parity_audit`` wires it to the
+# ``execution.engine_diff`` audit event.  These tests cover both the
+# helper and the wiring, plus the headline acceptance: shadow_decision
+# diverged audits stay at zero across the flag flip.
+# ============================================================================
+class PaperShadowParityTests(unittest.TestCase):
+    """``compare_paper_executed`` helper + audit wiring + parity invariant."""
+
+    def setUp(self) -> None:
+        self._state_backup = copy.deepcopy(control_main.repo.state)
+        self._original_paper_flag = control_main._get_execution_engine_paper_flag()
+        self._original_shadow_flag = control_main._get_execution_engine_shadow_flag()
+        control_main.execution_engine._paper_idempotency_cache.clear()
+        self.addCleanup(self._restore_state)
+
+    def _restore_state(self) -> None:
+        control_main.repo.state = copy.deepcopy(self._state_backup)
+        control_main.repo._persist(control_main.repo.state)
+        control_main._set_execution_engine_paper_flag(self._original_paper_flag)
+        control_main._set_execution_engine_shadow_flag(self._original_shadow_flag)
+        control_main.execution_engine._paper_idempotency_cache.clear()
+
+    def _make_trade(self, **overrides):
+        from models import AccountMode, Direction, TradeRecord
+
+        base = {
+            "id": "trade-A",
+            "symbol": "ETHUSDT",
+            "market": "perp",
+            "mode": AccountMode.PAPER,
+            "origin": "strategy",
+            "side": Direction.BUY,
+            "quantity": 0.01,
+            "price": 2000.0,
+            "pnl": "0",
+            "strategy_id": "eth-revert-02",
+            "created_at": "2026-04-28T08:00:00+08:00",
+            "status": "filled",
+        }
+        base.update(overrides)
+        return TradeRecord(**base)
+
+    # ------------------------------------------------------ helper unit tests
+    def test_compare_paper_executed_matched_returns_no_diffs(self) -> None:
+        from execution_diff import compare_paper_executed
+
+        legacy = self._make_trade(id="trade-legacy")
+        engine = self._make_trade(id="trade-engine")  # different id by design
+        diff = compare_paper_executed(legacy, engine)
+        self.assertFalse(diff.diverged)
+        self.assertEqual(diff.field_diffs, [])
+        # id and created_at are intentionally not compared.
+        self.assertEqual(diff.legacy_trade_id, "trade-legacy")
+        self.assertEqual(diff.engine_trade_id, "trade-engine")
+
+    def test_compare_paper_executed_quantity_diff(self) -> None:
+        from execution_diff import compare_paper_executed
+
+        legacy = self._make_trade(quantity=0.01)
+        engine = self._make_trade(quantity=0.02)
+        diff = compare_paper_executed(legacy, engine)
+        self.assertTrue(diff.diverged)
+        self.assertIn("quantity", diff.field_diffs)
+        self.assertFalse(diff.quantity_match)
+
+    def test_compare_paper_executed_price_diff(self) -> None:
+        from execution_diff import compare_paper_executed
+
+        legacy = self._make_trade(price=2000.0)
+        engine = self._make_trade(price=2001.5)
+        diff = compare_paper_executed(legacy, engine)
+        self.assertTrue(diff.diverged)
+        self.assertIn("price", diff.field_diffs)
+
+    def test_compare_paper_executed_status_diff(self) -> None:
+        from execution_diff import compare_paper_executed
+
+        legacy = self._make_trade(status="filled")
+        engine = self._make_trade(status="cancelled")
+        diff = compare_paper_executed(legacy, engine)
+        self.assertTrue(diff.diverged)
+        self.assertIn("status", diff.field_diffs)
+
+    def test_compare_paper_executed_side_diff(self) -> None:
+        from models import Direction
+        from execution_diff import compare_paper_executed
+
+        legacy = self._make_trade(side=Direction.BUY)
+        engine = self._make_trade(side=Direction.SELL)
+        diff = compare_paper_executed(legacy, engine)
+        self.assertTrue(diff.diverged)
+        self.assertIn("side", diff.field_diffs)
+
+    def test_compare_paper_executed_quantity_within_tolerance(self) -> None:
+        """Sub-LSB float drift (≤ 1e-9) does NOT count as a divergence."""
+        from execution_diff import compare_paper_executed
+
+        legacy = self._make_trade(quantity=0.01)
+        engine = self._make_trade(quantity=0.01 + 1e-12)
+        diff = compare_paper_executed(legacy, engine)
+        self.assertFalse(diff.diverged)
+
+    def test_compare_paper_executed_id_and_created_at_not_compared(self) -> None:
+        """Different id / created_at fields must NOT trigger divergence
+        because each ``execute_strategy_signal`` invocation generates them
+        fresh by design.
+        """
+        from execution_diff import compare_paper_executed
+
+        legacy = self._make_trade(
+            id="trade-1", created_at="2026-04-28T08:00:00+08:00"
+        )
+        engine = self._make_trade(
+            id="trade-2", created_at="2026-04-28T08:00:01+08:00"
+        )
+        diff = compare_paper_executed(legacy, engine)
+        self.assertFalse(diff.diverged)
+
+    # ----------------------------------------------------- audit wiring tests
+    def test_emit_engine_diff_audit_only_on_divergence(self) -> None:
+        """The audit emitter is silent when the two trades match —
+        steady-state must not pollute the audit log.
+        """
+        from models import (
+            ExecutionIntent,
+            ExecutionPreview,
+            RiskDecision,
+            AccountMode as Mode,
+            Direction,
+        )
+
+        preview = ExecutionPreview(
+            symbol="ETHUSDT", market="perp", mode=Mode.PAPER, side=Direction.BUY,
+            origin="manual", quantity=0.01, price=2000.0, notional="20",
+            action="增仓", allowed=True, current_position_size="0",
+            current_avg_price="0", projected_position_size="0.01",
+            projected_avg_price="2000", available_balance_before="100",
+            available_balance_after="80", estimated_realized_pnl="0",
+            generated_at="2026-04-28T08:00:00+08:00",
+        )
+        decision = RiskDecision(
+            verdict="allow", reason_code="risk.approved", reason_detail="",
+            preview=preview,
+        )
+        intent = ExecutionIntent(
+            strategy_id="eth-revert-02", strategy_name="ParityHarness",
+            source="manual", mode=Mode.PAPER, symbol="ETHUSDT", market="perp",
+            side=Direction.BUY, quantity=0.01, price=2000.0, signal="buy",
+            preview=preview, decision=decision, parameter_snapshot={},
+            requested_by="desktop_operator", note=None,
+            created_at="2026-04-28T08:00:00+08:00", intent_id="intent-r136-1",
+        )
+        legacy = self._make_trade(id="trade-legacy")
+        engine = self._make_trade(id="trade-engine")  # only id differs
+
+        emitted = []
+        original = control_main.repo.add_event
+
+        def spy(event_type, *args, **kwargs):
+            emitted.append({"event_type": event_type, "kwargs": kwargs})
+            return original(event_type, *args, **kwargs)
+
+        with patch.object(control_main.repo, "add_event", side_effect=spy):
+            control_main._emit_paper_engine_trade_parity_audit(
+                intent, legacy, engine
+            )
+
+        engine_diff_events = [
+            e for e in emitted if e["event_type"] == "execution.engine_diff"
+        ]
+        self.assertEqual(len(engine_diff_events), 0)
+
+    def test_emit_engine_diff_audit_writes_warning_on_divergence(self) -> None:
+        """When the helper detects divergence the wiring writes one
+        WARNING-level ``execution.engine_diff`` audit with the diff
+        fields.
+        """
+        from models import (
+            EventSeverity,
+            ExecutionIntent,
+            ExecutionPreview,
+            RiskDecision,
+            AccountMode as Mode,
+            Direction,
+        )
+
+        preview = ExecutionPreview(
+            symbol="ETHUSDT", market="perp", mode=Mode.PAPER, side=Direction.BUY,
+            origin="manual", quantity=0.01, price=2000.0, notional="20",
+            action="增仓", allowed=True, current_position_size="0",
+            current_avg_price="0", projected_position_size="0.01",
+            projected_avg_price="2000", available_balance_before="100",
+            available_balance_after="80", estimated_realized_pnl="0",
+            generated_at="2026-04-28T08:00:00+08:00",
+        )
+        decision = RiskDecision(
+            verdict="allow", reason_code="risk.approved", reason_detail="",
+            preview=preview,
+        )
+        intent = ExecutionIntent(
+            strategy_id="eth-revert-02", strategy_name="ParityHarness",
+            source="manual", mode=Mode.PAPER, symbol="ETHUSDT", market="perp",
+            side=Direction.BUY, quantity=0.01, price=2000.0, signal="buy",
+            preview=preview, decision=decision, parameter_snapshot={},
+            requested_by="desktop_operator", note=None,
+            created_at="2026-04-28T08:00:00+08:00", intent_id="intent-r136-2",
+        )
+        legacy = self._make_trade(id="trade-legacy", quantity=0.01)
+        engine = self._make_trade(id="trade-engine", quantity=0.02)
+
+        emitted = []
+        original = control_main.repo.add_event
+
+        def spy(event_type, *args, **kwargs):
+            emitted.append({"event_type": event_type, "kwargs": kwargs})
+            return original(event_type, *args, **kwargs)
+
+        with patch.object(control_main.repo, "add_event", side_effect=spy):
+            control_main._emit_paper_engine_trade_parity_audit(
+                intent, legacy, engine
+            )
+
+        engine_diff_events = [
+            e for e in emitted if e["event_type"] == "execution.engine_diff"
+        ]
+        self.assertEqual(len(engine_diff_events), 1)
+        event = engine_diff_events[0]
+        self.assertEqual(event["kwargs"]["severity"], EventSeverity.WARNING)
+        payload = event["kwargs"]["payload"]
+        self.assertEqual(payload["intent_id"], "intent-r136-2")
+        self.assertIn("quantity", payload["field_diffs"])
+
+    # ---------------------------------------------------- parity invariant
+    def test_shadow_decision_diverged_zero_with_paper_flag_off(self) -> None:
+        """Wave-3-A baseline: the shadow audit emits no `_diverged` event
+        for a normal paper intent.  Paper flag off (legacy path).
+        """
+        control_main._set_execution_engine_shadow_flag(True)
+        control_main._set_execution_engine_paper_flag(False)
+
+        intent = self._make_paper_intent_minimal()
+        diverged_count = self._count_shadow_diverged_for(intent)
+        self.assertEqual(diverged_count, 0)
+
+    def test_shadow_decision_diverged_zero_with_paper_flag_on(self) -> None:
+        """Headline acceptance: enabling the engine paper route does NOT
+        introduce shadow_decision_diverged audits — the engine path's
+        compute_decision still agrees with the legacy paper path.
+        """
+        control_main._set_execution_engine_shadow_flag(True)
+        control_main._set_execution_engine_paper_flag(True)
+
+        intent = self._make_paper_intent_minimal()
+        diverged_count = self._count_shadow_diverged_for(intent)
+        self.assertEqual(diverged_count, 0)
+
+    # ---------------------------------------------------- helpers
+    def _make_paper_intent_minimal(self):
+        from models import (
+            ExecutionIntent,
+            ExecutionPreview,
+            RiskDecision,
+            AccountMode as Mode,
+            Direction,
+        )
+
+        preview = ExecutionPreview(
+            symbol="ETHUSDT", market="perp", mode=Mode.PAPER, side=Direction.BUY,
+            origin="manual", quantity=0.01, price=2000.0, notional="20",
+            action="增仓", allowed=True, current_position_size="0",
+            current_avg_price="0", projected_position_size="0.01",
+            projected_avg_price="2000", available_balance_before="100",
+            available_balance_after="80", estimated_realized_pnl="0",
+            generated_at="2026-04-28T08:00:00+08:00",
+        )
+        decision = RiskDecision(
+            verdict="allow", reason_code="risk.approved", reason_detail="",
+            preview=preview,
+        )
+        return ExecutionIntent(
+            strategy_id="eth-revert-02", strategy_name="ParityHarness",
+            source="manual", mode=Mode.PAPER, symbol="ETHUSDT", market="perp",
+            side=Direction.BUY, quantity=0.01, price=2000.0, signal="buy",
+            preview=preview, decision=decision, parameter_snapshot={},
+            requested_by="desktop_operator", note=None,
+            created_at="2026-04-28T08:00:00+08:00", intent_id="intent-r136-shadow",
+        )
+
+    def _count_shadow_diverged_for(self, intent) -> int:
+        """Run the shadow audit and count the diverged events emitted."""
+        emitted = []
+        original = control_main.repo.add_event
+
+        def spy(event_type, *args, **kwargs):
+            emitted.append(event_type)
+            return original(event_type, *args, **kwargs)
+
+        with patch.object(control_main.repo, "add_event", side_effect=spy):
+            control_main._emit_execution_shadow_decision_audit(intent)
+
+        return sum(
+            1 for e in emitted
+            if e == "execution.shadow_decision_diverged"
+        )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

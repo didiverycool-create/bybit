@@ -300,6 +300,8 @@ from risk_engine import RiskEngine
 from execution_engine import ExecutionEngine
 from execution_diff import (
     DecisionDiff,
+    TradeDiff,
+    compare_paper_executed,
     compare_shadow_decision,
     derive_legacy_verb_from_paper_dispatch,
     derive_legacy_verb_from_reconciliation,
@@ -6805,6 +6807,56 @@ def _emit_execution_shadow_decision_audit(intent: ExecutionIntent) -> None:
             strategy_id=intent.strategy_id,
             parameter_snapshot=intent.parameter_snapshot,
         )
+
+
+def _emit_paper_engine_trade_parity_audit(
+    intent: ExecutionIntent,
+    legacy_trade: TradeRecord,
+    engine_trade: TradeRecord,
+) -> None:
+    """Round 136 — wave-3-B §F.2 commit 5 parity helper.
+
+    Compares the legacy ``repo.execute_strategy_signal`` output with the
+    engine's :class:`TradeRecord` and writes ``execution.engine_diff``
+    (WARNING) when the two diverge.  No audit is emitted when the trades
+    match — keeping the audit log noise-free in the steady state.
+
+    The helper is invoked from the F.4 double-write window (when both
+    paths run for the same intent so the audit can capture genuine
+    drift); wave-3-B ships only the helper + tests so the wiring is
+    ready when wave-3-D switches the live path on.
+    """
+
+    diff: TradeDiff = compare_paper_executed(legacy_trade, engine_trade)
+    if not diff.diverged:
+        return
+
+    payload: Dict[str, Any] = {
+        "strategy_id": diff.strategy_id,
+        "intent_id": intent.intent_id or "",
+        "mode": intent.mode.value,
+        "legacy_trade_id": diff.legacy_trade_id,
+        "engine_trade_id": diff.engine_trade_id,
+        "field_diffs": list(diff.field_diffs),
+        "side_match": diff.side_match,
+        "quantity_match": diff.quantity_match,
+        "price_match": diff.price_match,
+        "status_match": diff.status_match,
+        "mode_match": diff.mode_match,
+        "origin_match": diff.origin_match,
+        "symbol_match": diff.symbol_match,
+        "market_match": diff.market_match,
+    }
+
+    repo.add_event(
+        event_type="execution.engine_diff",
+        source="quant-core",
+        severity=EventSeverity.WARNING,
+        payload=payload,
+        symbol=intent.symbol,
+        strategy_id=intent.strategy_id,
+        parameter_snapshot=intent.parameter_snapshot,
+    )
 
 
 def _dispatch_strategy_signal_from_state(strategy_id: str, payload: StrategyExecutionRequest) -> StrategyExecutionResult:

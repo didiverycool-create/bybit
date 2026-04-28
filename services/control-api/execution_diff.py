@@ -1,4 +1,4 @@
-"""Round 125 — Shadow-mode decision diff helper for P0-4.2 §F.1.
+"""Round 125-136 — Shadow-mode decision diff helper for P0-4.2 §F.1+§F.2.
 
 The shadow path runs :meth:`execution_engine.ExecutionEngine.compute_decision`
 *alongside* the legacy ``_dispatch_paper_intent`` / ``_dispatch_live_intent``
@@ -10,6 +10,15 @@ legacy path.
 Round 129 lands the implementation; Round 125 keeps the public dataclass +
 signature stable so downstream tests (``CompareShadowDecisionRound129Tests``,
 ``ShadowAuditEmissionRound130Tests``) can import the names.
+
+Round 136 — wave-3-B §F.2 commit 5 adds :func:`compare_paper_executed` for
+the F.4 double-write parity contract.  The helper takes the legacy
+:class:`models.TradeRecord` (the trade ``repo.execute_strategy_signal`` would
+have produced) and the engine's :class:`models.TradeRecord` (the trade the
+engine actually wrote via the same path, kept in mock / replay tests for
+parity) and produces a typed :class:`TradeDiff` describing every
+divergence.  The diff is emitted as ``execution.engine_diff`` (WARNING) when
+non-empty.
 """
 
 from __future__ import annotations
@@ -17,7 +26,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import List, Optional
 
-from models import ExecutionDecision
+from models import ExecutionDecision, TradeRecord
 
 
 @dataclass(frozen=True)
@@ -131,6 +140,131 @@ def compare_shadow_decision(
     )
 
 
+# ============================================================================
+# Round 136 — Paper-mode trade parity (P0-4.2 §F.2 commit 5)
+# ============================================================================
+# When the engine route is enabled (``execution_engine.paper=True``), the
+# wave-3-B contract requires a double-write parity check that the engine's
+# produced trade is byte-equivalent to the legacy ``repo.execute_strategy_signal``
+# output.  :func:`compare_paper_executed` is the pure helper that performs
+# that comparison; the audit-emission wiring lives in ``main.py`` so the
+# diff helper stays I/O-free (matches the R125 design contract).
+# ============================================================================
+@dataclass(frozen=True)
+class TradeDiff:
+    """Diff record between the legacy ``repo.execute_strategy_signal``
+    output and the engine's produced :class:`models.TradeRecord`.
+
+    Field-level booleans capture whether the two records agree on each
+    semantic dimension (``side`` / ``quantity`` / ``price`` / ``status`` /
+    ``mode`` / ``origin``).  ``field_diffs`` is the typed list of diverged
+    field names so the audit emission can render a machine-readable
+    summary downstream.
+
+    The ``id`` and ``created_at`` fields are intentionally NOT compared —
+    each call produces a fresh trade id / timestamp by design, so
+    comparing them would always diverge.  The ``pnl`` field is also
+    excluded because pnl text formatting is upstream of this layer (the
+    repo formats it from the trade quantity / price / position).
+    """
+
+    strategy_id: str
+    legacy_trade_id: str
+    engine_trade_id: str
+    side_match: bool
+    quantity_match: bool
+    price_match: bool
+    status_match: bool
+    mode_match: bool
+    origin_match: bool
+    symbol_match: bool
+    market_match: bool
+    field_diffs: List[str] = field(default_factory=list)
+
+    @property
+    def diverged(self) -> bool:
+        """``True`` when any of the comparison fields disagreed."""
+        return bool(self.field_diffs)
+
+
+def compare_paper_executed(
+    legacy_record: TradeRecord,
+    engine_record: TradeRecord,
+) -> TradeDiff:
+    """Compare two :class:`models.TradeRecord` instances for paper-mode
+    parity.
+
+    Pure helper — no I/O.  Returns a :class:`TradeDiff` describing every
+    semantic divergence; ``id`` and ``created_at`` are excluded because
+    each ``repo.execute_strategy_signal`` invocation generates a fresh id
+    + timestamp by design, so comparing them would always disagree.
+    ``pnl`` is also excluded because the formatter upstream of this layer
+    is not deterministic across invocations (it reads current position
+    state at write time).
+
+    The caller (R136 audit emission in ``main.py``) writes
+    ``execution.engine_diff`` (WARNING) when the diff's ``diverged`` flag
+    is True.
+    """
+
+    field_diffs: List[str] = []
+
+    side_match = legacy_record.side == engine_record.side
+    if not side_match:
+        field_diffs.append("side")
+
+    # Quantity comparison uses an absolute-tolerance check because the
+    # legacy ``_create_strategy_trade_locked`` formats quantities through
+    # ``repr(float)`` which can drift sub-LSB; 1e-9 is well below any
+    # symbol's qty-step constraint.
+    qty_diff = abs(float(legacy_record.quantity) - float(engine_record.quantity))
+    quantity_match = qty_diff <= 1e-9
+    if not quantity_match:
+        field_diffs.append("quantity")
+
+    price_diff = abs(float(legacy_record.price) - float(engine_record.price))
+    price_match = price_diff <= 1e-9
+    if not price_match:
+        field_diffs.append("price")
+
+    status_match = legacy_record.status == engine_record.status
+    if not status_match:
+        field_diffs.append("status")
+
+    mode_match = legacy_record.mode == engine_record.mode
+    if not mode_match:
+        field_diffs.append("mode")
+
+    origin_match = legacy_record.origin == engine_record.origin
+    if not origin_match:
+        field_diffs.append("origin")
+
+    symbol_match = legacy_record.symbol == engine_record.symbol
+    if not symbol_match:
+        field_diffs.append("symbol")
+
+    market_match = legacy_record.market == engine_record.market
+    if not market_match:
+        field_diffs.append("market")
+
+    strategy_id = legacy_record.strategy_id or engine_record.strategy_id or ""
+
+    return TradeDiff(
+        strategy_id=strategy_id,
+        legacy_trade_id=legacy_record.id,
+        engine_trade_id=engine_record.id,
+        side_match=side_match,
+        quantity_match=quantity_match,
+        price_match=price_match,
+        status_match=status_match,
+        mode_match=mode_match,
+        origin_match=origin_match,
+        symbol_match=symbol_match,
+        market_match=market_match,
+        field_diffs=field_diffs,
+    )
+
+
 def derive_legacy_verb_from_paper_dispatch() -> str:
     """Return the legacy verb for paper dispatch.
 
@@ -158,7 +292,9 @@ def derive_legacy_verb_from_reconciliation(action: str) -> str:
 
 __all__ = [
     "DecisionDiff",
+    "TradeDiff",
     "compare_shadow_decision",
+    "compare_paper_executed",
     "derive_legacy_verb_from_paper_dispatch",
     "derive_legacy_verb_from_reconciliation",
 ]
