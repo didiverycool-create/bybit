@@ -30814,5 +30814,199 @@ class ExecutePaperBranchTests(unittest.TestCase):
         self.assertEqual(result.intent_id, "")
 
 
+# ============================================================================
+# Round 134 — _dispatch_paper_intent feature-flag gate (P0-4.2 §F.2 Wave-3-B)
+# ============================================================================
+# Wave-3-B §F.2 commit 3 wires ``main._dispatch_paper_intent`` to delegate
+# to ``ExecutionEngine.execute`` when ``execution_engine.paper=True``.  When
+# the flag is ``False`` (default) the legacy path stays verbatim so the
+# pre-wave-3-B behaviour is unchanged.  These tests verify both branches.
+# ============================================================================
+class PaperIntentEngineRouteTests(unittest.TestCase):
+    """``_dispatch_paper_intent`` routing — flag on vs flag off."""
+
+    def setUp(self) -> None:
+        # Snapshot state + flag so each test runs independent of others.
+        self._state_backup = copy.deepcopy(control_main.repo.state)
+        self._original_paper_flag = control_main._get_execution_engine_paper_flag()
+        self.addCleanup(self._restore)
+
+    def _restore(self) -> None:
+        control_main.repo.state = copy.deepcopy(self._state_backup)
+        control_main.repo._persist(control_main.repo.state)
+        control_main._set_execution_engine_paper_flag(self._original_paper_flag)
+
+    def _make_paper_intent(self):
+        from models import (
+            ExecutionIntent,
+            ExecutionPreview,
+            RiskDecision,
+            AccountMode as Mode,
+            Direction,
+        )
+
+        preview = ExecutionPreview(
+            symbol="ETHUSDT",
+            market="perp",
+            mode=Mode.PAPER,
+            side=Direction.BUY,
+            origin="manual",
+            quantity=0.01,
+            price=2000.0,
+            notional="20",
+            action="增仓",
+            allowed=True,
+            current_position_size="0",
+            current_avg_price="0",
+            projected_position_size="0.01",
+            projected_avg_price="2000",
+            available_balance_before="100",
+            available_balance_after="80",
+            estimated_realized_pnl="0",
+            generated_at="2026-04-28T08:00:00+08:00",
+        )
+        decision = RiskDecision(
+            verdict="allow",
+            reason_code="risk.approved",
+            reason_detail="",
+            preview=preview,
+        )
+        return ExecutionIntent(
+            strategy_id="eth-revert-02",
+            strategy_name="PaperRouteHarness",
+            source="manual",
+            mode=Mode.PAPER,
+            symbol="ETHUSDT",
+            market="perp",
+            side=Direction.BUY,
+            quantity=0.01,
+            price=2000.0,
+            signal="buy",
+            preview=preview,
+            decision=decision,
+            parameter_snapshot={},
+            requested_by="desktop_operator",
+            note=None,
+            created_at="2026-04-28T08:00:00+08:00",
+            intent_id="intent-r134-route",
+        )
+
+    def test_flag_off_uses_legacy_path_and_does_not_call_engine_execute(self) -> None:
+        """When the paper flag is off the dispatcher must NOT call
+        ``execution_engine.execute`` — the legacy code path stays in
+        charge of the trade write.
+
+        Patches the class method (not the instance) because
+        :class:`ExecutionEngine` uses ``__slots__`` so instance-level
+        ``patch.object`` fails with "attribute is read-only".
+        """
+        from execution_engine import ExecutionEngine
+        control_main._set_execution_engine_paper_flag(False)
+        intent = self._make_paper_intent()
+
+        with patch.object(ExecutionEngine, "execute") as spy_execute:
+            result = control_main._dispatch_paper_intent(intent)
+
+        spy_execute.assert_not_called()
+        self.assertEqual(result.kind, "paper_trade")
+        self.assertIsNotNone(result.trade)
+
+    def test_flag_on_routes_through_engine_execute(self) -> None:
+        """When the paper flag is on the dispatcher delegates to the
+        engine's ``execute``; the wire-shape result still resolves to
+        ``kind="paper_trade"`` so the desktop client sees no difference.
+
+        Records the call via a sidecar list rather than patching the
+        method (the class uses ``__slots__`` which makes ``patch.object``
+        on the instance fail).  Wrapping the real method preserves the
+        legacy ``repo.execute_strategy_signal`` write side-effect so the
+        wire-shape assertion still holds.
+        """
+        from execution_engine import ExecutionEngine
+        control_main._set_execution_engine_paper_flag(True)
+        intent = self._make_paper_intent()
+
+        observed: List[Any] = []
+        original_execute = ExecutionEngine.execute
+
+        def spy_execute(self_engine, decision):
+            observed.append(decision)
+            return original_execute(self_engine, decision)
+
+        with patch.object(ExecutionEngine, "execute", spy_execute):
+            result = control_main._dispatch_paper_intent(intent)
+
+        self.assertEqual(len(observed), 1)
+        decision = observed[0]
+        self.assertEqual(decision.intent.strategy_id, "eth-revert-02")
+        self.assertEqual(decision.intent.intent_id, "intent-r134-route")
+        # Wire-shape preserved.
+        self.assertEqual(result.kind, "paper_trade")
+        self.assertEqual(result.strategy_id, "eth-revert-02")
+        self.assertIsNotNone(result.trade)
+
+    def test_flag_on_writes_one_trade_no_double_dispatch(self) -> None:
+        """The engine's ``_apply_paper`` calls
+        ``repo.execute_strategy_signal`` once; the dispatcher must NOT
+        call it a second time on the engine path (otherwise the same
+        intent would create two trades).
+        """
+        control_main._set_execution_engine_paper_flag(True)
+        intent = self._make_paper_intent()
+
+        before_trades = len(control_main.repo.state.trades)
+
+        with patch.object(
+            control_main.repo,
+            "execute_strategy_signal",
+            wraps=control_main.repo.execute_strategy_signal,
+        ) as spy_legacy:
+            control_main._dispatch_paper_intent(intent)
+
+        # Exactly one repo write per dispatch.
+        self.assertEqual(spy_legacy.call_count, 1)
+        # Exactly one new trade in state.
+        self.assertEqual(
+            len(control_main.repo.state.trades) - before_trades, 1
+        )
+
+    def test_flag_default_is_false(self) -> None:
+        """Wave-3-B's default is paper-off so production rollouts are
+        opt-in.
+        """
+        control_main._FEATURE_FLAGS_RUNTIME.pop("execution_engine.paper", None)
+        self.assertFalse(control_main._get_execution_engine_paper_flag())
+
+    def test_legacy_path_still_clears_manual_execution_alerts(self) -> None:
+        """The legacy branch (flag off) keeps calling
+        ``_clear_strategy_manual_execution_alerts`` so operators see
+        recovery — the wave-3-A behaviour is unchanged.
+        """
+        control_main._set_execution_engine_paper_flag(False)
+        intent = self._make_paper_intent()
+
+        with patch.object(
+            control_main, "_clear_strategy_manual_execution_alerts"
+        ) as spy_clear:
+            control_main._dispatch_paper_intent(intent)
+
+        spy_clear.assert_called_once()
+
+    def test_engine_path_clears_manual_execution_alerts(self) -> None:
+        """The engine branch must also clear manual-execution alerts
+        (delegated through ``_apply_paper``) so the two branches are
+        symmetric on operator-visible side effects.
+        """
+        control_main._set_execution_engine_paper_flag(True)
+        intent = self._make_paper_intent()
+
+        with patch.object(
+            control_main, "_clear_strategy_manual_execution_alerts"
+        ) as spy_clear:
+            control_main._dispatch_paper_intent(intent)
+
+        spy_clear.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

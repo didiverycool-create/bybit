@@ -522,6 +522,17 @@ _EXECUTION_ENGINE_SHADOW_FLAG_NAME = "execution_engine.shadow"
 _EXECUTION_ENGINE_SHADOW_DEFAULT = True
 
 
+# Round 134 — wave-3-B §F.2 Paper Mode default-OFF toggle (P0-design-decisions
+# §G.3 + roadmap §F.2 安全口径).  When ``execution_engine.paper=True`` the
+# Paper dispatcher routes to ``ExecutionEngine.execute``; default ``False``
+# preserves the legacy ``repo.execute_strategy_signal`` path verbatim.  The
+# flag is intentionally *not* default-True even though the engine paper
+# branch is byte-equivalent — switching the active dispatch path is a
+# behaviour change and must be opt-in.
+_EXECUTION_ENGINE_PAPER_FLAG_NAME = "execution_engine.paper"
+_EXECUTION_ENGINE_PAPER_DEFAULT = False
+
+
 # Round 131 — in-process feature-flag store.  Wave-3-A keeps the canonical
 # state in memory because the SQLite persistence layer (P0-5.1) is not yet
 # wired into ``main.py`` at module load time; the persistence DAO
@@ -533,6 +544,7 @@ _EXECUTION_ENGINE_SHADOW_DEFAULT = True
 # behave the same as the design doc says.
 _FEATURE_FLAGS_RUNTIME: Dict[str, bool] = {
     _EXECUTION_ENGINE_SHADOW_FLAG_NAME: _EXECUTION_ENGINE_SHADOW_DEFAULT,
+    _EXECUTION_ENGINE_PAPER_FLAG_NAME: _EXECUTION_ENGINE_PAPER_DEFAULT,
 }
 
 
@@ -562,6 +574,30 @@ def _set_execution_engine_shadow_flag(value: bool) -> None:
     """
 
     _FEATURE_FLAGS_RUNTIME[_EXECUTION_ENGINE_SHADOW_FLAG_NAME] = bool(value)
+
+
+def _get_execution_engine_paper_flag() -> bool:
+    """Return ``True`` if the Paper Mode engine route is enabled.
+
+    Round 134 — mirrors :func:`_get_execution_engine_shadow_flag` shape so
+    callers (the legacy ``_dispatch_paper_intent`` wrapper) read both flags
+    through one idiom.  Default is ``False`` until production opts in.
+    """
+
+    return bool(
+        _FEATURE_FLAGS_RUNTIME.get(
+            _EXECUTION_ENGINE_PAPER_FLAG_NAME,
+            _EXECUTION_ENGINE_PAPER_DEFAULT,
+        )
+    )
+
+
+def _set_execution_engine_paper_flag(value: bool) -> None:
+    """Override the Paper Mode flag.  Test hook only — production sets
+    the flag through the persistence DAO so the audit trail picks it up.
+    """
+
+    _FEATURE_FLAGS_RUNTIME[_EXECUTION_ENGINE_PAPER_FLAG_NAME] = bool(value)
 
 
 openclaw = OpenClawGatewayClient()
@@ -6250,11 +6286,72 @@ def _build_execution_intent_from_state(
 
 
 def _dispatch_paper_intent(intent: ExecutionIntent) -> StrategyExecutionResult:
-    """Realise a Paper strategy intent: delegate trade creation + parameter
-    freezing to ``repo.execute_strategy_signal`` (itself rebuilt on top of
-    ``_execute_strategy_signal_from_intent_locked`` in R57) and clear any
-    lingering manual-execution alerts so the operator sees recovery.
+    """Realise a Paper strategy intent.
+
+    Round 134 — wave-3-B §F.2 commit 3 introduces a feature-flag gate.
+    When ``execution_engine.paper=True`` the dispatcher routes through
+    :meth:`ExecutionEngine.execute` (R132's paper branch); when the flag
+    is ``False`` (default) the legacy code path stays verbatim so the
+    pre-wave-3-B behaviour is unchanged.  The two branches produce a
+    byte-equivalent :class:`StrategyExecutionResult` because:
+
+    * The engine's ``_apply_paper`` calls ``repo.execute_strategy_signal``
+      with the same ``(strategy_id, requested_by, note)`` triplet the
+      legacy branch does (proved by ``ExecutePaperBranchTests``).
+    * Both branches call ``_clear_strategy_manual_execution_alerts`` with
+      the same ``resolution_detail`` Chinese copy.
+    * ``StrategyExecutionResult.kind="paper_trade"`` and the wire schema
+      are owned by this wrapper, not the engine — so the desktop client
+      sees the same response either way.
+
+    The engine path additionally writes three execution_events rows
+    (PROPOSED → PREVIEWED → ROUTED) per R133, which the legacy path does
+    not emit; this is an additive audit upgrade and the desktop UI does
+    not depend on it.
+
+    Parity-driven implementation note: when the flag is on we still call
+    ``repo.execute_strategy_signal`` indirectly (through the engine), so
+    the returned ``trade`` is structurally identical to the legacy call.
+    The wrapper builds the :class:`StrategyExecutionResult` here in both
+    branches to keep the wire-shape contract owned by ``main.py``.
     """
+
+    if _get_execution_engine_paper_flag():
+        # Engine route — F.2 commit 3.  The engine's paper branch reads
+        # ``decision.intent`` and re-runs ``repo.execute_strategy_signal``
+        # internally, so we synthesize the typed ``ExecutionDecision``
+        # via ``compute_decision`` before handing it off.  This keeps the
+        # control flow uniform with the wave-3-C live path that will use
+        # the same compute → execute pipeline.
+        state = repo.snapshot()
+        decision = execution_engine.compute_decision(intent, state)
+        result = execution_engine.execute(decision)
+        # The engine wrote the trade through the repo; pull the freshest
+        # one back so the wire response carries the same field shape the
+        # legacy branch returns.  Filtering by strategy + sorted-most-
+        # recent matches the legacy branch's "single trade just written"
+        # contract because the engine call is serialised by the repo
+        # lock, the same way the legacy path is.
+        trade = next(
+            (
+                item
+                for item in repo.snapshot().trades
+                if item.strategy_id == intent.strategy_id
+                and item.origin == "strategy"
+            ),
+            None,
+        )
+        return StrategyExecutionResult(
+            kind="paper_trade",
+            strategy_id=intent.strategy_id,
+            mode=intent.mode,
+            preview=intent.preview,
+            trade=trade,
+            message=f"{intent.strategy_name} 已按当前策略信号写入 Paper 成交。",
+            generated_at=datetime.now(timezone.utc).astimezone().isoformat(),
+        )
+
+    # Legacy path (flag off — default).  Behaviour identical to wave-3-A.
     trade = repo.execute_strategy_signal(
         intent.strategy_id,
         intent.requested_by,
