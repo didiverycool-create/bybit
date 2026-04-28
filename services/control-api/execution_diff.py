@@ -67,7 +67,7 @@ def compare_shadow_decision(
     legacy dispatcher's inferred branch.
 
     The legacy paper / live dispatchers do not emit a
-    :class:`ExecutionDecision`-shaped record; the caller (Round 130's audit
+    :class:`ExecutionDecision`-shaped record; the caller (Round 131's audit
     emission in ``main._dispatch_execution_intent``) inspects the legacy
     branch outputs (``LiveOrderReconciliation`` for live, the
     ``StrategyExecutionResult.kind=="paper_trade"`` short-path for paper) and
@@ -85,13 +85,80 @@ def compare_shadow_decision(
     * ``legacy_stale_order_ids`` — order ids the legacy path would cancel
       first; defaults to ``[]``.
 
-    Round 129 lands the implementation; Round 125 keeps a stub returning a
-    sentinel diff so the dataclass surface is exercised.
+    The diff records each disagreement as a typed entry in
+    ``field_diffs`` so the audit emission can render a machine-readable
+    summary rather than re-deriving the difference downstream.  Field
+    names follow ``<dotted.path>`` convention to match other typed audit
+    fields in the codebase (e.g. ``target_order.order_id``).
     """
 
-    raise NotImplementedError(
-        "compare_shadow_decision lands in Round 129 (wave-3-A F.1)"
+    intent_id = new_decision.intent.intent_id or ""
+    new_target_id = (
+        new_decision.target_order.order.order_id
+        if new_decision.target_order is not None
+        else None
+    )
+    new_stale_ids = [item.order.order_id for item in new_decision.stale_orders]
+    legacy_stales = list(legacy_stale_order_ids or [])
+
+    field_diffs: List[str] = []
+
+    verb_match = new_decision.verb == legacy_verb
+    if not verb_match:
+        field_diffs.append("verb")
+
+    reason_code_match = new_decision.reason_code == legacy_reason_code
+    if not reason_code_match:
+        field_diffs.append("reason_code")
+
+    if new_target_id != legacy_target_order_id:
+        field_diffs.append("target_order.order_id")
+
+    # Compare stale order id sets (order-insensitive — the legacy path may
+    # cancel them in any order, so the sets matter, not the sequence).
+    if set(new_stale_ids) != set(legacy_stales):
+        field_diffs.append("stale_orders")
+
+    return DecisionDiff(
+        intent_id=intent_id,
+        verb_match=verb_match,
+        new_verb=new_decision.verb,
+        legacy_verb=legacy_verb,
+        reason_code_match=reason_code_match,
+        new_reason_code=new_decision.reason_code,
+        legacy_reason_code=legacy_reason_code,
+        field_diffs=field_diffs,
     )
 
 
-__all__ = ["DecisionDiff", "compare_shadow_decision"]
+def derive_legacy_verb_from_paper_dispatch() -> str:
+    """Return the legacy verb for paper dispatch.
+
+    The legacy ``_dispatch_paper_intent`` always submits; this helper makes
+    that explicit so the audit emission (R131) can reference a single
+    source rather than duplicating the literal in two places.
+    """
+
+    return "submit"
+
+
+def derive_legacy_verb_from_reconciliation(action: str) -> str:
+    """Translate the legacy
+    :class:`~models.LiveOrderReconciliation.action` literal onto the
+    :class:`~models.ExecutionVerb` literal the engine emits, so the audit
+    emission (R131) can compare the two without re-mapping inline.
+    """
+
+    return {
+        "reuse": "keep",
+        "amend": "amend",
+        "submit": "submit",
+    }.get(action, action)
+
+
+__all__ = [
+    "DecisionDiff",
+    "compare_shadow_decision",
+    "derive_legacy_verb_from_paper_dispatch",
+    "derive_legacy_verb_from_reconciliation",
+]

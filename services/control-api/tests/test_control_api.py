@@ -30037,5 +30037,250 @@ class ComputeDecisionParityRound129Tests(unittest.TestCase):
         self.assertIs(decision.risk_decision, intent.decision)
 
 
+# ============================================================================
+# Round 130 — compare_shadow_decision DecisionDiff coverage (P0-4.2 §F.1)
+# ----------------------------------------------------------------------------
+# Round 130 lands ``execution_diff.compare_shadow_decision`` (the body the
+# R125 skeleton stubbed).  The tests exercise the 4 distinct outcomes the
+# audit emission needs to discriminate:
+#
+#   (a) full match — verb / reason_code / target_order / stale_orders all
+#       align — emits ``execution.shadow_decision`` (INFO).
+#   (b) verb mismatch — engine and legacy disagree on the verb itself.
+#   (c) reason_code mismatch — verb agrees but reason_code does not.
+#   (d) field micro-diff — verb + reason_code agree but target / stale
+#       differ (covers a corner case where the engine wraps a slightly
+#       different OrderRecord).
+# ============================================================================
+class CompareShadowDecisionRound130Tests(unittest.TestCase):
+    """Diff helper coverage."""
+
+    def _make_decision(
+        self,
+        *,
+        verb: str = "submit",
+        reason_code: str = "order.no_existing_match",
+        target_order_id: Optional[str] = None,
+        stale_order_ids: Optional[List[str]] = None,
+        intent_id: str = "intent-r130-01",
+    ):
+        from models import (
+            ExecutionDecision,
+            ExecutionIntent,
+            ExecutionPreview,
+            RiskDecision,
+            ActiveExchangeOrder,
+            OrderRecord,
+        )
+        preview = ExecutionPreview(
+            symbol="BTCUSDT",
+            market="perp",
+            mode=AccountMode.LIVE,
+            side=Direction.BUY,
+            origin="strategy",
+            quantity=0.001,
+            price=10000.0,
+            notional="10",
+            action="开多",
+            allowed=True,
+            current_position_size="0",
+            current_avg_price="0",
+            projected_position_size="0.001",
+            projected_avg_price="10000",
+            available_balance_before="100",
+            available_balance_after="90",
+            estimated_realized_pnl="0",
+            generated_at="2026-04-28T08:00:00+08:00",
+        )
+        decision_risk = RiskDecision(
+            verdict="allow",
+            reason_code="risk.approved",
+            reason_detail="",
+            preview=preview,
+        )
+        intent = ExecutionIntent(
+            strategy_id="strat-1",
+            strategy_name="DiffHarness",
+            source="auto",
+            mode=AccountMode.LIVE,
+            symbol="BTCUSDT",
+            market="perp",
+            side=Direction.BUY,
+            quantity=0.001,
+            price=10000.0,
+            signal="buy",
+            preview=preview,
+            decision=decision_risk,
+            parameter_snapshot={},
+            requested_by="strategy_runtime_worker",
+            note=None,
+            created_at="2026-04-28T08:00:00+08:00",
+            intent_id=intent_id,
+        )
+
+        target_order = None
+        if target_order_id is not None:
+            target_order = ActiveExchangeOrder(
+                order=OrderRecord(
+                    source="bybit_private",
+                    origin="strategy",
+                    strategy_id="strat-1",
+                    order_id=target_order_id,
+                    symbol="BTCUSDT",
+                    market="perp",
+                    side=Direction.BUY,
+                    order_type="limit",
+                    qty="0.001",
+                    price="10000",
+                    status="new",
+                    created_at="2026-04-28T08:00:00+08:00",
+                ),
+                intent_id=intent_id,
+            )
+        stales = []
+        for sid in stale_order_ids or []:
+            stales.append(
+                ActiveExchangeOrder(
+                    order=OrderRecord(
+                        source="bybit_private",
+                        origin="strategy",
+                        strategy_id="strat-1",
+                        order_id=sid,
+                        symbol="BTCUSDT",
+                        market="perp",
+                        side=Direction.SELL,
+                        order_type="limit",
+                        qty="0.001",
+                        price="10000",
+                        status="new",
+                        created_at="2026-04-28T08:00:00+08:00",
+                    ),
+                    intent_id=intent_id,
+                )
+            )
+        return ExecutionDecision(
+            verb=verb,
+            intent=intent,
+            target_order=target_order,
+            stale_orders=stales,
+            risk_decision=decision_risk,
+            reason_code=reason_code,
+        )
+
+    def test_full_match_yields_no_field_diffs(self) -> None:
+        from execution_diff import compare_shadow_decision
+
+        decision = self._make_decision(
+            verb="submit",
+            reason_code="order.no_existing_match",
+            stale_order_ids=["opp-01"],
+        )
+        diff = compare_shadow_decision(
+            decision,
+            legacy_verb="submit",
+            legacy_reason_code="order.no_existing_match",
+            legacy_target_order_id=None,
+            legacy_stale_order_ids=["opp-01"],
+        )
+        self.assertTrue(diff.verb_match)
+        self.assertTrue(diff.reason_code_match)
+        self.assertEqual(diff.field_diffs, [])
+        self.assertFalse(diff.diverged)
+        self.assertEqual(diff.intent_id, "intent-r130-01")
+
+    def test_verb_mismatch(self) -> None:
+        from execution_diff import compare_shadow_decision
+
+        decision = self._make_decision(verb="amend",
+                                        reason_code="order.differs_numeric",
+                                        target_order_id="match-01")
+        diff = compare_shadow_decision(
+            decision,
+            legacy_verb="submit",  # legacy disagrees
+            legacy_reason_code="order.differs_numeric",
+            legacy_target_order_id="match-01",
+        )
+        self.assertFalse(diff.verb_match)
+        self.assertTrue(diff.reason_code_match)
+        self.assertIn("verb", diff.field_diffs)
+        self.assertTrue(diff.diverged)
+        self.assertEqual(diff.new_verb, "amend")
+        self.assertEqual(diff.legacy_verb, "submit")
+
+    def test_reason_code_mismatch(self) -> None:
+        from execution_diff import compare_shadow_decision
+
+        decision = self._make_decision(
+            verb="amend",
+            reason_code="order.differs_numeric",
+            target_order_id="match-01",
+        )
+        diff = compare_shadow_decision(
+            decision,
+            legacy_verb="amend",
+            legacy_reason_code="order.requires_reduce_only",  # disagree
+            legacy_target_order_id="match-01",
+        )
+        self.assertTrue(diff.verb_match)
+        self.assertFalse(diff.reason_code_match)
+        self.assertIn("reason_code", diff.field_diffs)
+        self.assertNotIn("verb", diff.field_diffs)
+        self.assertTrue(diff.diverged)
+
+    def test_field_micro_diff_target_order(self) -> None:
+        from execution_diff import compare_shadow_decision
+
+        decision = self._make_decision(
+            verb="keep",
+            reason_code="order.matches_target",
+            target_order_id="engine-target",
+        )
+        diff = compare_shadow_decision(
+            decision,
+            legacy_verb="keep",
+            legacy_reason_code="order.matches_target",
+            legacy_target_order_id="legacy-target",  # different id
+        )
+        # Verb / reason_code agree, but target_order does not.
+        self.assertTrue(diff.verb_match)
+        self.assertTrue(diff.reason_code_match)
+        self.assertIn("target_order.order_id", diff.field_diffs)
+        self.assertTrue(diff.diverged)
+
+    def test_field_micro_diff_stale_orders(self) -> None:
+        from execution_diff import compare_shadow_decision
+
+        decision = self._make_decision(
+            verb="submit",
+            reason_code="order.no_existing_match",
+            stale_order_ids=["opp-01", "opp-02"],
+        )
+        diff = compare_shadow_decision(
+            decision,
+            legacy_verb="submit",
+            legacy_reason_code="order.no_existing_match",
+            legacy_target_order_id=None,
+            legacy_stale_order_ids=["opp-01"],  # missing opp-02
+        )
+        self.assertTrue(diff.verb_match)
+        self.assertTrue(diff.reason_code_match)
+        self.assertIn("stale_orders", diff.field_diffs)
+
+    def test_legacy_verb_helpers(self) -> None:
+        from execution_diff import (
+            derive_legacy_verb_from_paper_dispatch,
+            derive_legacy_verb_from_reconciliation,
+        )
+
+        self.assertEqual(derive_legacy_verb_from_paper_dispatch(), "submit")
+        self.assertEqual(derive_legacy_verb_from_reconciliation("reuse"), "keep")
+        self.assertEqual(
+            derive_legacy_verb_from_reconciliation("amend"), "amend"
+        )
+        self.assertEqual(
+            derive_legacy_verb_from_reconciliation("submit"), "submit"
+        )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
