@@ -29161,5 +29161,96 @@ class BacktestEngineEdgeCaseRound122Tests(unittest.TestCase):
         self.assertEqual(engine_result, wrapper_result)
 
 
+# ============================================================================
+# Round 125 — ExecutionEngine module skeleton (P0-4.2 §F.1 Shadow Mode)
+# ----------------------------------------------------------------------------
+# Round 125 lands the public skeleton of ``execution_engine`` /
+# ``execution_state_machine`` / ``execution_diff``.  These tests guard the
+# module shape (importable, public symbols exposed, signatures present) so
+# downstream rounds (R126-R131) can extend the bodies without breaking the
+# surface contract.
+# ============================================================================
+class ExecutionEngineSkeletonRound125Tests(unittest.TestCase):
+    """Module skeleton contract for the wave-3-A Shadow Mode trio.
+
+    The three modules must be importable independently and re-export the
+    canonical symbols listed in ``docs/P0-4.2-implementation-roadmap-2026-04-27.md``
+    §B (no surprise typos in public names).  Round 125 ships skeletons only,
+    so the bodies raise :class:`NotImplementedError`; the tests cover the
+    surface, not the behaviour.
+    """
+
+    def test_execution_engine_module_imports_and_exposes_class(self) -> None:
+        import execution_engine  # type: ignore
+
+        self.assertTrue(hasattr(execution_engine, "ExecutionEngine"))
+        self.assertIn("ExecutionEngine", execution_engine.__all__)
+
+    def test_execution_state_machine_exposes_nine_states(self) -> None:
+        import execution_state_machine as esm  # type: ignore
+
+        # The 9 states from §C.1 must all be exported as module-level constants.
+        expected_states = {
+            "PROPOSED",
+            "PREVIEWED",
+            "ROUTED",
+            "ACKED",
+            "PARTIALLY_FILLED",
+            "FILLED",
+            "CANCELED",
+            "REJECTED",
+            "EXTERNALLY_MODIFIED",
+        }
+        self.assertEqual(esm.EXECUTION_STATES, frozenset(expected_states))
+        self.assertEqual(
+            esm.EXECUTION_TERMINAL_STATES,
+            frozenset({"FILLED", "CANCELED", "REJECTED", "EXTERNALLY_MODIFIED"}),
+        )
+
+    def test_execution_state_machine_graph_class_exists(self) -> None:
+        import execution_state_machine as esm  # type: ignore
+
+        # Round 125 keeps LEGAL_TRANSITIONS empty; R126 fills the table from
+        # the design doc.  The placeholder shape must still be a Mapping.
+        self.assertTrue(hasattr(esm.ExecutionStateGraph, "LEGAL_TRANSITIONS"))
+        self.assertEqual(dict(esm.ExecutionStateGraph.LEGAL_TRANSITIONS), {})
+
+    def test_validate_transition_rejects_unknown_states(self) -> None:
+        import execution_state_machine as esm  # type: ignore
+
+        # Unknown ``from_state`` / ``to_state`` must always be rejected even
+        # without the legal-transition table populated.
+        self.assertFalse(esm.validate_transition("BOGUS", "ev", "FILLED"))
+        self.assertFalse(esm.validate_transition("PROPOSED", "ev", "BOGUS"))
+
+    def test_execution_diff_decision_diff_is_frozen_dataclass(self) -> None:
+        import dataclasses
+
+        import execution_diff  # type: ignore
+
+        self.assertTrue(dataclasses.is_dataclass(execution_diff.DecisionDiff))
+        self.assertTrue(execution_diff.DecisionDiff.__dataclass_params__.frozen)
+        # ``compare_shadow_decision`` is a public callable surface.
+        self.assertTrue(callable(execution_diff.compare_shadow_decision))
+
+    def test_execution_engine_compute_decision_signature_is_present(self) -> None:
+        import inspect
+
+        import execution_engine  # type: ignore
+
+        # The three public methods (compute_decision / execute / recover)
+        # must exist on the class so downstream rounds slot bodies in.
+        for method_name in ("compute_decision", "execute", "recover"):
+            self.assertTrue(
+                callable(getattr(execution_engine.ExecutionEngine, method_name))
+            )
+
+        # ``compute_decision(intent, state) -> ExecutionDecision`` per §B.1.
+        sig = inspect.signature(execution_engine.ExecutionEngine.compute_decision)
+        self.assertEqual(
+            list(sig.parameters.keys()), ["self", "intent", "state"]
+        )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
