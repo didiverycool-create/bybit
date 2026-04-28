@@ -29813,5 +29813,229 @@ class ExecutionIntentExtendedFieldsRound128Tests(unittest.TestCase):
             self.assertNotEqual(classified, "recovery")
 
 
+# ============================================================================
+# Round 129 — ExecutionEngine.compute_decision parity (P0-4.2 §F.1 Shadow)
+# ----------------------------------------------------------------------------
+# Round 129 implements ``ExecutionEngine.compute_decision`` as a typed
+# wrapper around the legacy classifier(s).  The parity contract is
+# byte-equal: the engine's output must match what the legacy
+# ``_classify_live_order_reconciliation`` (live) and ``_dispatch_paper_intent``
+# (paper) branches would have produced, just surfaced as a typed
+# :class:`ExecutionDecision`.  These tests guard the 5 canonical outcomes
+# documented in the design doc §F.1:
+#
+#   1. paper.submit (paper mode always submits)
+#   2. order.no_existing_match → verb="submit"
+#   3. order.matches_target → verb="keep" (legacy "reuse")
+#   4. order.differs_numeric → verb="amend"
+#   5. order.requires_reduce_only → verb="amend"
+# ============================================================================
+class ComputeDecisionParityRound129Tests(unittest.TestCase):
+    """Byte-equal parity between the engine's ``compute_decision`` output
+    and the legacy ``_classify_live_order_reconciliation`` /
+    ``_dispatch_paper_intent`` branching.
+
+    Engines have access to :func:`main._classify_live_order_reconciliation`
+    via late binding (see :func:`execution_engine._resolve_main_module`),
+    so these tests construct an :class:`ExecutionEngine` against the
+    module-level singletons and assert each outcome lines up.
+    """
+
+    def _engine(self):
+        import execution_engine
+        return execution_engine.ExecutionEngine(
+            repo=control_main.repo,
+            persistence=None,
+            risk_engine=control_main.risk_engine,
+        )
+
+    def _live_intent(self, *, side: Direction = Direction.BUY,
+                     quantity: float = 0.25, price: float = 42_100.0,
+                     mode=AccountMode.LIVE):
+        from models import ExecutionIntent, ExecutionPreview
+        from risk_decision import evaluate_risk_decision
+
+        preview = ExecutionPreview(
+            symbol="BTCUSDT",
+            market="perp",
+            mode=mode,
+            side=side,
+            origin="strategy",
+            quantity=quantity,
+            price=price,
+            notional=f"{quantity * price:.2f}",
+            action="开多" if side == Direction.BUY else "开空",
+            allowed=True,
+            warnings=[],
+            current_position_size="0",
+            current_avg_price="--",
+            projected_position_size=str(quantity),
+            projected_avg_price=str(price),
+            available_balance_before="50000.00",
+            available_balance_after="39475.00",
+            estimated_realized_pnl="--",
+            generated_at="2026-04-28T08:00:00+08:00",
+        )
+        return ExecutionIntent(
+            strategy_id="intent-r129-01",
+            strategy_name="ParityHarness",
+            source="auto",
+            mode=mode,
+            symbol="BTCUSDT",
+            market="perp",
+            side=side,
+            quantity=quantity,
+            price=price,
+            signal="long",
+            preview=preview,
+            decision=evaluate_risk_decision(preview),
+            parameter_snapshot={},
+            requested_by="strategy_runtime_worker",
+            note=None,
+            created_at="2026-04-28T08:00:00+08:00",
+        )
+
+    def _order(self, *, order_id: str, side: Direction = Direction.BUY,
+               qty: str = "0.25", price: str = "42100.00",
+               status: str = "new"):
+        from models import OrderRecord
+        return OrderRecord(
+            source="bybit_private",
+            origin="strategy",
+            strategy_id="intent-r129-01",
+            order_id=order_id,
+            symbol="BTCUSDT",
+            market="perp",
+            side=side,
+            order_type="limit",
+            qty=qty,
+            price=price,
+            status=status,
+            created_at="2026-04-28T07:00:00+08:00",
+        )
+
+    # ----- Paper mode ----------------------------------------------------
+    def test_paper_mode_always_submit(self) -> None:
+        engine = self._engine()
+        intent = self._live_intent(mode=AccountMode.PAPER)
+
+        decision = engine.compute_decision(intent, control_main.repo.snapshot())
+
+        self.assertEqual(decision.verb, "submit")
+        self.assertEqual(decision.reason_code, "paper.submit")
+        self.assertIsNone(decision.target_order)
+        self.assertEqual(decision.stale_orders, [])
+        # The new_order_request must mirror the intent's numeric fields.
+        self.assertIsNotNone(decision.new_order_request)
+        self.assertEqual(decision.new_order_request.quantity, intent.quantity)
+        self.assertEqual(decision.new_order_request.price, intent.price)
+        # Pure: same intent must yield identical decision verb / reason_code.
+        decision_again = engine.compute_decision(intent, control_main.repo.snapshot())
+        self.assertEqual(decision_again.verb, decision.verb)
+        self.assertEqual(decision_again.reason_code, decision.reason_code)
+
+    # ----- Live mode parity with _classify_live_order_reconciliation -----
+    def _patch_open_orders(self, orders):
+        """Patch :func:`main.parse_open_orders` to return the supplied
+        order set so the engine's ``_collect_existing_strategy_orders``
+        sees the same input the legacy live dispatcher does in production.
+        """
+        return patch.object(
+            control_main, "parse_open_orders", return_value=list(orders)
+        )
+
+    def test_live_submit_when_no_matching_order(self) -> None:
+        engine = self._engine()
+        intent = self._live_intent(side=Direction.BUY)
+        opposite = self._order(order_id="opp-01", side=Direction.SELL)
+
+        with self._patch_open_orders([opposite]):
+            decision = engine.compute_decision(
+                intent, control_main.repo.snapshot()
+            )
+
+        # Parity: legacy classifier for the same input must also return submit.
+        legacy = control_main._classify_live_order_reconciliation(
+            intent, [opposite], requires_reduce_only=False,
+        )
+        self.assertEqual(decision.verb, "submit")
+        self.assertEqual(decision.reason_code, legacy.reason_code)
+        self.assertEqual(decision.reason_code, "order.no_existing_match")
+        self.assertIsNone(decision.target_order)
+        self.assertEqual(
+            [o.order.order_id for o in decision.stale_orders], ["opp-01"]
+        )
+        self.assertIsNotNone(decision.new_order_request)
+
+    def test_live_keep_when_matching_order_matches(self) -> None:
+        engine = self._engine()
+        intent = self._live_intent(side=Direction.BUY,
+                                    quantity=0.25, price=42_100.0)
+        matching = self._order(order_id="match-01", qty="0.25",
+                                price="42100.00")
+        opposite = self._order(order_id="opp-01", side=Direction.SELL)
+
+        with self._patch_open_orders([matching, opposite]):
+            decision = engine.compute_decision(
+                intent, control_main.repo.snapshot()
+            )
+
+        # Legacy classifier returns ``"reuse"`` → engine maps to ``"keep"``.
+        legacy = control_main._classify_live_order_reconciliation(
+            intent, [matching, opposite], requires_reduce_only=False,
+        )
+        self.assertEqual(legacy.action, "reuse")
+        self.assertEqual(decision.verb, "keep")
+        self.assertEqual(decision.reason_code, legacy.reason_code)
+        self.assertEqual(decision.reason_code, "order.matches_target")
+        self.assertIsNotNone(decision.target_order)
+        self.assertEqual(decision.target_order.order.order_id, "match-01")
+        self.assertEqual(
+            [o.order.order_id for o in decision.stale_orders], ["opp-01"]
+        )
+        # ``keep`` does not emit a new_order_request.
+        self.assertIsNone(decision.new_order_request)
+
+    def test_live_amend_when_quantity_differs(self) -> None:
+        engine = self._engine()
+        intent = self._live_intent(side=Direction.BUY,
+                                    quantity=0.25, price=42_100.0)
+        diff_qty = self._order(order_id="amend-qty", qty="0.50",
+                                price="42100.00")
+
+        with self._patch_open_orders([diff_qty]):
+            decision = engine.compute_decision(
+                intent, control_main.repo.snapshot()
+            )
+
+        legacy = control_main._classify_live_order_reconciliation(
+            intent, [diff_qty], requires_reduce_only=False,
+        )
+        self.assertEqual(legacy.action, "amend")
+        self.assertEqual(decision.verb, "amend")
+        self.assertEqual(decision.reason_code, legacy.reason_code)
+        self.assertEqual(decision.reason_code, "order.differs_numeric")
+        self.assertIsNotNone(decision.target_order)
+        self.assertEqual(decision.target_order.order.order_id, "amend-qty")
+        # ``amend`` includes a new_order_request.
+        self.assertIsNotNone(decision.new_order_request)
+        self.assertEqual(decision.new_order_request.quantity, 0.25)
+
+    def test_live_decision_intent_is_passed_through(self) -> None:
+        """The engine's ExecutionDecision.intent must match the input intent
+        exactly so downstream consumers (R130 diff helper, R131 audit
+        emission) can chain to the original intent without re-deriving it.
+        """
+
+        engine = self._engine()
+        intent = self._live_intent(side=Direction.BUY)
+        with self._patch_open_orders([]):
+            decision = engine.compute_decision(
+                intent, control_main.repo.snapshot()
+            )
+        self.assertIs(decision.intent, intent)
+        self.assertIs(decision.risk_decision, intent.decision)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

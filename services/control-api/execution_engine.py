@@ -1,14 +1,28 @@
-"""Round 125 — Unified ExecutionEngine for P0-4.2 §F.1 Shadow Mode.
+"""Round 125-129 — Unified ExecutionEngine for P0-4.2 §F.1 Shadow Mode.
 
 Coordinator that owns the (compute_decision → execute → recover) pipeline.
 See ``docs/P0-4.2-execution-engine-design.md`` §B-§E for the full contract;
 this module is intended to become the single owner of every Bybit RPC dispatch
-path (paper / demo / live).  Round 125 lands the **module skeleton only**:
+path (paper / demo / live).
 
-* Public signatures + docstrings as specified in
-  ``docs/P0-4.2-implementation-roadmap-2026-04-27.md`` §B.1.
-* Bodies raise :class:`NotImplementedError` until later rounds (R128 lands
-  ``compute_decision``; ``execute`` / ``recover`` arrive in wave-3-B/D).
+Wave-3-A milestones:
+
+* R125 — module skeleton (signatures + docstrings).
+* R126 — :class:`execution_state_machine.ExecutionStateGraph` legal-transition
+  table populated from §C.2.
+* R127 — typed §B.2-§B.5 :mod:`models` shapes
+  (:class:`~models.TargetPosition` / :class:`~models.ActiveExchangeOrder` /
+  :class:`~models.ExecutionDecision` / :class:`~models.ExecutionResult` /
+  :class:`~models.RecoveryReport`).
+* R128 — :class:`~models.ExecutionIntent` extension fields + ``"recovery"``
+  source variant (J.4).
+* R129 — :meth:`ExecutionEngine.compute_decision` lands as a byte-equivalent
+  wrapper around the legacy ``_classify_live_order_reconciliation`` (live)
+  / ``_dispatch_paper_intent`` (paper) branching, surfaced as a typed
+  :class:`~models.ExecutionDecision` so Shadow Mode can compare against
+  the legacy path.
+
+``execute`` / ``recover`` continue to raise until wave-3-B / wave-3-D.
 
 Wave-3-A scope discipline (mirrors R118 RiskEngine):
     * **No behaviour change.** Importing this module must not affect any of
@@ -17,6 +31,9 @@ Wave-3-A scope discipline (mirrors R118 RiskEngine):
     * **No coupling to ``main.py`` at import time.** The engine resolves
       dependencies through constructor injection, not module-level imports
       from ``main`` (which would create a circular import — see R117).
+      ``compute_decision`` reaches into the legacy classifier through
+      ``sys.modules["main"]`` at call time, mirroring the R118
+      ``_resolve_main_module`` pattern.
     * **Shadow-only invocation in F.1.** ``compute_decision`` is a pure
       function and may be called from ``main._dispatch_execution_intent``
       *before* the legacy paper / live branches return; ``execute`` /
@@ -25,19 +42,90 @@ Wave-3-A scope discipline (mirrors R118 RiskEngine):
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Optional
+import sys
+from typing import TYPE_CHECKING, Any, List, Optional
 
 from models import (
-    ActiveExchangeOrder,  # noqa: F401  # imported for docstring linkage
+    AccountMode,
+    ActiveExchangeOrder,
     ExecutionDecision,
     ExecutionIntent,
     ExecutionResult,
+    LiveOrderAction,
+    LiveOrderReconciliation,
+    NewOrderRequest,
+    OrderRecord,
     RecoveryReport,
 )
 
 if TYPE_CHECKING:  # pragma: no cover - typing-only imports
+    from types import ModuleType
+
     from repository import AppRepository
     from risk_engine import RiskEngine
+
+
+# --------------------------------------------------------------------------- #
+# Internal helpers (module-level, pure functions).                            #
+# --------------------------------------------------------------------------- #
+
+# Mapping from the legacy :class:`LiveOrderReconciliation.action` (which only
+# has 3 variants) onto the typed :class:`models.ExecutionVerb` literal (6
+# variants).  ``submit`` maps verbatim; ``reuse`` becomes ``keep`` (the
+# engine's term for "no Bybit RPC needed, the existing order already
+# matches"); ``amend`` maps verbatim.  The two new verbs
+# (``cancel_and_resubmit`` / ``cancel_only`` / ``noop``) are not produced by
+# the legacy classifier today; the engine only emits them when the new
+# decision logic surfaces them in F.2 / F.3.
+_LIVE_ACTION_TO_VERB = {
+    "reuse": "keep",
+    "amend": "amend",
+    "submit": "submit",
+}
+
+
+def _resolve_main_module() -> "ModuleType":
+    """Return the loaded ``main`` module.
+
+    Mirrors :func:`risk_engine._resolve_main_module` so the engine can call
+    ``main._classify_live_order_reconciliation`` /
+    ``main._execution_preview_requires_reduce_only`` without creating a
+    circular import.  Resolution is deferred to call time; raising here is
+    safer than failing at import.
+    """
+
+    module = sys.modules.get("main")
+    if module is None:
+        raise RuntimeError(
+            "ExecutionEngine 调度依赖的 ``main`` 模块尚未加载，无法访问 "
+            "_classify_live_order_reconciliation。"
+        )
+    return module
+
+
+def _wrap_order_record_as_active_exchange_order(
+    record: OrderRecord, *, intent: ExecutionIntent
+) -> ActiveExchangeOrder:
+    """Coerce a legacy :class:`OrderRecord` into the typed
+    :class:`ActiveExchangeOrder` shape that :class:`ExecutionDecision`
+    expects.
+
+    The legacy reconciliation classifier returns plain :class:`OrderRecord`
+    instances; the engine wraps them with ``intent_id`` / ``state`` / etc.
+    so downstream consumers (R130 diff helper, R131 audit emission) read a
+    typed record.  Wave-3-A keeps ``intent_id=None`` and
+    ``exchange_link_id=None`` on shadow-wrapped orders because the legacy
+    path has not stamped these fields onto its own orders; F.3 onwards the
+    engine populates them at the source.
+    """
+
+    return ActiveExchangeOrder(
+        order=record,
+        intent_id=intent.intent_id,
+        exchange_link_id=intent.exchange_link_id,
+        state="ACKED",
+        last_known_status=record.status,
+    )
 
 
 class ExecutionEngine:
@@ -99,19 +187,147 @@ class ExecutionEngine:
         ``intent`` against the supplied ``state`` snapshot.  No I/O, no
         repository writes.
 
-        Round 128 lands the implementation as a thin wrapper around the
-        existing :func:`main._classify_live_order_reconciliation` (live
-        branch) and an unconditional ``submit``-equivalent verb for paper
-        mode; the resulting :class:`ExecutionDecision` is byte-equivalent to
-        the legacy dispatcher's branching, surfaced as a typed record so
-        Shadow Mode can compare it against the legacy path (F.1).
+        Round 129 lands the implementation as a byte-equivalent wrapper
+        around the legacy dispatch branching:
 
-        :raises NotImplementedError: until R128 ships.
+        * **Paper mode** — the legacy ``_dispatch_paper_intent`` always
+          calls ``repo.execute_strategy_signal`` to write a fresh trade;
+          the engine surfaces this as ``verb="submit"`` with
+          ``target_order=None`` and a synthetic ``reason_code="paper.submit"``.
+          No reconciliation exists in paper mode (Paper trades do not
+          create resting orders).
+        * **Live / Demo mode** — delegate to
+          :func:`main._classify_live_order_reconciliation` to produce the
+          same 4-way reason-code classification the legacy
+          ``_dispatch_live_intent`` consumes
+          (``order.matches_target`` / ``order.differs_numeric`` /
+          ``order.requires_reduce_only`` / ``order.no_existing_match``),
+          then translate the typed
+          :class:`~models.LiveOrderReconciliation.action` into the engine's
+          :class:`~models.ExecutionVerb` literal:
+
+            * ``"reuse"`` → ``"keep"``  (existing order already matches)
+            * ``"amend"`` → ``"amend"``
+            * ``"submit"`` → ``"submit"``
+
+        ``decision.intent`` is the input intent verbatim.
+        ``decision.target_order`` wraps the matching :class:`OrderRecord`
+        into a typed :class:`ActiveExchangeOrder` for ``"keep"`` / ``"amend"``
+        (and stays ``None`` for ``"submit"``).  ``stale_orders`` is the
+        legacy classifier's ``stale_orders`` list, also wrapped.
+        ``new_order_request`` is populated for ``"submit"`` / ``"amend"``
+        with the engine-formatted :class:`NewOrderRequest`; ``"keep"`` does
+        not need a new RPC payload so it stays ``None``.
+
+        The function is **pure**: it does not write SQLite, does not call
+        Bybit RPCs, does not mutate ``state``.  Wave-3-A's Shadow Mode
+        relies on this purity guarantee to spawn the engine alongside the
+        legacy path without side effects.
         """
 
-        raise NotImplementedError(
-            "ExecutionEngine.compute_decision lands in Round 128 (wave-3-A F.1)"
+        # Paper mode: the legacy dispatcher always submits.  The engine
+        # produces a typed ``submit`` decision with a synthetic reason code
+        # so the diff helper (R130) can match it against the legacy path.
+        if intent.mode == AccountMode.PAPER:
+            new_request = NewOrderRequest(
+                strategy_id=intent.strategy_id,
+                symbol=intent.symbol,
+                market=intent.market,
+                mode=intent.mode,
+                side=intent.side,
+                quantity=intent.quantity,
+                price=intent.price,
+                reduce_only=False,
+                note=intent.note,
+                exchange_link_id=intent.exchange_link_id,
+            )
+            return ExecutionDecision(
+                verb="submit",
+                intent=intent,
+                target_order=None,
+                stale_orders=[],
+                new_order_request=new_request,
+                risk_decision=intent.decision,
+                reason_code="paper.submit",
+                reason_detail="Paper 模式：写入新成交（引擎影子决策）。",
+            )
+
+        # Live / Demo mode: delegate the reconciliation classification to
+        # the existing helper and translate its action -> verb.
+        main_mod = _resolve_main_module()
+        existing_orders = self._collect_existing_strategy_orders(intent, main_mod)
+        requires_reduce_only = main_mod._execution_preview_requires_reduce_only(
+            intent.preview
         )
+        reconciliation: LiveOrderReconciliation = (
+            main_mod._classify_live_order_reconciliation(
+                intent,
+                existing_orders,
+                requires_reduce_only=requires_reduce_only,
+            )
+        )
+
+        verb = _LIVE_ACTION_TO_VERB[reconciliation.action]
+        target_order: Optional[ActiveExchangeOrder] = None
+        if reconciliation.matching_order is not None:
+            target_order = _wrap_order_record_as_active_exchange_order(
+                reconciliation.matching_order, intent=intent
+            )
+        stale_orders = [
+            _wrap_order_record_as_active_exchange_order(stale, intent=intent)
+            for stale in reconciliation.stale_orders
+        ]
+
+        # Build ``new_order_request`` for verbs that need a fresh / amended
+        # RPC payload.  ``keep`` reuses the existing order verbatim, so no
+        # request payload is needed.
+        new_request: Optional[NewOrderRequest] = None
+        if verb in ("submit", "amend"):
+            new_request = NewOrderRequest(
+                strategy_id=intent.strategy_id,
+                symbol=intent.symbol,
+                market=intent.market,
+                mode=intent.mode,
+                side=intent.side,
+                quantity=intent.quantity,
+                price=intent.price,
+                reduce_only=requires_reduce_only,
+                note=intent.note,
+                exchange_link_id=intent.exchange_link_id,
+            )
+
+        return ExecutionDecision(
+            verb=verb,
+            intent=intent,
+            target_order=target_order,
+            stale_orders=stale_orders,
+            new_order_request=new_request,
+            risk_decision=intent.decision,
+            reason_code=reconciliation.reason_code,
+            reason_detail=reconciliation.reason_detail,
+        )
+
+    def _collect_existing_strategy_orders(
+        self, intent: ExecutionIntent, main_mod: Any
+    ) -> List[OrderRecord]:
+        """Read open Bybit-private orders attributed to ``intent``'s
+        strategy / symbol / market, mirroring
+        :func:`main._dispatch_live_intent`'s lookup so the engine sees the
+        same input set the legacy reconciliation does.
+
+        Pure read — uses the same ``parse_open_orders`` shortcut the legacy
+        path uses.  Returns ``[]`` when no orders are attributed.
+        """
+
+        return [
+            item
+            for item in main_mod.parse_open_orders(use_private_only=True)
+            if item.source == "bybit_private"
+            and item.origin == "strategy"
+            and item.strategy_id == intent.strategy_id
+            and item.symbol == intent.symbol
+            and item.market == intent.market
+        ]
 
     def execute(
         self,
