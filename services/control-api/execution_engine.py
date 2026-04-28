@@ -55,8 +55,13 @@ Wave-3-A scope discipline (mirrors R118 RiskEngine):
 
 from __future__ import annotations
 
+import json
+import sqlite3
 import sys
-from typing import TYPE_CHECKING, Any, List, Optional
+import warnings
+from datetime import datetime, timezone
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from uuid import uuid4
 
 from models import (
     AccountMode,
@@ -82,6 +87,17 @@ if TYPE_CHECKING:  # pragma: no cover - typing-only imports
 
     from repository import AppRepository
     from risk_engine import RiskEngine
+
+
+# In-memory fallback store for execution_events when no SQLite connection is
+# bound (Round 133 — wave-3-B §F.2 commit 2).  The roadmap requires the
+# engine to write PROPOSED → PREVIEWED → ROUTED rows on every paper execute;
+# when the engine is constructed with ``persistence=None`` (the default in
+# wave-3-B until SQLite is wired into ``main.py``) the engine falls back to
+# this list and emits a single warn log so operators can see the writes are
+# not durable yet.  Tests inspect this list to verify the row content.
+_IN_MEMORY_EXECUTION_EVENTS: List[Dict[str, Any]] = []
+_IN_MEMORY_FALLBACK_WARNED = False
 
 
 # --------------------------------------------------------------------------- #
@@ -120,6 +136,156 @@ def _resolve_main_module() -> "ModuleType":
             "_classify_live_order_reconciliation。"
         )
     return module
+
+
+def _resolve_persistence_connection(persistence: Any) -> Optional[sqlite3.Connection]:
+    """Coerce the engine's ``persistence`` constructor argument into a usable
+    :class:`sqlite3.Connection` or ``None``.
+
+    Round 133 — wave-3-B §F.2 commit 2 needs a forgiving resolver because the
+    engine is currently constructed with ``persistence=None`` in ``main.py``;
+    when wave-3-C wires SQLite this argument will hold either:
+
+    * a bare :class:`sqlite3.Connection` (test fixtures pass this directly), or
+    * a :class:`persistence.unit_of_work.PersistenceUnit` (wraps a
+      connection — exposed via the ``connection`` property), or
+    * an arbitrary object that holds the connection on a ``connection`` /
+      ``conn`` attribute (extension shape — keep the resolver tolerant so
+      future producers do not have to invent yet another protocol).
+
+    Returns ``None`` when none of the above apply; callers use this to fall
+    back to the in-memory store and emit a warn log.
+    """
+
+    if persistence is None:
+        return None
+    if isinstance(persistence, sqlite3.Connection):
+        return persistence
+    for attr in ("connection", "conn"):
+        candidate = getattr(persistence, attr, None)
+        if isinstance(candidate, sqlite3.Connection):
+            return candidate
+    return None
+
+
+def _serialise_execution_payload(decision: ExecutionDecision, state_to: str) -> str:
+    """Build the ``payload_json`` field for an execution_events row.
+
+    Captures enough context to replay the engine's reasoning later — the
+    state-machine event name, the chosen verb, the intent's mode / symbol /
+    side, and the risk decision summary.  Kept compact so SQLite row size
+    stays predictable; full reconstruction (e.g. for shadow-parity) goes
+    through ``audit_events`` which carry the verbose ``ExecutionPreview``
+    body.
+    """
+
+    intent = decision.intent
+    return json.dumps(
+        {
+            "state_to": state_to,
+            "verb": decision.verb,
+            "mode": intent.mode.value,
+            "symbol": intent.symbol,
+            "market": intent.market,
+            "side": intent.side.value if hasattr(intent.side, "value") else str(intent.side),
+            "quantity": intent.quantity,
+            "price": intent.price,
+            "reason_code": decision.reason_code,
+            "risk_verdict": decision.risk_decision.verdict,
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def _serialise_risk_decision(decision: ExecutionDecision) -> str:
+    """JSON-encode the risk decision summary for the
+    ``risk_decision_json`` column.  Mirrors the shape audit consumers
+    already expect.
+    """
+
+    return json.dumps(
+        {
+            "verdict": decision.risk_decision.verdict,
+            "reason_code": decision.risk_decision.reason_code,
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def _emit_execution_event_row(
+    *,
+    connection: Optional[sqlite3.Connection],
+    intent: ExecutionIntent,
+    decision: ExecutionDecision,
+    state_from: Optional[str],
+    state_to: str,
+    occurred_at: datetime,
+    sequence_index: int,
+) -> str:
+    """Write one execution_events row (or append to the in-memory fallback)
+    capturing a single state-machine transition.
+
+    Returns the row id.  When ``connection`` is None the row is appended to
+    :data:`_IN_MEMORY_EXECUTION_EVENTS` and a one-shot warn log is emitted.
+    """
+
+    global _IN_MEMORY_FALLBACK_WARNED
+
+    # Compose a deterministic-ish id so callers can correlate the trio.
+    # ULID would be ideal but we don't depend on a ULID lib in main; uuid4 +
+    # short prefix is sufficient and matches the audit_events shape.
+    row_id = f"ee-{uuid4().hex[:12]}"
+    intent_id = intent.intent_id or f"intent-{uuid4().hex[:8]}"
+    intent_seq = intent.intent_seq if intent.intent_seq is not None else 0
+
+    # ``occurred_at`` carries microsecond precision but the table column is
+    # TEXT; format with the ISO8601 / RFC3339 contract used elsewhere
+    # (matches AuditDao + ConfigDao).  We add a +sequence_index*microsecond
+    # delta so the same call's three rows do not collide on the
+    # UNIQUE (intent_id, state_to, occurred_at) constraint when the wall
+    # clock has insufficient resolution.
+    ts = occurred_at.replace(microsecond=(occurred_at.microsecond + sequence_index) % 1_000_000)
+    occurred_at_iso = ts.isoformat()
+
+    row: Dict[str, Any] = {
+        "id": row_id,
+        "intent_id": intent_id,
+        "intent_seq": intent_seq,
+        "strategy_id": intent.strategy_id,
+        "exchange_link_id": intent.exchange_link_id,
+        "state_from": state_from,
+        "state_to": state_to,
+        "verb": decision.verb,
+        "order_id": None,
+        "risk_decision_json": _serialise_risk_decision(decision),
+        "payload_json": _serialise_execution_payload(decision, state_to),
+        "audit_event_id": None,
+        "occurred_at": occurred_at_iso,
+    }
+
+    if connection is None:
+        if not _IN_MEMORY_FALLBACK_WARNED:
+            warnings.warn(
+                "execution_engine.execution_events: SQLite connection not "
+                "bound (persistence=None); falling back to in-memory store.",
+                RuntimeWarning,
+                stacklevel=3,
+            )
+            _IN_MEMORY_FALLBACK_WARNED = True
+        _IN_MEMORY_EXECUTION_EVENTS.append(dict(row))
+        return row_id
+
+    # SQLite path: defer to the existing DAO so the schema contract stays
+    # in one place.  Imported lazily to avoid pulling persistence at module
+    # load time (the engine currently runs without persistence in tests).
+    from persistence.dao_execution_event import ExecutionEventDao  # local import
+
+    dao = ExecutionEventDao(connection)
+    dao.insert(row)  # type: ignore[arg-type]
+    connection.commit()
+    return row_id
 
 
 def _wrap_order_record_as_active_exchange_order(
@@ -409,6 +575,15 @@ class ExecutionEngine:
           ``main._dispatch_paper_intent``) which still owns the wire shape
           desktop consumes.
 
+        Round 133 — wave-3-B §F.2 commit 2 adds three execution_events
+        rows (PROPOSED → PREVIEWED → ROUTED) so the SQLite log shows the
+        engine's traversal through the state machine for every paper
+        execute.  When ``persistence`` is bound to a SQLite connection
+        the rows go through :class:`ExecutionEventDao`; when it is
+        ``None`` the rows are appended to an in-memory list and a
+        one-shot ``RuntimeWarning`` is emitted (so dev fixtures keep
+        working before SQLite is wired into ``main.py``).
+
         The engine does **not** mutate ``decision`` — the input is passed
         through verbatim.  ``ExecutionResult.intent_id`` is taken from
         ``decision.intent.intent_id`` when present, falling back to an
@@ -417,6 +592,33 @@ class ExecutionEngine:
 
         intent = decision.intent
         main_mod = _resolve_main_module()
+
+        # R133 — emit PROPOSED + PREVIEWED rows up front so the audit log
+        # shows the engine's view *before* the legacy write happens.  Any
+        # exception inside the legacy call is then captured against the
+        # ROUTED row that follows.  The three rows share an ``occurred_at``
+        # base + sequence index so they keep a strict ordering even on
+        # systems where ``datetime.now`` lacks microsecond resolution.
+        connection = _resolve_persistence_connection(self._persistence)
+        occurred_at = datetime.now(timezone.utc)
+        _emit_execution_event_row(
+            connection=connection,
+            intent=intent,
+            decision=decision,
+            state_from=None,
+            state_to=EXECUTION_STATE_PROPOSED,
+            occurred_at=occurred_at,
+            sequence_index=0,
+        )
+        _emit_execution_event_row(
+            connection=connection,
+            intent=intent,
+            decision=decision,
+            state_from=EXECUTION_STATE_PROPOSED,
+            state_to=EXECUTION_STATE_PREVIEWED,
+            occurred_at=occurred_at,
+            sequence_index=1,
+        )
 
         trade = main_mod.repo.execute_strategy_signal(
             intent.strategy_id,
@@ -427,6 +629,20 @@ class ExecutionEngine:
             intent.strategy_id,
             intent.mode,
             resolution_detail="后续 Paper 手动策略执行已恢复成功，旧的拦截提醒已收起。",
+        )
+
+        # ROUTED row lands after the legacy write completes successfully.
+        # If the legacy call had raised, the helper would never reach this
+        # row — leaving the trail at PREVIEWED, which downstream replay can
+        # treat as "the engine started but did not finish" and reconcile.
+        _emit_execution_event_row(
+            connection=connection,
+            intent=intent,
+            decision=decision,
+            state_from=EXECUTION_STATE_PREVIEWED,
+            state_to=EXECUTION_STATE_ROUTED,
+            occurred_at=occurred_at,
+            sequence_index=2,
         )
 
         return ExecutionResult(
@@ -458,4 +674,10 @@ class ExecutionEngine:
         )
 
 
-__all__ = ["ExecutionEngine"]
+__all__ = [
+    "ExecutionEngine",
+    # R133 — exported for tests to inspect the in-memory fallback when no
+    # SQLite connection is bound to the engine; production code should
+    # never touch this list directly.
+    "_IN_MEMORY_EXECUTION_EVENTS",
+]

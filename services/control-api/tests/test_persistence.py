@@ -982,5 +982,280 @@ class OnDiskConnectionTests(unittest.TestCase):
             conn2.close()
 
 
+# ============================================================================
+# Round 133 — paper intent writes PROPOSED/PREVIEWED/ROUTED execution_events
+# ============================================================================
+# Wave-3-B §F.2 commit 2 wires the engine's _apply_paper helper to write
+# three execution_events rows on every paper execute (one per state-machine
+# transition).  When the engine is constructed with persistence=None the
+# rows go to an in-memory list with a one-shot warn log; when a SQLite
+# connection is bound, the same rows go through ExecutionEventDao.
+# ============================================================================
+class ExecutionEventDaoPaperIntentTests(unittest.TestCase):
+    """Engine paper branch writes three execution_events rows per execute."""
+
+    def setUp(self) -> None:
+        self.conn = _fresh_conn()
+        # The engine is module-imported by main; we need to instantiate a
+        # standalone engine here to bind it to our test connection without
+        # touching main's singleton.
+        import execution_engine as ee  # type: ignore
+        from risk_engine import RiskEngine  # type: ignore
+
+        # Reset the in-memory fallback warn flag so tests stay independent.
+        ee._IN_MEMORY_EXECUTION_EVENTS.clear()
+        ee._IN_MEMORY_FALLBACK_WARNED = False
+
+        self.module = ee
+        self.engine = ee.ExecutionEngine(
+            repo=None,  # not used by the helper under test
+            persistence=self.conn,
+            risk_engine=RiskEngine(),
+        )
+
+    def tearDown(self) -> None:
+        self.conn.close()
+
+    def _make_paper_decision(self):
+        from models import (
+            AccountMode,
+            Direction,
+            ExecutionDecision,
+            ExecutionIntent,
+            ExecutionPreview,
+            NewOrderRequest,
+            RiskDecision,
+        )
+
+        preview = ExecutionPreview(
+            symbol="ETHUSDT",
+            market="perp",
+            mode=AccountMode.PAPER,
+            side=Direction.BUY,
+            origin="manual",
+            quantity=0.01,
+            price=2000.0,
+            notional="20",
+            action="增仓",
+            allowed=True,
+            current_position_size="0",
+            current_avg_price="0",
+            projected_position_size="0.01",
+            projected_avg_price="2000",
+            available_balance_before="100",
+            available_balance_after="80",
+            estimated_realized_pnl="0",
+            generated_at="2026-04-28T08:00:00+08:00",
+        )
+        risk = RiskDecision(
+            verdict="allow",
+            reason_code="risk.approved",
+            reason_detail="",
+            preview=preview,
+        )
+        intent = ExecutionIntent(
+            strategy_id="eth-revert-02",
+            strategy_name="ExecHarness",
+            source="manual",
+            mode=AccountMode.PAPER,
+            symbol="ETHUSDT",
+            market="perp",
+            side=Direction.BUY,
+            quantity=0.01,
+            price=2000.0,
+            signal="buy",
+            preview=preview,
+            decision=risk,
+            parameter_snapshot={},
+            requested_by="desktop_operator",
+            note=None,
+            created_at="2026-04-28T08:00:00+08:00",
+            intent_id="intent-r133-01",
+            intent_seq=42,
+        )
+        new_request = NewOrderRequest(
+            strategy_id="eth-revert-02",
+            symbol="ETHUSDT",
+            market="perp",
+            mode=AccountMode.PAPER,
+            side=Direction.BUY,
+            quantity=0.01,
+            price=2000.0,
+            reduce_only=False,
+            note=None,
+            exchange_link_id=None,
+        )
+        return ExecutionDecision(
+            verb="submit",
+            intent=intent,
+            target_order=None,
+            stale_orders=[],
+            new_order_request=new_request,
+            risk_decision=risk,
+            reason_code="paper.submit",
+            reason_detail="Paper 模式：写入新成交（引擎影子决策）。",
+        )
+
+    def _emit_three_rows_via_helper(self):
+        """Call the module helper directly so we can verify SQLite writes
+        without spinning up the legacy ``repo.execute_strategy_signal``
+        path (which writes a real trade and is exercised in
+        ``ExecutePaperBranchTests``).  Mirrors the calling shape of
+        ``_apply_paper`` exactly so the contract is enforced.
+        """
+        from datetime import datetime, timezone
+        from execution_state_machine import (
+            EXECUTION_STATE_PROPOSED,
+            EXECUTION_STATE_PREVIEWED,
+            EXECUTION_STATE_ROUTED,
+        )
+
+        decision = self._make_paper_decision()
+        intent = decision.intent
+        ts = datetime.now(timezone.utc)
+
+        for index, (state_from, state_to) in enumerate(
+            [
+                (None, EXECUTION_STATE_PROPOSED),
+                (EXECUTION_STATE_PROPOSED, EXECUTION_STATE_PREVIEWED),
+                (EXECUTION_STATE_PREVIEWED, EXECUTION_STATE_ROUTED),
+            ]
+        ):
+            self.module._emit_execution_event_row(
+                connection=self.conn,
+                intent=intent,
+                decision=decision,
+                state_from=state_from,
+                state_to=state_to,
+                occurred_at=ts,
+                sequence_index=index,
+            )
+        return intent
+
+    def test_paper_intent_writes_proposed_previewed_routed(self) -> None:
+        """The engine writes exactly three execution_events rows for a
+        single paper execute, threaded through the legal-transition table
+        (PROPOSED → PREVIEWED → ROUTED).
+        """
+        intent = self._emit_three_rows_via_helper()
+
+        dao = ExecutionEventDao(self.conn)
+        rows = dao.list_by_intent(intent.intent_id)
+
+        self.assertEqual(len(rows), 3)
+        # list_by_intent orders ascending so the trail is chronological.
+        self.assertEqual(
+            [r["state_to"] for r in rows],
+            ["PROPOSED", "PREVIEWED", "ROUTED"],
+        )
+        # state_from threading: PROPOSED has None; PREVIEWED follows
+        # PROPOSED; ROUTED follows PREVIEWED.
+        self.assertIsNone(rows[0]["state_from"])
+        self.assertEqual(rows[1]["state_from"], "PROPOSED")
+        self.assertEqual(rows[2]["state_from"], "PREVIEWED")
+        # Each row carries the chosen verb + strategy linkage.
+        for row in rows:
+            self.assertEqual(row["verb"], "submit")
+            self.assertEqual(row["strategy_id"], "eth-revert-02")
+            self.assertEqual(row["intent_seq"], 42)
+
+    def test_paper_intent_payload_json_captures_decision_summary(self) -> None:
+        """Each row's payload_json includes the verb / mode / symbol /
+        risk verdict so an audit replay can reconstruct the intent.
+        """
+        intent = self._emit_three_rows_via_helper()
+
+        dao = ExecutionEventDao(self.conn)
+        rows = dao.list_by_intent(intent.intent_id)
+
+        for row in rows:
+            payload = json.loads(row["payload_json"])
+            self.assertEqual(payload["verb"], "submit")
+            self.assertEqual(payload["mode"], "paper")
+            self.assertEqual(payload["symbol"], "ETHUSDT")
+            self.assertEqual(payload["risk_verdict"], "allow")
+
+    def test_paper_intent_risk_decision_json_round_trips(self) -> None:
+        intent = self._emit_three_rows_via_helper()
+
+        dao = ExecutionEventDao(self.conn)
+        rows = dao.list_by_intent(intent.intent_id)
+
+        for row in rows:
+            decision_payload = json.loads(row["risk_decision_json"])
+            self.assertEqual(decision_payload["verdict"], "allow")
+            self.assertEqual(
+                decision_payload["reason_code"], "risk.approved"
+            )
+
+    def test_paper_intent_unique_constraint_on_state_to(self) -> None:
+        """Three rows on the same intent share the same intent_id but
+        carry different (state_to, occurred_at) — must not violate the
+        UNIQUE constraint.
+        """
+        intent = self._emit_three_rows_via_helper()
+
+        dao = ExecutionEventDao(self.conn)
+        rows = dao.list_by_intent(intent.intent_id)
+        unique_keys = {(r["intent_id"], r["state_to"], r["occurred_at"]) for r in rows}
+        self.assertEqual(len(unique_keys), 3)
+
+    def test_in_memory_fallback_when_persistence_is_none(self) -> None:
+        """When the engine has no SQLite connection, rows fall through to
+        the in-memory list and a one-shot RuntimeWarning is emitted.
+        """
+        import warnings
+
+        self.module._IN_MEMORY_EXECUTION_EVENTS.clear()
+        self.module._IN_MEMORY_FALLBACK_WARNED = False
+
+        from datetime import datetime, timezone
+        from execution_state_machine import EXECUTION_STATE_PROPOSED
+
+        decision = self._make_paper_decision()
+        with warnings.catch_warnings(record=True) as captured:
+            warnings.simplefilter("always")
+            self.module._emit_execution_event_row(
+                connection=None,
+                intent=decision.intent,
+                decision=decision,
+                state_from=None,
+                state_to=EXECUTION_STATE_PROPOSED,
+                occurred_at=datetime.now(timezone.utc),
+                sequence_index=0,
+            )
+
+        # Exactly one row landed in the in-memory store.
+        self.assertEqual(len(self.module._IN_MEMORY_EXECUTION_EVENTS), 1)
+        self.assertEqual(
+            self.module._IN_MEMORY_EXECUTION_EVENTS[0]["state_to"], "PROPOSED"
+        )
+        # Warn fired exactly once on first fallback.
+        warn_messages = [
+            str(w.message) for w in captured
+            if issubclass(w.category, RuntimeWarning)
+        ]
+        self.assertTrue(
+            any("execution_events" in m for m in warn_messages),
+            f"expected fallback warning, got {warn_messages!r}",
+        )
+
+    def test_resolve_persistence_handles_unit_of_work_wrapper(self) -> None:
+        """The resolver must coerce a PersistenceUnit (which exposes the
+        connection via .connection) into the underlying sqlite3.Connection
+        so wave-3-C can pass either shape.
+        """
+        unit = PersistenceUnit(self.conn)
+        resolved = self.module._resolve_persistence_connection(unit)
+        self.assertIs(resolved, self.conn)
+
+    def test_resolve_persistence_returns_none_for_unknown_shapes(self) -> None:
+        sentinel = object()
+        self.assertIsNone(
+            self.module._resolve_persistence_connection(sentinel)
+        )
+        self.assertIsNone(self.module._resolve_persistence_connection(None))
+
+
 if __name__ == "__main__":
     unittest.main()
