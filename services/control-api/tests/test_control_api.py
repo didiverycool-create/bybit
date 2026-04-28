@@ -31008,5 +31008,207 @@ class PaperIntentEngineRouteTests(unittest.TestCase):
         spy_clear.assert_called_once()
 
 
+# ============================================================================
+# Round 135 — Paper idempotency dedup on (strategy_id, intent_seq) (P0-4.2 §F.2)
+# ============================================================================
+# Wave-3-B §F.2 commit 4 wires the engine's _apply_paper helper with an
+# idempotency cache keyed by (strategy_id, intent_seq).  A second submit
+# with the same intent_seq returns the cached ExecutionResult without
+# re-writing the trade or re-emitting execution_events rows.  Intents
+# without an intent_seq (None — pre-R128 callers) bypass the cache so
+# manual desktop "Execute" repeats still work as before.
+# ============================================================================
+class PaperIntentIdempotencyTests(unittest.TestCase):
+    """Engine paper idempotency — same intent_seq returns cached result."""
+
+    def setUp(self) -> None:
+        self._state_backup = copy.deepcopy(control_main.repo.state)
+        # Clear the engine's idempotency cache so prior tests do not leak.
+        control_main.execution_engine._paper_idempotency_cache.clear()
+        self.addCleanup(self._restore_state)
+
+    def _restore_state(self) -> None:
+        control_main.repo.state = copy.deepcopy(self._state_backup)
+        control_main.repo._persist(control_main.repo.state)
+        control_main.execution_engine._paper_idempotency_cache.clear()
+
+    def _make_paper_intent(self, *, intent_seq: Optional[int], intent_id: str = "intent-r135"):
+        from models import (
+            ExecutionIntent,
+            ExecutionPreview,
+            RiskDecision,
+            AccountMode as Mode,
+            Direction,
+        )
+
+        preview = ExecutionPreview(
+            symbol="ETHUSDT",
+            market="perp",
+            mode=Mode.PAPER,
+            side=Direction.BUY,
+            origin="manual",
+            quantity=0.01,
+            price=2000.0,
+            notional="20",
+            action="增仓",
+            allowed=True,
+            current_position_size="0",
+            current_avg_price="0",
+            projected_position_size="0.01",
+            projected_avg_price="2000",
+            available_balance_before="100",
+            available_balance_after="80",
+            estimated_realized_pnl="0",
+            generated_at="2026-04-28T08:00:00+08:00",
+        )
+        decision = RiskDecision(
+            verdict="allow",
+            reason_code="risk.approved",
+            reason_detail="",
+            preview=preview,
+        )
+        return ExecutionIntent(
+            strategy_id="eth-revert-02",
+            strategy_name="IdempotencyHarness",
+            source="manual",
+            mode=Mode.PAPER,
+            symbol="ETHUSDT",
+            market="perp",
+            side=Direction.BUY,
+            quantity=0.01,
+            price=2000.0,
+            signal="buy",
+            preview=preview,
+            decision=decision,
+            parameter_snapshot={},
+            requested_by="desktop_operator",
+            note=None,
+            created_at="2026-04-28T08:00:00+08:00",
+            intent_id=intent_id,
+            intent_seq=intent_seq,
+        )
+
+    def _execute_via_engine(self, intent):
+        """Drive the engine end-to-end to mimic ``_dispatch_paper_intent``
+        on the engine route.
+        """
+        decision = control_main.execution_engine.compute_decision(
+            intent, control_main.repo.snapshot()
+        )
+        return control_main.execution_engine.execute(decision)
+
+    def test_repeat_same_seq_returns_cached_result(self) -> None:
+        """Two submits with the same (strategy_id, intent_seq) — second
+        returns the cached ``ExecutionResult`` without re-writing the
+        trade or re-emitting execution_events rows.
+        """
+        intent_first = self._make_paper_intent(intent_seq=701, intent_id="ee-1")
+
+        first_result = self._execute_via_engine(intent_first)
+        before_trades = len(control_main.repo.state.trades)
+
+        intent_second = self._make_paper_intent(intent_seq=701, intent_id="ee-2")
+        second_result = self._execute_via_engine(intent_second)
+
+        # Same Python object — cached return.
+        self.assertIs(first_result, second_result)
+        # No additional trade was written.
+        self.assertEqual(len(control_main.repo.state.trades), before_trades)
+
+    def test_new_seq_proceeds(self) -> None:
+        """A different ``intent_seq`` is not cached and triggers a fresh
+        write.
+        """
+        intent_a = self._make_paper_intent(intent_seq=801, intent_id="ee-a")
+        result_a = self._execute_via_engine(intent_a)
+
+        before_trades = len(control_main.repo.state.trades)
+
+        intent_b = self._make_paper_intent(intent_seq=802, intent_id="ee-b")
+        result_b = self._execute_via_engine(intent_b)
+
+        # Different ExecutionResult objects.
+        self.assertIsNot(result_a, result_b)
+        self.assertEqual(result_b.status, "submitted")
+        # New trade lands.
+        self.assertEqual(
+            len(control_main.repo.state.trades), before_trades + 1
+        )
+
+    def test_intent_without_intent_seq_bypasses_cache(self) -> None:
+        """Pre-R128 legacy intents that lack ``intent_seq`` always
+        re-execute — repeat submits keep writing trades.
+        """
+        intent_first = self._make_paper_intent(
+            intent_seq=None, intent_id="ee-no-seq-1"
+        )
+        result_first = self._execute_via_engine(intent_first)
+        before = len(control_main.repo.state.trades)
+
+        intent_second = self._make_paper_intent(
+            intent_seq=None, intent_id="ee-no-seq-2"
+        )
+        result_second = self._execute_via_engine(intent_second)
+
+        # Different objects — no cache hit.
+        self.assertIsNot(result_first, result_second)
+        # New trade lands.
+        self.assertEqual(len(control_main.repo.state.trades), before + 1)
+
+    def test_dedup_per_strategy_id_isolation(self) -> None:
+        """Two strategies with the same ``intent_seq`` do NOT collide —
+        the cache key is ``(strategy_id, intent_seq)``.
+        """
+        intent_eth = self._make_paper_intent(intent_seq=900, intent_id="ee-eth")
+        result_eth = self._execute_via_engine(intent_eth)
+
+        # Synthesize a second intent on a different paper strategy.  We
+        # reuse eth-revert-02 here because it's the only seeded paper
+        # strategy; the assertion still holds because we mutate
+        # ``strategy_id`` to a unique value to model the isolation case.
+        intent_other = self._make_paper_intent(intent_seq=900, intent_id="ee-other")
+        # Force a different strategy_id to test isolation; even though
+        # ``repo.execute_strategy_signal`` would reject this id (no
+        # matching strategy), the cache lookup happens *before* the
+        # repo write — so we should get a cache miss and the legacy
+        # error path triggers.
+        from models import ExecutionIntent
+        intent_other = intent_other.model_copy(
+            update={"strategy_id": "trend-btc-01"}
+        )
+
+        # Should NOT return the eth result.  It instead errors out at
+        # ``execute_strategy_signal`` (trend-btc-01 is LIVE not PAPER).
+        with self.assertRaises(ValueError):
+            self._execute_via_engine(intent_other)
+
+        # The eth-revert-02 cache entry is still intact for replays.
+        intent_eth_replay = self._make_paper_intent(
+            intent_seq=900, intent_id="ee-eth-replay"
+        )
+        result_eth_replay = self._execute_via_engine(intent_eth_replay)
+        self.assertIs(result_eth, result_eth_replay)
+
+    def test_cache_clears_on_explicit_reset(self) -> None:
+        """After clearing the cache, the same intent_seq triggers a
+        fresh write again.  Useful for restart scenarios where the
+        engine's in-memory state is wiped.
+        """
+        intent = self._make_paper_intent(intent_seq=950, intent_id="ee-clear-1")
+        result_first = self._execute_via_engine(intent)
+
+        control_main.execution_engine._paper_idempotency_cache.clear()
+        before = len(control_main.repo.state.trades)
+
+        intent_again = self._make_paper_intent(
+            intent_seq=950, intent_id="ee-clear-2"
+        )
+        result_again = self._execute_via_engine(intent_again)
+
+        # Different object after reset; new trade lands.
+        self.assertIsNot(result_first, result_again)
+        self.assertEqual(len(control_main.repo.state.trades), before + 1)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

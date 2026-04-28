@@ -329,7 +329,13 @@ class ExecutionEngine:
     until F.2 / F.4.
     """
 
-    __slots__ = ("_repo", "_persistence", "_risk_engine", "_clock")
+    __slots__ = (
+        "_repo",
+        "_persistence",
+        "_risk_engine",
+        "_clock",
+        "_paper_idempotency_cache",
+    )
 
     def __init__(
         self,
@@ -362,6 +368,17 @@ class ExecutionEngine:
         self._persistence = persistence
         self._risk_engine = risk_engine
         self._clock = clock
+        # R135 — Paper idempotency cache.  Keyed by ``(strategy_id, intent_seq)``
+        # so a second submit with the same intent_seq returns the first
+        # call's :class:`ExecutionResult` without re-executing
+        # ``repo.execute_strategy_signal`` or re-emitting execution_events
+        # rows.  Stores ``None`` for legacy intents (``intent_seq is None``)
+        # so they remain "always re-execute" — matching the legacy
+        # dispatcher's behaviour for desktop manual submits without a
+        # generated sequence.
+        self._paper_idempotency_cache: Dict[
+            "tuple[str, int]", ExecutionResult
+        ] = {}
 
     def compute_decision(
         self,
@@ -593,6 +610,20 @@ class ExecutionEngine:
         intent = decision.intent
         main_mod = _resolve_main_module()
 
+        # R135 — Idempotency dedup on (strategy_id, intent_seq).  When the
+        # caller submits the same intent_seq twice (e.g. desktop double-
+        # click, retry-on-timeout), return the cached
+        # :class:`ExecutionResult` from the first call without re-writing
+        # the trade or re-emitting execution_events rows.  Intents without
+        # an ``intent_seq`` (``None`` — pre-R128 legacy callers) bypass
+        # the cache so manual repeats still work as before.
+        cache_key: Optional[tuple] = None
+        if intent.intent_seq is not None:
+            cache_key = (intent.strategy_id, int(intent.intent_seq))
+            cached = self._paper_idempotency_cache.get(cache_key)
+            if cached is not None:
+                return cached
+
         # R133 — emit PROPOSED + PREVIEWED rows up front so the audit log
         # shows the engine's view *before* the legacy write happens.  Any
         # exception inside the legacy call is then captured against the
@@ -645,7 +676,7 @@ class ExecutionEngine:
             sequence_index=2,
         )
 
-        return ExecutionResult(
+        result = ExecutionResult(
             intent_id=intent.intent_id or "",
             status="submitted",
             final_state=EXECUTION_STATE_ROUTED,
@@ -654,6 +685,16 @@ class ExecutionEngine:
             risk_decision=decision.risk_decision,
             error_detail=None,
         )
+
+        # R135 — Cache the result so a subsequent call with the same
+        # ``(strategy_id, intent_seq)`` short-circuits at the head of
+        # ``_apply_paper``.  The cache lives on the engine instance, so
+        # callers that share the singleton (``main.execution_engine``)
+        # share the dedup state too.
+        if cache_key is not None:
+            self._paper_idempotency_cache[cache_key] = result
+
+        return result
 
     def recover(
         self,
