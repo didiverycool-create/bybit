@@ -29468,5 +29468,200 @@ class ExecutionStateMachineRound126Tests(unittest.TestCase):
         )
 
 
+# ============================================================================
+# Round 127 — typed ExecutionDecision + supporting models (P0-4.2 §B.2-§B.5)
+# ----------------------------------------------------------------------------
+# Round 127 lands the typed shapes the engine needs to talk in (TargetPosition
+# / ActiveExchangeOrder / NewOrderRequest / ExecutionDecision /
+# ExecutionResult / RecoveryReport).  The tests guard:
+#
+#   * round-trip serialisation (Pydantic ``.model_dump()`` / ``.model_validate()``)
+#   * default value invariants (``stale_orders=[]``, etc.)
+#   * cross-references with existing models (RiskDecision / OrderRecord)
+#
+# Behaviour-coverage of the engine itself comes in R128 (compute_decision).
+# ============================================================================
+class ExecutionDecisionModelRound127Tests(unittest.TestCase):
+    """Round-trip + default-value tests for the typed P0-4.2 §B.2-§B.5
+    models.  These tests do not exercise the engine — they prove the
+    pydantic shapes are stable so downstream commits can rely on them.
+    """
+
+    def _make_preview(self):
+        from models import ExecutionPreview
+        from models import AccountMode as Mode, Direction
+        return ExecutionPreview(
+            symbol="BTCUSDT",
+            market="perp",
+            mode=Mode.PAPER,
+            side=Direction.BUY,
+            origin="manual",
+            quantity=0.001,
+            price=10000.0,
+            notional="10",
+            action="增仓",
+            allowed=True,
+            current_position_size="0",
+            current_avg_price="0",
+            projected_position_size="0.001",
+            projected_avg_price="10000",
+            available_balance_before="100",
+            available_balance_after="90",
+            estimated_realized_pnl="0",
+            generated_at=datetime.now(timezone.utc).astimezone().isoformat(),
+        )
+
+    def _make_intent(self):
+        from models import ExecutionIntent, RiskDecision
+        from models import AccountMode as Mode, Direction
+        preview = self._make_preview()
+        decision = RiskDecision(
+            verdict="allow",
+            reason_code="risk.approved",
+            reason_detail="",
+            preview=preview,
+        )
+        return ExecutionIntent(
+            strategy_id="strat-1",
+            strategy_name="Strat 1",
+            source="manual",
+            mode=Mode.PAPER,
+            symbol="BTCUSDT",
+            market="perp",
+            side=Direction.BUY,
+            quantity=0.001,
+            price=10000.0,
+            signal="buy",
+            preview=preview,
+            decision=decision,
+            parameter_snapshot={},
+            requested_by="desktop_operator",
+            note=None,
+            created_at=datetime.now(timezone.utc).astimezone().isoformat(),
+        )
+
+    def test_target_position_default_derived_from_strategy_signal(self) -> None:
+        from models import TargetPosition
+
+        tp = TargetPosition(
+            strategy_id="strat-1",
+            symbol="BTCUSDT",
+            market="perp",
+            side="long",
+            size=0.001,
+            reference_price=10000.0,
+        )
+        self.assertEqual(tp.derived_from, "strategy_signal")
+        self.assertEqual(tp.confidence, 0.0)
+
+    def test_active_exchange_order_defaults_to_acked(self) -> None:
+        from models import ActiveExchangeOrder, OrderRecord
+        from models import Direction
+        order = OrderRecord(
+            source="bybit_private",
+            origin="strategy",
+            strategy_id="strat-1",
+            order_id="order-1",
+            symbol="BTCUSDT",
+            market="perp",
+            side=Direction.BUY,
+            order_type="Limit",
+            qty="0.001",
+            price="10000",
+            status="New",
+            created_at="2026-04-28T00:00:00Z",
+        )
+        active = ActiveExchangeOrder(order=order)
+        self.assertEqual(active.state, "ACKED")
+        self.assertEqual(active.fills, [])
+        self.assertFalse(active.drift_detected)
+        self.assertIsNone(active.intent_id)
+
+    def test_new_order_request_validation(self) -> None:
+        from models import NewOrderRequest
+        from models import AccountMode as Mode, Direction
+        req = NewOrderRequest(
+            symbol="BTCUSDT",
+            market="perp",
+            mode=Mode.PAPER,
+            side=Direction.BUY,
+            quantity=0.001,
+            price=10000.0,
+        )
+        self.assertEqual(req.reduce_only, False)
+        self.assertIsNone(req.exchange_link_id)
+
+        # Quantity / price must be positive; pydantic should reject 0.
+        with self.assertRaises(Exception):
+            NewOrderRequest(
+                symbol="BTCUSDT",
+                market="perp",
+                mode=Mode.PAPER,
+                side=Direction.BUY,
+                quantity=0,
+                price=10000.0,
+            )
+
+    def test_execution_decision_round_trip(self) -> None:
+        from models import ExecutionDecision
+
+        intent = self._make_intent()
+        decision = ExecutionDecision(
+            verb="submit",
+            intent=intent,
+            risk_decision=intent.decision,
+            reason_code="order.no_existing_match",
+        )
+        self.assertEqual(decision.verb, "submit")
+        self.assertEqual(decision.stale_orders, [])
+        self.assertIsNone(decision.target_order)
+
+        # Round-trip via .model_dump() must preserve the typed verb.
+        try:
+            dumped = decision.model_dump()
+            restored = ExecutionDecision.model_validate(dumped)
+        except AttributeError:  # pragma: no cover - Pydantic v1 fallback
+            dumped = decision.dict()
+            restored = ExecutionDecision.parse_obj(dumped)
+        self.assertEqual(restored.verb, "submit")
+        self.assertEqual(restored.reason_code, "order.no_existing_match")
+
+    def test_execution_result_default_status_invariants(self) -> None:
+        from models import ExecutionResult, RiskDecision
+
+        preview = self._make_preview()
+        decision = RiskDecision(
+            verdict="allow",
+            reason_code="risk.approved",
+            reason_detail="",
+            preview=preview,
+        )
+        result = ExecutionResult(
+            intent_id="intent-1",
+            status="submitted",
+            final_state="ROUTED",
+            risk_decision=decision,
+        )
+        self.assertEqual(result.audit_event_ids, [])
+        self.assertIsNone(result.error_detail)
+        self.assertIsNone(result.order)
+
+    def test_recovery_report_defaults_are_empty(self) -> None:
+        from models import RecoveryReport
+
+        report = RecoveryReport()
+        self.assertEqual(report.active_orders, [])
+        self.assertEqual(report.divergences, [])
+        self.assertEqual(report.recovered_intents, [])
+
+    def test_fill_fragment_round_trip(self) -> None:
+        from models import FillFragment
+
+        fill = FillFragment(fill_id="fill-1", quantity=0.0005, price=10001.0)
+        self.assertEqual(fill.quantity, 0.0005)
+        # Datetime default lands automatically.
+        self.assertIsNotNone(fill.occurred_at)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

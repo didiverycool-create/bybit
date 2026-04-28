@@ -15,10 +15,9 @@ signature stable so downstream tests (``CompareShadowDecisionRound129Tests``,
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, List, Optional
+from typing import List, Optional
 
-if TYPE_CHECKING:  # pragma: no cover - typing-only imports
-    from models import ExecutionDecision
+from models import ExecutionDecision
 
 
 @dataclass(frozen=True)
@@ -58,7 +57,7 @@ class DecisionDiff:
 
 
 def compare_shadow_decision(
-    new_decision: "ExecutionDecision",
+    new_decision: ExecutionDecision,
     legacy_verb: str,
     legacy_reason_code: str,
     legacy_target_order_id: Optional[str] = None,

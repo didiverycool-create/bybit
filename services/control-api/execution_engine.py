@@ -27,15 +27,15 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Optional
 
-from models import ExecutionIntent
+from models import (
+    ActiveExchangeOrder,  # noqa: F401  # imported for docstring linkage
+    ExecutionDecision,
+    ExecutionIntent,
+    ExecutionResult,
+    RecoveryReport,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - typing-only imports
-    from models import (
-        ActiveExchangeOrder,  # noqa: F401  # imported for docstring linkage
-        ExecutionDecision,
-        ExecutionResult,
-        RecoveryReport,
-    )
     from repository import AppRepository
     from risk_engine import RiskEngine
 
@@ -94,7 +94,7 @@ class ExecutionEngine:
         self,
         intent: ExecutionIntent,
         state: Any,
-    ) -> "ExecutionDecision":
+    ) -> ExecutionDecision:
         """Pure function: derive the next :class:`ExecutionDecision` for
         ``intent`` against the supplied ``state`` snapshot.  No I/O, no
         repository writes.
@@ -115,8 +115,8 @@ class ExecutionEngine:
 
     def execute(
         self,
-        decision: "ExecutionDecision",
-    ) -> "ExecutionResult":
+        decision: ExecutionDecision,
+    ) -> ExecutionResult:
         """Realise a :class:`ExecutionDecision` against the appropriate
         backend (paper write / Bybit RPC).  Routes by ``decision.verb`` to
         ``_apply_paper`` / ``_apply_live`` / ``_apply_amend`` /
@@ -137,7 +137,7 @@ class ExecutionEngine:
         self,
         state: Any,
         exchange_state: Any,
-    ) -> "RecoveryReport":
+    ) -> RecoveryReport:
         """Cold-start three-way reconcile per ``P0-4.2`` §E.1.  Reads the
         persisted local authority (``state.json`` / SQLite), the exchange
         authority (``BybitPrivate.fetch_open_orders``), and produces a

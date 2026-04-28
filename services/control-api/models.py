@@ -1597,6 +1597,160 @@ class LiveOrderReconciliation(BaseModel):
     timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
+# Round 127 — typed models for the wave-3-A unified ExecutionEngine
+# (P0-4.2 §F.1 Shadow Mode).  These shapes mirror the design doc §B.2-§B.5
+# and let :mod:`execution_engine` produce a fully typed :class:`ExecutionDecision`
+# (and downstream :class:`ExecutionResult`) that the legacy dispatcher's
+# ``_dispatch_paper_intent`` / ``_dispatch_live_intent`` will compare against
+# in shadow mode.  Numeric quantities use ``float`` to match the rest of
+# ``models.py`` (no ``Decimal`` is used in this file); the engine itself is
+# responsible for honouring the qty-step / tick-size constraints upstream
+# of constructing :class:`TargetPosition`.
+
+
+# §B.2 — TargetPosition: where the engine thinks the strategy *should* be.
+TargetPositionSide = Literal["flat", "long", "short"]
+TargetPositionDerivedFrom = Literal[
+    "strategy_signal",
+    "manual_intent",
+    "stop_loss",
+    "external_close",
+]
+
+
+class TargetPosition(BaseModel):
+    """Engine view of "this strategy should be at <side> <size> @ <ref>".
+
+    All shadow-mode call sites pass ``derived_from="strategy_signal"`` since
+    the live / paper paths derive the position from a strategy preview;
+    other variants (manual / stop-loss / external close) land in wave-3-B/C
+    when the engine takes ownership of the corresponding flows.
+    """
+
+    strategy_id: str
+    symbol: str
+    market: Literal["spot", "perp"]
+    side: TargetPositionSide
+    size: float = Field(ge=0)
+    reference_price: float = Field(ge=0)
+    confidence: float = 0.0
+    derived_from: TargetPositionDerivedFrom = "strategy_signal"
+    decided_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+# §B.3 — ActiveExchangeOrder: thin wrapper over :class:`OrderRecord` that
+# threads the intent linkage + reconciliation state.  The wrapper does not
+# alter :class:`OrderRecord`'s wire schema (desktop unaffected); ``intent_id``
+# / ``exchange_link_id`` may be ``None`` for legacy / external orders the
+# engine reattaches during recovery (§E.1).
+class FillFragment(BaseModel):
+    """One execution slice against an active order (matches Bybit's
+    ``execution`` topic granularity).
+    """
+
+    fill_id: str
+    quantity: float = Field(ge=0)
+    price: float = Field(ge=0)
+    occurred_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class ActiveExchangeOrder(BaseModel):
+    order: OrderRecord
+    intent_id: Optional[str] = None
+    exchange_link_id: Optional[str] = None
+    state: str = "ACKED"  # one of ``EXECUTION_STATE_*`` from execution_state_machine
+    last_observed_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc)
+    )
+    last_known_status: str = ""
+    fills: List[FillFragment] = Field(default_factory=list)
+    drift_detected: bool = False
+
+
+# §B.4 — NewOrderRequest: the typed RPC payload the engine forwards when
+# verb in {submit, cancel_and_resubmit}.  Mirrors the manual order flow's
+# :class:`ManualOrderRequest` but adds the strategy linkage so the engine
+# stamps ``orderLinkId`` correctly without piggybacking on ``ManualOrderRequest``.
+class NewOrderRequest(BaseModel):
+    strategy_id: Optional[str] = None
+    symbol: str
+    market: Literal["spot", "perp"]
+    mode: AccountMode
+    side: Direction
+    quantity: float = Field(gt=0)
+    price: float = Field(gt=0)
+    reduce_only: bool = False
+    note: Optional[str] = None
+    exchange_link_id: Optional[str] = None
+
+
+# §B.4 — ExecutionDecision: the next action the engine has chosen.
+# Pure output of :meth:`execution_engine.ExecutionEngine.compute_decision`;
+# realising the decision is :meth:`execute`'s job (lands in F.2 / F.3).
+ExecutionVerb = Literal[
+    "keep",
+    "amend",
+    "cancel_and_resubmit",
+    "cancel_only",
+    "submit",
+    "noop",
+]
+
+
+class ExecutionDecision(BaseModel):
+    verb: ExecutionVerb
+    intent: ExecutionIntent
+    target_order: Optional[ActiveExchangeOrder] = None
+    stale_orders: List[ActiveExchangeOrder] = Field(default_factory=list)
+    new_order_request: Optional[NewOrderRequest] = None
+    risk_decision: RiskDecision
+    reason_code: str
+    reason_detail: Optional[str] = None
+    decided_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+# §B.5 — ExecutionResult: the engine's terminal outcome after :meth:`execute`.
+# Wave-3-A does not write this yet (no execute path) but the type is needed
+# now so ``execution_engine.py`` can declare the return type.
+ExecutionResultStatus = Literal[
+    "submitted",
+    "amended",
+    "reused",
+    "cancelled",
+    "noop",
+    "blocked",
+    "rejected",
+    "failed_transient",
+    "externally_modified",
+]
+
+
+class ExecutionResult(BaseModel):
+    intent_id: str
+    status: ExecutionResultStatus
+    final_state: str  # one of ``EXECUTION_STATE_*``
+    order: Optional[ActiveExchangeOrder] = None
+    audit_event_ids: List[str] = Field(default_factory=list)
+    risk_decision: RiskDecision
+    error_detail: Optional[str] = None
+    completed_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+# RecoveryReport: the artefact :meth:`recover` produces (§E.1).  Wave-3-A
+# only declares the shape; F.4 lands the body.
+class RecoveryDivergence(BaseModel):
+    order_id: str
+    reason: Literal["local_only", "exchange_only", "qty_mismatch", "status_mismatch"]
+    detail: str = ""
+
+
+class RecoveryReport(BaseModel):
+    active_orders: List[ActiveExchangeOrder] = Field(default_factory=list)
+    divergences: List[RecoveryDivergence] = Field(default_factory=list)
+    recovered_intents: List[str] = Field(default_factory=list)
+    completed_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
 # Round 60 — ``AutoDispatchGate`` captures the verdict of the autonomous
 # strategy-runtime worker's pre-flight guard chain.  Before R60, six
 # ``continue``-style guards inside ``_auto_dispatch_strategy_signal_changes``
