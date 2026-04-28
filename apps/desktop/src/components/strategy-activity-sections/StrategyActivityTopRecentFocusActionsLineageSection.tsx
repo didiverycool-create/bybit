@@ -1,0 +1,133 @@
+import type { StrategyActivityTopRecentFocusActionsLineageSectionProps } from './strategyActivityTopRecentFocusActionsTypes'
+import StrategyActivityTopRecentFocusActionsLineageBacktestSection from './StrategyActivityTopRecentFocusActionsLineageBacktestSection'
+import StrategyActivityTopRecentFocusActionsLineagePrimaryReviewSection from './StrategyActivityTopRecentFocusActionsLineagePrimaryReviewSection'
+import StrategyActivityTopRecentFocusActionsLineageTrackingSection from './StrategyActivityTopRecentFocusActionsLineageTrackingSection'
+
+export default function StrategyActivityTopRecentFocusActionsLineageSection({
+  showLineageActions,
+  activityLatestBacktest,
+  activityLatestBacktestStrategyId,
+  activityLatestBacktestReview,
+  activityLatestActionableBacktestRecord,
+  activityLatestActionableBacktestHasRecommendation,
+  activityLatestActionableBacktestDiffersFromLatest,
+  activityLatestActionableBacktestJobCanRetry,
+  activityLatestBacktestSourceChangeRequestId,
+  activityLatestBacktestSourceBacktestId,
+  activityLatestBacktestSourceReviewId,
+  activityLatestBacktestSourceProposalId,
+  activityLatestActionablePrimaryReviewStrategyId,
+  activityLatestActionablePrimaryReviewHasRecommendation,
+  activityLatestActionablePrimaryReviewRecord,
+  activityLatestActionablePrimaryReviewDiffersFromLatest,
+  activityLatestTrackingJobLinkedReviewId,
+  activityLatestTrackingJobChangeRequestId,
+  activityLatestTrackingJobBacktestId,
+  activityLatestTrackingJobSourceChangeRequestId,
+  activityLatestTrackingJobSourceBacktestId,
+  activityLatestTrackingJobSourceReviewId,
+  activityLatestTrackingJobSourceProposalId,
+  activityLatestTrackingJobStrategyId,
+  latestBacktestReviewOpenId,
+  latestBacktestJobOpenId,
+  latestActionableBacktestJobOpenId,
+  latestActionablePrimaryReviewOpenId,
+  latestPrimaryReviewSourceJobId,
+  latestPrimaryReviewSourceChangeRequestId,
+  latestPrimaryReviewSourceBacktestId,
+  latestPrimaryReviewSourceReviewId,
+  latestPrimaryReviewSourceProposalId,
+  latestTrackingReviewSourceJobId,
+  latestTrackingReviewSourceChangeRequestId,
+  latestTrackingReviewSourceBacktestId,
+  latestTrackingReviewSourceReviewId,
+  latestTrackingReviewSourceProposalId,
+  serviceAvailable,
+  backtestMutationPending,
+  retryAgentJobMutationPending,
+  onOpenStrategyProposal,
+  onOpenChangeRequest,
+  onOpenBacktestDetail,
+  onOpenSourceReview,
+  onOpenAiSchedulerJob,
+  onRetryAgentJobWithFocus,
+  onRerunBacktestFromRecommendation,
+  onRerunBacktestFromReview,
+}: StrategyActivityTopRecentFocusActionsLineageSectionProps) {
+  if (!showLineageActions) {
+    return null
+  }
+
+  return (
+    <div className="inline-actions inline-actions--tight" data-strategy-activity-top-actions="lineage">
+      <StrategyActivityTopRecentFocusActionsLineageBacktestSection
+        activityLatestBacktest={activityLatestBacktest}
+        activityLatestBacktestStrategyId={activityLatestBacktestStrategyId}
+        activityLatestBacktestReview={activityLatestBacktestReview}
+        activityLatestActionableBacktestRecord={activityLatestActionableBacktestRecord}
+        activityLatestActionableBacktestHasRecommendation={activityLatestActionableBacktestHasRecommendation}
+        activityLatestActionableBacktestDiffersFromLatest={activityLatestActionableBacktestDiffersFromLatest}
+        activityLatestActionableBacktestJobCanRetry={activityLatestActionableBacktestJobCanRetry}
+        activityLatestBacktestSourceChangeRequestId={activityLatestBacktestSourceChangeRequestId}
+        activityLatestBacktestSourceBacktestId={activityLatestBacktestSourceBacktestId}
+        activityLatestBacktestSourceReviewId={activityLatestBacktestSourceReviewId}
+        activityLatestBacktestSourceProposalId={activityLatestBacktestSourceProposalId}
+        latestBacktestReviewOpenId={latestBacktestReviewOpenId}
+        latestBacktestJobOpenId={latestBacktestJobOpenId}
+        latestActionableBacktestJobOpenId={latestActionableBacktestJobOpenId}
+        serviceAvailable={serviceAvailable}
+        backtestMutationPending={backtestMutationPending}
+        retryAgentJobMutationPending={retryAgentJobMutationPending}
+        onOpenStrategyProposal={onOpenStrategyProposal}
+        onOpenChangeRequest={onOpenChangeRequest}
+        onOpenBacktestDetail={onOpenBacktestDetail}
+        onOpenSourceReview={onOpenSourceReview}
+        onOpenReviewInspector={onOpenReviewInspector}
+        onOpenAiSchedulerJob={onOpenAiSchedulerJob}
+        onRetryAgentJobWithFocus={onRetryAgentJobWithFocus}
+        onRerunBacktestFromRecommendation={onRerunBacktestFromRecommendation}
+      />
+      <StrategyActivityTopRecentFocusActionsLineagePrimaryReviewSection
+        activityLatestActionablePrimaryReviewStrategyId={activityLatestActionablePrimaryReviewStrategyId}
+        activityLatestActionablePrimaryReviewHasRecommendation={activityLatestActionablePrimaryReviewHasRecommendation}
+        activityLatestActionablePrimaryReviewRecord={activityLatestActionablePrimaryReviewRecord}
+        activityLatestActionablePrimaryReviewDiffersFromLatest={activityLatestActionablePrimaryReviewDiffersFromLatest}
+        latestActionablePrimaryReviewOpenId={latestActionablePrimaryReviewOpenId}
+        latestPrimaryReviewSourceJobId={latestPrimaryReviewSourceJobId}
+        latestPrimaryReviewSourceChangeRequestId={latestPrimaryReviewSourceChangeRequestId}
+        latestPrimaryReviewSourceBacktestId={latestPrimaryReviewSourceBacktestId}
+        latestPrimaryReviewSourceReviewId={latestPrimaryReviewSourceReviewId}
+        latestPrimaryReviewSourceProposalId={latestPrimaryReviewSourceProposalId}
+        serviceAvailable={serviceAvailable}
+        backtestMutationPending={backtestMutationPending}
+        onOpenStrategyProposal={onOpenStrategyProposal}
+        onOpenChangeRequest={onOpenChangeRequest}
+        onOpenBacktestDetail={onOpenBacktestDetail}
+        onOpenSourceReview={onOpenSourceReview}
+        onOpenAiSchedulerJob={onOpenAiSchedulerJob}
+        onRerunBacktestFromReview={onRerunBacktestFromReview}
+      />
+      <StrategyActivityTopRecentFocusActionsLineageTrackingSection
+        activityLatestTrackingJobLinkedReviewId={activityLatestTrackingJobLinkedReviewId}
+        activityLatestTrackingJobChangeRequestId={activityLatestTrackingJobChangeRequestId}
+        activityLatestTrackingJobBacktestId={activityLatestTrackingJobBacktestId}
+        activityLatestTrackingJobSourceChangeRequestId={activityLatestTrackingJobSourceChangeRequestId}
+        activityLatestTrackingJobSourceBacktestId={activityLatestTrackingJobSourceBacktestId}
+        activityLatestTrackingJobSourceReviewId={activityLatestTrackingJobSourceReviewId}
+        activityLatestTrackingJobSourceProposalId={activityLatestTrackingJobSourceProposalId}
+        activityLatestTrackingJobStrategyId={activityLatestTrackingJobStrategyId}
+        latestTrackingReviewSourceJobId={latestTrackingReviewSourceJobId}
+        latestTrackingReviewSourceChangeRequestId={latestTrackingReviewSourceChangeRequestId}
+        latestTrackingReviewSourceBacktestId={latestTrackingReviewSourceBacktestId}
+        latestTrackingReviewSourceReviewId={latestTrackingReviewSourceReviewId}
+        latestTrackingReviewSourceProposalId={latestTrackingReviewSourceProposalId}
+        onOpenStrategyProposal={onOpenStrategyProposal}
+        onOpenChangeRequest={onOpenChangeRequest}
+        onOpenBacktestDetail={onOpenBacktestDetail}
+        onOpenSourceReview={onOpenSourceReview}
+        onOpenAiSchedulerJob={onOpenAiSchedulerJob}
+        onOpenReviewInspector={onOpenReviewInspector}
+      />
+    </div>
+  )
+}

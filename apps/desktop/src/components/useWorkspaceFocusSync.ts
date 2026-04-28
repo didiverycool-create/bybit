@@ -1,0 +1,46 @@
+import { useWorkspaceFocusSyncModel } from './useWorkspaceFocusSyncModel'
+import type { UseWorkspaceFocusSyncArgs } from './useWorkspaceFocusSync.types'
+
+export function useWorkspaceFocusSync({
+  activeSection,
+  selectedProposalId,
+  selectedChangeRequestId,
+  proposalCatalog,
+  replayFocusedReviewId,
+  reviewCatalog,
+  reviewInspectorOpen,
+  reviewInspectorReviewId,
+  reviewInspectorStrategyId,
+  aiSchedulerFocusedJobId,
+  schedulerJobs,
+  changeRequests,
+  strategies,
+  selectedStrategyCurrentId,
+  selectedStrategyId,
+  selectedSymbol,
+  setSelectedStrategyId,
+  setSelectedSymbol,
+  setReviewInspectorStrategyId,
+}: UseWorkspaceFocusSyncArgs) {
+  return useWorkspaceFocusSyncModel({
+    activeSection,
+    selectedProposalId,
+    selectedChangeRequestId,
+    proposalCatalog,
+    replayFocusedReviewId,
+    reviewCatalog,
+    reviewInspectorOpen,
+    reviewInspectorReviewId,
+    reviewInspectorStrategyId,
+    aiSchedulerFocusedJobId,
+    schedulerJobs,
+    changeRequests,
+    strategies,
+    selectedStrategyCurrentId,
+    selectedStrategyId,
+    selectedSymbol,
+    setSelectedStrategyId,
+    setSelectedSymbol,
+    setReviewInspectorStrategyId,
+  })
+}

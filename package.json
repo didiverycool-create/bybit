@@ -1,0 +1,28 @@
+{
+  "name": "bybit-quant-platform",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "dev": "pnpm --dir apps/desktop dev",
+    "dev:desktop": "pnpm --dir apps/desktop dev",
+    "dev:desktop:repair": "pnpm --dir apps/desktop dev:repair",
+    "smoke:market-switch": "pnpm --dir apps/desktop smoke:market-switch",
+    "smoke:strategy-activity": "pnpm --dir apps/desktop smoke:strategy-activity",
+    "report:market-switch": "pnpm --dir apps/desktop report:market-switch",
+    "report:market-switch:json": "pnpm --dir apps/desktop report:market-switch:json",
+    "report:strategy-activity": "pnpm --dir apps/desktop report:strategy-activity",
+    "report:strategy-activity:json": "pnpm --dir apps/desktop report:strategy-activity:json",
+    "verify:market-switch": "node ./scripts/verify-market-switch.mjs",
+    "verify:strategy-activity": "node ./scripts/verify-strategy-activity.mjs",
+    "report:verify-market-switch": "node ./scripts/report-verify-market-switch.mjs",
+    "report:verify-market-switch:json": "node ./scripts/report-verify-market-switch.mjs --json",
+    "report:verify-strategy-activity": "node ./scripts/report-verify-strategy-activity.mjs",
+    "report:verify-strategy-activity:json": "node ./scripts/report-verify-strategy-activity.mjs --json",
+    "build": "pnpm --dir apps/desktop build",
+    "build:desktop": "pnpm --dir apps/desktop build",
+    "lint": "pnpm --dir apps/desktop lint",
+    "lint:desktop": "pnpm --dir apps/desktop lint",
+    "test:control-api": "python3 -m unittest discover -s services/control-api/tests -p 'test_*.py' -v",
+    "verify:backend": "python3 -m py_compile services/control-api/*.py services/control-api/tests/test_control_api.py && python3 -m unittest discover -s services/control-api/tests -p 'test_*.py' -v"
+  }
+}

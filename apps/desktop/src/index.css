@@ -1,0 +1,89 @@
+:root {
+  color-scheme: dark;
+  font-family: var(--font-body);
+  line-height: 1.5;
+  font-weight: 400;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  --bg-page: #060b14;
+  --bg-panel: rgba(10, 15, 24, 0.92);
+  --border-strong: rgba(148, 163, 184, 0.18);
+  --shadow-soft:
+    0 18px 42px rgba(2, 6, 23, 0.28), inset 0 1px 0 rgba(255, 255, 255, 0.02);
+  --shadow-strong:
+    0 24px 60px rgba(2, 6, 23, 0.36), inset 0 1px 0 rgba(255, 255, 255, 0.03);
+  --text-strong: #f8fafc;
+  --text-muted: #94a3b8;
+  --text-soft: #64748b;
+  --accent-green: #34d399;
+  --accent-cyan: #22d3ee;
+  --accent-emerald: #34d399;
+  --accent-amber: #fbbf24;
+  --accent-rose: #fb7185;
+  --font-display:
+    "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei UI", "Noto Sans SC",
+    "Source Han Sans SC", sans-serif;
+  --font-body:
+    "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei UI", "Noto Sans SC",
+    "Source Han Sans SC", sans-serif;
+  --font-mono:
+    "SFMono-Regular", "JetBrains Mono", "Cascadia Code", "Roboto Mono", monospace;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+  color: var(--text-muted);
+  background:
+    radial-gradient(circle at top left, rgba(20, 184, 166, 0.12), transparent 30%),
+    radial-gradient(circle at top right, rgba(59, 130, 246, 0.08), transparent 28%),
+    linear-gradient(180deg, #040812 0%, #050b15 48%, #060b14 100%);
+  font-family: var(--font-body);
+}
+
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  background:
+    linear-gradient(rgba(148, 163, 184, 0.03) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(148, 163, 184, 0.03) 1px, transparent 1px);
+  background-size: 38px 38px;
+  mask-image: linear-gradient(180deg, rgba(0, 0, 0, 0.48), rgba(0, 0, 0, 0.2));
+}
+
+button,
+input,
+textarea,
+select {
+  font: inherit;
+}
+
+button {
+  cursor: pointer;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+code {
+  font-family: var(--font-mono);
+}
+
+#root {
+  isolation: isolate;
+}

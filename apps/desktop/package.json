@@ -1,0 +1,47 @@
+{
+  "name": "@bybit/desktop",
+  "private": true,
+  "version": "0.1.0",
+  "main": "dist-electron/main/main.js",
+  "scripts": {
+    "dev": "concurrently -k \"node ./scripts/dev-reuse-or-run.mjs --replace-stale ../../services/control-api/main.py ../../services/control-api http http://127.0.0.1:8787/health python3 ../../services/control-api/main.py\" \"node ./scripts/dev-reuse-or-run.mjs --replace-unhealthy vite http http://localhost:5173 vite --strictPort\" \"tsc -p tsconfig.electron.json -w\" \"wait-on http://127.0.0.1:8787/health http://localhost:5173 dist-electron/main/main.js && node ./scripts/run-electron-single.mjs\"",
+    "dev:repair": "concurrently -k \"node ./scripts/dev-reuse-or-run.mjs --replace-stale ../../services/control-api/main.py ../../services/control-api --replace-unhealthy ../../services/control-api/main.py http http://127.0.0.1:8787/health python3 ../../services/control-api/main.py\" \"node ./scripts/dev-reuse-or-run.mjs --replace-unhealthy vite http http://localhost:5173 vite --strictPort\" \"tsc -p tsconfig.electron.json -w\" \"wait-on http://127.0.0.1:8787/health http://localhost:5173 dist-electron/main/main.js && node ./scripts/run-electron-single.mjs\"",
+    "smoke:market-switch": "node ./scripts/smoke-market-switch.mjs",
+    "smoke:strategy-activity": "node ./scripts/smoke-strategy-activity.mjs",
+    "report:market-switch": "node ./scripts/report-market-switch.mjs",
+    "report:market-switch:json": "node ./scripts/report-market-switch.mjs --json",
+    "report:strategy-activity": "node ./scripts/report-strategy-activity.mjs",
+    "report:strategy-activity:json": "node ./scripts/report-strategy-activity.mjs --json",
+    "verify:market-switch": "pnpm run lint && pnpm run build && pnpm run smoke:market-switch",
+    "verify:strategy-activity": "pnpm run lint && pnpm run build && pnpm run smoke:strategy-activity",
+    "build": "pnpm run build:renderer && pnpm run build:electron",
+    "build:renderer": "vite build",
+    "build:electron": "tsc -p tsconfig.electron.json",
+    "lint": "eslint ."
+  },
+  "dependencies": {
+    "@tanstack/react-query": "^5.78.0",
+    "echarts": "^5.6.0",
+    "echarts-for-react": "^3.0.2",
+    "lucide-react": "^0.502.0",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.1",
+    "@types/node": "^22.15.3",
+    "@types/react": "^19.1.8",
+    "@types/react-dom": "^19.1.6",
+    "@vitejs/plugin-react": "^4.4.1",
+    "concurrently": "^9.2.1",
+    "electron": "^35.7.5",
+    "eslint": "^9.28.0",
+    "eslint-plugin-react-hooks": "^5.2.0",
+    "eslint-plugin-react-refresh": "^0.4.24",
+    "globals": "^16.4.0",
+    "typescript": "^5.8.3",
+    "typescript-eslint": "^8.46.1",
+    "vite": "^6.3.5",
+    "wait-on": "^8.0.4"
+  }
+}

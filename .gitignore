@@ -1,0 +1,8 @@
+node_modules
+dist
+dist-electron
+.DS_Store
+*.log
+.runtime
+__pycache__
+*.pyc
