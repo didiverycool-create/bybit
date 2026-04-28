@@ -30613,5 +30613,206 @@ class SettingsPayloadFeatureFlagsRound131Tests(unittest.TestCase):
             control_main._FEATURE_FLAGS_RUNTIME.update(original)
 
 
+# ============================================================================
+# Round 132 — ExecutionEngine.execute paper branch (P0-4.2 §F.2 Wave-3-B)
+# ============================================================================
+# Wave-3-B's first commit lands :meth:`ExecutionEngine.execute`'s paper
+# branch via :meth:`_apply_paper`.  The branch wraps
+# ``repo.execute_strategy_signal`` so the produced :class:`TradeRecord` is
+# byte-equivalent to the legacy ``main._dispatch_paper_intent`` output.
+# These tests cover the engine-side contract; the routing flag wiring lands
+# in R134 (``PaperIntentEngineRouteTests``).
+# ============================================================================
+class ExecutePaperBranchTests(unittest.TestCase):
+    """Engine paper branch — byte-equivalence with legacy paper dispatch."""
+
+    def setUp(self) -> None:
+        # Snapshot the repo state so creating paper trades inside the
+        # engine's _apply_paper does not pollute downstream tests
+        # (HardConstraintIntegrationTests in particular relies on the
+        # PAPER_STARTING_CASH balance being intact).
+        self._state_backup = copy.deepcopy(control_main.repo.state)
+        self.addCleanup(self._restore_state)
+
+    def _restore_state(self) -> None:
+        control_main.repo.state = copy.deepcopy(self._state_backup)
+        control_main.repo._persist(control_main.repo.state)
+
+    def _make_paper_intent(self, *, intent_id: Optional[str] = "intent-r132-01"):
+        from models import (
+            ExecutionIntent,
+            ExecutionPreview,
+            RiskDecision,
+            AccountMode as Mode,
+            Direction,
+        )
+
+        # eth-revert-02 is the seeded paper-mode strategy (status=paper_only,
+        # mode=PAPER), so ``repo.execute_strategy_signal`` accepts it.
+        preview = ExecutionPreview(
+            symbol="ETHUSDT",
+            market="perp",
+            mode=Mode.PAPER,
+            side=Direction.BUY,
+            origin="manual",
+            quantity=0.01,
+            price=2000.0,
+            notional="20",
+            action="增仓",
+            allowed=True,
+            current_position_size="0",
+            current_avg_price="0",
+            projected_position_size="0.01",
+            projected_avg_price="2000",
+            available_balance_before="100",
+            available_balance_after="80",
+            estimated_realized_pnl="0",
+            generated_at="2026-04-28T08:00:00+08:00",
+        )
+        decision = RiskDecision(
+            verdict="allow",
+            reason_code="risk.approved",
+            reason_detail="",
+            preview=preview,
+        )
+        return ExecutionIntent(
+            strategy_id="eth-revert-02",
+            strategy_name="ExecutePaperHarness",
+            source="manual",
+            mode=Mode.PAPER,
+            symbol="ETHUSDT",
+            market="perp",
+            side=Direction.BUY,
+            quantity=0.01,
+            price=2000.0,
+            signal="buy",
+            preview=preview,
+            decision=decision,
+            parameter_snapshot={},
+            requested_by="desktop_operator",
+            note=None,
+            created_at="2026-04-28T08:00:00+08:00",
+            intent_id=intent_id,
+        )
+
+    def _compute_paper_decision(self, intent):
+        return control_main.execution_engine.compute_decision(
+            intent, control_main.repo.snapshot()
+        )
+
+    def test_execute_paper_returns_typed_execution_result(self) -> None:
+        """``ExecutionEngine.execute`` on a paper decision returns an
+        :class:`ExecutionResult` with status='submitted', final_state='ROUTED'
+        and the original :class:`RiskDecision` threaded through.
+        """
+        from models import ExecutionResult
+
+        intent = self._make_paper_intent()
+        decision = self._compute_paper_decision(intent)
+
+        result = control_main.execution_engine.execute(decision)
+
+        self.assertIsInstance(result, ExecutionResult)
+        self.assertEqual(result.status, "submitted")
+        self.assertEqual(result.final_state, "ROUTED")
+        self.assertEqual(result.intent_id, "intent-r132-01")
+        self.assertIsNone(result.order)
+        self.assertIsNone(result.error_detail)
+        # Risk decision must be threaded verbatim.
+        self.assertEqual(result.risk_decision.verdict, "allow")
+        self.assertEqual(result.risk_decision.reason_code, "risk.approved")
+
+    def test_execute_paper_uses_paper_strategy(self) -> None:
+        """The harness must point at a paper-mode strategy so
+        ``repo.execute_strategy_signal`` accepts the call.  This protects
+        the rest of the suite from a silent regression where the seeded
+        strategy gets flipped away from paper mode.
+        """
+        intent = self._make_paper_intent()
+        strategy = next(
+            item for item in control_main.repo.snapshot().strategies
+            if item.id == intent.strategy_id
+        )
+        from models import AccountMode as Mode
+        self.assertTrue(
+            strategy.mode == Mode.PAPER or strategy.status == "paper_only"
+        )
+
+    def test_execute_paper_calls_repo_execute_strategy_signal_byte_equal(self) -> None:
+        """The engine paper branch must call
+        ``repo.execute_strategy_signal(strategy_id, requested_by, note)``
+        with the same arguments the legacy ``_dispatch_paper_intent`` does
+        — so the produced trade is byte-equivalent.
+        """
+        intent = self._make_paper_intent()
+        decision = self._compute_paper_decision(intent)
+
+        with patch.object(
+            control_main.repo,
+            "execute_strategy_signal",
+            wraps=control_main.repo.execute_strategy_signal,
+        ) as spy:
+            control_main.execution_engine.execute(decision)
+
+        self.assertEqual(spy.call_count, 1)
+        args, kwargs = spy.call_args
+        # Legacy signature is positional: (strategy_id, requested_by, note).
+        self.assertEqual(args[0], "eth-revert-02")
+        self.assertEqual(args[1], "desktop_operator")
+        self.assertIsNone(args[2])
+
+    def test_execute_paper_clears_manual_execution_alerts(self) -> None:
+        """After writing the paper trade the engine must call
+        ``main._clear_strategy_manual_execution_alerts`` so the operator
+        sees recovery — same hook the legacy dispatcher invokes.
+        """
+        intent = self._make_paper_intent()
+        decision = self._compute_paper_decision(intent)
+
+        with patch.object(
+            control_main,
+            "_clear_strategy_manual_execution_alerts",
+        ) as spy_clear:
+            control_main.execution_engine.execute(decision)
+
+        spy_clear.assert_called_once()
+        args, kwargs = spy_clear.call_args
+        self.assertEqual(args[0], "eth-revert-02")
+        from models import AccountMode as Mode
+        self.assertEqual(args[1], Mode.PAPER)
+        # Resolution detail must match the legacy dispatcher's wording so
+        # the audit copy stays byte-identical.
+        self.assertEqual(
+            kwargs["resolution_detail"],
+            "后续 Paper 手动策略执行已恢复成功，旧的拦截提醒已收起。",
+        )
+
+    def test_execute_paper_leaves_decision_intent_untouched(self) -> None:
+        """The engine must not mutate ``decision.intent`` — paper paths
+        relay the intent verbatim so the audit trail can quote it later.
+        """
+        intent = self._make_paper_intent(intent_id="intent-r132-immutable")
+        decision = self._compute_paper_decision(intent)
+
+        original_intent_id = decision.intent.intent_id
+        original_strategy_id = decision.intent.strategy_id
+
+        control_main.execution_engine.execute(decision)
+
+        self.assertEqual(decision.intent.intent_id, original_intent_id)
+        self.assertEqual(decision.intent.strategy_id, original_strategy_id)
+
+    def test_execute_paper_intent_without_intent_id_falls_back_to_empty(self) -> None:
+        """Pre-R128 intents may not carry ``intent_id``; the engine must
+        gracefully fall back to an empty string rather than raising.
+        """
+        intent = self._make_paper_intent(intent_id=None)
+        decision = self._compute_paper_decision(intent)
+
+        result = control_main.execution_engine.execute(decision)
+
+        self.assertEqual(result.intent_id, "")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

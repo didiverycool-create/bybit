@@ -1,4 +1,4 @@
-"""Round 125-129 — Unified ExecutionEngine for P0-4.2 §F.1 Shadow Mode.
+"""Round 125-132 — Unified ExecutionEngine for P0-4.2 §F.1+§F.2.
 
 Coordinator that owns the (compute_decision → execute → recover) pipeline.
 See ``docs/P0-4.2-execution-engine-design.md`` §B-§E for the full contract;
@@ -22,7 +22,18 @@ Wave-3-A milestones:
   :class:`~models.ExecutionDecision` so Shadow Mode can compare against
   the legacy path.
 
-``execute`` / ``recover`` continue to raise until wave-3-B / wave-3-D.
+Wave-3-B milestones (Paper Mode — §F.2):
+
+* R132 — :meth:`ExecutionEngine.execute` paper branch lands via the private
+  :meth:`_apply_paper` helper.  The branch wraps
+  ``repo.execute_strategy_signal`` so the produced :class:`models.TradeRecord`
+  is byte-equivalent to the legacy ``main._dispatch_paper_intent`` output;
+  the engine wraps the resulting :class:`models.StrategyExecutionResult`
+  into a typed :class:`models.ExecutionResult` (status="submitted",
+  final_state="ROUTED", error_detail=None on success).  ``execute`` for
+  live verbs continues to raise until F.3 (wave-3-C).
+
+``recover`` continues to raise until wave-3-D.
 
 Wave-3-A scope discipline (mirrors R118 RiskEngine):
     * **No behaviour change.** Importing this module must not affect any of
@@ -36,8 +47,10 @@ Wave-3-A scope discipline (mirrors R118 RiskEngine):
       ``_resolve_main_module`` pattern.
     * **Shadow-only invocation in F.1.** ``compute_decision`` is a pure
       function and may be called from ``main._dispatch_execution_intent``
-      *before* the legacy paper / live branches return; ``execute`` /
-      ``recover`` stay raising until wave-3-B onwards.
+      *before* the legacy paper / live branches return.  ``execute`` lands
+      its paper branch in F.2 (R132) gated behind the
+      ``execution_engine.paper`` feature flag (default ``False``); ``recover``
+      stays raising until wave-3-D.
 """
 
 from __future__ import annotations
@@ -56,6 +69,12 @@ from models import (
     NewOrderRequest,
     OrderRecord,
     RecoveryReport,
+    StrategyExecutionResult,
+)
+from execution_state_machine import (
+    EXECUTION_STATE_PROPOSED,
+    EXECUTION_STATE_PREVIEWED,
+    EXECUTION_STATE_ROUTED,
 )
 
 if TYPE_CHECKING:  # pragma: no cover - typing-only imports
@@ -334,19 +353,90 @@ class ExecutionEngine:
         decision: ExecutionDecision,
     ) -> ExecutionResult:
         """Realise a :class:`ExecutionDecision` against the appropriate
-        backend (paper write / Bybit RPC).  Routes by ``decision.verb`` to
-        ``_apply_paper`` / ``_apply_live`` / ``_apply_amend`` /
-        ``_apply_cancel`` / ``_apply_noop`` (private; signatures land with
-        their respective wave-3-B / wave-3-C commits).  All SQLite writes
-        happen inside a :class:`~persistence.unit_of_work.PersistenceUnit`
-        context.
+        backend (paper write / Bybit RPC).  Routes by ``decision.intent.mode``
+        to :meth:`_apply_paper` (R132) / :meth:`_apply_live` (F.3).
 
-        :raises NotImplementedError: ``execute`` ships in F.2 (Paper) and
-            F.3 (Demo / Live).  Round 125 keeps the signature only.
+        Round 132 — wave-3-B §F.2 lands the paper branch.  When
+        ``decision.intent.mode == AccountMode.PAPER`` the engine delegates
+        to :meth:`_apply_paper`, which wraps the legacy
+        ``repo.execute_strategy_signal`` write so the produced trade is
+        byte-equivalent to ``main._dispatch_paper_intent``.  Live / demo
+        verbs continue to raise until wave-3-C (F.3).
+
+        :returns: a typed :class:`ExecutionResult` whose ``status`` /
+            ``final_state`` / ``order`` faithfully reflect the realised
+            paper write.  Paper trades do not produce a resting Bybit
+            order (no exchange-side state) so ``order`` is ``None`` and
+            ``final_state`` is ``ROUTED`` (the engine reaches "routed"
+            for paper because there is no ACK loop — the local write is
+            the terminal state for the paper path).
+        :raises NotImplementedError: live / demo verbs ship in F.3.
         """
 
+        if decision.intent.mode == AccountMode.PAPER:
+            return self._apply_paper(decision)
+
         raise NotImplementedError(
-            "ExecutionEngine.execute lands in wave-3-B (F.2 Paper)"
+            "ExecutionEngine.execute live branch lands in wave-3-C (F.3 Demo)"
+        )
+
+    def _apply_paper(self, decision: ExecutionDecision) -> ExecutionResult:
+        """Realise a paper-mode :class:`ExecutionDecision` by delegating to
+        the same ``repo.execute_strategy_signal`` helper the legacy
+        ``main._dispatch_paper_intent`` uses.  The engine wraps the produced
+        :class:`StrategyExecutionResult` into a typed
+        :class:`ExecutionResult` so downstream callers (audit emission,
+        shadow parity helper) can treat paper / live outcomes uniformly.
+
+        Round 132 — wave-3-B §F.2 contract:
+
+        * ``repo.execute_strategy_signal(strategy_id, requested_by, note)``
+          is called with the same arguments the legacy dispatcher passes,
+          so the resulting :class:`models.TradeRecord` is byte-equivalent
+          (matched test: ``ExecutePaperBranchTests``).
+        * ``main._clear_strategy_manual_execution_alerts`` is invoked
+          afterwards so the operator sees recovery clear the same way the
+          legacy path does.  The engine reaches into ``main`` through
+          :func:`_resolve_main_module` (no circular import).
+        * The returned :class:`ExecutionResult` carries
+          ``status="submitted"`` (paper trades are always written, never
+          blocked here — risk decision is upstream of execute), and
+          ``final_state="ROUTED"`` because paper has no exchange ACK loop.
+        * ``order=None`` because paper trades produce a
+          :class:`TradeRecord`, not a resting :class:`OrderRecord`; the
+          legacy paper :class:`StrategyExecutionResult.kind="paper_trade"`
+          contract is preserved by the caller (the wrapper in
+          ``main._dispatch_paper_intent``) which still owns the wire shape
+          desktop consumes.
+
+        The engine does **not** mutate ``decision`` — the input is passed
+        through verbatim.  ``ExecutionResult.intent_id`` is taken from
+        ``decision.intent.intent_id`` when present, falling back to an
+        empty string for legacy intents that pre-date R128.
+        """
+
+        intent = decision.intent
+        main_mod = _resolve_main_module()
+
+        trade = main_mod.repo.execute_strategy_signal(
+            intent.strategy_id,
+            intent.requested_by,
+            intent.note,
+        )
+        main_mod._clear_strategy_manual_execution_alerts(
+            intent.strategy_id,
+            intent.mode,
+            resolution_detail="后续 Paper 手动策略执行已恢复成功，旧的拦截提醒已收起。",
+        )
+
+        return ExecutionResult(
+            intent_id=intent.intent_id or "",
+            status="submitted",
+            final_state=EXECUTION_STATE_ROUTED,
+            order=None,
+            audit_event_ids=[],
+            risk_decision=decision.risk_decision,
+            error_detail=None,
         )
 
     def recover(
