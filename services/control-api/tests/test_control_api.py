@@ -29210,10 +29210,13 @@ class ExecutionEngineSkeletonRound125Tests(unittest.TestCase):
     def test_execution_state_machine_graph_class_exists(self) -> None:
         import execution_state_machine as esm  # type: ignore
 
-        # Round 125 keeps LEGAL_TRANSITIONS empty; R126 fills the table from
-        # the design doc.  The placeholder shape must still be a Mapping.
+        # The placeholder shape must be a Mapping; the actual rows arrive in
+        # R126 and are guarded by ``ExecutionStateMachineRound126Tests``.
         self.assertTrue(hasattr(esm.ExecutionStateGraph, "LEGAL_TRANSITIONS"))
-        self.assertEqual(dict(esm.ExecutionStateGraph.LEGAL_TRANSITIONS), {})
+        from typing import Mapping  # local import keeps import surface tight
+        self.assertIsInstance(
+            esm.ExecutionStateGraph.LEGAL_TRANSITIONS, Mapping
+        )
 
     def test_validate_transition_rejects_unknown_states(self) -> None:
         import execution_state_machine as esm  # type: ignore
@@ -29249,6 +29252,219 @@ class ExecutionEngineSkeletonRound125Tests(unittest.TestCase):
         sig = inspect.signature(execution_engine.ExecutionEngine.compute_decision)
         self.assertEqual(
             list(sig.parameters.keys()), ["self", "intent", "state"]
+        )
+
+
+# ============================================================================
+# Round 126 — ExecutionStateGraph LEGAL_TRANSITIONS table (P0-4.2 §C.2)
+# ----------------------------------------------------------------------------
+# Round 126 fills the legal-transition table from the design doc §C.2.  The
+# tests guard each documented edge plus the non-membership of common illegal
+# transitions (e.g. PROPOSED → FILLED skipping ACKED, terminal → anything,
+# etc.).  Property-based hypothesis tests come in F.4 — this round only
+# guards the byte-equal mapping with the design doc.
+# ============================================================================
+class ExecutionStateMachineRound126Tests(unittest.TestCase):
+    """Legal-transition table contract — every row of §C.2 plus a handful of
+    illegal edges that property-based fuzzing will hit later.
+    """
+
+    def test_legal_transitions_table_is_populated(self) -> None:
+        import execution_state_machine as esm  # type: ignore
+
+        # Round 126 fills the table; the count equals the number of edges
+        # explicitly documented in §C.2 (13 happy-path edges; ROUTED-timeout
+        # / ACKED-ttl_exceeded are retry triggers, not state edges, so they
+        # are intentionally absent — see ExecutionStateGraph docstring).
+        self.assertEqual(len(esm.ExecutionStateGraph.LEGAL_TRANSITIONS), 13)
+
+    def test_proposed_to_previewed(self) -> None:
+        import execution_state_machine as esm  # type: ignore
+
+        self.assertTrue(
+            esm.validate_transition(
+                esm.EXECUTION_STATE_PROPOSED,
+                esm.EXECUTION_EVENT_BUILD_PREVIEW,
+                esm.EXECUTION_STATE_PREVIEWED,
+            )
+        )
+
+    def test_previewed_to_routed(self) -> None:
+        import execution_state_machine as esm  # type: ignore
+
+        self.assertTrue(
+            esm.validate_transition(
+                esm.EXECUTION_STATE_PREVIEWED,
+                esm.EXECUTION_EVENT_RISK_ALLOW,
+                esm.EXECUTION_STATE_ROUTED,
+            )
+        )
+
+    def test_routed_to_acked_on_create(self) -> None:
+        import execution_state_machine as esm  # type: ignore
+
+        self.assertTrue(
+            esm.validate_transition(
+                esm.EXECUTION_STATE_ROUTED,
+                esm.EXECUTION_EVENT_BYBIT_CREATE_OK,
+                esm.EXECUTION_STATE_ACKED,
+            )
+        )
+
+    def test_routed_to_acked_on_amend(self) -> None:
+        import execution_state_machine as esm  # type: ignore
+
+        self.assertTrue(
+            esm.validate_transition(
+                esm.EXECUTION_STATE_ROUTED,
+                esm.EXECUTION_EVENT_BYBIT_AMEND_OK,
+                esm.EXECUTION_STATE_ACKED,
+            )
+        )
+
+    def test_routed_to_canceled_on_cancel(self) -> None:
+        import execution_state_machine as esm  # type: ignore
+
+        self.assertTrue(
+            esm.validate_transition(
+                esm.EXECUTION_STATE_ROUTED,
+                esm.EXECUTION_EVENT_BYBIT_CANCEL_OK,
+                esm.EXECUTION_STATE_CANCELED,
+            )
+        )
+
+    def test_acked_to_partially_filled(self) -> None:
+        import execution_state_machine as esm  # type: ignore
+
+        self.assertTrue(
+            esm.validate_transition(
+                esm.EXECUTION_STATE_ACKED,
+                esm.EXECUTION_EVENT_WS_PARTIAL_FILL,
+                esm.EXECUTION_STATE_PARTIALLY_FILLED,
+            )
+        )
+
+    def test_acked_to_filled(self) -> None:
+        import execution_state_machine as esm  # type: ignore
+
+        self.assertTrue(
+            esm.validate_transition(
+                esm.EXECUTION_STATE_ACKED,
+                esm.EXECUTION_EVENT_WS_FILL,
+                esm.EXECUTION_STATE_FILLED,
+            )
+        )
+
+    def test_acked_to_canceled_on_own_cancel(self) -> None:
+        import execution_state_machine as esm  # type: ignore
+
+        self.assertTrue(
+            esm.validate_transition(
+                esm.EXECUTION_STATE_ACKED,
+                esm.EXECUTION_EVENT_WS_CANCEL_OWN,
+                esm.EXECUTION_STATE_CANCELED,
+            )
+        )
+
+    def test_acked_to_externally_modified_on_external_cancel(self) -> None:
+        import execution_state_machine as esm  # type: ignore
+
+        self.assertTrue(
+            esm.validate_transition(
+                esm.EXECUTION_STATE_ACKED,
+                esm.EXECUTION_EVENT_WS_CANCEL_EXTERNAL,
+                esm.EXECUTION_STATE_EXTERNALLY_MODIFIED,
+            )
+        )
+
+    def test_acked_to_externally_modified_on_external_amend(self) -> None:
+        import execution_state_machine as esm  # type: ignore
+
+        self.assertTrue(
+            esm.validate_transition(
+                esm.EXECUTION_STATE_ACKED,
+                esm.EXECUTION_EVENT_WS_AMEND_EXTERNAL,
+                esm.EXECUTION_STATE_EXTERNALLY_MODIFIED,
+            )
+        )
+
+    def test_acked_to_rejected(self) -> None:
+        import execution_state_machine as esm  # type: ignore
+
+        self.assertTrue(
+            esm.validate_transition(
+                esm.EXECUTION_STATE_ACKED,
+                esm.EXECUTION_EVENT_WS_REJECT,
+                esm.EXECUTION_STATE_REJECTED,
+            )
+        )
+
+    def test_partially_filled_to_filled(self) -> None:
+        import execution_state_machine as esm  # type: ignore
+
+        self.assertTrue(
+            esm.validate_transition(
+                esm.EXECUTION_STATE_PARTIALLY_FILLED,
+                esm.EXECUTION_EVENT_WS_FILL,
+                esm.EXECUTION_STATE_FILLED,
+            )
+        )
+
+    def test_partially_filled_to_canceled(self) -> None:
+        import execution_state_machine as esm  # type: ignore
+
+        self.assertTrue(
+            esm.validate_transition(
+                esm.EXECUTION_STATE_PARTIALLY_FILLED,
+                esm.EXECUTION_EVENT_WS_CANCEL_OWN,
+                esm.EXECUTION_STATE_CANCELED,
+            )
+        )
+
+    def test_illegal_proposed_to_filled_directly(self) -> None:
+        import execution_state_machine as esm  # type: ignore
+
+        # PROPOSED cannot leap to FILLED — must traverse PREVIEWED / ROUTED
+        # / ACKED first per §C.3 invariant 4.
+        self.assertFalse(
+            esm.validate_transition(
+                esm.EXECUTION_STATE_PROPOSED,
+                esm.EXECUTION_EVENT_WS_FILL,
+                esm.EXECUTION_STATE_FILLED,
+            )
+        )
+
+    def test_illegal_terminal_to_acked(self) -> None:
+        import execution_state_machine as esm  # type: ignore
+
+        # FILLED is terminal — no event can transition out of it.
+        self.assertFalse(
+            esm.validate_transition(
+                esm.EXECUTION_STATE_FILLED,
+                esm.EXECUTION_EVENT_WS_CANCEL_OWN,
+                esm.EXECUTION_STATE_CANCELED,
+            )
+        )
+
+    def test_illegal_no_back_to_proposed(self) -> None:
+        import execution_state_machine as esm  # type: ignore
+
+        # §C.3 invariant 2 — no state transitions back to PROPOSED.  The
+        # table must not contain any (any_state, *) -> PROPOSED row.
+        for (from_state, _event), to_state in (
+            esm.ExecutionStateGraph.LEGAL_TRANSITIONS.items()
+        ):
+            self.assertNotEqual(to_state, esm.EXECUTION_STATE_PROPOSED)
+
+    def test_illegal_unknown_event_returns_false(self) -> None:
+        import execution_state_machine as esm  # type: ignore
+
+        self.assertFalse(
+            esm.validate_transition(
+                esm.EXECUTION_STATE_PROPOSED,
+                "definitely.not.an.event",
+                esm.EXECUTION_STATE_PREVIEWED,
+            )
         )
 
 
