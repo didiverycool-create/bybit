@@ -716,6 +716,51 @@ def get_settings():
     return settings
 
 
+@router.get("/api/internal/persistence/feature-flags")
+def get_internal_feature_flags() -> Dict[str, Any]:
+    """Round 137 — wave-3-B §F.2 commit 6 read-only feature-flag endpoint.
+
+    Surfaces the current in-process feature-flag store so the desktop
+    "Settings → 数据" panel can render the wave-3 engine flag state
+    (``execution_engine.shadow`` / ``execution_engine.paper`` / future
+    siblings) without having to consume the larger ``/api/settings``
+    payload.
+
+    The endpoint is **read-only** — writes still go through the
+    persistence DAO (``ConfigDao.set_feature_flag``).  No authentication
+    is required because the entire control-api binds to localhost
+    (127.0.0.1) by design and the desktop client is the only consumer.
+
+    Response shape::
+
+        {
+            "flags": {"execution_engine.shadow": true, ...},
+            "defaults": {"execution_engine.shadow": true, ...},
+            "source": "runtime",
+        }
+
+    ``flags`` carries the live values; ``defaults`` documents what the
+    flag would resolve to if the in-process store were cleared (this
+    matches the design contract that "no row → safe default").
+    ``source`` is currently always ``"runtime"`` (in-process); wave-3-C
+    will add ``"sqlite"`` once the persistence DAO is wired into
+    ``main.py`` at module load time.
+    """
+
+    runtime_flags = dict(main._FEATURE_FLAGS_RUNTIME)
+    defaults: Dict[str, bool] = {
+        main._EXECUTION_ENGINE_SHADOW_FLAG_NAME:
+            main._EXECUTION_ENGINE_SHADOW_DEFAULT,
+        main._EXECUTION_ENGINE_PAPER_FLAG_NAME:
+            main._EXECUTION_ENGINE_PAPER_DEFAULT,
+    }
+    return {
+        "flags": runtime_flags,
+        "defaults": defaults,
+        "source": "runtime",
+    }
+
+
 @router.post("/api/settings", response_model=SettingsPayload)
 def update_settings(payload: SettingsUpdatePayload):
     try:

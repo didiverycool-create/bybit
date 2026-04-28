@@ -31523,5 +31523,111 @@ class PaperShadowParityTests(unittest.TestCase):
         )
 
 
+# ============================================================================
+# Round 137 — Feature-flag read-only endpoint (P0-4.2 §F.2 Wave-3-B commit 6)
+# ============================================================================
+# Wave-3-B §F.2 commit 6 surfaces the current in-process feature-flag
+# store via ``GET /api/internal/persistence/feature-flags`` so the desktop
+# "Settings → 数据" panel can render the wave-3 engine flag state
+# without consuming the larger ``/api/settings`` payload.
+# ============================================================================
+class FeatureFlagReadEndpointTests(unittest.TestCase):
+    """``GET /api/internal/persistence/feature-flags`` read-only contract."""
+
+    def setUp(self) -> None:
+        # Snapshot the runtime flag store so each test starts from a
+        # known baseline and any mutations are reverted.
+        self._original = dict(control_main._FEATURE_FLAGS_RUNTIME)
+        self.addCleanup(self._restore)
+
+    def _restore(self) -> None:
+        control_main._FEATURE_FLAGS_RUNTIME.clear()
+        control_main._FEATURE_FLAGS_RUNTIME.update(self._original)
+
+    def test_endpoint_returns_runtime_flags(self) -> None:
+        """The endpoint surfaces the live in-process store."""
+        from routes import get_internal_feature_flags
+
+        control_main._FEATURE_FLAGS_RUNTIME.clear()
+        control_main._FEATURE_FLAGS_RUNTIME["execution_engine.shadow"] = True
+        control_main._FEATURE_FLAGS_RUNTIME["execution_engine.paper"] = False
+
+        response = get_internal_feature_flags()
+        self.assertIn("flags", response)
+        self.assertEqual(
+            response["flags"],
+            {
+                "execution_engine.shadow": True,
+                "execution_engine.paper": False,
+            },
+        )
+
+    def test_endpoint_returns_defaults_block(self) -> None:
+        """``defaults`` carries the safe-default values used when the
+        runtime store has no entry for a flag.  This documents the
+        design's "no row → safe default" contract for desktop UI.
+        """
+        from routes import get_internal_feature_flags
+
+        response = get_internal_feature_flags()
+        self.assertIn("defaults", response)
+        self.assertEqual(
+            response["defaults"]["execution_engine.shadow"], True
+        )
+        self.assertEqual(
+            response["defaults"]["execution_engine.paper"], False
+        )
+
+    def test_endpoint_source_is_runtime(self) -> None:
+        """Wave-3-B keeps the canonical store in-memory; the response
+        documents this with ``source="runtime"``.  Wave-3-C will switch
+        to ``"sqlite"`` once the DAO is wired in.
+        """
+        from routes import get_internal_feature_flags
+
+        response = get_internal_feature_flags()
+        self.assertEqual(response["source"], "runtime")
+
+    def test_endpoint_reflects_flag_mutation(self) -> None:
+        """Setting a flag through the runtime helper is observable on the
+        endpoint response — same call, different value.
+        """
+        from routes import get_internal_feature_flags
+
+        control_main._set_execution_engine_paper_flag(True)
+        response = get_internal_feature_flags()
+        self.assertTrue(response["flags"]["execution_engine.paper"])
+
+        control_main._set_execution_engine_paper_flag(False)
+        response = get_internal_feature_flags()
+        self.assertFalse(response["flags"]["execution_engine.paper"])
+
+    def test_endpoint_does_not_mutate_store(self) -> None:
+        """The endpoint is read-only — repeated calls do not change the
+        runtime store contents.
+        """
+        from routes import get_internal_feature_flags
+
+        before = dict(control_main._FEATURE_FLAGS_RUNTIME)
+        for _ in range(5):
+            get_internal_feature_flags()
+        after = dict(control_main._FEATURE_FLAGS_RUNTIME)
+        self.assertEqual(before, after)
+
+    def test_endpoint_returns_empty_flags_when_store_cleared(self) -> None:
+        """When the runtime store is empty (e.g. cold start before any
+        defaults are loaded), the endpoint returns ``flags={}`` but
+        still documents the defaults so desktop can render the UI.
+        """
+        from routes import get_internal_feature_flags
+
+        control_main._FEATURE_FLAGS_RUNTIME.clear()
+        response = get_internal_feature_flags()
+        self.assertEqual(response["flags"], {})
+        # Defaults are always present.
+        self.assertIn("execution_engine.shadow", response["defaults"])
+        self.assertIn("execution_engine.paper", response["defaults"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
