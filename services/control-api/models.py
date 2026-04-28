@@ -1554,7 +1554,16 @@ class StrategyExecutionResult(BaseModel):
 # together.  ``source`` discriminates manual vs. autonomous dispatch so the
 # dispatcher can pick the right audit emission / alert-clear semantics
 # without re-parsing ``requested_by``.
-ExecutionIntentSource = Literal["manual", "auto"]
+# Round 128 — extended with the ``"recovery"`` variant per J.4 拍板
+# (``docs/P0-design-decisions-2026-04-26.md``).  The new variant tags
+# :class:`ExecutionIntent`s synthesised by the engine's cold-start recovery
+# path (§E.1) so audit consumers can distinguish "real user / strategy
+# initiated" vs "engine reattaching an external / orphan order" without
+# inspecting ``requested_by``.  Pre-R128 grep audit confirmed the only
+# production reader is :func:`main._classify_execution_intent_source`
+# (which now defaults ``recovery`` to never get auto-classified — recovery
+# intents are always built directly in :meth:`ExecutionEngine.recover`).
+ExecutionIntentSource = Literal["manual", "auto", "recovery"]
 
 
 class ExecutionIntent(BaseModel):
@@ -1574,6 +1583,18 @@ class ExecutionIntent(BaseModel):
     requested_by: str
     note: Optional[str] = None
     created_at: str
+    # Round 128 — ExecutionEngine extensions per design doc §B.1.  All six
+    # fields are optional with safe defaults so the legacy
+    # ``_build_execution_intent_from_state`` callsite remains unchanged in
+    # wave-3-A; the engine's ``compute_decision`` reads them when present
+    # and falls back to deterministic per-call defaults otherwise.  Wave-3-B
+    # / wave-3-C land the producers that actually populate these fields.
+    intent_id: Optional[str] = None
+    intent_seq: Optional[int] = None
+    exchange_link_id: Optional[str] = None
+    target_position: Optional[TargetPosition] = None
+    parent_intent_id: Optional[str] = None
+    ttl_seconds: int = 60
 
 
 # Round 59 — ``LiveOrderReconciliation`` captures the outcome of comparing a

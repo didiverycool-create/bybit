@@ -6126,6 +6126,14 @@ def _classify_execution_intent_source(payload: StrategyExecutionRequest) -> Exec
     The value is frozen onto ``ExecutionIntent.source`` so downstream audit
     emissions and the repo persistence helper can tell the two apart without
     re-parsing ``requested_by``.
+
+    Round 128 — :data:`ExecutionIntentSource` was extended with a
+    ``"recovery"`` variant for cold-start recovery intents synthesised by
+    :meth:`execution_engine.ExecutionEngine.recover` (P0-4.2 §E.1).  This
+    classifier never returns ``"recovery"``: recovery intents are built
+    directly inside the engine without going through the
+    ``StrategyExecutionRequest`` route, so the J.4 拍板 invariant ("only the
+    engine can stamp recovery as the source") holds.
     """
     if (payload.requested_by or "").strip() == "strategy_runtime_worker":
         return "auto"

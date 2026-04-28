@@ -29663,5 +29663,155 @@ class ExecutionDecisionModelRound127Tests(unittest.TestCase):
         self.assertIsNotNone(fill.occurred_at)
 
 
+# ============================================================================
+# Round 128 — ExecutionIntent extension + recovery source (P0-4.2 §B.1 / J.4)
+# ----------------------------------------------------------------------------
+# Round 128 extends ``ExecutionIntent`` with the six engine-only fields the
+# design doc §B.1 calls out (intent_id / intent_seq / exchange_link_id /
+# target_position / parent_intent_id / ttl_seconds) and adds the J.4 拍板
+# ``"recovery"`` variant to ``ExecutionIntentSource``.  The tests guard:
+#
+#   * defaults (existing producers like _build_execution_intent_from_state
+#     keep working without populating the new fields)
+#   * the recovery source is constructible (engine recover() will use it)
+#   * _classify_execution_intent_source still returns only "auto" / "manual"
+# ============================================================================
+class ExecutionIntentExtendedFieldsRound128Tests(unittest.TestCase):
+    """Backward-compatible extension of :class:`ExecutionIntent`.
+
+    The legacy callsite (:func:`main._build_execution_intent_from_state`)
+    constructs the intent without any of the new R128 fields, so the new
+    fields must default safely (``None`` for the optional ULID / linkage
+    fields, ``ttl_seconds=60`` matching the design doc).
+    """
+
+    def _make_preview(self):
+        from models import ExecutionPreview, AccountMode as Mode, Direction
+        return ExecutionPreview(
+            symbol="BTCUSDT",
+            market="perp",
+            mode=Mode.PAPER,
+            side=Direction.BUY,
+            origin="manual",
+            quantity=0.001,
+            price=10000.0,
+            notional="10",
+            action="增仓",
+            allowed=True,
+            current_position_size="0",
+            current_avg_price="0",
+            projected_position_size="0.001",
+            projected_avg_price="10000",
+            available_balance_before="100",
+            available_balance_after="90",
+            estimated_realized_pnl="0",
+            generated_at=datetime.now(timezone.utc).astimezone().isoformat(),
+        )
+
+    def _make_intent_kwargs(self):
+        from models import RiskDecision, AccountMode as Mode, Direction
+        preview = self._make_preview()
+        decision = RiskDecision(
+            verdict="allow",
+            reason_code="risk.approved",
+            reason_detail="",
+            preview=preview,
+        )
+        return {
+            "strategy_id": "strat-1",
+            "strategy_name": "Strat 1",
+            "source": "manual",
+            "mode": Mode.PAPER,
+            "symbol": "BTCUSDT",
+            "market": "perp",
+            "side": Direction.BUY,
+            "quantity": 0.001,
+            "price": 10000.0,
+            "signal": "buy",
+            "preview": preview,
+            "decision": decision,
+            "parameter_snapshot": {},
+            "requested_by": "desktop_operator",
+            "note": None,
+            "created_at": datetime.now(timezone.utc).astimezone().isoformat(),
+        }
+
+    def test_extension_fields_default_safely(self) -> None:
+        from models import ExecutionIntent
+
+        intent = ExecutionIntent(**self._make_intent_kwargs())
+        self.assertIsNone(intent.intent_id)
+        self.assertIsNone(intent.intent_seq)
+        self.assertIsNone(intent.exchange_link_id)
+        self.assertIsNone(intent.target_position)
+        self.assertIsNone(intent.parent_intent_id)
+        # Design doc §B.1 anchors ``ttl_seconds`` at 60.
+        self.assertEqual(intent.ttl_seconds, 60)
+
+    def test_extension_fields_round_trip_when_populated(self) -> None:
+        from models import ExecutionIntent, TargetPosition
+
+        target = TargetPosition(
+            strategy_id="strat-1",
+            symbol="BTCUSDT",
+            market="perp",
+            side="long",
+            size=0.001,
+            reference_price=10000.0,
+        )
+        kwargs = self._make_intent_kwargs()
+        kwargs.update(
+            intent_id="01HXYZ123",
+            intent_seq=42,
+            exchange_link_id="strategy-paper-strat-1-aabbcc",
+            target_position=target,
+            parent_intent_id="01HXYZ000",
+            ttl_seconds=120,
+        )
+        intent = ExecutionIntent(**kwargs)
+        self.assertEqual(intent.intent_id, "01HXYZ123")
+        self.assertEqual(intent.intent_seq, 42)
+        self.assertEqual(intent.ttl_seconds, 120)
+        self.assertEqual(intent.target_position.size, 0.001)
+        # Round-trip via .model_dump() preserves the embedded TargetPosition.
+        try:
+            dumped = intent.model_dump()
+            restored = ExecutionIntent.model_validate(dumped)
+        except AttributeError:  # pragma: no cover - Pydantic v1 fallback
+            dumped = intent.dict()
+            restored = ExecutionIntent.parse_obj(dumped)
+        self.assertEqual(restored.target_position.symbol, "BTCUSDT")
+        self.assertEqual(restored.parent_intent_id, "01HXYZ000")
+
+    def test_recovery_source_round_trip(self) -> None:
+        from models import ExecutionIntent
+
+        kwargs = self._make_intent_kwargs()
+        kwargs["source"] = "recovery"
+        intent = ExecutionIntent(**kwargs)
+        self.assertEqual(intent.source, "recovery")
+
+    def test_classify_execution_intent_source_never_returns_recovery(
+        self,
+    ) -> None:
+        # J.4 invariant: the auto / manual classifier never returns "recovery".
+        # Recovery intents must come from the engine directly.
+        from models import StrategyExecutionRequest, AccountMode as Mode
+
+        for requested_by in (
+            "strategy_runtime_worker",
+            "desktop_operator",
+            "manual:user@host",
+            "openclaw_worker",
+            "",
+        ):
+            payload = StrategyExecutionRequest(
+                mode=Mode.PAPER, requested_by=requested_by
+            )
+            classified = control_main._classify_execution_intent_source(payload)
+            self.assertIn(classified, ("auto", "manual"))
+            self.assertNotEqual(classified, "recovery")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
