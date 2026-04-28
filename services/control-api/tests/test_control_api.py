@@ -30282,5 +30282,336 @@ class CompareShadowDecisionRound130Tests(unittest.TestCase):
         )
 
 
+# ============================================================================
+# Round 131 — Shadow audit emission + feature-flag plumbing (P0-4.2 §F.1)
+# ----------------------------------------------------------------------------
+# Round 131 wires the engine into _dispatch_execution_intent: when the
+# ``execution_engine.shadow`` feature flag is on (default True), every
+# dispatch fires the engine's compute_decision side-by-side with the
+# legacy path and writes one ``execution.shadow_decision`` audit (INFO).
+# When the engine and legacy paths disagree, an additional WARNING-level
+# ``execution.shadow_decision_diverged`` audit is emitted.
+#
+# Tests cover:
+#   * audit emission shape (INFO when matched, INFO + WARNING when diverged)
+#   * flag-off path (no audit emitted)
+#   * feature-flag DAO helpers (get/set, default, JSON round-trip)
+#   * SettingsPayload feature_flags read-only mirror via /api/settings
+# ============================================================================
+class ShadowAuditEmissionRound131Tests(unittest.TestCase):
+    """Shadow audit emission contract."""
+
+    def setUp(self) -> None:
+        # Snapshot the current shadow flag so each test runs independent of
+        # any prior overrides.
+        self._original_flag = control_main._get_execution_engine_shadow_flag()
+
+    def tearDown(self) -> None:
+        control_main._set_execution_engine_shadow_flag(self._original_flag)
+
+    def _make_paper_intent(self):
+        """Build a minimal paper-mode intent suitable for _dispatch_execution_intent."""
+        from models import (
+            ExecutionIntent, ExecutionPreview, RiskDecision, AccountMode as Mode,
+            Direction,
+        )
+        preview = ExecutionPreview(
+            symbol="BTCUSDT", market="perp", mode=Mode.PAPER, side=Direction.BUY,
+            origin="manual", quantity=0.001, price=10000.0, notional="10",
+            action="增仓", allowed=True, current_position_size="0",
+            current_avg_price="0", projected_position_size="0.001",
+            projected_avg_price="10000", available_balance_before="100",
+            available_balance_after="90", estimated_realized_pnl="0",
+            generated_at="2026-04-28T08:00:00+08:00",
+        )
+        decision = RiskDecision(
+            verdict="allow", reason_code="risk.approved", reason_detail="",
+            preview=preview,
+        )
+        return ExecutionIntent(
+            strategy_id="trend-btc-01",  # uses seeded strategy
+            strategy_name="ShadowHarness", source="manual",
+            mode=Mode.PAPER, symbol="BTCUSDT", market="perp",
+            side=Direction.BUY, quantity=0.001, price=10000.0,
+            signal="buy", preview=preview, decision=decision,
+            parameter_snapshot={}, requested_by="desktop_operator",
+            note=None, created_at="2026-04-28T08:00:00+08:00",
+            intent_id="intent-r131-01",
+        )
+
+    def test_paper_dispatch_emits_shadow_decision_info(self) -> None:
+        """Paper mode + flag-on: emits exactly one shadow_decision (INFO)
+        and zero diverged events because compute_decision returns
+        verb='submit' / reason_code='paper.submit' which matches the
+        legacy paper path verbatim.
+        """
+        control_main._set_execution_engine_shadow_flag(True)
+
+        intent = self._make_paper_intent()
+        # Spy on add_event but allow real execution (the legacy paper
+        # path needs to write the trade).
+        emitted = []
+        original_add_event = control_main.repo.add_event
+
+        def spy_add_event(event_type, *args, **kwargs):
+            emitted.append({"event_type": event_type, "kwargs": kwargs})
+            return original_add_event(event_type, *args, **kwargs)
+
+        with patch.object(control_main.repo, "add_event", side_effect=spy_add_event):
+            control_main._emit_execution_shadow_decision_audit(intent)
+
+        shadow_events = [e for e in emitted if e["event_type"] == "execution.shadow_decision"]
+        diverged_events = [
+            e for e in emitted
+            if e["event_type"] == "execution.shadow_decision_diverged"
+        ]
+        self.assertEqual(len(shadow_events), 1)
+        self.assertEqual(len(diverged_events), 0)
+        # Payload contains the typed diff fields.
+        payload = shadow_events[0]["kwargs"]["payload"]
+        self.assertTrue(payload["verb_match"])
+        self.assertTrue(payload["reason_code_match"])
+        self.assertEqual(payload["new_verb"], "submit")
+        self.assertEqual(payload["legacy_verb"], "submit")
+        self.assertEqual(payload["new_reason_code"], "paper.submit")
+        self.assertEqual(payload["mode"], "paper")
+        self.assertEqual(payload["intent_id"], "intent-r131-01")
+
+    def test_diverged_decision_emits_two_events(self) -> None:
+        """When the engine and legacy paths disagree, the audit emitter
+        writes BOTH a shadow_decision (INFO) and a shadow_decision_diverged
+        (WARNING) row so operators can filter for divergences.
+        """
+        control_main._set_execution_engine_shadow_flag(True)
+        intent = self._make_paper_intent()
+
+        emitted = []
+        original_add_event = control_main.repo.add_event
+
+        def spy_add_event(event_type, *args, **kwargs):
+            emitted.append({"event_type": event_type, "kwargs": kwargs})
+            return original_add_event(event_type, *args, **kwargs)
+
+        # Force a divergence by patching compare_shadow_decision to return
+        # a diff whose ``diverged=True``.  This isolates the emission logic.
+        from execution_diff import DecisionDiff
+
+        fake_diff = DecisionDiff(
+            intent_id="intent-r131-01",
+            verb_match=False,
+            new_verb="amend",
+            legacy_verb="submit",
+            reason_code_match=True,
+            new_reason_code="order.differs_numeric",
+            legacy_reason_code="order.differs_numeric",
+            field_diffs=["verb"],
+        )
+        with patch.object(control_main, "compare_shadow_decision", return_value=fake_diff):
+            with patch.object(
+                control_main.repo, "add_event", side_effect=spy_add_event
+            ):
+                control_main._emit_execution_shadow_decision_audit(intent)
+
+        types = [e["event_type"] for e in emitted]
+        self.assertIn("execution.shadow_decision", types)
+        self.assertIn("execution.shadow_decision_diverged", types)
+        # Diverged audit must be WARNING; matched audit INFO.
+        diverged = next(
+            e for e in emitted
+            if e["event_type"] == "execution.shadow_decision_diverged"
+        )
+        from models import EventSeverity
+        self.assertEqual(diverged["kwargs"]["severity"], EventSeverity.WARNING)
+
+    def test_flag_off_short_circuits_shadow(self) -> None:
+        """When the flag is off, _dispatch_execution_intent must not invoke
+        the shadow emitter at all (legacy path is unchanged).
+        """
+        control_main._set_execution_engine_shadow_flag(False)
+        intent = self._make_paper_intent()
+
+        # Patch the emitter — when the flag is off it must not be called.
+        with patch.object(
+            control_main, "_emit_execution_shadow_decision_audit"
+        ) as spy_emit:
+            with patch.object(
+                control_main, "_dispatch_paper_intent",
+                return_value=MagicMock()
+            ):
+                control_main._dispatch_execution_intent(intent)
+
+        spy_emit.assert_not_called()
+
+    def test_default_flag_value_is_true(self) -> None:
+        """Wave-3-A's default is shadow-on so the design doc's "observe a
+        week before flipping anything off" stance holds.
+        """
+        # Reset to documented default.
+        control_main._FEATURE_FLAGS_RUNTIME.pop("execution_engine.shadow", None)
+        self.assertTrue(control_main._get_execution_engine_shadow_flag())
+
+
+class FeatureFlagPlumbingRound131Tests(unittest.TestCase):
+    """ConfigDao.get_feature_flags / set_feature_flag DAO helpers."""
+
+    def setUp(self) -> None:
+        from persistence import ConfigDao, run_migrations
+        from persistence.connection import connect
+
+        self.conn = connect(":memory:")
+        run_migrations(self.conn)
+        self.dao = ConfigDao(self.conn)
+
+    def tearDown(self) -> None:
+        self.conn.close()
+
+    def test_get_feature_flags_returns_default_when_no_snapshot(self) -> None:
+        # No row written yet; default kicks in.
+        flags = self.dao.get_feature_flags(
+            default={"execution_engine.shadow": True}
+        )
+        self.assertEqual(flags, {"execution_engine.shadow": True})
+
+    def test_get_feature_flags_returns_empty_dict_with_no_default(self) -> None:
+        flags = self.dao.get_feature_flags()
+        self.assertEqual(flags, {})
+
+    def test_set_feature_flag_persists_and_reads_back(self) -> None:
+        self.dao.set_feature_flag(
+            "execution_engine.shadow",
+            False,
+            edited_by="desktop_operator",
+            created_at="2026-04-28T10:00:00.000Z",
+        )
+        flags = self.dao.get_feature_flags()
+        self.assertEqual(flags, {"execution_engine.shadow": False})
+
+    def test_set_feature_flag_merges_existing_flags(self) -> None:
+        self.dao.set_feature_flag(
+            "execution_engine.shadow",
+            True,
+            edited_by="desktop_operator",
+            created_at="2026-04-28T10:00:00.000Z",
+        )
+        self.dao.set_feature_flag(
+            "execution_engine.paper",
+            False,
+            edited_by="desktop_operator",
+            created_at="2026-04-28T10:01:00.000Z",
+        )
+        flags = self.dao.get_feature_flags()
+        self.assertEqual(
+            flags,
+            {"execution_engine.shadow": True, "execution_engine.paper": False},
+        )
+
+    def test_set_feature_flag_creates_new_row_each_time(self) -> None:
+        # Event-sourced semantics: every change creates a new row.
+        self.dao.set_feature_flag(
+            "execution_engine.shadow",
+            True,
+            edited_by="desktop_operator",
+            created_at="2026-04-28T10:00:00.000Z",
+        )
+        self.dao.set_feature_flag(
+            "execution_engine.shadow",
+            False,
+            edited_by="desktop_operator",
+            created_at="2026-04-28T10:01:00.000Z",
+        )
+        rows = self.dao.list(snapshot_kind="feature_flags")
+        self.assertEqual(len(rows), 2)
+        # Most recent wins.
+        flags = self.dao.get_feature_flags()
+        self.assertEqual(flags, {"execution_engine.shadow": False})
+
+    def test_get_feature_flags_handles_corrupted_payload(self) -> None:
+        # Defensive: a corrupted payload must not crash the engine; it
+        # falls back to the default.
+        from persistence.dao_config import ConfigSnapshotRow
+        self.dao.insert(
+            ConfigSnapshotRow(
+                snapshot_kind="feature_flags",
+                payload_json="not-json",
+                edited_by="desktop_operator",
+                edit_reason=None,
+                created_at="2026-04-28T10:00:00.000Z",
+            )
+        )
+        flags = self.dao.get_feature_flags(default={"x": True})
+        self.assertEqual(flags, {"x": True})
+
+
+class SettingsPayloadFeatureFlagsRound131Tests(unittest.TestCase):
+    """SettingsPayload exposes feature_flags as a read-only mirror so the
+    desktop UI can render the wave-3 engine flag state.
+    """
+
+    def test_settings_payload_default_feature_flags_is_empty(self) -> None:
+        from models import SettingsPayload, AccountMode as Mode
+
+        payload = SettingsPayload(
+            bybit_web_entry="https://www.bybit.com",
+            api_base_url="https://api.bybit.com",
+            openclaw_gateway_url="ws://127.0.0.1:18789",
+            openclaw_agent="codex",
+            default_mode=Mode.PAPER,
+            notification_channels=["desktop"],
+        )
+        self.assertEqual(payload.feature_flags, {})
+
+    def test_settings_payload_round_trip_preserves_feature_flags(
+        self,
+    ) -> None:
+        from models import SettingsPayload, AccountMode as Mode
+
+        payload = SettingsPayload(
+            bybit_web_entry="https://www.bybit.com",
+            api_base_url="https://api.bybit.com",
+            openclaw_gateway_url="ws://127.0.0.1:18789",
+            openclaw_agent="codex",
+            default_mode=Mode.PAPER,
+            notification_channels=["desktop"],
+            feature_flags={
+                "execution_engine.shadow": True,
+                "execution_engine.paper": False,
+            },
+        )
+        try:
+            dumped = payload.model_dump()
+            restored = SettingsPayload.model_validate(dumped)
+        except AttributeError:  # pragma: no cover - Pydantic v1
+            dumped = payload.dict()
+            restored = SettingsPayload.parse_obj(dumped)
+        self.assertEqual(
+            restored.feature_flags,
+            {"execution_engine.shadow": True, "execution_engine.paper": False},
+        )
+
+    def test_get_settings_endpoint_merges_runtime_feature_flags(self) -> None:
+        # The /api/settings endpoint mirrors the runtime feature_flags
+        # store onto the response so desktop can read the current shadow
+        # flag without writing it back.
+        original = dict(control_main._FEATURE_FLAGS_RUNTIME)
+        try:
+            # Override runtime flags to a known value.
+            control_main._FEATURE_FLAGS_RUNTIME.clear()
+            control_main._FEATURE_FLAGS_RUNTIME["execution_engine.shadow"] = True
+            control_main._FEATURE_FLAGS_RUNTIME["execution_engine.paper"] = False
+
+            from routes import get_settings
+            settings = get_settings()
+
+            self.assertEqual(
+                settings.feature_flags["execution_engine.shadow"], True
+            )
+            self.assertEqual(
+                settings.feature_flags["execution_engine.paper"], False
+            )
+        finally:
+            control_main._FEATURE_FLAGS_RUNTIME.clear()
+            control_main._FEATURE_FLAGS_RUNTIME.update(original)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

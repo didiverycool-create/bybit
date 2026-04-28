@@ -1941,6 +1941,15 @@ class SettingsPayload(BaseModel):
     grafana_dashboard_uid: Optional[str] = None
     grafana_org_id: int = 1
     grafana_theme: Literal["dark", "light"] = "dark"
+    # Round 131 — read-only mirror of the persistence-layer feature flags
+    # (P0-5.1 §G.3 拍板).  Wave-3-A surfaces the wave-3 execution-engine
+    # rollout flags here so the desktop "Settings" panel can render the
+    # current state without writing them back through this endpoint.
+    # Writes go through the dedicated DAO (``dao_feature_flags``); the
+    # value here is updated at snapshot time.  The default empty dict keeps
+    # legacy callers (seed builder, settings update path) wire-compatible
+    # — populating the field is opt-in.
+    feature_flags: Dict[str, bool] = Field(default_factory=dict)
 
 
 class SettingsUpdatePayload(BaseModel):

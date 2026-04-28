@@ -5,10 +5,19 @@ state (settings, workspace preferences, feature flags) is stored as
 event-sourced rows: each save inserts a new row, the most recent row wins.
 "current value" reads use ``ORDER BY created_at DESC LIMIT 1`` (or
 ``MAX(created_at)``) keyed by ``snapshot_kind``.
+
+Round 131 — wave-3-A's §F.1 Shadow Mode adds the ``feature_flags`` helpers
+:meth:`ConfigDao.get_feature_flags` / :meth:`ConfigDao.set_feature_flag` so
+the engine can read the ``execution_engine.shadow`` flag without exposing
+SQL details to call-sites.  The helpers wrap the existing ``get_current``
+/ ``insert`` paths so they participate in the same audit trail and do not
+introduce any new SQL.  Callers that need a default value when no flag
+snapshot exists can pass ``default=`` to :meth:`get_feature_flags`.
 """
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from typing import Any, Dict, List, Optional, TypedDict
 
@@ -117,6 +126,62 @@ class ConfigDao:
         rows = [_row_to_dict(r) for r in cursor.fetchall()]
         cursor.close()
         return rows
+
+    # ------------------------------------------------------ feature-flag helpers
+    def get_feature_flags(
+        self, *, default: Optional[Dict[str, bool]] = None
+    ) -> Dict[str, bool]:
+        """Return the most recent ``feature_flags`` snapshot as a typed
+        ``Dict[str, bool]``.
+
+        Wraps :meth:`get_current` and JSON-decodes the payload.  When no
+        flags snapshot has been written yet, returns ``default or {}`` so
+        the engine's "default-on / default-off" decision lives at the call
+        site (P0-design-decisions §G.3 enforces "no row → safe default").
+        """
+
+        row = self.get_current("feature_flags")
+        if row is None:
+            return dict(default or {})
+        try:
+            payload = json.loads(row["payload_json"])
+        except (TypeError, ValueError):
+            return dict(default or {})
+        if not isinstance(payload, dict):
+            return dict(default or {})
+        # Coerce values to bool to defend against legacy rows that stored
+        # truthy ints / strings; flags are intentionally limited to bool to
+        # keep the desktop "Settings" UI typed.
+        return {str(key): bool(value) for key, value in payload.items()}
+
+    def set_feature_flag(
+        self,
+        flag: str,
+        value: bool,
+        *,
+        edited_by: str,
+        created_at: str,
+        edit_reason: Optional[str] = None,
+    ) -> int:
+        """Update a single feature flag by inserting a new row that merges
+        ``flag=value`` onto the latest snapshot.  Returns the new row id.
+
+        The merge-then-insert pattern preserves the event-sourced semantics
+        (every change creates an audit row) while letting callers update one
+        flag at a time without having to re-read the full set.
+        """
+
+        current = self.get_feature_flags()
+        current[str(flag)] = bool(value)
+        return self.insert(
+            ConfigSnapshotRow(
+                snapshot_kind="feature_flags",
+                payload_json=json.dumps(current, separators=(",", ":")),
+                edited_by=edited_by,
+                edit_reason=edit_reason,
+                created_at=created_at,
+            )
+        )
 
 
 __all__ = ["ConfigDao", "ConfigSnapshotRow"]

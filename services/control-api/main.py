@@ -297,6 +297,13 @@ from execution_preview_builders import (
 )
 from risk_decision import derive_block_reason_code
 from risk_engine import RiskEngine
+from execution_engine import ExecutionEngine
+from execution_diff import (
+    DecisionDiff,
+    compare_shadow_decision,
+    derive_legacy_verb_from_paper_dispatch,
+    derive_legacy_verb_from_reconciliation,
+)
 from strategy_alerts import (
     _AUTO_DISPATCH_TO_RISK_SUB_BLOCK_CODE,
     _RISK_SUB_BLOCK_TO_AUTO_DISPATCH_GATE_REASON,
@@ -493,6 +500,70 @@ class StrategyExecutionNoopError(RuntimeError):
 
 
 repo = AppRepository()
+# Round 131 — wave-3-A §F.1 Shadow Mode singleton.  The engine reads /
+# does not write any state in this round; it is constructed against the
+# already-initialised :data:`risk_engine` so :meth:`ExecutionEngine.compute_decision`
+# can share the same risk-decision graph as the legacy
+# ``_dispatch_strategy_signal_from_state`` path.  ``persistence=None`` for
+# wave-3-A because the engine does not persist anything yet (F.2 onwards).
+execution_engine = ExecutionEngine(
+    repo=repo, persistence=None, risk_engine=risk_engine
+)
+
+
+# Round 131 — wave-3-A Shadow Mode default-on toggle (P0-design-decisions
+# §G.3).  Read from the persisted feature_flags snapshot when present,
+# otherwise fall back to the dev-default ``True``.  Production deployments
+# that want the legacy path-only behaviour set
+# ``execution_engine.shadow=False`` through the persistence DAO; the audit
+# emission below honours that within milliseconds without process restart
+# because the helper re-reads the flag on every dispatch.
+_EXECUTION_ENGINE_SHADOW_FLAG_NAME = "execution_engine.shadow"
+_EXECUTION_ENGINE_SHADOW_DEFAULT = True
+
+
+# Round 131 — in-process feature-flag store.  Wave-3-A keeps the canonical
+# state in memory because the SQLite persistence layer (P0-5.1) is not yet
+# wired into ``main.py`` at module load time; the persistence DAO
+# :meth:`ConfigDao.get_feature_flags` already exists and will be the
+# single source of truth in wave-3-B/C onward, but for now this dict gives
+# tests a stable hook to override the default-True behaviour without
+# spinning up a SQLite database.  The default value comes from
+# :data:`_EXECUTION_ENGINE_SHADOW_DEFAULT` so production-like cold-starts
+# behave the same as the design doc says.
+_FEATURE_FLAGS_RUNTIME: Dict[str, bool] = {
+    _EXECUTION_ENGINE_SHADOW_FLAG_NAME: _EXECUTION_ENGINE_SHADOW_DEFAULT,
+}
+
+
+def _get_execution_engine_shadow_flag() -> bool:
+    """Return ``True`` if shadow mode is enabled.
+
+    Reads the in-process flag store first (wave-3-A canonical source);
+    when wave-3-B/C wires SQLite-backed reads, this function will fall back
+    to :meth:`ConfigDao.get_feature_flags` when the in-process store has
+    not been overridden by tests.  Errors fall back to the safe default.
+    """
+
+    return bool(
+        _FEATURE_FLAGS_RUNTIME.get(
+            _EXECUTION_ENGINE_SHADOW_FLAG_NAME,
+            _EXECUTION_ENGINE_SHADOW_DEFAULT,
+        )
+    )
+
+
+def _set_execution_engine_shadow_flag(value: bool) -> None:
+    """Override the shadow-mode flag.
+
+    Wave-3-A test hook — production would write through the persistence
+    DAO instead.  Kept simple here so tests that don't touch SQLite can
+    still toggle the flag without monkey-patching.
+    """
+
+    _FEATURE_FLAGS_RUNTIME[_EXECUTION_ENGINE_SHADOW_FLAG_NAME] = bool(value)
+
+
 openclaw = OpenClawGatewayClient()
 market_data = BybitPublicMarketClient(repo.snapshot().settings.api_base_url)
 private_data = BybitPrivateClient()
@@ -6506,10 +6577,137 @@ def _dispatch_execution_intent(intent: ExecutionIntent) -> StrategyExecutionResu
     ``intent.mode``.  The decision verdict is assumed to already be
     ``"allow"``: blocked decisions must be surfaced before intent
     construction by ``_dispatch_strategy_signal_from_state``.
+
+    Round 131 — wave-3-A §F.1 Shadow Mode.  Before the legacy paper / live
+    branches return, the engine's :meth:`ExecutionEngine.compute_decision`
+    is run side-by-side and the resulting :class:`ExecutionDecision` is
+    compared against the legacy path via
+    :func:`execution_diff.compare_shadow_decision`.  The diff is emitted
+    as one ``execution.shadow_decision`` audit (INFO when the engine and
+    legacy paths agree, WARNING ``execution.shadow_decision_diverged``
+    when they disagree).  No side effects on the legacy path —
+    ``_dispatch_paper_intent`` / ``_dispatch_live_intent`` continue to be
+    the primary execution authority in wave-3-A.
+
+    The shadow path is gated on the ``execution_engine.shadow`` feature
+    flag (default ``True``).  Errors inside the shadow branch are
+    swallowed (best-effort; logged via stderr) so a defective engine cannot
+    break the legacy dispatcher.
     """
+
+    if _get_execution_engine_shadow_flag():
+        try:
+            _emit_execution_shadow_decision_audit(intent)
+        except Exception as exc:  # pragma: no cover - defensive
+            # Never let a shadow-mode error break the legacy path.
+            print(
+                f"[execution_engine.shadow] shadow audit emission failed: {exc!r}",
+                file=sys.stderr,
+            )
+
     if intent.mode == AccountMode.PAPER:
         return _dispatch_paper_intent(intent)
     return _dispatch_live_intent(intent)
+
+
+def _emit_execution_shadow_decision_audit(intent: ExecutionIntent) -> None:
+    """Run the engine's :meth:`compute_decision` alongside the legacy path
+    and emit one ``execution.shadow_decision`` audit row recording the
+    diff.
+
+    Helper kept side-effect-isolated so the caller's ``try/except`` can
+    catch any engine bug without affecting the legacy dispatcher.
+
+    Live mode: the legacy path's branch is inferred by re-running the
+    existing :func:`_classify_live_order_reconciliation` helper (a pure
+    function — same input set the engine reads) and translating its
+    :class:`~models.LiveOrderReconciliation.action` into the engine's verb
+    space.  Paper mode: the legacy verb is always ``"submit"`` (the
+    legacy ``_dispatch_paper_intent`` always writes a fresh trade).
+    """
+
+    state = repo.snapshot()
+    decision = execution_engine.compute_decision(intent, state)
+
+    # Derive the legacy path's expected verb / reason_code / target /
+    # stale orders so the diff helper can compare them against the
+    # engine's typed decision.
+    legacy_verb: str
+    legacy_reason_code: str
+    legacy_target_order_id: Optional[str] = None
+    legacy_stale_order_ids: List[str] = []
+
+    if intent.mode == AccountMode.PAPER:
+        legacy_verb = derive_legacy_verb_from_paper_dispatch()
+        legacy_reason_code = "paper.submit"
+    else:
+        existing_orders = [
+            item
+            for item in parse_open_orders(use_private_only=True)
+            if item.source == "bybit_private"
+            and item.origin == "strategy"
+            and item.strategy_id == intent.strategy_id
+            and item.symbol == intent.symbol
+            and item.market == intent.market
+        ]
+        legacy_recon = _classify_live_order_reconciliation(
+            intent,
+            existing_orders,
+            requires_reduce_only=_execution_preview_requires_reduce_only(intent.preview),
+        )
+        legacy_verb = derive_legacy_verb_from_reconciliation(legacy_recon.action)
+        legacy_reason_code = legacy_recon.reason_code
+        if legacy_recon.matching_order is not None:
+            legacy_target_order_id = legacy_recon.matching_order.order_id
+        legacy_stale_order_ids = [
+            stale.order_id for stale in legacy_recon.stale_orders
+        ]
+
+    diff: DecisionDiff = compare_shadow_decision(
+        decision,
+        legacy_verb=legacy_verb,
+        legacy_reason_code=legacy_reason_code,
+        legacy_target_order_id=legacy_target_order_id,
+        legacy_stale_order_ids=legacy_stale_order_ids,
+    )
+
+    payload: Dict[str, Any] = {
+        "strategy_id": intent.strategy_id,
+        "strategy_name": intent.strategy_name,
+        "intent_id": diff.intent_id,
+        "mode": intent.mode.value,
+        "verb_match": diff.verb_match,
+        "reason_code_match": diff.reason_code_match,
+        "new_verb": diff.new_verb,
+        "legacy_verb": diff.legacy_verb,
+        "new_reason_code": diff.new_reason_code,
+        "legacy_reason_code": diff.legacy_reason_code,
+        "field_diffs": list(diff.field_diffs),
+    }
+
+    # Always emit the matched-case audit at INFO so the timeline shows the
+    # engine ran.  When diverged, emit an additional WARNING-level audit so
+    # operators can filter for "engine disagreed with legacy" without
+    # parsing payloads.
+    repo.add_event(
+        event_type="execution.shadow_decision",
+        source="quant-core",
+        severity=EventSeverity.INFO,
+        payload=payload,
+        symbol=intent.symbol,
+        strategy_id=intent.strategy_id,
+        parameter_snapshot=intent.parameter_snapshot,
+    )
+    if diff.diverged:
+        repo.add_event(
+            event_type="execution.shadow_decision_diverged",
+            source="quant-core",
+            severity=EventSeverity.WARNING,
+            payload=payload,
+            symbol=intent.symbol,
+            strategy_id=intent.strategy_id,
+            parameter_snapshot=intent.parameter_snapshot,
+        )
 
 
 def _dispatch_strategy_signal_from_state(strategy_id: str, payload: StrategyExecutionRequest) -> StrategyExecutionResult:

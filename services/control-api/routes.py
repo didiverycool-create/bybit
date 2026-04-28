@@ -701,7 +701,19 @@ def get_audit_events():
 
 @router.get("/api/settings", response_model=SettingsPayload)
 def get_settings():
-    return main.repo.snapshot().settings
+    # Round 131 — merge the runtime feature-flag store onto the persisted
+    # settings before returning so the desktop "Settings" panel sees the
+    # current execution-engine.shadow flag (default ``True``).  The
+    # underlying state.settings.feature_flags stays empty / persisted as-is
+    # — this is purely a read-time mirror.  Future work (wave-3-B) replaces
+    # the runtime store with a SQLite-backed read.
+    settings = main.repo.snapshot().settings
+    runtime_flags = dict(main._FEATURE_FLAGS_RUNTIME)
+    if runtime_flags:
+        merged_flags = dict(settings.feature_flags or {})
+        merged_flags.update(runtime_flags)
+        return settings.model_copy(update={"feature_flags": merged_flags})
+    return settings
 
 
 @router.post("/api/settings", response_model=SettingsPayload)

@@ -3994,6 +3994,12 @@ class AppRepository:
                 grafana_dashboard_uid=grafana_dashboard_uid,
                 grafana_org_id=grafana_org_id,
                 grafana_theme=payload.grafana_theme or current.grafana_theme,
+                # Round 131 — preserve the read-only feature_flags mirror
+                # across settings updates.  The settings update endpoint
+                # cannot write feature flags (those go through the
+                # persistence DAO); carrying the current value forward keeps
+                # the desktop UI consistent.
+                feature_flags=dict(current.feature_flags or {}),
             )
             self.state.settings = next_settings
             self.add_event(
